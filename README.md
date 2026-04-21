@@ -101,6 +101,33 @@ on first run (migrations apply automatically) and opens a Unix socket at
 
 For production, LaunchAgent plists are in `ops/`. See `ops/README.md`.
 
+## Install as a Claude Code plugin
+
+polygram also ships as a Claude Code plugin — adds admin slash commands
+and bundles the transcript-query skill for use inside your Claude sessions.
+
+```
+/plugin install https://github.com/shumkov/polygram.git
+```
+
+Once installed:
+
+- `/polygram:status` — running bots, IPC health, recent events, one-line verdict
+- `/polygram:logs <bot>` — tail `~/polygram/logs/<bot>.log`
+- `/polygram:pair-code` — walks you through issuing a pairing code (in-band via Telegram)
+- `/polygram:approvals [bot]` — pending and recent tool-approval rows
+
+The bundled **`telegram-history` skill** lets Claude query the transcript
+directly:
+
+```
+"Summarise the Orders topic today" →
+  uses skills/telegram-history to run `recent <chat> --since 24h`
+```
+
+Scope is derived from `process.cwd()`: the skill refuses to run from an
+unmapped directory unless `BRIDGE_ADMIN=1` is set.
+
 ## Configuration
 
 Minimal:

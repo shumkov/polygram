@@ -1,0 +1,13 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "polygram",
+  "version": "0.1.0",
+  "description": "Admin + transcript skills for the polygram Telegram daemon.",
+  "author": {
+    "name": "Ivan Shumkov",
+    "email": "ivan.shumkov@dash.org"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/shumkov/polygram",
+  "repository": "https://github.com/shumkov/polygram"
+}
