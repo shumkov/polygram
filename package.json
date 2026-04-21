@@ -1,0 +1,43 @@
+{
+  "name": "polygram",
+  "version": "0.1.0",
+  "description": "Telegram daemon for Claude Code that preserves the OpenClaw per-chat session model. Migration path for OpenClaw users moving to Claude Code.",
+  "main": "bridge.js",
+  "bin": {
+    "polygram": "bridge.js",
+    "polygram-split-db": "scripts/split-db.js"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "start": "node bridge.js",
+    "split-db": "node scripts/split-db.js",
+    "ipc-smoke": "node scripts/ipc-smoke.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "telegram",
+    "claude-code",
+    "bot",
+    "daemon",
+    "multi-bot",
+    "sqlite",
+    "transcript"
+  ],
+  "author": "Ivan Shumkov <ivan.shumkov@dash.org>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shumkov/polygram.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shumkov/polygram/issues"
+  },
+  "homepage": "https://github.com/shumkov/polygram#readme",
+  "type": "commonjs",
+  "dependencies": {
+    "better-sqlite3": "^12.9.0",
+    "grammy": "^1.42.0"
+  }
+}

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Template: one plist per bot. Replace BOTNAME and YOURNAME.
+
+  Install:
+    cp ops/polygram.plist.example ~/Library/LaunchAgents/com.polygram.BOTNAME.plist
+    sed -i '' 's/BOTNAME/my-admin-bot/g; s|YOURNAME|'"$USER"'|g' \
+      ~/Library/LaunchAgents/com.polygram.BOTNAME.plist
+    launchctl load ~/Library/LaunchAgents/com.polygram.BOTNAME.plist
+
+  Restart:
+    launchctl kickstart -k gui/$(id -u)/com.polygram.BOTNAME
+
+  Logs:
+    tail -f /Users/YOURNAME/polygram/logs/BOTNAME.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.polygram.BOTNAME</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/Users/YOURNAME/polygram/bridge.js</string>
+        <string>--bot</string>
+        <string>BOTNAME</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/YOURNAME/polygram</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/YOURNAME/polygram/logs/BOTNAME.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOURNAME/polygram/logs/BOTNAME.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/YOURNAME/.npm-global/bin</string>
+        <key>HOME</key>
+        <string>/Users/YOURNAME</string>
+        <key>NODE_ENV</key>
+        <string>production</string>
+    </dict>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

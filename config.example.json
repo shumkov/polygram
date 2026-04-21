@@ -1,0 +1,118 @@
+{
+  "_comment": "Copy to config.json and fill in real values. Two bots shown: one admin, one partner-facing with approvals + voice.",
+
+  "bots": {
+    "admin-bot": {
+      "token": "REPLACE_WITH_BOT_TOKEN_FROM_BOTFATHER",
+      "allowConfigCommands": true,
+      "_comment_adminChatId": "Required when allowConfigCommands is true for pairing commands (/pair-code, /pairings, /unpair) to work. These grant cross-chat trust and are gated to the admin chat only.",
+      "adminChatId": "123456789",
+      "needsToken": false,
+      "streamReplies": true,
+      "streamMinChars": 30,
+      "streamThrottleMs": 500,
+      "voice": {
+        "enabled": true,
+        "provider": "openai",
+        "openai": {
+          "apiKeyEnv": "OPENAI_API_KEY",
+          "model": "whisper-1"
+        },
+        "language": "auto",
+        "maxDurationSec": 600,
+        "ackReaction": "👂"
+      }
+    },
+
+    "partner-bot": {
+      "token": "REPLACE_WITH_PARTNER_BOT_TOKEN",
+      "needsToken": false,
+      "approvals": {
+        "adminChatId": "123456789",
+        "timeoutMs": 300000,
+        "gatedTools": [
+          "Bash(rm *)",
+          "Bash(git push *)",
+          "mcp__*__invoice_create",
+          "mcp__*__order_write"
+        ]
+      },
+      "voice": {
+        "enabled": true,
+        "provider": "local",
+        "local": {
+          "binary": "/opt/homebrew/bin/whisper-cpp",
+          "model": "/Users/you/models/ggml-base.en.bin"
+        }
+      }
+    }
+  },
+
+  "chats": {
+    "123456789": {
+      "name": "Admin DM",
+      "bot": "admin-bot",
+      "agent": "admin",
+      "model": "opus",
+      "effort": "medium",
+      "cwd": "/Users/you/admin-agent",
+      "timeout": 600
+    },
+
+    "-1000000000001": {
+      "name": "Ops Group",
+      "bot": "admin-bot",
+      "agent": "admin",
+      "model": "sonnet",
+      "effort": "low",
+      "cwd": "/Users/you/admin-agent",
+      "requireMention": true,
+      "_comment_isolateTopics": "Default false: all topics share one Claude context (intuitive for organisational topics). Set true for OpenClaw-style per-topic isolation when each topic is a genuinely separate project.",
+      "topics": {
+        "100": "Orders",
+        "200": "Billing",
+        "300": "Planning"
+      }
+    },
+
+    "-1000000000003": {
+      "name": "Projects Group (per-topic isolation)",
+      "bot": "admin-bot",
+      "agent": "admin",
+      "model": "sonnet",
+      "effort": "low",
+      "cwd": "/Users/you/admin-agent",
+      "requireMention": true,
+      "isolateTopics": true,
+      "topics": {
+        "100": "Customer A",
+        "200": "Customer B"
+      }
+    },
+
+    "-1000000000002": {
+      "name": "Partner Group",
+      "bot": "partner-bot",
+      "agent": "partner",
+      "model": "sonnet",
+      "effort": "low",
+      "cwd": "/Users/you/partner-agent",
+      "requireMention": true
+    }
+  },
+
+  "defaults": {
+    "model": "sonnet",
+    "effort": "low",
+    "timeout": 300,
+    "inboxRetentionDays": 30
+  },
+
+  "maxWarmProcesses": 10,
+
+  "attachmentLimits": {
+    "maxCount": 5,
+    "maxTotalMb": 20,
+    "maxFileMb": 10
+  }
+}

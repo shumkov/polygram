@@ -1,0 +1,29 @@
+# Secrets & live state
+config.json
+sessions.json
+sessions.json.*
+*.db
+*.db-wal
+*.db-shm
+*.db.archived-*
+*.malformed-*
+.env
+.env.*
+/tmp/polygram-*.secret
+*.secret
+
+# Deployment-specific (one-off ops tooling)
+/scripts/_one-shot-*.js
+/contrib/
+
+# Runtime
+inbox/
+logs/
+node_modules/
+.DS_Store
+*.log
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
