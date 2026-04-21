@@ -116,7 +116,7 @@ function refuseIfActiveWriter(srcPath) {
   // A hot WAL (< 60s) strongly suggests a live writer.
   if (age < 60_000) {
     console.error(`[split-db] refusing: ${wal} is active (mtime ${Math.round(age/1000)}s ago)`);
-    console.error('[split-db] stop the bridge process(es) first: launchctl unload ...');
+    console.error('[split-db] stop the polygram process(es) first: launchctl unload ...');
     process.exit(3);
   }
 }

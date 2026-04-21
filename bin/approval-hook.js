@@ -1,19 +1,19 @@
 #!/usr/bin/env node
 /**
- * Claude Code PreToolUse hook -> bridge daemon approval round-trip.
+ * Claude Code PreToolUse hook -> polygram daemon approval round-trip.
  *
  * Installed into an agent's settings.json:
  *   { "hooks": { "PreToolUse": [
  *     { "matcher": "Bash|WebFetch|mcp__*", "hooks": [
  *       { "type": "command",
- *         "command": "/Users/YOURNAME/polygram/bin/bridge-approval-hook.js" }
+ *         "command": "/Users/YOURNAME/polygram/bin/approval-hook.js" }
  *     ]}
  *   ]}}
  *
- * Environment (set by the bridge when spawning Claude):
- *   BRIDGE_BOT       - bot name owning this session (socket suffix)
- *   BRIDGE_CHAT_ID   - chat whose message triggered this turn (for the card)
- *   BRIDGE_TURN_ID   - optional; helps dedupe re-fires on Claude retries
+ * Environment (set by polygram when spawning Claude):
+ *   POLYGRAM_BOT       - bot name owning this session (socket suffix)
+ *   POLYGRAM_CHAT_ID   - chat whose message triggered this turn (for the card)
+ *   POLYGRAM_TURN_ID   - optional; helps dedupe re-fires on Claude retries
  *
  * Contract (Claude Code):
  *   stdin  JSON: { session_id, hook_event_name: "PreToolUse",
@@ -27,7 +27,7 @@
  *     0 - allow (empty stdout) or structured decision in stdout
  *     2 - block (deny)
  *
- * Failure policy: on IPC error (bridge down, socket missing, timeout) we
+ * Failure policy: on IPC error (polygram down, socket missing, timeout) we
  * deny by default. Better to block a legitimate tool call than to let a
  * destructive one through when the approver is unreachable.
  */
@@ -35,12 +35,12 @@
 const fs = require('fs');
 
 (async () => {
-  const botName = process.env.BRIDGE_BOT;
-  const chatId  = process.env.BRIDGE_CHAT_ID;
-  const turnId  = process.env.BRIDGE_TURN_ID || null;
+  const botName = process.env.POLYGRAM_BOT;
+  const chatId  = process.env.POLYGRAM_CHAT_ID;
+  const turnId  = process.env.POLYGRAM_TURN_ID || null;
 
   if (!botName || !chatId) {
-    deny('bridge-approval-hook: BRIDGE_BOT and BRIDGE_CHAT_ID env vars required');
+    deny('polygram-approval-hook: POLYGRAM_BOT and POLYGRAM_CHAT_ID env vars required');
     return;
   }
 
@@ -58,7 +58,7 @@ const fs = require('fs');
 
   // Resolve relative to this hook's own location rather than a hardcoded
   // absolute path — an absolute-path require is a symlink-swap RCE vector
-  // (anyone who can write to that path gets code execution in-bridge).
+  // (anyone who can write to that path gets code execution in-polygram).
   const path = require('path');
   const { call, socketPathFor, readSecret } = require(path.join(__dirname, '..', 'lib', 'ipc-client'));
   let res;
@@ -76,12 +76,12 @@ const fs = require('fs');
       },
     });
   } catch (err) {
-    deny(`bridge unreachable: ${err.message}`);
+    deny(`polygram unreachable: ${err.message}`);
     return;
   }
 
   if (!res || !res.ok) {
-    deny(`bridge error: ${res?.error || 'unknown'}`);
+    deny(`polygram error: ${res?.error || 'unknown'}`);
     return;
   }
 

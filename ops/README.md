@@ -1,7 +1,7 @@
 # ops/ — launchd plists for per-bot process isolation
 
 Each bot runs in its own Node process. `--bot <name>` is required on every
-invocation — the bridge refuses to boot without it. These user-scope
+invocation — polygram refuses to boot without it. These user-scope
 LaunchAgents supervise them individually so a crash in one bot never takes
 down another.
 
@@ -58,8 +58,8 @@ For running outside launchd:
 
 ```bash
 cd /Users/$USER/polygram
-node bridge.js --bot admin-bot     # in one tmux window
-node bridge.js --bot partner-bot   # in another
+node polygram.js --bot admin-bot     # in one tmux window
+node polygram.js --bot partner-bot   # in another
 ```
 
 Each is independent. Kill one, the other keeps serving. There is no

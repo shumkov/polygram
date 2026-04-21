@@ -48,7 +48,7 @@ ergonomics while running on top of `claude` CLI.
 - **Prompt-injection hardening.** User text wrapped in `<untrusted-input>`
   with xml-escape; attributes use `&quot;`. A partner typing
   `</channel><system>...` sees it as literal text in the prompt.
-- **Pairing codes** for guest onboarding without bridge restart
+- **Pairing codes** for guest onboarding without polygram restart
   (`/pair-code`, `/pair <CODE>`, `/pairings`, `/unpair`).
 - **Step-level streaming replies** (optional per bot). Telegram message
   edits on each assistant step as Claude works through tool calls and
@@ -91,11 +91,11 @@ cp config.example.json config.json
 ## Run
 
 ```bash
-node bridge.js --bot admin-bot          # one bot, one process
-node bridge.js --bot partner-bot        # another bot, another process
+node polygram.js --bot admin-bot          # one bot, one process
+node polygram.js --bot partner-bot        # another bot, another process
 ```
 
-`--bot` is required. Each process creates `<bot>.db` next to `bridge.js`
+`--bot` is required. Each process creates `<bot>.db` next to `polygram.js`
 on first run (migrations apply automatically) and opens a Unix socket at
 `/tmp/polygram-<bot>.sock`.
 
@@ -122,11 +122,11 @@ directly:
 
 ```
 "Summarise the Orders topic today" →
-  uses skills/telegram-history to run `recent <chat> --since 24h`
+  uses skills/history to run `recent <chat> --since 24h`
 ```
 
 Scope is derived from `process.cwd()`: the skill refuses to run from an
-unmapped directory unless `BRIDGE_ADMIN=1` is set.
+unmapped directory unless `POLYGRAM_ADMIN=1` is set.
 
 ## Configuration
 
@@ -212,13 +212,13 @@ failures should surface.
 A Claude skill that queries the transcript:
 
 ```bash
-node skills/telegram-history/scripts/query.js recent -1000000000001 --since 24h
-node skills/telegram-history/scripts/query.js search "invoice" --user Maria
-node skills/telegram-history/scripts/query.js around --chat -100... --msg-id 12345 --before 10
+node skills/history/scripts/query.js recent -1000000000001 --since 24h
+node skills/history/scripts/query.js search "invoice" --user Maria
+node skills/history/scripts/query.js around --chat -100... --msg-id 12345 --before 10
 ```
 
 Bot scope is derived from `process.cwd()` — the skill refuses to run if
-the cwd doesn't match a chat in config, unless `BRIDGE_ADMIN=1` is set.
+the cwd doesn't match a chat in config, unless `POLYGRAM_ADMIN=1` is set.
 With per-bot DBs the skill opens only the current bot's file; in admin
 mode it unions across all `<bot>.db` files.
 
@@ -243,7 +243,7 @@ Install the hook at the agent level (`settings.json`):
       "matcher": "Bash|mcp__*",
       "hooks": [{
         "type": "command",
-        "command": "/abs/path/to/polygram/bin/bridge-approval-hook.js"
+        "command": "/abs/path/to/polygram/bin/approval-hook.js"
       }]
     }]
   }
@@ -267,15 +267,15 @@ npm run ipc-smoke -- my-bot
 Layout:
 
 ```
-bridge.js                         main daemon
-bin/bridge-approval-hook.js       PreToolUse hook
+polygram.js                         main daemon
+bin/approval-hook.js       PreToolUse hook
 lib/                              core modules (db, prompt, telegram,
                                    process-manager, sessions, history,
                                    attachments, inbox, voice, approvals,
                                    pairings, ipc-{server,client},
                                    session-key, stream-reply, ...)
 migrations/NNN-*.sql              applied at boot, guarded by user_version
-skills/telegram-history/          Claude skill
+skills/history/          Claude skill
 ops/                              LaunchAgent plists
 scripts/split-db.js               one-time shared-DB → per-bot migration
 tests/*.test.js                   node:test

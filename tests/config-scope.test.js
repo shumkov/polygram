@@ -24,17 +24,17 @@ const fullConfig = {
 
 describe('parseBotArg', () => {
   test('returns null when --bot not in argv', () => {
-    assert.equal(parseBotArg(['node', 'bridge.js']), null);
+    assert.equal(parseBotArg(['node', 'polygram.js']), null);
     assert.equal(parseBotArg([]), null);
   });
 
   test('returns bot name when --bot <name> present', () => {
-    assert.equal(parseBotArg(['node', 'bridge.js', '--bot', 'shumabit']), 'shumabit');
+    assert.equal(parseBotArg(['node', 'polygram.js', '--bot', 'shumabit']), 'shumabit');
     assert.equal(parseBotArg(['--bot', 'umi-assistant']), 'umi-assistant');
   });
 
   test('throws when --bot has no value', () => {
-    assert.throws(() => parseBotArg(['node', 'bridge.js', '--bot']), /requires a bot name/);
+    assert.throws(() => parseBotArg(['node', 'polygram.js', '--bot']), /requires a bot name/);
   });
 
   test('throws when --bot followed by another flag', () => {

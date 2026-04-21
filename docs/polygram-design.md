@@ -1153,7 +1153,7 @@ Agent definition (`~/partner-agent/.claude/settings.json`):
 exec python3 - <<'PY'
 import json, socket, sys, os
 req = json.load(sys.stdin)
-req['chat_id'] = os.environ.get('BRIDGE_CHAT_ID')
+req['chat_id'] = os.environ.get('POLYGRAM_CHAT_ID')
 s = socket.socket(socket.AF_UNIX)
 s.connect('/tmp/polygram-<bot>.sock')
 s.sendall((json.dumps({'op':'approval_request', **req}) + '\n').encode())
@@ -1593,7 +1593,7 @@ cleanup pass removed it:
 - IPC payload `bot_name` field — validated if present, but callers can
   omit it (the socket implies the bot).
 - `--bot <name>` CLI flag.
-- `BRIDGE_BOT` env var for the approval hook.
+- `POLYGRAM_BOT` env var for the approval hook.
 - `config.chats[id].bot` field in the full `config.json` — the filter
   consumes it at boot.
 

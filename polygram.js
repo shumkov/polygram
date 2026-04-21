@@ -433,19 +433,19 @@ function spawnClaude(sessionKey, ctx) {
   // Scrub env to an allowlist: under bypassPermissions a prompt-injected
   // child can exfiltrate any env var, so we pass only what Claude Code and
   // normal shell tools need. TELEGRAM_BOT_TOKEN is opt-in per bot via
-  // config.bot.needsToken — partner bots go through the bridge for every
+  // config.bot.needsToken — partner bots go through polygram for every
   // outbound message and never need direct API access.
   const botConfig = config.bot || {};
   const childEnv = filterEnv(process.env);
   childEnv.HOME = CHILD_HOME;
   childEnv.CLAUDE_CHANNEL_BOT = BOT_NAME;
   // Approval hook integration: the hook runs as a child of Claude and reads
-  // these to route its IPC. BRIDGE_TURN_ID isn't set here (one session can
+  // these to route its IPC. POLYGRAM_TURN_ID isn't set here (one session can
   // run many turns) — the hook treats it as optional.
-  childEnv.BRIDGE_BOT = BOT_NAME;
-  childEnv.BRIDGE_CHAT_ID = String(chatId || '');
+  childEnv.POLYGRAM_BOT = BOT_NAME;
+  childEnv.POLYGRAM_CHAT_ID = String(chatId || '');
   // Allow the PreToolUse approval hook to authenticate to the IPC socket.
-  if (process.env.BRIDGE_IPC_SECRET) childEnv.BRIDGE_IPC_SECRET = process.env.BRIDGE_IPC_SECRET;
+  if (process.env.POLYGRAM_IPC_SECRET) childEnv.POLYGRAM_IPC_SECRET = process.env.POLYGRAM_IPC_SECRET;
   if (botConfig.needsToken) {
     childEnv.TELEGRAM_BOT_TOKEN = botConfig.token || '';
   }
@@ -1487,7 +1487,7 @@ async function main() {
     process.exit(2);
   }
   DB_PATH = dbOverride || path.join(DB_DIR, `${BOT_NAME}.db`);
-  console.log(`[bridge] bot: ${BOT_NAME} (${Object.keys(config.chats).length} chats) db: ${DB_PATH}`);
+  console.log(`[polygram] bot: ${BOT_NAME} (${Object.keys(config.chats).length} chats) db: ${DB_PATH}`);
 
   try {
     db = dbClient.open(DB_PATH);
@@ -1571,7 +1571,7 @@ async function main() {
     // Fresh per-boot secret, persisted 0600 for same-UID readers (cron
     // scripts, hook); also exported to spawned Claude processes via env.
     const ipcSecret = ipcServer.writeSecret(BOT_NAME);
-    process.env.BRIDGE_IPC_SECRET = ipcSecret;
+    process.env.POLYGRAM_IPC_SECRET = ipcSecret;
     ipcCloser = await ipcServer.start({
       path: ipcServer.socketPathFor(BOT_NAME),
       secret: ipcSecret,

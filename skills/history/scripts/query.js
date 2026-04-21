@@ -9,7 +9,7 @@
  * Opens bridge.db read-only. Bot scope is derived from process.cwd() —
  * each bot's Claude project dir maps to a chat.cwd in config.json, so a
  * partner-spawned skill invocation cannot escape its bot's chat allowlist.
- * Set BRIDGE_ADMIN=1 for unrestricted queries from unmapped cwd.
+ * Set POLYGRAM_ADMIN=1 for unrestricted queries from unmapped cwd.
  *
  * Default output: JSON (one row per message). Pass --format pretty for
  * human-readable lines.
@@ -21,12 +21,12 @@ const Database = require('better-sqlite3');
 
 const history = require('../lib/history');
 
-const BRIDGE_DIR = process.env.BRIDGE_DIR || path.resolve(__dirname, '../../../../polygram');
-const CONFIG_PATH = process.env.BRIDGE_CONFIG || path.join(BRIDGE_DIR, 'config.json');
-// BRIDGE_DB overrides auto-resolution. Otherwise the skill reads one DB per
+const POLYGRAM_DIR = process.env.POLYGRAM_DIR || path.resolve(__dirname, '../../../../polygram');
+const CONFIG_PATH = process.env.POLYGRAM_CONFIG || path.join(POLYGRAM_DIR, 'config.json');
+// POLYGRAM_DB overrides auto-resolution. Otherwise the skill reads one DB per
 // bot (<bot>.db) when the bot scope is known, or all bot DBs for admin.
 // Legacy `bridge.db` is used as a fallback when per-bot DBs don't exist yet.
-const DB_OVERRIDE = process.env.BRIDGE_DB || null;
+const DB_OVERRIDE = process.env.POLYGRAM_DB || null;
 
 function die(msg, code = 1) {
   process.stderr.write(`history: ${msg}\n`);
@@ -65,7 +65,7 @@ function loadConfig() {
 /**
  * Derive bot scope from the current working directory.
  * Each chat in config.json has a `cwd` pointing at the bot's Claude project
- * root. process.cwd() is set by the bridge when it spawns Claude, so this
+ * root. process.cwd() is set by polygram when it spawns Claude, so this
  * cannot be spoofed from inside a prompt. Fails closed: if no chat's cwd
  * matches and no admin override is set, we refuse to run.
  */
@@ -85,15 +85,15 @@ function deriveBotScope(cfg) {
     };
   }
 
-  // No cwd match. Allow explicit admin override via env var, which the bridge
+  // No cwd match. Allow explicit admin override via env var, which polygram
   // never sets and thus cannot be triggered from a bot-spawned subprocess.
-  if (process.env.BRIDGE_ADMIN === '1') {
+  if (process.env.POLYGRAM_ADMIN === '1') {
     return { bot: null, allowedChatIds: null };
   }
 
   // Legacy fallback: respect CLAUDE_CHANNEL_BOT ONLY if it matches a known bot
   // in the config. This preserves manual shumabit/umi-assistant invocation via
-  // the bridge env var without opening an admin-by-default hole.
+  // polygram env var without opening an admin-by-default hole.
   const envBot = process.env.CLAUDE_CHANNEL_BOT;
   if (envBot && cfg.bots?.[envBot]) {
     const allowed = Object.entries(cfg.chats || {})
@@ -102,7 +102,7 @@ function deriveBotScope(cfg) {
     if (allowed.length) return { bot: envBot, allowedChatIds: allowed };
   }
 
-  die(`cannot determine bot scope for cwd ${cwd}; set BRIDGE_ADMIN=1 for unrestricted access`);
+  die(`cannot determine bot scope for cwd ${cwd}; set POLYGRAM_ADMIN=1 for unrestricted access`);
 }
 
 function openDbReadOnly(dbPath) {
@@ -113,7 +113,7 @@ function openDbReadOnly(dbPath) {
 
 /**
  * Post-Phase-8: pick the right DB file(s) to query.
- *  - If BRIDGE_DB is set, use it (explicit override).
+ *  - If POLYGRAM_DB is set, use it (explicit override).
  *  - If bot scope is known and <bot>.db exists, use that single file.
  *  - If bot scope is known but per-bot DB is missing, fall back to legacy
  *    bridge.db (pre-cutover state).
@@ -122,8 +122,8 @@ function openDbReadOnly(dbPath) {
  */
 function resolveDbPaths(cfg, bot) {
   if (DB_OVERRIDE) return [DB_OVERRIDE];
-  const perBot = (b) => path.join(BRIDGE_DIR, `${b}.db`);
-  const legacy = path.join(BRIDGE_DIR, 'bridge.db');
+  const perBot = (b) => path.join(POLYGRAM_DIR, `${b}.db`);
+  const legacy = path.join(POLYGRAM_DIR, 'bridge.db');
 
   if (bot) {
     const p = perBot(bot);
@@ -138,7 +138,7 @@ function resolveDbPaths(cfg, bot) {
     .filter((p) => fs.existsSync(p));
   if (paths.length) return paths;
   if (fs.existsSync(legacy)) return [legacy];
-  die(`no per-bot DBs found in ${BRIDGE_DIR} and no legacy bridge.db either`);
+  die(`no per-bot DBs found in ${POLYGRAM_DIR} and no legacy bridge.db either`);
 }
 
 /**

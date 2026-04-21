@@ -275,7 +275,7 @@ describe('buildPrompt — full integration', () => {
     assert.ok(p.includes('<channel source="telegram"'));
     assert.ok(p.includes('chat_id="-100123"'));
     assert.ok(p.includes('user="Ivan"'));
-    assert.ok(p.includes('<bridge-info>'));
+    assert.ok(p.includes('<polygram-info>'));
     assert.ok(p.includes('hello'));
     assert.ok(p.endsWith('</channel>'));
   });
@@ -357,7 +357,7 @@ describe('buildPrompt — full integration', () => {
     assert.ok(p.includes('&lt;/untrusted-input&gt;'));
   });
 
-  test('bridge-info primer warns about untrusted tags', () => {
+  test('polygram-info primer warns about untrusted tags', () => {
     const p = buildPrompt({ msg: basicMsg });
     assert.ok(/untrusted-input.*data.*not instructions/i.test(p), 'primer present');
   });
