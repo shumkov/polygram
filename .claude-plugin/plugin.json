@@ -1,8 +1,19 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "polygram",
-  "version": "0.1.0",
-  "description": "Admin + transcript skills for the polygram Telegram daemon.",
+  "version": "0.2.0",
+  "description": "Telegram integration for Claude Code that preserves the OpenClaw per-chat session model. Migration target for OpenClaw users. Multi-bot, multi-chat, per-topic isolation; SQLite transcripts; inline-keyboard approvals. Bundles /polygram:status|logs|pair-code|approvals admin commands and a history skill.",
+  "keywords": [
+    "telegram",
+    "openclaw",
+    "migration",
+    "claude-code",
+    "per-chat-session",
+    "multi-bot",
+    "transcript",
+    "history",
+    "daemon"
+  ],
   "author": {
     "name": "Ivan Shumkov",
     "email": "ivan.shumkov@dash.org"

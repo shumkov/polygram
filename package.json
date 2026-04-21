@@ -32,12 +32,18 @@
   },
   "keywords": [
     "telegram",
+    "openclaw",
+    "openclaw-migration",
     "claude-code",
+    "claude",
+    "per-chat-session",
     "bot",
     "daemon",
     "multi-bot",
     "sqlite",
-    "transcript"
+    "transcript",
+    "history",
+    "telegram-agent"
   ],
   "author": "Ivan Shumkov <ivan.shumkov@dash.org>",
   "license": "MIT",

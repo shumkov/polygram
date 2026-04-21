@@ -1,8 +1,14 @@
 # polygram
 
-A Telegram daemon for Claude Code that preserves the per-chat session model
-from OpenClaw. Intended primarily as a migration path for users moving
-their Telegram-based ops from OpenClaw to Claude Code.
+A Telegram daemon and Claude Code plugin that preserves the per-chat
+session model from **OpenClaw**. Intended primarily as a **migration
+path** for users moving their Telegram-based ops from OpenClaw to Claude
+Code, after OpenClaw dropped Claude support.
+
+> If you ran OpenClaw with multiple Telegram chats — each with its own
+> context, its own memory, its own transcript — polygram gives you that
+> shape back on top of `claude` CLI. Install as a daemon, a Claude plugin,
+> or both.
 
 ## Background
 
