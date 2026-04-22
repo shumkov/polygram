@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "shumkov",
+  "description": "Ivan Shumkov's Claude Code plugins.",
+  "owner": {
+    "name": "Ivan Shumkov",
+    "email": "ivanshumkov@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "polygram",
+      "description": "Telegram integration for Claude Code that preserves the OpenClaw per-chat session model. Migration target for OpenClaw users. Bundles /polygram:status|logs|pair-code|approvals admin commands and a history skill.",
+      "category": "integration",
+      "source": "./",
+      "homepage": "https://github.com/shumkov/polygram"
+    }
+  ]
+}
