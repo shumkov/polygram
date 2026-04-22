@@ -59,7 +59,7 @@ function main() {
   console.log(`[split-db] bots: ${bots.join(', ')}`);
   if (dryRun) console.log('[split-db] DRY RUN - no files written or renamed');
 
-  // Refuse to split if a live bridge is writing to srcPath. The WAL file's
+  // Refuse to split if a live polygram is writing to srcPath. The WAL file's
   // presence + recent mtime is a strong proxy: SQLite WAL checkpoints after
   // ~1000 pages or a clean close, so a hot WAL means an active writer.
   refuseIfActiveWriter(srcPath);
@@ -87,7 +87,7 @@ function main() {
     }
   });
   // `transaction` runs deferred by default; we want immediate write-lock
-  // on the source to block any concurrent bridge from slipping in.
+  // on the source to block any concurrent polygram from slipping in.
   srcTx.immediate();
 
   src.raw.close();
@@ -112,7 +112,7 @@ function refuseIfActiveWriter(srcPath) {
   const wal = `${srcPath}-wal`;
   if (!fs.existsSync(wal)) return;
   const age = Date.now() - fs.statSync(wal).mtimeMs;
-  // 60s is generous — a clean bridge shutdown checkpoints the WAL.
+  // 60s is generous — a clean polygram shutdown checkpoints the WAL.
   // A hot WAL (< 60s) strongly suggests a live writer.
   if (age < 60_000) {
     console.error(`[split-db] refusing: ${wal} is active (mtime ${Math.round(age/1000)}s ago)`);

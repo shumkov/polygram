@@ -15,7 +15,7 @@ let db;
 let dbPath;
 
 function freshDb() {
-  dbPath = path.join(os.tmpdir(), `bridge-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.db`);
+  dbPath = path.join(os.tmpdir(), `polygram-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.db`);
   return open(dbPath);
 }
 
@@ -73,7 +73,7 @@ describe('insertMessage', () => {
     assert.equal(row.user, 'Ivan');
     assert.equal(row.text, 'hi');
     assert.equal(row.direction, 'in');
-    assert.equal(row.source, 'bridge');
+    assert.equal(row.source, 'polygram');
     assert.equal(row.status, 'received');
     assert.ok(row.ts > 0);
   });
@@ -283,7 +283,7 @@ describe('events + config_changes', () => {
   });
 
   test('logEvent with no detail writes null detail_json', () => {
-    db.logEvent('bridge-start');
+    db.logEvent('polygram-start');
     const row = db.raw.prepare('SELECT * FROM events ORDER BY id DESC LIMIT 1').get();
     assert.equal(row.detail_json, null);
   });

@@ -106,7 +106,7 @@ function deriveBotScope(cfg) {
 }
 
 function openDbReadOnly(dbPath) {
-  if (!fs.existsSync(dbPath)) die(`bridge DB not found at ${dbPath}`);
+  if (!fs.existsSync(dbPath)) die(`polygram DB not found at ${dbPath}`);
   const raw = new Database(dbPath, { readonly: true, fileMustExist: true });
   return { raw };
 }

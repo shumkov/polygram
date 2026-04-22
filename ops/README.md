@@ -89,7 +89,7 @@ launchctl load   ~/Library/LaunchAgents/com.polygram.my-bot.plist
 The script is idempotent; safe to re-run. It refuses to proceed if a WAL
 file on the source DB indicates a live writer.
 
-## Cron → bridge (IPC, not direct DB write)
+## Cron → polygram (IPC, not direct DB write)
 
 Cron jobs that want to post to Telegram must address a specific bot:
 

@@ -1,4 +1,4 @@
--- Feature 1: pairing codes for live onboarding without bridge restarts.
+-- Feature 1: pairing codes for live onboarding without polygram restarts.
 
 -- Pairing codes (single-use, short-lived).
 CREATE TABLE pair_codes (

@@ -29,7 +29,7 @@ function teardown() {
 function seedMessage(db, overrides = {}) {
   const defaults = {
     chat_id: '1', msg_id: 1, user: 'x', text: 'hi',
-    direction: 'in', source: 'bridge', bot_name: 'shumabit',
+    direction: 'in', source: 'polygram', bot_name: 'shumabit',
     status: 'received', ts: Date.now(),
   };
   const row = { ...defaults, ...overrides };

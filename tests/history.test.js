@@ -37,7 +37,7 @@ function seed(db, rows) {
       user_id: r.user_id || null,
       text: r.text || '',
       direction: r.direction || 'in',
-      source: r.source || 'bridge',
+      source: r.source || 'polygram',
       bot_name: r.bot_name || null,
       ts: r.ts,
     });

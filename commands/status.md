@@ -21,9 +21,9 @@ a short Markdown table (one row per bot):
    ```
    Interpret the result:
    - `ping: {"id":null,"ok":true,"pong":true,"bot":"<bot>"}` → socket alive
-   - `ERR: connect ECONNREFUSED` → socket stale (bridge not actually
+   - `ERR: connect ECONNREFUSED` → socket stale (polygram not actually
      serving despite plist being loaded)
-   - `ERR: ENOENT` → socket missing (bridge never got that far at boot)
+   - `ERR: ENOENT` → socket missing (polygram never got that far at boot)
 
 3. **Recent events in each bot's DB.** For every bot, run:
    ```

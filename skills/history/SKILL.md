@@ -52,6 +52,6 @@ Flags: `--days 7`
 
 # Notes
 
-- DB opened read-only — safe to run alongside the live bridge.
+- DB opened read-only — safe to run alongside the live polygram.
 - Output capped at 500 rows. Narrow with `--since` or `--days` for wide queries.
 - Times in `ts` are ms epoch. `formatPretty` shows local HH:MM.

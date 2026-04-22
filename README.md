@@ -87,23 +87,31 @@ Practical differences that matter for migration:
 Requires Node 20+.
 
 ```bash
-git clone https://github.com/shumkov/polygram.git
-cd polygram
-npm install
-cp config.example.json config.json
-# edit config.json: tokens from @BotFather, chat IDs, cwds
+# Global binary:
+npm install -g polygram
+
+# Data directory (config + per-bot DBs + inbox live here):
+mkdir ~/polygram && cd ~/polygram
+cp $(npm root -g)/polygram/config.example.json config.json
+# edit config.json: bot tokens from @BotFather, chat IDs, cwds
 ```
 
 ## Run
 
 ```bash
-node polygram.js --bot admin-bot          # one bot, one process
-node polygram.js --bot partner-bot        # another bot, another process
+cd ~/polygram
+polygram --bot admin-bot          # one bot, one process
+polygram --bot partner-bot        # another bot, another process
 ```
 
-`--bot` is required. Each process creates `<bot>.db` next to `polygram.js`
-on first run (migrations apply automatically) and opens a Unix socket at
-`/tmp/polygram-<bot>.sock`.
+`--bot` is required. Paths resolve from your current working directory:
+
+- `config.json` → `$PWD/config.json` (override with `--config` or `POLYGRAM_CONFIG`)
+- `<bot>.db` → `$PWD/<bot>.db` (override with `--db` or `POLYGRAM_DB`)
+- `inbox/` → `$PWD/inbox/` (override with `POLYGRAM_INBOX`)
+
+Migrations are bundled in the package and apply automatically. The daemon
+opens a Unix socket at `/tmp/polygram-<bot>.sock`.
 
 For production, LaunchAgent plists are in `ops/`. See `ops/README.md`.
 

@@ -6,7 +6,7 @@
  * Process stays warm: no cold start, full prompt caching.
  *
  * Architecture:
- *   Telegram (grammy long-poll) → bridge receives message
+ *   Telegram (grammy long-poll) → polygram receives message
  *   → looks up per-chat config (model, effort, agent, cwd)
  *   → sends to persistent claude process via stdin (stream-json)
  *   → reads response from stdout (stream-json)
@@ -41,17 +41,21 @@ const {
 const ipcServer = require('./lib/ipc-server');
 
 // ─── Config ──────────────────────────────────────────────────────────
+//
+// User data (config, per-bot DBs, inbox) resolves from the cwd the operator
+// runs polygram in. Package resources (migrations/) stay under __dirname.
+// This makes `npm install -g polygram` + `cd ~/my-data && polygram --bot X`
+// work without symlinks or POLYGRAM_DIR gymnastics.
 
-const CONFIG_PATH = path.join(__dirname, 'config.json');
-const SESSIONS_JSON_PATH = path.join(__dirname, 'sessions.json'); // legacy, imported once on boot
-const DB_DIR = __dirname;
+const DATA_DIR = process.cwd();
+const CONFIG_PATH = process.env.POLYGRAM_CONFIG || path.join(DATA_DIR, 'config.json');
+const SESSIONS_JSON_PATH = path.join(DATA_DIR, 'sessions.json'); // legacy, imported once on boot
+const DB_DIR = DATA_DIR;
 // DB_PATH is resolved in main() from --db or <bot>.db default.
 let DB_PATH = null;
-// Paths that vary per deployment are env-configurable. Defaults preserve
-// the author's local layout for back-compat but the repo itself is portable.
 const STICKERS_PATH = process.env.POLYGRAM_STICKERS
-  || path.join(process.env.HOME || '', 'polygram-stickers.json');
-const INBOX_DIR = process.env.POLYGRAM_INBOX || path.join(__dirname, 'inbox');
+  || path.join(DATA_DIR, 'stickers.json');
+const INBOX_DIR = process.env.POLYGRAM_INBOX || path.join(DATA_DIR, 'inbox');
 const CLAUDE_BIN = process.env.POLYGRAM_CLAUDE_BIN
   || path.join(process.env.HOME || '', '.npm-global/bin/claude');
 const CHILD_HOME = process.env.POLYGRAM_CHILD_HOME || process.env.HOME || '';
@@ -181,7 +185,7 @@ function recordInbound(msg) {
     text: msg.text || msg.caption || '',
     reply_to_id: msg.reply_to_message?.message_id || null,
     direction: 'in',
-    source: 'bridge',
+    source: 'polygram',
     bot_name: BOT_NAME,
     attachments_json: attachments.length ? JSON.stringify(attachments) : null,
     model: chatConfig?.model || null,
@@ -1507,7 +1511,7 @@ async function main() {
       console.log(`[inbox] swept ${swept.swept} files (${(swept.bytes / 1_048_576).toFixed(1)} MiB) older than ${inboxRetentionMs / 86_400_000}d`);
       db.logEvent('inbox-swept', { files: swept.swept, bytes: swept.bytes, retention_days: inboxRetentionMs / 86_400_000 });
     }
-    db.logEvent('bridge-start', { migration: migration.reason, imported: migration.imported });
+    db.logEvent('polygram-start', { migration: migration.reason, imported: migration.imported });
   } catch (err) {
     console.error(`[db] FATAL: ${err.message}`);
     console.error('Bridge cannot run without a DB (Phase 2: DB is source of truth).');
@@ -1555,12 +1559,12 @@ async function main() {
     try { fs.unlinkSync(ipcServer.secretPathFor(BOT_NAME)); } catch {}
     // Resolve any blocked hook waiters so Claude processes don't hang.
     for (const list of approvalWaiters.values()) {
-      for (const fn of list) { try { fn('cancelled', 'bridge shutting down'); } catch {} }
+      for (const fn of list) { try { fn('cancelled', 'polygram shutting down'); } catch {} }
     }
     approvalWaiters.clear();
     if (pm) pm.shutdown().catch(() => {});
     if (db) {
-      try { db.logEvent('bridge-stop'); db.raw.close(); } catch {}
+      try { db.logEvent('polygram-stop'); db.raw.close(); } catch {}
     }
     setTimeout(() => process.exit(0), 1000);
   };
