@@ -2,39 +2,66 @@
 description: Show polygram daemon health — running bots, IPC sockets, recent events.
 ---
 
-You are asked to report the current health of the polygram Telegram daemon.
+Report the health of the polygram Telegram daemon.
 
-Do these checks, in order, using the Bash tool, and summarise the results in
-a short Markdown table (one row per bot):
+Do these checks with the Bash tool and summarise per-bot in a short
+Markdown table. Cover launchd **and** tmux supervision — users run either.
 
-1. **Which bots are supervised by launchd.** Run:
-   ```
-   launchctl list | grep -i polygram || echo "no LaunchAgents loaded"
-   ```
-   Parse the output. Each line `<PID>\t<exit>\t<label>` is one bot
-   (e.g. `com.polygram.my-bot`). The PID column tells you whether it is
-   running; `-` means loaded but not currently running.
+### 1. Discover configured bots
 
-2. **Is each bot's Unix socket alive?** For every bot you identified, run:
-   ```
-   node ~/polygram/scripts/ipc-smoke.js <bot-name>
-   ```
-   Interpret the result:
-   - `ping: {"id":null,"ok":true,"pong":true,"bot":"<bot>"}` → socket alive
-   - `ERR: connect ECONNREFUSED` → socket stale (polygram not actually
-     serving despite plist being loaded)
-   - `ERR: ENOENT` → socket missing (polygram never got that far at boot)
+Read bot names from `~/polygram/config.json` (or `$POLYGRAM_CONFIG`):
 
-3. **Recent events in each bot's DB.** For every bot, run:
-   ```
-   sqlite3 ~/polygram/<bot>.db "SELECT ts, kind, detail_json FROM events ORDER BY ts DESC LIMIT 5;"
-   ```
-   Call out anything that looks like an error (`-fail`, `-error`,
-   `crashed-mid-send`, `poll-stalled`, `approval-sweep-failed`).
+```
+jq -r '.bots | keys[]' ~/polygram/config.json
+```
 
-4. **Summarise.** A two-line per-bot summary, plus an overall verdict at
-   the bottom (✅ healthy / ⚠️ degraded / ❌ broken).
+### 2. Per bot, check supervisor + process
 
-If the user's polygram install is not at `~/polygram`, they may have set
-`POLYGRAM_HOME` or a custom path. Ask them to point you at it rather than
-guessing.
+**a) LaunchAgent** — `launchctl list | grep com.polygram.<bot>`. If
+present the bot is under launchd. PID `-` means loaded but not running.
+
+**b) tmux** — `tmux list-windows -a 2>/dev/null | grep <bot>`. If
+present the bot is running in a tmux pane (most common during testing).
+
+**c) Process** — `pgrep -f "polygram --bot <bot>"`. Confirms the Node
+process is actually alive regardless of supervisor.
+
+Label supervision as:
+- `launchd` — plist loaded
+- `tmux` — window present
+- `foreground` — alive but unsupervised (will die on logout/crash)
+- `absent` — no process
+
+### 3. IPC socket liveness
+
+```
+polygram-ipc <bot-name>
+```
+
+That's the `polygram-ipc` bin installed alongside the daemon. Interpret:
+- `ping: {"ok":true,...}` — socket alive ✅
+- `ERR: ECONNREFUSED` — socket stale (supervisor claims running, isn't serving)
+- `ERR: ENOENT` — socket missing
+- `command not found: polygram-ipc` — user has polygram < 0.3.2; tell
+  them to `npm install -g polygram@latest`
+
+### 4. Recent events
+
+```
+sqlite3 ~/polygram/<bot>.db "SELECT ts, kind FROM events ORDER BY ts DESC LIMIT 5;"
+```
+
+Flag anything ending in `-failed`, `-error`, `crashed-mid-send`,
+`poll-stalled`, `approval-sweep-failed`.
+
+### 5. Summarise
+
+Compact Markdown table + overall verdict:
+
+- ✅ **healthy** — every bot supervised, live socket, no recent errors
+- ⚠️ **degraded** — running but not supervised (foreground) OR sweeper
+  events present OR stale socket
+- ❌ **broken** — any bot has no live process or no live socket
+
+If the install isn't at `~/polygram/`, ask for the data-dir path rather
+than guessing.
