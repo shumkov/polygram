@@ -2,66 +2,72 @@
 description: Show polygram daemon health — running bots, IPC sockets, recent events.
 ---
 
-Report the health of the polygram Telegram daemon.
+Report polygram health. Be mechanical: run exactly these commands in
+order, parse their output, produce a single Markdown table.
 
-Do these checks with the Bash tool and summarise per-bot in a short
-Markdown table. Cover launchd **and** tmux supervision — users run either.
-
-### 1. Discover configured bots
-
-Read bot names from `~/polygram/config.json` (or `$POLYGRAM_CONFIG`):
+## Commands to run (in this order, Bash tool)
 
 ```
+# 1. Configured bots
 jq -r '.bots | keys[]' ~/polygram/config.json
+
+# 2. launchd supervision (may be empty — that's fine, tmux is also valid)
+launchctl list 2>/dev/null | grep com.polygram || true
+
+# 3. tmux supervision (may be empty — that's fine, launchd is also valid)
+tmux list-windows -a 2>/dev/null | grep -Ei 'polygram|shumabit|umi-assistant' || true
+
+# 4. Running Node processes (authoritative)
+pgrep -fa 'polygram --bot' || true
+
+# 5. IPC socket ping per bot — `polygram-ipc` is a bin installed by the
+#    `polygram` npm package (polygram >= 0.3.2). It is NOT the same as
+#    ipc-smoke.js. Do NOT look for ipc-smoke.js anywhere; it doesn't
+#    exist as a loose file in the install.
+polygram-ipc <bot1>
+polygram-ipc <bot2>
+# (etc, one per bot from step 1)
+
+# 6. Recent events per bot
+sqlite3 ~/polygram/<bot>.db "SELECT datetime(ts/1000, 'unixepoch'), kind FROM events ORDER BY ts DESC LIMIT 5"
 ```
 
-### 2. Per bot, check supervisor + process
+## Interpretation rules
 
-**a) LaunchAgent** — `launchctl list | grep com.polygram.<bot>`. If
-present the bot is under launchd. PID `-` means loaded but not running.
+**Supervision is ✅ if ANY of these are true** (NOT all — any one is fine):
+- launchd line matched in step 2
+- tmux window matched in step 3
+- **either counts as "supervised"** — tmux is a first-class supervisor
+  for this project
 
-**b) tmux** — `tmux list-windows -a 2>/dev/null | grep <bot>`. If
-present the bot is running in a tmux pane (most common during testing).
+**Supervision is ❌ (foreground) only when BOTH step 2 AND step 3 are empty**, yet step 4 shows the process running.
 
-**c) Process** — `pgrep -f "polygram --bot <bot>"`. Confirms the Node
-process is actually alive regardless of supervisor.
+**Socket is ✅** if step 5 prints `ping: {"id":null,"ok":true,"pong":true,...}`.
+**Socket is ❌** on `ECONNREFUSED` or `ENOENT`.
 
-Label supervision as:
-- `launchd` — plist loaded
-- `tmux` — window present
-- `foreground` — alive but unsupervised (will die on logout/crash)
-- `absent` — no process
+**Events healthy** unless step 6 shows any of:
+`*-failed`, `*-error`, `crashed-mid-send`, `poll-stalled`, `approval-sweep-failed`.
 
-### 3. IPC socket liveness
+## Verdict
 
-```
-polygram-ipc <bot-name>
-```
+- ✅ **healthy** — every bot: supervised (launchd OR tmux) + live socket + no error events
+- ⚠️ **degraded** — every bot alive but at least one is true-foreground
+  (neither launchd nor tmux), OR stale socket, OR recent error events
+- ❌ **broken** — any bot has no live process or its socket is absent
 
-That's the `polygram-ipc` bin installed alongside the daemon. Interpret:
-- `ping: {"ok":true,...}` — socket alive ✅
-- `ERR: ECONNREFUSED` — socket stale (supervisor claims running, isn't serving)
-- `ERR: ENOENT` — socket missing
-- `command not found: polygram-ipc` — user has polygram < 0.3.2; tell
-  them to `npm install -g polygram@latest`
-
-### 4. Recent events
+## Output format
 
 ```
-sqlite3 ~/polygram/<bot>.db "SELECT ts, kind FROM events ORDER BY ts DESC LIMIT 5;"
+| Bot | Supervision | Socket | Errors (last 5) |
+|-----|-------------|--------|-----------------|
+| <bot1> | ✅ tmux | ✅ | clean |
+| <bot2> | ✅ launchd | ✅ | clean |
+
+Verdict: ✅ healthy
 ```
 
-Flag anything ending in `-failed`, `-error`, `crashed-mid-send`,
-`poll-stalled`, `approval-sweep-failed`.
+Do NOT speculate about ipc-smoke.js or any path that wasn't listed above.
+If a command errors, print its stderr verbatim and move on.
 
-### 5. Summarise
-
-Compact Markdown table + overall verdict:
-
-- ✅ **healthy** — every bot supervised, live socket, no recent errors
-- ⚠️ **degraded** — running but not supervised (foreground) OR sweeper
-  events present OR stale socket
-- ❌ **broken** — any bot has no live process or no live socket
-
-If the install isn't at `~/polygram/`, ask for the data-dir path rather
-than guessing.
+If `~/polygram/config.json` doesn't exist, ask the user for their data
+directory path before running anything else.
