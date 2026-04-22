@@ -120,23 +120,40 @@ For production, LaunchAgent plists are in `ops/`. See `ops/README.md`.
 polygram also ships as a Claude Code plugin — adds admin slash commands
 and bundles the transcript-query skill for use inside your Claude sessions.
 
+The repo doubles as a single-plugin marketplace. Two commands at your
+Claude Code `/` prompt:
+
 ```
-/plugin install https://github.com/shumkov/polygram.git
+/plugin marketplace add https://github.com/shumkov/polygram.git
+/plugin install polygram@shumkov
 ```
 
-Once installed:
+The first registers the marketplace (`shumkov`). The second installs the
+`polygram` plugin from it.
 
-- `/polygram:status` — running bots, IPC health, recent events, one-line verdict
+To enable in a specific Claude project, add to `.claude/settings.json`:
+
+```json
+{
+  "enabledPlugins": {
+    "polygram@shumkov": true
+  }
+}
+```
+
+Once enabled:
+
+- `/polygram:status` — running bots, IPC health, recent events
 - `/polygram:logs <bot>` — tail `~/polygram/logs/<bot>.log`
 - `/polygram:pair-code` — walks you through issuing a pairing code (in-band via Telegram)
 - `/polygram:approvals [bot]` — pending and recent tool-approval rows
 
-The bundled **`telegram-history` skill** lets Claude query the transcript
-directly:
+The bundled **`history` skill** lets Claude query the transcript directly
+when you ask about past chat activity:
 
 ```
 "Summarise the Orders topic today" →
-  uses skills/history to run `recent <chat> --since 24h`
+  Claude invokes the history skill → runs `recent <chat> --since 24h`
 ```
 
 Scope is derived from `process.cwd()`: the skill refuses to run from an
