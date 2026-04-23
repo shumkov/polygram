@@ -962,7 +962,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       if (droppedModel) dbWrite(() => db.logEvent('queue-drained', { chat_id: chatId, reason: 'model-change', dropped: droppedModel }), 'log queue-drained');
       await pm.killChat(chatId);
       const ver = MODEL_VERSIONS[newModel] || newModel;
-      await sendReply(`Model → ${newModel} (${ver})  (ephemeral — reverts on restart)`);
+      await sendReply(`Model → ${newModel} (${ver})`);
     } else {
       await sendReply(`Unknown model. Use: opus, sonnet, haiku`);
     }
@@ -982,7 +982,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       const droppedEffort = drainQueuesForChat(chatId);
       if (droppedEffort) dbWrite(() => db.logEvent('queue-drained', { chat_id: chatId, reason: 'effort-change', dropped: droppedEffort }), 'log queue-drained');
       await pm.killChat(chatId);
-      await sendReply(`Effort → ${newEffort}  (ephemeral — reverts on restart)`);
+      await sendReply(`Effort → ${newEffort}`);
     } else {
       await sendReply(`Unknown effort. Use: low, medium, high, xhigh, max`);
     }
