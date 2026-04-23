@@ -115,6 +115,38 @@ opens a Unix socket at `/tmp/polygram-<bot>.sock`.
 
 For production, LaunchAgent plists are in `ops/`. See `ops/README.md`.
 
+## Health check
+
+Every install includes a round-trip smoke test:
+
+```bash
+polygram-smoke --bot my-bot --to <admin-chat-id>
+```
+
+Exits 0 on success, 1 on any step failure. It verifies:
+
+1. **IPC ping** — the per-bot unix socket is up
+2. **Outbound round-trip** — IPC `send` op → Telegram API → returns a `msg_id`
+3. **DB read-back** — that `msg_id` is in the `messages` table with
+   `direction='out'`, `status='sent'`, matching text
+
+A sample passing run:
+
+```
+✅ ipc-ping — bot=my-bot
+✅ outbound-send — msg_id=12345
+✅ db-readback — sent row confirmed (source=polygram-smoke)
+
+polygram-smoke: PASS  my-bot  2026-04-22T15:30:00.000Z
+```
+
+Flags: `--db <path>` or `POLYGRAM_DB` for non-default DB location;
+`--timeout-ms <ms>` (default 8000).
+
+The test sends a tagged message (`polygram-smoke:<timestamp>`) silently
+to the target chat. Use your own DM as `--to` so the marker arrives
+somewhere you control.
+
 ## Install as a Claude Code plugin
 
 polygram also ships as a Claude Code plugin — adds admin slash commands
