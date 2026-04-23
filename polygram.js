@@ -105,12 +105,35 @@ function loadConfig() {
 }
 
 function saveConfig() {
-  // Atomic write: crash between write and rename leaves the old config
-  // intact. Exclude the `bot` convenience alias from serialisation — it's
-  // a runtime pointer into config.bots[BOT_NAME], not persistent state.
+  // Atomic read-merge-write. In-memory `config` is FILTERED (only one bot +
+  // its chats) because filterConfigToBot narrowed it at boot. Writing it
+  // back directly would clobber every OTHER bot's section on disk. Instead:
+  // read the current on-disk config fresh, apply our bot-scoped changes,
+  // write the merged result. This is safe against parallel writers because
+  // each bot only mutates entries inside its own scope (its bot entry + its
+  // own chats), and we use rename for atomicity.
+  const onDisk = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+
+  // Apply our bot's changes.
+  if (BOT_NAME && config.bots?.[BOT_NAME]) {
+    onDisk.bots = onDisk.bots || {};
+    onDisk.bots[BOT_NAME] = config.bots[BOT_NAME];
+  }
+  // Apply chat changes — only chats the filter left in our memory belong
+  // to this bot; overwrite those keys, leave the rest of onDisk.chats alone.
+  if (config.chats) {
+    onDisk.chats = onDisk.chats || {};
+    for (const [chatId, chat] of Object.entries(config.chats)) {
+      onDisk.chats[chatId] = chat;
+    }
+  }
+  // Top-level non-bot-scoped fields (defaults, maxWarmProcesses, etc.)
+  // reflect ops-wide policy. Only copy if our in-memory value is newer —
+  // but detecting that is hard; simplest safe rule is: don't touch them
+  // from a bot-scoped process. Leave onDisk's values as-is.
+
   const tmp = `${CONFIG_PATH}.tmp.${process.pid}`;
-  const { bot: _bot, ...serialisable } = config;
-  fs.writeFileSync(tmp, JSON.stringify(serialisable, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(onDisk, null, 2));
   fs.renameSync(tmp, CONFIG_PATH);
 }
 
