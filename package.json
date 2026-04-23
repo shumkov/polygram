@@ -1,12 +1,13 @@
 {
   "name": "polygram",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Telegram daemon for Claude Code that preserves the OpenClaw per-chat session model. Migration path for OpenClaw users moving to Claude Code.",
   "main": "lib/ipc-client.js",
   "bin": {
     "polygram": "polygram.js",
     "polygram-split-db": "scripts/split-db.js",
-    "polygram-ipc": "scripts/ipc-smoke.js"
+    "polygram-ipc": "scripts/ipc-smoke.js",
+    "polygram-smoke": "scripts/smoke.js"
   },
   "files": [
     "polygram.js",
@@ -15,6 +16,7 @@
     "migrations/",
     "scripts/split-db.js",
     "scripts/ipc-smoke.js",
+    "scripts/smoke.js",
     "skills/",
     "commands/",
     ".claude-plugin/",
