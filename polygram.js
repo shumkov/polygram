@@ -951,8 +951,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     const newModel = text.slice(7).trim();
     if (['opus', 'sonnet', 'haiku'].includes(newModel)) {
       const oldModel = chatConfig.model;
+      // Ephemeral: in-memory only, reverts to config.json on restart.
       chatConfig.model = newModel;
-      saveConfig();
       dbWrite(() => db.logConfigChange({
         chat_id: chatId, thread_id: threadIdStr, field: 'model',
         old_value: oldModel, new_value: newModel,
@@ -962,7 +962,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       if (droppedModel) dbWrite(() => db.logEvent('queue-drained', { chat_id: chatId, reason: 'model-change', dropped: droppedModel }), 'log queue-drained');
       await pm.killChat(chatId);
       const ver = MODEL_VERSIONS[newModel] || newModel;
-      await sendReply(`Model → ${newModel} (${ver})`);
+      await sendReply(`Model → ${newModel} (${ver})  (ephemeral — reverts on restart)`);
     } else {
       await sendReply(`Unknown model. Use: opus, sonnet, haiku`);
     }
@@ -972,8 +972,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     const newEffort = text.slice(8).trim();
     if (['low', 'medium', 'high', 'xhigh', 'max'].includes(newEffort)) {
       const oldEffort = chatConfig.effort;
+      // Ephemeral: in-memory only, reverts to config.json on restart.
       chatConfig.effort = newEffort;
-      saveConfig();
       dbWrite(() => db.logConfigChange({
         chat_id: chatId, thread_id: threadIdStr, field: 'effort',
         old_value: oldEffort, new_value: newEffort,
@@ -982,7 +982,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       const droppedEffort = drainQueuesForChat(chatId);
       if (droppedEffort) dbWrite(() => db.logEvent('queue-drained', { chat_id: chatId, reason: 'effort-change', dropped: droppedEffort }), 'log queue-drained');
       await pm.killChat(chatId);
-      await sendReply(`Effort → ${newEffort}`);
+      await sendReply(`Effort → ${newEffort}  (ephemeral — reverts on restart)`);
     } else {
       await sendReply(`Unknown effort. Use: low, medium, high, xhigh, max`);
     }
