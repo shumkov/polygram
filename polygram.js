@@ -555,6 +555,18 @@ async function enqueue(sessionKey, chatId, msg, bot) {
   if (!processing[sessionKey]) processQueue(sessionKey);
 }
 
+// Sessions the operator just /stop'd (or natural-language "стоп"). Entries
+// suppress the generic "Sorry, I couldn't process" reply below — the abort
+// handler already sent its own "Остановлено." ack, and the subsequent
+// handleMessage rejection from the killed subprocess would otherwise
+// spam a second contradictory message. Cleared on first use; long-lived
+// only if the abort kills something that never finishes rejecting.
+const abortedSessions = new Set();
+
+function markSessionAborted(sessionKey) {
+  abortedSessions.add(sessionKey);
+}
+
 async function processQueue(sessionKey) {
   processing[sessionKey] = true;
   while (queues[sessionKey]?.length > 0) {
@@ -562,6 +574,8 @@ async function processQueue(sessionKey) {
     try {
       await handleMessage(sessionKey, chatId, msg, bot);
     } catch (err) {
+      const wasAborted = abortedSessions.has(sessionKey);
+      if (wasAborted) abortedSessions.delete(sessionKey);
       // Raw err.message can carry host paths, DB columns, internal state.
       // Surface a generic message to the user; log the detail to events
       // so operators can still debug.
@@ -571,15 +585,18 @@ async function processQueue(sessionKey) {
         msg_id: msg?.message_id,
         error: err.message?.slice(0, 500),
         stack: err.stack?.split('\n').slice(0, 5).join('\n'),
+        aborted: wasAborted || undefined,
       }), 'log handler-error');
-      try {
-        await tg(bot, 'sendMessage', {
-          chat_id: chatId,
-          text: `Sorry, I couldn't process that message. The operator has been notified.`,
-          reply_parameters: { message_id: msg.message_id },
-        }, { source: 'error-reply', botName: BOT_NAME });
-      } catch (replyErr) {
-        console.error(`[${sessionKey}] failed to send error reply: ${replyErr.message}`);
+      if (!wasAborted) {
+        try {
+          await tg(bot, 'sendMessage', {
+            chat_id: chatId,
+            text: `Sorry, I couldn't process that message. The operator has been notified.`,
+            reply_parameters: { message_id: msg.message_id },
+          }, { source: 'error-reply', botName: BOT_NAME });
+        } catch (replyErr) {
+          console.error(`[${sessionKey}] failed to send error reply: ${replyErr.message}`);
+        }
       }
     }
   }
@@ -1428,6 +1445,11 @@ function createBot(token) {
       const sessionKey = getSessionKey(chatId, threadId, chatConfig);
       const hadActive = pm.has(sessionKey) && !!pm.get(sessionKey)?.inFlight;
       const dropped = drainQueuesForChat(chatId);
+      // Mark BEFORE killing: the 'close' event fires almost immediately
+      // after SIGTERM, and processQueue's catch needs to see the flag to
+      // skip the generic error-reply. If we marked after, there'd be a
+      // race where the error-reply slips through.
+      if (hadActive) markSessionAborted(sessionKey);
       await pm.killChat(chatId).catch(() => {});
       dbWrite(() => db.logEvent('abort-requested', {
         chat_id: chatId, user_id: msg.from?.id || null,
