@@ -32,6 +32,7 @@ const { parseBotArg, parseDbArg, filterConfigToBot } = require('./lib/config-sco
 const { createStore: createPairingsStore, parseTtl: parsePairingTtl } = require('./lib/pairings');
 const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/voice');
 const { createStreamer } = require('./lib/stream-reply');
+const { isAbortRequest } = require('./lib/abort-detector');
 const {
   createStore: createApprovalsStore,
   matchesAnyPattern: matchesApprovalPattern,
@@ -1397,6 +1398,36 @@ function createBot(token) {
 
     const rawText = ctx.message.text || '';
     const cleanText = mentionRe ? rawText.replace(mentionRe, '').trim() : rawText.trim();
+
+    // Abort: skip the queue entirely. Matches bilingual natural-language
+    // cues ("stop" / "стоп" / "cancel" / "отмена" / …) and explicit
+    // slash commands (/stop, /abort, /cancel). Kills the active Claude
+    // subprocess and drains queued messages for this chat. Replies so
+    // the user sees the bot heard them — silent abort is worse than
+    // acknowledged abort.
+    if (isAbortRequest(cleanText)) {
+      const threadId = ctx.message.message_thread_id?.toString();
+      const sessionKey = getSessionKey(chatId, threadId, chatConfig);
+      const hadActive = pm.has(sessionKey) && !!pm.get(sessionKey)?.inFlight;
+      const dropped = drainQueuesForChat(chatId);
+      await pm.killChat(chatId).catch(() => {});
+      dbWrite(() => db.logEvent('abort-requested', {
+        chat_id: chatId, user_id: ctx.message.from?.id || null,
+        had_active: hadActive, queued_dropped: dropped,
+        trigger: cleanText.slice(0, 40),
+      }), 'log abort-requested');
+      const reply = hadActive || dropped
+        ? (dropped ? `Остановлено. Очередь очищена (${dropped}).` : 'Остановлено.')
+        : 'Нечего останавливать.';
+      try {
+        await tg(bot, 'sendMessage', {
+          chat_id: chatId, text: reply,
+          reply_parameters: { message_id: ctx.message.message_id, allow_sending_without_reply: true },
+          ...(threadId && { message_thread_id: threadId }),
+        }, { source: 'abort-ack', botName: BOT_NAME });
+      } catch {}
+      return;
+    }
 
     const botAllowsCommands = !!config.bot?.allowConfigCommands;
     const isAdminCmd = botAllowsCommands && ADMIN_CMD_RE.test(cleanText);
