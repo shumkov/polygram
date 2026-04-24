@@ -249,10 +249,14 @@ describe('ProcessManager stream-json handling', () => {
 
   test('send while busy rejects', async () => {
     const entry = await pm.getOrSpawn('a');
-    pm.send('a', 'first'); // pending, no resolution
+    const first = pm.send('a', 'first'); // pending, no resolution
     await assert.rejects(() => pm.send('a', 'second'), /busy/);
-    // clean up
+    // clean up: emit result so the `first` promise resolves and both
+    // timers get cleared. Without awaiting `first`, its 30-min default
+    // maxTurnMs keeps node's event loop alive to the point the test
+    // runner flags "Promise resolution still pending, loop drained".
     entry.proc.emitEvent({ type: 'result', subtype: 'success', result: 'x' });
+    await first;
   });
 
   test('send timeout rejects + clears inFlight', async () => {

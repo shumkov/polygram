@@ -1167,11 +1167,21 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     }, outMetaBase),
     edit: async (messageId, text) => {
       try {
-        return await bot.api.editMessageText(chatId, messageId, text);
+        // Route edits through tg() so applyFormatting runs (MarkdownV2
+        // + escape). Going direct to bot.api.editMessageText would
+        // skip formatting and leave every edit rendering literal
+        // **bold** / `code` in the bubble — which was the visible bug
+        // in 0.4.2 where the initial send was formatted and every
+        // subsequent edit overwrote it with plain text.
+        return await tg(bot, 'editMessageText', {
+          chat_id: chatId,
+          message_id: messageId,
+          text,
+        }, { source: 'bot-reply-stream-edit', botName: BOT_NAME });
       } catch (err) {
-        // Stream-edit failures would otherwise be invisible — edits bypass
-        // tg() so there's no messages row reflecting the attempt. Log to
-        // events so stuck streams leave a forensic trail.
+        // Stream-edit failures would otherwise be invisible — edits
+        // don't insert a messages row by default (tg() does, but we
+        // want the failure path specifically surfaced). Log to events.
         dbWrite(() => db.logEvent('telegram-edit-failed', {
           chat_id: chatId, msg_id: messageId,
           api_error: err.message?.slice(0, 200),
