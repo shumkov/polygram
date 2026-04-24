@@ -1904,6 +1904,25 @@ async function main() {
       const r = head?.context?.reactor;
       if (r) r.setState(classifyToolName(toolName));
     },
+    // Fires after a graceful /model or /effort drain has actually
+    // swapped to the new settings. Post a confirmation back to the
+    // chat so the user knows the switch happened.
+    onRespawn: (sessionKey, reason, entry) => {
+      const chatId = entry.chatId;
+      if (!chatId) return;
+      const chatConfig = config.chats[chatId];
+      if (!chatConfig) return;
+      const text = reason === 'model-change'
+        ? `✓ Using ${chatConfig.model} now.`
+        : reason === 'effort-change'
+        ? `✓ Effort is ${chatConfig.effort} now.`
+        : `✓ Ready.`;
+      const threadId = entry.threadId || undefined;
+      tg(bot, 'sendMessage', {
+        chat_id: chatId, text,
+        ...(threadId && { message_thread_id: threadId }),
+      }, { source: 'respawn-confirm', botName: BOT_NAME }).catch(() => {});
+    },
   });
 
   console.log(`polygram (LRU cap=${cap}, SQLite source of truth)`);
