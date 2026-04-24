@@ -1,0 +1,70 @@
+name: Release
+
+# Fires on any tag matching `v*`. Expected flow:
+#   1. bump package.json + .claude-plugin/plugin.json to the new version,
+#      commit, push to main
+#   2. git tag v0.4.4 && git push origin v0.4.4
+#   3. this workflow: tests → npm publish (OIDC) → GitHub Release
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Configure this GitHub Environment in repo Settings → Environments
+    # → release. npm's trusted-publisher entry must also reference it.
+    environment: release
+
+    permissions:
+      # Required for npm OIDC trusted publishing.
+      id-token: write
+      # Required for `gh release create`.
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so gh can walk back to the previous tag.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          # Mandatory for OIDC auth to kick in even though no token is used.
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing requires npm >= 11.5.1. Node 22.x ships 10.x.
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+
+      - run: npm test
+
+      - name: Verify tag matches package version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" \!= "$PKG_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+
+      # Do NOT set NODE_AUTH_TOKEN (not even empty). npm's OIDC path only
+      # activates when no auth token env is present.
+      - name: Publish to npm (OIDC)
+        run: npm publish --access public
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
