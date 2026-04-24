@@ -1271,6 +1271,87 @@ function createBot(token) {
   // not another bot's problem.
   const knownChat = (chatId) => !!config.chats[chatId];
 
+  // Claim a pair code from an unconfigured private chat and persist a new
+  // chat entry so subsequent messages go through the normal flow. Replies
+  // to the user on both success and failure. Returns the new chatConfig on
+  // success, null on any failure.
+  //
+  // The new chat inherits cwd/agent from bot-level pairedChatDefaults if
+  // present, otherwise from the first existing chat the bot owns — on the
+  // reasonable assumption that paired DMs should behave like other DMs for
+  // this bot. Operator can override by setting config.bots.<bot>.pairedChatDefaults.
+  async function onboardPairedChat(ctx, code) {
+    const chatId = ctx.chat.id.toString();
+    const userId = ctx.message.from?.id;
+    const send = (text) => bot.api.sendMessage(chatId, text).catch(() => {});
+
+    if (!userId) {
+      await send('No user id on request.');
+      return null;
+    }
+
+    const res = pairings.claimCode({
+      code, claimer_user_id: userId,
+      chat_id: chatId, bot_name: BOT_NAME,
+    });
+    dbWrite(() => db.logEvent('pair-claim-attempt', {
+      bot: BOT_NAME, user_id: userId, chat_id: chatId,
+      ok: res.ok, reason: res.reason, via: 'auto-onboard',
+    }), 'log pair-claim-attempt');
+
+    if (!res.ok) {
+      const reply = res.reason === 'rate-limited'
+        ? 'Too many attempts. Try again later.'
+        : 'Invalid or expired code.';
+      await send(reply);
+      return null;
+    }
+
+    const paired = config.bot?.pairedChatDefaults || {};
+    const globals = config.defaults || {};
+    const firstChat = Object.values(config.chats)[0] || {};
+    const chatName = paired.name
+      || (ctx.chat.username && `@${ctx.chat.username}`)
+      || ctx.chat.first_name
+      || `User ${userId}`;
+
+    const cwd = paired.cwd || firstChat.cwd;
+    if (!cwd) {
+      dbWrite(() => db.logEvent('auto-onboard-failed', {
+        bot: BOT_NAME, chat_id: chatId, user_id: userId,
+        reason: 'no-cwd',
+      }), 'log auto-onboard-failed');
+      await send('Paired, but no working directory is configured. Ask the operator to set pairedChatDefaults.cwd.');
+      return null;
+    }
+
+    const newChat = {
+      name: chatName,
+      bot: BOT_NAME,
+      agent: paired.agent || firstChat.agent,
+      model: paired.model || globals.model || 'sonnet',
+      effort: paired.effort || globals.effort || 'medium',
+      cwd,
+      timeout: paired.timeout || globals.timeout || 600,
+    };
+    if (paired.requireMention != null) newChat.requireMention = paired.requireMention;
+
+    config.chats[chatId] = newChat;
+    try { saveConfig(); }
+    catch (err) {
+      console.error(`[${BOT_NAME}] saveConfig on auto-onboard failed: ${err.message}`);
+    }
+    dbWrite(() => db.logEvent('chat-auto-created', {
+      bot: BOT_NAME, chat_id: chatId, user_id: userId,
+      source: 'pair-claim', model: newChat.model, effort: newChat.effort,
+    }), 'log chat-auto-created');
+
+    const chatLabel = res.chat_id ? `chat ${res.chat_id}` : `every chat ${BOT_NAME} is in`;
+    const suffix = res.note ? `\n(${res.note})` : '';
+    await send(`Paired. You can use me in ${chatLabel}.${suffix}`);
+    return newChat;
+  }
+
   bot.on('message', async (ctx) => {
     if (!isWellFormedMessage(ctx.message)) {
       dbWrite(() => db.logEvent('malformed-update', {
@@ -1281,7 +1362,25 @@ function createBot(token) {
       return;
     }
     const chatId = ctx.chat.id.toString();
-    const chatConfig = config.chats[chatId];
+    let chatConfig = config.chats[chatId];
+
+    // Auto-onboarding: /pair <CODE> from an unconfigured private chat.
+    // Without this, the !chatConfig drop below would silently eat pair
+    // claims from DMs the operator hasn't pre-listed — defeating the
+    // whole point of pair codes (which exist to grant access without
+    // pre-configuration). Group chats are not auto-onboarded: they must
+    // still be added to config.json by the operator, because adding a
+    // group can affect multiple users.
+    if (!chatConfig && ctx.chat.type === 'private') {
+      const probe = (ctx.message.text || '').trim();
+      const pairMatch = /^\/pair(?:@\S+)?\s+(\S+)\s*$/.exec(probe);
+      if (pairMatch) {
+        chatConfig = await onboardPairedChat(ctx, pairMatch[1]);
+        if (!chatConfig) return;
+        recordInbound(ctx.message);
+        return;
+      }
+    }
     if (!chatConfig) return;
 
     // Record every inbound msg, even unaddressed ones — needed for reply-to

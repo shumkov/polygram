@@ -11,6 +11,14 @@
       "streamReplies": true,
       "streamMinChars": 30,
       "streamThrottleMs": 500,
+      "_comment_pairedChatDefaults": "When a user sends /pair <CODE> from a private chat that isn't in config.chats yet, polygram auto-creates a chat entry using these defaults (merged over top-level `defaults`). Leave out `cwd` at your peril — without it, auto-onboarded DMs have no working directory and pairing will fail.",
+      "pairedChatDefaults": {
+        "agent": "admin",
+        "cwd": "/Users/you/admin-agent",
+        "model": "sonnet",
+        "effort": "medium",
+        "timeout": 600
+      },
       "voice": {
         "enabled": true,
         "provider": "openai",
