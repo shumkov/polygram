@@ -285,6 +285,69 @@ describe('createSender factory', () => {
   });
 });
 
+describe('send — pre-connect retry', () => {
+  beforeEach(() => { db = freshDb(); });
+  afterEach(() => cleanup());
+
+  function makeFlakyPreConnectBot() {
+    let first = true;
+    const calls = [];
+    return {
+      calls,
+      api: {
+        raw: new Proxy({}, {
+          get: (_, method) => (params) => {
+            calls.push({ method });
+            if (first) {
+              first = false;
+              const err = new Error('getaddrinfo EAI_AGAIN api.telegram.org');
+              err.code = 'EAI_AGAIN';
+              throw err;
+            }
+            return Promise.resolve({ message_id: 99, date: 1 });
+          },
+        }),
+      },
+    };
+  }
+
+  test('retries once on pre-connect error (EAI_AGAIN) and succeeds', async () => {
+    const bot = makeFlakyPreConnectBot();
+    const res = await send({
+      bot, method: 'sendMessage',
+      params: { chat_id: '1', text: 'hi' },
+      db, logger: silentLogger(),
+    });
+    assert.equal(res.message_id, 99);
+    assert.equal(bot.calls.length, 2);
+    // Logged as retry event.
+    const ev = db.raw.prepare("SELECT kind FROM events WHERE kind = 'telegram-retry'").get();
+    assert.equal(ev?.kind, 'telegram-retry');
+  });
+
+  test('does NOT retry ETIMEDOUT (message may have landed)', async () => {
+    let callCount = 0;
+    const bot = {
+      api: {
+        raw: new Proxy({}, {
+          get: () => () => {
+            callCount += 1;
+            const err = new Error('request timed out');
+            err.code = 'ETIMEDOUT';
+            throw err;
+          },
+        }),
+      },
+    };
+    await assert.rejects(() => send({
+      bot, method: 'sendMessage',
+      params: { chat_id: '1', text: 'hi' },
+      db, logger: silentLogger(),
+    }), /timed out/);
+    assert.equal(callCount, 1, 'must not retry post-connect timeout');
+  });
+});
+
 describe('send — thread-not-found fallback', () => {
   beforeEach(() => { db = freshDb(); });
   afterEach(() => cleanup());
