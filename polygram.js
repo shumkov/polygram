@@ -562,15 +562,29 @@ async function sendToProcess(sessionKey, prompt, context = {}) {
 const CONCURRENT_WARN_THRESHOLD = 20;
 const inFlightHandlers = new Map(); // sessionKey → count
 
-// Sessions the operator just /stop'd (or natural-language "стоп"). Entries
-// suppress the generic "Sorry, I couldn't process" reply — the abort
-// handler already sent its own "Остановлено." ack, and handleMessage
-// rejections from the killed subprocess would otherwise spam a second
-// contradictory message.
-const abortedSessions = new Set();
+// Sessions the operator just /stop'd (or natural-language "стоп"). Keyed
+// by sessionKey → timestamp of abort. ANY pending that rejects within
+// ABORT_GRACE_MS of the mark is considered abort-caused — its generic
+// error reply is suppressed and the streamer warning is skipped.
+//
+// Timestamp model (vs the earlier "delete after first read" Set) fixes
+// the case where multiple pendings were in-flight at abort time: all of
+// them reject with "Process killed", all of them should be silent, not
+// just the first one.
+const ABORT_GRACE_MS = 15_000;
+const abortedSessions = new Map();
 
 function markSessionAborted(sessionKey) {
-  abortedSessions.add(sessionKey);
+  abortedSessions.set(sessionKey, Date.now());
+  // Sweep old entries opportunistically.
+  for (const [k, ts] of abortedSessions) {
+    if (Date.now() - ts > ABORT_GRACE_MS * 2) abortedSessions.delete(k);
+  }
+}
+
+function isSessionRecentlyAborted(sessionKey) {
+  const ts = abortedSessions.get(sessionKey);
+  return ts != null && (Date.now() - ts) < ABORT_GRACE_MS;
 }
 
 // Called by bot.on('message') for every regular (non-admin, non-pair)
@@ -586,9 +600,15 @@ function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
     }), 'log queue-depth-warning');
   }
   handleMessage(sessionKey, chatId, msg, bot).catch((err) => {
-    const wasAborted = abortedSessions.has(sessionKey);
-    if (wasAborted) abortedSessions.delete(sessionKey);
+    const wasAborted = isSessionRecentlyAborted(sessionKey);
     console.error(`[${sessionKey}] Error:`, err.message);
+    // Mark the row as 'failed' so boot replay doesn't re-dispatch it.
+    // Exception: aborted sessions → 'aborted' (same — not replayable).
+    // Shutdown case handled separately in the SIGTERM handler.
+    dbWrite(() => db.setInboundHandlerStatus({
+      chat_id: chatId, msg_id: msg.message_id,
+      status: wasAborted ? 'aborted' : 'failed',
+    }), 'set handler_status=failed/aborted');
     dbWrite(() => db.logEvent('handler-error', {
       chat_id: chatId, session_key: sessionKey,
       msg_id: msg?.message_id,
@@ -964,6 +984,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const chatConfig = config.chats[chatId];
   if (!chatConfig) return;
 
+  // Mark the inbound row as 'dispatched' so the boot replay loop knows
+  // this turn started. Cleared to 'replied' (or 'failed') when done.
+  dbWrite(() => db.setInboundHandlerStatus({
+    chat_id: chatId, msg_id: msg.message_id, status: 'dispatched',
+  }), 'set handler_status=dispatched');
+
   const text = msg.text || msg.caption || '';
   const threadId = msg.message_thread_id;
   const threadIdStr = threadId?.toString() || null;
@@ -1334,25 +1360,32 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     }
 
     console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
+    // Success: mark the inbound row 'replied' so boot replay doesn't
+    // pick it up again on restart.
+    dbWrite(() => db.setInboundHandlerStatus({
+      chat_id: chatId, msg_id: msg.message_id, status: 'replied',
+    }), 'set handler_status=replied');
   } catch (err) {
-    // Generic suffix — err.message can leak internal paths/state.
-    await streamer.finalize('', { errorSuffix: 'stream interrupted' }).catch(() => {});
-    // Signal the failure to the user's message reaction. Timeout gets its
-    // own face; anything else is generic error.
-    if (/wall-clock ceiling|idle with no Claude activity/i.test(err?.message || '')) {
-      reactor.setState('TIMEOUT');
+    // If the user just aborted this session, silently finalise the stream
+    // without the scary "⚠ stream interrupted" banner. The user has already
+    // seen their "Остановлено." ack; adding a warning to the partial bubble
+    // just reads as "something crashed".
+    const abortedByUser = isSessionRecentlyAborted(sessionKey);
+    if (abortedByUser) {
+      await streamer.finalize('').catch(() => {});
+      // Leave reaction as-is — no 🤯 / 😨; user asked for stop.
     } else {
-      reactor.setState('ERROR');
+      await streamer.finalize('', { errorSuffix: 'stream interrupted' }).catch(() => {});
+      if (/wall-clock ceiling|idle with no Claude activity/i.test(err?.message || '')) {
+        reactor.setState('TIMEOUT');
+      } else {
+        reactor.setState('ERROR');
+      }
     }
     throw err;
   } finally {
     stopTyping();
-    // streamer is per-turn and not stored in any session Map in 0.4.8
-    // Give the reactor a beat to flush the terminal state (DONE/ERROR/TIMEOUT
-    // bypass throttle so this is instant in practice; the stop() below
-    // guards against any late transition leaking after the turn ends).
     reactor.stop();
-    // reactor is per-turn and not stored in any session Map in 0.4.8
   }
 }
 
@@ -1935,22 +1968,69 @@ async function main() {
 
   bot = createBot(config.bot.token);
 
-  const shutdown = () => {
+  // Graceful shutdown: stop accepting new inbound, drain in-flight pendings
+  // up to SHUTDOWN_DRAIN_MS, then mark anything still unfinished so boot
+  // replay picks it up. Prevents "Sorry, I couldn't process that message"
+  // from showing on every restart.
+  const SHUTDOWN_DRAIN_MS = 30_000;
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log('\nShutting down...');
+    // 1. Stop accepting new inbound first so nothing new queues behind the drain.
     if (bot && bot._stop) bot._stop();
+
+    // 2. Drain in-flight handlers. Wait for inFlightHandlers to empty or
+    //    SHUTDOWN_DRAIN_MS to elapse. pm handlers resolve naturally when
+    //    result events arrive; the dispatcher's .finally decrements.
+    const drainStart = Date.now();
+    while (inFlightHandlers.size > 0) {
+      if (Date.now() - drainStart >= SHUTDOWN_DRAIN_MS) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const drainElapsed = Date.now() - drainStart;
+    let remaining = 0;
+    for (const n of inFlightHandlers.values()) remaining += n;
+
+    // 3. Anything still in-flight → mark in DB as replay-pending so the
+    //    next polygram boot re-dispatches it. User never sees an error.
+    if (remaining > 0 && db) {
+      try {
+        const res = db.markReplayPending({ botName: BOT_NAME });
+        dbWrite(() => db.logEvent('shutdown-drain', {
+          bot: BOT_NAME,
+          in_flight: remaining,
+          replay_marked: res?.changes ?? 0,
+          elapsed_ms: drainElapsed,
+        }), 'log shutdown-drain');
+        console.log(`[shutdown] drained ${drainElapsed}ms, ${remaining} still in-flight, ${res?.changes ?? 0} rows marked replay-pending`);
+      } catch (err) {
+        console.error(`[shutdown] markReplayPending failed: ${err.message}`);
+      }
+    } else if (db) {
+      dbWrite(() => db.logEvent('shutdown-drain', {
+        bot: BOT_NAME,
+        in_flight: 0,
+        elapsed_ms: drainElapsed,
+      }), 'log shutdown-drain');
+      console.log(`[shutdown] clean drain in ${drainElapsed}ms`);
+    }
+
+    // 4. Remaining shutdown: approvals sweeper, IPC, resolve hook waiters,
+    //    kill pm subprocesses, close DB.
     if (approvalSweepTimer) clearInterval(approvalSweepTimer);
     if (ipcCloser) ipcCloser.close().catch(() => {});
     try { fs.unlinkSync(ipcServer.secretPathFor(BOT_NAME)); } catch {}
-    // Resolve any blocked hook waiters so Claude processes don't hang.
     for (const list of approvalWaiters.values()) {
       for (const fn of list) { try { fn('cancelled', 'polygram shutting down'); } catch {} }
     }
     approvalWaiters.clear();
-    if (pm) pm.shutdown().catch(() => {});
+    if (pm) await pm.shutdown().catch(() => {});
     if (db) {
       try { db.logEvent('polygram-stop'); db.raw.close(); } catch {}
     }
-    setTimeout(() => process.exit(0), 1000);
+    setTimeout(() => process.exit(0), 100);
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
@@ -1974,6 +2054,65 @@ async function main() {
     console.error(`[ipc] failed to start: ${err.message}`);
   }
   approvalSweepTimer = startApprovalSweeper();
+
+  // Boot replay: re-dispatch any inbound turns that were interrupted by
+  // the previous polygram's shutdown or crash. These are rows marked
+  // 'dispatched', 'processing', or 'replay-pending' (set by the SIGTERM
+  // handler) — all within the last 30 min so we don't resurrect ancient
+  // work. Dedupe against already-sent outbound replies in case the
+  // previous instance DID answer before dying.
+  try {
+    const chatIds = Object.keys(config.chats);
+    if (chatIds.length > 0) {
+      const candidates = db.getReplayCandidates({ chatIds });
+      let replayed = 0;
+      let skipped = 0;
+      for (const row of candidates) {
+        if (db.hasOutboundReplyTo({ chat_id: row.chat_id, msg_id: row.msg_id })) {
+          // Already replied — just mark so we don't look at it again.
+          db.setInboundHandlerStatus({
+            chat_id: row.chat_id, msg_id: row.msg_id, status: 'replied',
+          });
+          skipped += 1;
+          continue;
+        }
+        // Reconstruct a minimal grammy-like Message object. Enough for
+        // dispatchRegularMessage (mention detect, abort, admin cmds,
+        // shouldHandle, enqueue). Attachments carry file_ids so the
+        // normal download path re-fetches on replay.
+        const reconstructed = {
+          chat: { id: Number(row.chat_id), type: row.chat_id.startsWith('-') ? 'supergroup' : 'private' },
+          message_id: row.msg_id,
+          from: { id: row.user_id, first_name: row.user },
+          text: row.text || '',
+          date: Math.floor(row.ts / 1000),
+          ...(row.thread_id && { message_thread_id: Number(row.thread_id) }),
+          ...(row.reply_to_id && { reply_to_message: { message_id: row.reply_to_id } }),
+        };
+        // Attach already-extracted attachments via the media-group shortcut
+        // field so extractAttachments picks them up without re-parsing
+        // grammy fields that don't exist on this reconstructed object.
+        if (row.attachments_json) {
+          try {
+            reconstructed._mergedAttachments = JSON.parse(row.attachments_json);
+          } catch {}
+        }
+        const chatConfig = config.chats[row.chat_id];
+        if (!chatConfig) { skipped += 1; continue; }
+        const sessionKey = getSessionKey(row.chat_id, row.thread_id, chatConfig);
+        dispatchHandleMessage(sessionKey, row.chat_id, reconstructed, bot);
+        replayed += 1;
+      }
+      if (candidates.length > 0) {
+        console.log(`[replay] ${replayed} turns re-dispatched, ${skipped} skipped (already replied or no chat config)`);
+        dbWrite(() => db.logEvent('replay-on-boot', {
+          bot: BOT_NAME, replayed, skipped, total: candidates.length,
+        }), 'log replay-on-boot');
+      }
+    }
+  } catch (err) {
+    console.error(`[replay] boot replay failed: ${err.message}`);
+  }
 
   console.log(`[${BOT_NAME}] Starting...`);
   const pollPromise = pollBot(bot).catch(err => {

@@ -163,13 +163,23 @@ describe('ProcessManager LRU eviction', () => {
     assert.equal(evictEvent.detail.session_key, 'a');
   });
 
-  test('all in-flight → throws with lru-full event', async () => {
+  test('all in-flight → getOrSpawn waits until a slot frees', async () => {
     const a = await pm.getOrSpawn('a');
     a.inFlight = true;
     const b = await pm.getOrSpawn('b');
     b.inFlight = true;
-    await assert.rejects(() => pm.getOrSpawn('c'), /LRU full/);
-    assert.ok(db.events.find((e) => e.kind === 'lru-full'));
+    // c's getOrSpawn would have thrown before 0.4.12. Now it waits.
+    let cResolved = false;
+    const cPromise = pm.getOrSpawn('c').then((e) => { cResolved = true; return e; });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(cResolved, false, 'c should still be waiting');
+    assert.ok(db.events.find((e) => e.kind === 'lru-wait'));
+    // Free a slot: flip 'a' to idle and signal.
+    a.inFlight = false;
+    pm._maybeSignalLruWaiter();
+    const c = await cPromise;
+    assert.ok(c, 'c resolved after slot freed');
+    assert.ok(pm.has('c'));
   });
 
   test('in-flight process is never evicted', async () => {
