@@ -34,6 +34,7 @@ const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/voice'
 const { createStreamer } = require('./lib/stream-reply');
 const { isAbortRequest } = require('./lib/abort-detector');
 const { startTyping } = require('./lib/typing-indicator');
+const { createReactionManager, classifyToolName } = require('./lib/status-reactions');
 const {
   createStore: createApprovalsStore,
   matchesAnyPattern: matchesApprovalPattern,
@@ -81,6 +82,7 @@ let ipcCloser = null;
 let BOT_NAME = null;  // string, frozen after boot
 let bot = null;       // grammy Bot for BOT_NAME
 let streamers = new Map();  // sessionKey -> active Streamer (while turn is in flight)
+let reactors = new Map();   // sessionKey -> active ReactionManager (while turn is in flight)
 
 // Allowlist of env var names passed through to spawned Claude processes.
 // Anything not listed here is dropped to prevent leaked secrets/ssh agents
@@ -1160,6 +1162,26 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   });
   streamers.set(sessionKey, streamer);
 
+  // Status reactions on the user's message: 👀 queued → 🤔 thinking →
+  // 👨‍💻 coding / ⚡ web / 🔥 tool → 👍 done / 🤯 error. Silent (no
+  // notifications), updates in place, one emoji per message. Uses
+  // setMessageReaction which skips the DB row (the tg() wrapper
+  // short-circuits that method), so no transcript spam.
+  const reactor = createReactionManager({
+    apply: async (emoji) => {
+      const params = {
+        chat_id: chatId,
+        message_id: msg.message_id,
+        reaction: emoji ? [{ type: 'emoji', emoji }] : [],
+      };
+      await tg(bot, 'setMessageReaction', params,
+        { source: 'status-reaction', botName: BOT_NAME });
+    },
+    logError: (m) => console.error(`[${label}] ${m}`),
+  });
+  reactors.set(sessionKey, reactor);
+  reactor.setState('THINKING');
+
   try {
     const result = await sendToProcess(sessionKey, prompt);
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
@@ -1168,7 +1190,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
 
     if (result.error) {
       console.error(`[${label}] Error (${elapsed}s):`, result.error);
+      reactor.setState('ERROR');
       if (!result.text) return;
+    } else {
+      reactor.setState('DONE');
     }
 
     if (!result.text || result.text === 'NO_REPLY') return;
@@ -1236,10 +1261,22 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   } catch (err) {
     // Generic suffix — err.message can leak internal paths/state.
     await streamer.finalize('', { errorSuffix: 'stream interrupted' }).catch(() => {});
+    // Signal the failure to the user's message reaction. Timeout gets its
+    // own face; anything else is generic error.
+    if (/wall-clock ceiling|idle with no Claude activity/i.test(err?.message || '')) {
+      reactor.setState('TIMEOUT');
+    } else {
+      reactor.setState('ERROR');
+    }
     throw err;
   } finally {
     stopTyping();
     streamers.delete(sessionKey);
+    // Give the reactor a beat to flush the terminal state (DONE/ERROR/TIMEOUT
+    // bypass throttle so this is instant in practice; the stop() below
+    // guards against any late transition leaking after the turn ends).
+    reactor.stop();
+    reactors.delete(sessionKey);
   }
 }
 
@@ -1727,6 +1764,10 @@ async function main() {
     onStreamChunk: (sessionKey, partial) => {
       const s = streamers.get(sessionKey);
       if (s) s.onChunk(partial).catch(() => {});
+    },
+    onToolUse: (sessionKey, toolName) => {
+      const r = reactors.get(sessionKey);
+      if (r) r.setState(classifyToolName(toolName));
     },
   });
 
