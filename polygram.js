@@ -1547,7 +1547,21 @@ async function pollBot(bot) {
 
   await bot.api.deleteWebhook();
 
+  // Restore polling offset from DB so a restart doesn't re-process the
+  // backlog Telegram has accumulated while we were down. Grammy's in-memory
+  // offset resets to 0 each boot, which makes getUpdates return every
+  // un-confirmed update since the last ack — for an overnight outage that
+  // can mean replaying dozens of stale messages.
   let offset = 0;
+  try {
+    const saved = db?.getPollingOffset?.(BOT_NAME);
+    if (saved && saved > 0) {
+      offset = saved + 1;
+      console.log(`[${BOT_NAME}] resuming polling from update_id ${saved}`);
+    }
+  } catch (err) {
+    console.error(`[${BOT_NAME}] getPollingOffset failed: ${err.message}`);
+  }
   let running = true;
   bot._lastPollTs = Date.now();
 
@@ -1583,6 +1597,13 @@ async function pollBot(bot) {
         } catch (err) {
           console.error(`[${BOT_NAME}] Handler error:`, err.message);
         }
+      }
+      // Persist offset after batch dispatch so a crash mid-batch only risks
+      // re-processing the unacked updates. We write only on non-empty batches
+      // to avoid churning the row on every 25s idle poll.
+      if (updates.length > 0) {
+        dbWrite(() => db.savePollingOffset(BOT_NAME, updates[updates.length - 1].update_id),
+          'save polling offset');
       }
       // No sleep on the success path: long-poll already blocks up to 25s
       // when idle. Sleeping here would add latency with no gain.
