@@ -6,7 +6,7 @@
  *     run default static checks (config / DB / IPC / Telegram)
  *
  *   polygram-doctor --bot <name> --roundtrip --to <chat_id>
- *     also do the old polygram-smoke outbound round-trip
+ *     also do an outbound round-trip: IPC send → Telegram → DB read-back
  *
  *   polygram-doctor --bot <name> --json
  *     machine-readable output for monitoring pipelines

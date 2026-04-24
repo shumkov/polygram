@@ -117,35 +117,39 @@ For production, LaunchAgent plists are in `ops/`. See `ops/README.md`.
 
 ## Health check
 
-Every install includes a round-trip smoke test:
+Every install includes `polygram-doctor` for operational diagnostics:
 
 ```bash
-polygram-smoke --bot my-bot --to <admin-chat-id>
+polygram-doctor --bot my-bot
 ```
 
-Exits 0 on success, 1 on any step failure. It verifies:
+Runs static checks without touching live chats: config parseable,
+DB schema current, IPC socket up, Telegram `getMe` succeeds, recent
+errors from the last 24h, stuck pending outbound rows, pending
+approvals. Exits 0 on pass, 1 on any failure (add `--strict` to
+fail on warnings too).
 
-1. **IPC ping** — the per-bot unix socket is up
-2. **Outbound round-trip** — IPC `send` op → Telegram API → returns a `msg_id`
-3. **DB read-back** — that `msg_id` is in the `messages` table with
-   `direction='out'`, `status='sent'`, matching text
-
-A sample passing run:
+Output:
 
 ```
-✅ ipc-ping — bot=my-bot
-✅ outbound-send — msg_id=12345
-✅ db-readback — sent row confirmed (source=polygram-smoke)
+✅ config — bot found, 4 chat(s), admin=68861949
+✅ db — schema v5
+✅ ipc — socket responsive, bot=my-bot
+✅ telegram — @my_bot (My Bot)
+✅ recent-errors — no failure events in last 24h
+✅ pending-outbound — no stale pending outbound rows
+✅ approvals — no pending approvals
 
-polygram-smoke: PASS  my-bot  2026-04-22T15:30:00.000Z
+7 ok / 0 warn / 0 fail  (bot=my-bot)
 ```
 
-Flags: `--db <path>` or `POLYGRAM_DB` for non-default DB location;
-`--timeout-ms <ms>` (default 8000).
+Flags: `--json` for machine-readable output, `--db <path>` /
+`POLYGRAM_DB` for non-default DB location, `--timeout-ms <ms>`
+(default 8000), `--strict` to exit 1 on warnings.
 
-The test sends a tagged message (`polygram-smoke:<timestamp>`) silently
-to the target chat. Use your own DM as `--to` so the marker arrives
-somewhere you control.
+For a full outbound round-trip verification (the old `polygram-smoke`),
+add `--roundtrip --to <chat_id>`. That sends a silent tagged message
+and verifies it lands in the DB with `status=sent`.
 
 ## Install as a Claude Code plugin
 

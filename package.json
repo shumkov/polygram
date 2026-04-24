@@ -7,7 +7,6 @@
     "polygram": "polygram.js",
     "polygram-split-db": "scripts/split-db.js",
     "polygram-ipc": "scripts/ipc-smoke.js",
-    "polygram-smoke": "scripts/smoke.js",
     "polygram-doctor": "scripts/doctor.js"
   },
   "files": [
@@ -17,7 +16,6 @@
     "migrations/",
     "scripts/split-db.js",
     "scripts/ipc-smoke.js",
-    "scripts/smoke.js",
     "scripts/doctor.js",
     "skills/",
     "commands/",
