@@ -247,43 +247,97 @@ describe('ProcessManager stream-json handling', () => {
     assert.equal(entry.inFlight, false);
   });
 
-  test('send while busy rejects', async () => {
+  test('concurrent sends queue in FIFO order', async () => {
+    // 0.4.8: pendingQueue replaces the "Process busy" reject. Multiple
+    // sends to the same session enqueue; their promises resolve in order
+    // as result events arrive.
     const entry = await pm.getOrSpawn('a');
-    const first = pm.send('a', 'first'); // pending, no resolution
-    await assert.rejects(() => pm.send('a', 'second'), /busy/);
-    // clean up: emit result so the `first` promise resolves and both
-    // timers get cleared. Without awaiting `first`, its 30-min default
-    // maxTurnMs keeps node's event loop alive to the point the test
-    // runner flags "Promise resolution still pending, loop drained".
-    entry.proc.emitEvent({ type: 'result', subtype: 'success', result: 'x' });
-    await first;
+    const first = pm.send('a', 'first');
+    const second = pm.send('a', 'second');
+    assert.equal(entry.pendingQueue.length, 2);
+    assert.equal(entry.pendingQueue[0].activated, true);
+    assert.equal(entry.pendingQueue[1].activated, false, 'only head is activated');
+    entry.proc.emitEvent({ type: 'result', subtype: 'success', result: 'r1' });
+    const r1 = await first;
+    assert.equal(r1.text, 'r1');
+    // After first resolves, second becomes head and activates.
+    assert.equal(entry.pendingQueue.length, 1);
+    assert.equal(entry.pendingQueue[0].activated, true);
+    entry.proc.emitEvent({ type: 'result', subtype: 'success', result: 'r2' });
+    const r2 = await second;
+    assert.equal(r2.text, 'r2');
+    assert.equal(entry.inFlight, false);
+    assert.equal(entry.pendingQueue.length, 0);
   });
 
-  test('send timeout rejects + clears inFlight', async () => {
+  test('send timeout rejects only that pending, not the subprocess', async () => {
     const entry = await pm.getOrSpawn('a');
     const p = pm.send('a', 'hi', { timeoutMs: 30 });
     await assert.rejects(() => p, /Timeout/);
-    // 0.3.9: idle timeout now also SIGTERMs the subprocess. Without this,
-    // a stuck claude lingers and the next send() writes stdin into a dead
-    // process — the root cause of the 1.5h hang we saw in production.
-    assert.equal(entry.proc.killed, true);
-    // The entry's pending state is cleared synchronously with the reject.
-    assert.equal(entry.pending, null);
+    // 0.4.8 policy: timer fires reject the ONE pending. Subprocess stays
+    // alive, other pendings in queue keep working. Don't SIGTERM.
+    assert.equal(entry.proc.killed, false, 'timer fire does not kill subprocess');
+    assert.equal(entry.pendingQueue.length, 0);
     assert.equal(entry.inFlight, false);
   });
 
   test('wall-clock ceiling fires even if idle timer keeps resetting', async () => {
     const entry = await pm.getOrSpawn('a');
-    // Arm with a short wall-clock ceiling but a much longer idle timeout,
-    // then keep emitting assistant events to reset the idle timer every
-    // few ms. Without the wall-clock ceiling, this would never time out.
     const p = pm.send('a', 'hi', { timeoutMs: 5000, maxTurnMs: 50 });
     const keepAlive = setInterval(() => {
       entry.proc.emitEvent({ type: 'assistant', message: { content: [{ type: 'text', text: 'thinking...' }] } });
     }, 5);
     await assert.rejects(() => p, /wall-clock ceiling/);
     clearInterval(keepAlive);
-    assert.equal(entry.proc.killed, true);
+    // Subprocess stays alive per 0.4.8 policy.
+    assert.equal(entry.proc.killed, false);
+  });
+
+  test('any stream-json event type resets idle timer (Fix A)', async () => {
+    // Subagent work emits `user`-type tool_result events between the
+    // parent's assistant events. Before Fix A, only `assistant` events
+    // reset the idle timer, so a 5-min subagent call would time out
+    // mid-work even though Claude was doing real work.
+    const entry = await pm.getOrSpawn('a');
+    const p = pm.send('a', 'hi', { timeoutMs: 40 });
+    // Pump tool_result-ish events every 10ms for 100ms — each should
+    // push the 40ms idle timer further back. If the fix didn't work,
+    // the timer would fire at ~40ms.
+    const t = setInterval(() => {
+      entry.proc.emitEvent({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'x', content: '...' }] } });
+    }, 10);
+    // After 100ms, kill the loop and emit a real result. If idle reset
+    // was broken, p would have rejected already.
+    await new Promise((r) => setTimeout(r, 100));
+    clearInterval(t);
+    entry.proc.emitEvent({ type: 'result', subtype: 'success', result: 'done' });
+    const res = await p;
+    assert.equal(res.text, 'done');
+  });
+
+  test('requestRespawn with empty queue kills immediately', async () => {
+    const entry = await pm.getOrSpawn('a');
+    const res = pm.requestRespawn('a', 'model-change');
+    assert.equal(res.killed, true);
+    assert.equal(res.queued, 0);
+  });
+
+  test('requestRespawn while queue non-empty defers to drain', async () => {
+    const entry = await pm.getOrSpawn('a');
+    const p = pm.send('a', 'work');
+    const res = pm.requestRespawn('a', 'model-change');
+    assert.equal(res.killed, false);
+    assert.equal(res.queued, 1);
+    assert.equal(entry.needsRespawn, 'model-change');
+    // Further sends are refused while respawn is pending.
+    await assert.rejects(() => pm.send('a', 'next'), /awaiting respawn/);
+    // When the last pending drains, entry gets killed automatically.
+    entry.proc.emitEvent({ type: 'result', subtype: 'success', result: 'done' });
+    await p;
+    // Give the micro-task scheduler a tick so the async kill starts.
+    await new Promise((r) => setImmediate(r));
+    // entry should now be deleted (killed) or closed.
+    assert.ok(!pm.has('a') || pm.get('a').closed);
   });
 
   test('result with error subtype surfaces error', async () => {

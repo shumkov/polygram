@@ -26,7 +26,7 @@ const { buildPrompt } = require('./lib/prompt');
 const { filterAttachments, MAX_FILE_BYTES } = require('./lib/attachments');
 const { ProcessManager } = require('./lib/process-manager');
 const { createSender } = require('./lib/telegram');
-const { drainQueuesForChat: drainQueuesForChatImpl } = require('./lib/queue-utils');
+const { createAsyncLock } = require('./lib/async-lock');
 const { sweepInbox } = require('./lib/inbox');
 const { parseBotArg, parseDbArg, filterConfigToBot } = require('./lib/config-scope');
 const { createStore: createPairingsStore, parseTtl: parsePairingTtl } = require('./lib/pairings');
@@ -82,8 +82,11 @@ let ipcCloser = null;
 // single-valued), we keep them as plain module-level variables — not a map.
 let BOT_NAME = null;  // string, frozen after boot
 let bot = null;       // grammy Bot for BOT_NAME
-let streamers = new Map();  // sessionKey -> active Streamer (while turn is in flight)
-let reactors = new Map();   // sessionKey -> active ReactionManager (while turn is in flight)
+// 0.4.8 note: streamer + reactor are per-turn, not per-session. They live
+// on the pending's `context` object in the pm pendingQueue, keyed to the
+// specific turn (not the session). The old per-session Maps were a bug
+// for concurrent pendings — the second send() would overwrite the first's
+// streamer reference before the first turn finished.
 
 // Allowlist of env var names passed through to spawned Claude processes.
 // Anything not listed here is dropped to prevent leaked secrets/ssh agents
@@ -520,90 +523,103 @@ async function getOrSpawnForChat(sessionKey) {
   return pm.getOrSpawn(sessionKey, ctx);
 }
 
-async function sendToProcess(sessionKey, prompt) {
+async function sendToProcess(sessionKey, prompt, context = {}) {
   const entry = await getOrSpawnForChat(sessionKey);
   if (!entry) throw new Error('No process for chat');
   const chatId = getChatIdFromKey(sessionKey);
   const chatConfig = config.chats[chatId];
   const timeoutMs = (chatConfig.timeout || config.defaults.timeout) * 1000;
-  // Wall-clock ceiling (seconds). Overridable per-chat via chatConfig.maxTurn
-  // or globally via config.defaults.maxTurn. 30 min default is generous for
-  // long audits; stuck API calls rarely run that long without firing the
-  // idle timer first. Unit: seconds → milliseconds.
   const maxTurnMs = (chatConfig.maxTurn || config.defaults?.maxTurn || 1800) * 1000;
-  return pm.send(sessionKey, prompt, { timeoutMs, maxTurnMs });
-}
-
-// ─── Message queue (per-chat) ───────────────────────────────────────
-
-const queues = {};
-const processing = {};
-const MAX_QUEUE_DEPTH = 50; // per chat — cron storm or spammer insurance
-
-async function enqueue(sessionKey, chatId, msg, bot) {
-  if (!queues[sessionKey]) queues[sessionKey] = [];
-  if (queues[sessionKey].length >= MAX_QUEUE_DEPTH) {
-    // Drop oldest rather than rejecting newest — the user's freshest
-    // intent is more valuable than backlog. Emit an event so operators
-    // see this rather than a queue silently degrading.
-    queues[sessionKey].shift();
-    dbWrite(() => db.logEvent('queue-overflow', {
-      chat_id: chatId, session_key: sessionKey, cap: MAX_QUEUE_DEPTH,
-    }), 'log queue-overflow');
+  // Per-session stdin lock orders the write step, not the result-wait.
+  // pm.send's Promise executor writes stdin synchronously, so as soon as
+  // pm.send returns (not resolves — returns), the stdin write has
+  // happened. We release the lock right after that and await the result
+  // OUTSIDE the lock — otherwise one long turn would serialise the whole
+  // session, which is what we're trying to escape.
+  const release = await stdinLock.acquire(sessionKey);
+  let resultPromise;
+  try {
+    resultPromise = pm.send(sessionKey, prompt, { timeoutMs, maxTurnMs, context });
+  } finally {
+    release();
   }
-  queues[sessionKey].push({ msg, bot, chatId });
-  if (!processing[sessionKey]) processQueue(sessionKey);
+  return resultPromise;
 }
+
+// ─── Message dispatch ───────────────────────────────────────────────
+
+// 0.4.8: per-session concurrent dispatch. No FIFO polygram-level queue any
+// more — inbound messages immediately kick off handleMessage. Pre-work
+// (attachment download, voice transcription) runs in parallel across
+// messages; a per-session stdin lock (in handleMessage) orders the
+// eventual pm.send writes so Claude reads user messages in arrival order
+// and replies come out in the same order.
+//
+// We still track in-flight handleMessage calls per session so we can:
+//   - emit a `queue-depth-warning` event if the count ever exceeds a
+//     threshold (abnormal inbound rate, slow pre-work, stuck bot)
+//   - (future) drain on shutdown if we want clean exit
+const CONCURRENT_WARN_THRESHOLD = 20;
+const inFlightHandlers = new Map(); // sessionKey → count
 
 // Sessions the operator just /stop'd (or natural-language "стоп"). Entries
-// suppress the generic "Sorry, I couldn't process" reply below — the abort
-// handler already sent its own "Остановлено." ack, and the subsequent
-// handleMessage rejection from the killed subprocess would otherwise
-// spam a second contradictory message. Cleared on first use; long-lived
-// only if the abort kills something that never finishes rejecting.
+// suppress the generic "Sorry, I couldn't process" reply — the abort
+// handler already sent its own "Остановлено." ack, and handleMessage
+// rejections from the killed subprocess would otherwise spam a second
+// contradictory message.
 const abortedSessions = new Set();
 
 function markSessionAborted(sessionKey) {
   abortedSessions.add(sessionKey);
 }
 
-async function processQueue(sessionKey) {
-  processing[sessionKey] = true;
-  while (queues[sessionKey]?.length > 0) {
-    const { msg, bot, chatId } = queues[sessionKey].shift();
-    try {
-      await handleMessage(sessionKey, chatId, msg, bot);
-    } catch (err) {
-      const wasAborted = abortedSessions.has(sessionKey);
-      if (wasAborted) abortedSessions.delete(sessionKey);
-      // Raw err.message can carry host paths, DB columns, internal state.
-      // Surface a generic message to the user; log the detail to events
-      // so operators can still debug.
-      console.error(`[${sessionKey}] Error:`, err.message);
-      dbWrite(() => db.logEvent('handler-error', {
-        chat_id: chatId, session_key: sessionKey,
-        msg_id: msg?.message_id,
-        error: err.message?.slice(0, 500),
-        stack: err.stack?.split('\n').slice(0, 5).join('\n'),
-        aborted: wasAborted || undefined,
-      }), 'log handler-error');
-      if (!wasAborted) {
-        try {
-          await tg(bot, 'sendMessage', {
-            chat_id: chatId,
-            text: `Sorry, I couldn't process that message. The operator has been notified.`,
-            reply_parameters: { message_id: msg.message_id },
-          }, { source: 'error-reply', botName: BOT_NAME });
-        } catch (replyErr) {
-          console.error(`[${sessionKey}] failed to send error reply: ${replyErr.message}`);
-        }
-      }
-    }
+// Called by bot.on('message') for every regular (non-admin, non-pair)
+// message. Runs handleMessage in a fire-and-forget manner with centralised
+// error handling. Replaces the old processQueue loop.
+function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
+  const count = (inFlightHandlers.get(sessionKey) || 0) + 1;
+  inFlightHandlers.set(sessionKey, count);
+  if (count === CONCURRENT_WARN_THRESHOLD) {
+    dbWrite(() => db.logEvent('queue-depth-warning', {
+      chat_id: chatId, session_key: sessionKey,
+      in_flight: count, threshold: CONCURRENT_WARN_THRESHOLD,
+    }), 'log queue-depth-warning');
   }
-  processing[sessionKey] = false;
+  handleMessage(sessionKey, chatId, msg, bot).catch((err) => {
+    const wasAborted = abortedSessions.has(sessionKey);
+    if (wasAborted) abortedSessions.delete(sessionKey);
+    console.error(`[${sessionKey}] Error:`, err.message);
+    dbWrite(() => db.logEvent('handler-error', {
+      chat_id: chatId, session_key: sessionKey,
+      msg_id: msg?.message_id,
+      error: err.message?.slice(0, 500),
+      stack: err.stack?.split('\n').slice(0, 5).join('\n'),
+      aborted: wasAborted || undefined,
+    }), 'log handler-error');
+    if (!wasAborted) {
+      tg(bot, 'sendMessage', {
+        chat_id: chatId,
+        text: `Sorry, I couldn't process that message. The operator has been notified.`,
+        reply_parameters: { message_id: msg.message_id },
+      }, { source: 'error-reply', botName: BOT_NAME }).catch((replyErr) => {
+        console.error(`[${sessionKey}] failed to send error reply: ${replyErr.message}`);
+      });
+    }
+  }).finally(() => {
+    const n = (inFlightHandlers.get(sessionKey) || 1) - 1;
+    if (n <= 0) inFlightHandlers.delete(sessionKey);
+    else inFlightHandlers.set(sessionKey, n);
+  });
 }
 
-const drainQueuesForChat = (chatId) => drainQueuesForChatImpl(queues, chatId);
+// drainQueuesForChat is retained as a no-op for backwards compat with
+// call sites in /model, /effort, chat-migration, and abort handlers.
+// Returns 0 always; a drain isn't meaningful in the concurrent model —
+// callers that want to abort should rely on pm.killChat.
+const drainQueuesForChat = (_chatId) => 0;
+
+// Per-session lock ordering stdin writes. Module is I/O-pure.
+const stdinLock = createAsyncLock();
 
 // Typing indicator is imported from lib/typing-indicator — it adds a
 // per-chat circuit breaker with exponential backoff so a chat that
@@ -975,6 +991,25 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     await sendReply(info);
     return;
   }
+  // Helper: request respawn across ALL sessionKeys owned by this chat (one
+  // per topic if isolateTopics=true, otherwise just the single chat-level
+  // key). Graceful: in-flight turns drain on old settings, new turns use
+  // the new settings. Returns total pending turns across all keys so the
+  // reply can tell the user.
+  const requestRespawnForChat = (reason) => {
+    const prefix = String(chatId);
+    let totalQueued = 0;
+    let anyActive = false;
+    for (const key of pm.keys()) {
+      if (key === prefix || key.startsWith(prefix + ':')) {
+        const res = pm.requestRespawn(key, reason);
+        totalQueued += res.queued;
+        if (!res.killed) anyActive = true;
+      }
+    }
+    return { queued: totalQueued, anyActive };
+  };
+
   if (botAllowsCommands && text.startsWith('/model ')) {
     const newModel = text.slice(7).trim();
     if (['opus', 'sonnet', 'haiku'].includes(newModel)) {
@@ -986,11 +1021,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         old_value: oldModel, new_value: newModel,
         user: cmdUser, user_id: cmdUserId, source: 'command',
       }), 'log model change');
-      const droppedModel = drainQueuesForChat(chatId);
-      if (droppedModel) dbWrite(() => db.logEvent('queue-drained', { chat_id: chatId, reason: 'model-change', dropped: droppedModel }), 'log queue-drained');
-      await pm.killChat(chatId);
+      const { queued, anyActive } = requestRespawnForChat('model-change');
       const ver = MODEL_VERSIONS[newModel] || newModel;
-      await sendReply(`Model → ${newModel} (${ver})`);
+      const suffix = anyActive
+        ? ` (applies after ${queued} in-flight turn${queued === 1 ? '' : 's'} complete${queued === 1 ? 's' : ''})`
+        : '';
+      await sendReply(`Model → ${newModel} (${ver})${suffix}`);
     } else {
       await sendReply(`Unknown model. Use: opus, sonnet, haiku`);
     }
@@ -1007,10 +1043,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         old_value: oldEffort, new_value: newEffort,
         user: cmdUser, user_id: cmdUserId, source: 'command',
       }), 'log effort change');
-      const droppedEffort = drainQueuesForChat(chatId);
-      if (droppedEffort) dbWrite(() => db.logEvent('queue-drained', { chat_id: chatId, reason: 'effort-change', dropped: droppedEffort }), 'log queue-drained');
-      await pm.killChat(chatId);
-      await sendReply(`Effort → ${newEffort}`);
+      const { queued, anyActive } = requestRespawnForChat('effort-change');
+      const suffix = anyActive
+        ? ` (applies after ${queued} in-flight turn${queued === 1 ? '' : 's'} complete${queued === 1 ? 's' : ''})`
+        : '';
+      await sendReply(`Effort → ${newEffort}${suffix}`);
     } else {
       await sendReply(`Unknown effort. Use: low, medium, high, xhigh, max`);
     }
@@ -1194,7 +1231,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     throttleMs: botCfg.streamThrottleMs,
     logger: { error: (m) => console.error(`[${label}] ${m}`) },
   });
-  streamers.set(sessionKey, streamer);
+  // streamer is registered with this turn via pm.send's context (below)
 
   // Status reactions on the user's message: 👀 queued → 🤔 thinking →
   // 👨‍💻 coding / ⚡ web / 🔥 tool → 👍 done / 🤯 error. Silent (no
@@ -1213,11 +1250,15 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     },
     logError: (m) => console.error(`[${label}] ${m}`),
   });
-  reactors.set(sessionKey, reactor);
   reactor.setState('THINKING');
 
   try {
-    const result = await sendToProcess(sessionKey, prompt);
+    // Pass streamer + reactor as per-turn context. pm's callbacks pick
+    // them off entry.pendingQueue[0].context so concurrent pendings each
+    // get routed to their own streamer/reactor.
+    const result = await sendToProcess(sessionKey, prompt, {
+      streamer, reactor, sourceMsgId: msg.message_id,
+    });
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
     stopTyping();
@@ -1305,12 +1346,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     throw err;
   } finally {
     stopTyping();
-    streamers.delete(sessionKey);
+    // streamer is per-turn and not stored in any session Map in 0.4.8
     // Give the reactor a beat to flush the terminal state (DONE/ERROR/TIMEOUT
     // bypass throttle so this is instant in practice; the stop() below
     // guards against any late transition leaking after the turn ends).
     reactor.stop();
-    reactors.delete(sessionKey);
+    // reactor is per-turn and not stored in any session Map in 0.4.8
   }
 }
 
@@ -1513,7 +1554,7 @@ function createBot(token) {
 
     const threadId = msg.message_thread_id?.toString();
     const sessionKey = getSessionKey(chatId, threadId, chatConfig);
-    await enqueue(sessionKey, chatId, msg, bot);
+    dispatchHandleMessage(sessionKey, chatId, msg, bot);
   };
 
   // Media-group buffer: coalesce multi-photo uploads (Telegram delivers
@@ -1854,12 +1895,17 @@ async function main() {
       console.log(`[${entry.label}] Process exited (code ${code})`);
       dbWrite(() => db.logEvent('process-close', { chat_id: entry.chatId, session_key: sessionKey, code }), 'log process-close');
     },
-    onStreamChunk: (sessionKey, partial) => {
-      const s = streamers.get(sessionKey);
+    onStreamChunk: (sessionKey, partial, entry) => {
+      // Route to the head pending's per-turn streamer. In the 0.4.8
+      // concurrent-pending model, there can be N pendings queued — only
+      // the HEAD is the turn Claude is actively emitting events for.
+      const head = entry.pendingQueue?.[0];
+      const s = head?.context?.streamer;
       if (s) s.onChunk(partial).catch(() => {});
     },
-    onToolUse: (sessionKey, toolName) => {
-      const r = reactors.get(sessionKey);
+    onToolUse: (sessionKey, toolName, entry) => {
+      const head = entry.pendingQueue?.[0];
+      const r = head?.context?.reactor;
       if (r) r.setState(classifyToolName(toolName));
     },
   });
