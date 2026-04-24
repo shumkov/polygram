@@ -40,9 +40,6 @@ jobs:
           # Mandatory for OIDC auth to kick in even though no token is used.
           registry-url: 'https://registry.npmjs.org'
 
-      # Trusted publishing requires npm >= 11.5.1. Node 22.x ships 10.x.
-      - run: npm install -g npm@latest
-
       - run: npm ci
 
       - run: npm test
@@ -56,10 +53,17 @@ jobs:
             exit 1
           fi
 
+      # Node 22 ships with npm 10.x; trusted publishing requires npm >= 11.5.1.
+      # Rather than upgrading npm in-place (breaks with a promise-retry module
+      # lookup on ubuntu-latest's hosted toolcache), use npx to run a pinned
+      # npm 11 for just the publish step. `-y` suppresses the confirmation
+      # prompt; it downloads npm 11 into the npm cache on first use and
+      # leaves the system npm untouched.
+      #
       # Do NOT set NODE_AUTH_TOKEN (not even empty). npm's OIDC path only
       # activates when no auth token env is present.
       - name: Publish to npm (OIDC)
-        run: npm publish --access public
+        run: npx -y npm@latest publish --access public
 
       - name: Create GitHub Release
         env:
