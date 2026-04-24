@@ -1295,7 +1295,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       reactor.setState('ERROR');
       if (!result.text) return;
     } else {
-      reactor.setState('DONE');
+      // Clear the progress reaction instead of stamping 👍 — the reply
+      // bubble itself is the "done" signal and a permanent thumbs-up on
+      // every answered message is chat noise (plus triggers reaction
+      // notifications for other group members).
+      reactor.clear().catch(() => {});
     }
 
     if (!result.text || result.text === 'NO_REPLY') return;
