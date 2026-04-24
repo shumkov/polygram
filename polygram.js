@@ -35,6 +35,7 @@ const { createStreamer } = require('./lib/stream-reply');
 const { isAbortRequest } = require('./lib/abort-detector');
 const { startTyping } = require('./lib/typing-indicator');
 const { createReactionManager, classifyToolName } = require('./lib/status-reactions');
+const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
 const {
   createStore: createApprovalsStore,
   matchesAnyPattern: matchesApprovalPattern,
@@ -230,6 +231,12 @@ function sanitizeFilename(name) {
 }
 
 function extractAttachments(msg) {
+  // Media-group bundling path: when we synthesised a single message from
+  // several siblings sharing a media_group_id, the merged attachment list
+  // was pre-computed in `_mergedAttachments`. Return it directly instead
+  // of running the per-field extraction against the primary message.
+  if (Array.isArray(msg._mergedAttachments)) return msg._mergedAttachments;
+
   const items = [];
   if (msg.document) {
     const d = msg.document;
@@ -1400,6 +1407,90 @@ function createBot(token) {
     return newChat;
   }
 
+  // Shared post-validation dispatch. Called directly for single messages
+  // and for the synthesised "primary" of a media-group bundle.
+  const dispatchRegularMessage = async (msg) => {
+    const chatId = msg.chat.id.toString();
+    const chatConfig = config.chats[chatId];
+    if (!chatConfig) return;
+
+    const rawText = msg.text || '';
+    const cleanText = mentionRe ? rawText.replace(mentionRe, '').trim() : rawText.trim();
+
+    // Abort: skip the queue entirely. Matches bilingual natural-language
+    // cues ("stop" / "стоп" / "cancel" / "отмена" / …) and explicit
+    // slash commands (/stop, /abort, /cancel). Kills the active Claude
+    // subprocess and drains queued messages for this chat. Replies so
+    // the user sees the bot heard them — silent abort is worse than
+    // acknowledged abort.
+    if (isAbortRequest(cleanText)) {
+      const threadId = msg.message_thread_id?.toString();
+      const sessionKey = getSessionKey(chatId, threadId, chatConfig);
+      const hadActive = pm.has(sessionKey) && !!pm.get(sessionKey)?.inFlight;
+      const dropped = drainQueuesForChat(chatId);
+      await pm.killChat(chatId).catch(() => {});
+      dbWrite(() => db.logEvent('abort-requested', {
+        chat_id: chatId, user_id: msg.from?.id || null,
+        had_active: hadActive, queued_dropped: dropped,
+        trigger: cleanText.slice(0, 40),
+      }), 'log abort-requested');
+      const reply = hadActive || dropped
+        ? (dropped ? `Остановлено. Очередь очищена (${dropped}).` : 'Остановлено.')
+        : 'Нечего останавливать.';
+      try {
+        await tg(bot, 'sendMessage', {
+          chat_id: chatId, text: reply,
+          reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
+          ...(threadId && { message_thread_id: threadId }),
+        }, { source: 'abort-ack', botName: BOT_NAME });
+      } catch {}
+      return;
+    }
+
+    const botAllowsCommands = !!config.bot?.allowConfigCommands;
+    const isAdminCmd = botAllowsCommands && ADMIN_CMD_RE.test(cleanText);
+    const isPairClaim = PAIR_CLAIM_RE.test(cleanText);
+    if (isAdminCmd || isPairClaim) {
+      msg.text = cleanText;
+      const threadId = msg.message_thread_id?.toString();
+      const sessionKey = getSessionKey(chatId, threadId, chatConfig);
+      await handleMessage(sessionKey, chatId, msg, bot);
+      return;
+    }
+
+    if (!shouldHandle(msg, chatConfig, botUsername)) return;
+
+    if (botUsername) {
+      msg.text = cleanText;
+    }
+
+    const threadId = msg.message_thread_id?.toString();
+    const sessionKey = getSessionKey(chatId, threadId, chatConfig);
+    await enqueue(sessionKey, chatId, msg, bot);
+  };
+
+  // Media-group buffer: coalesce multi-photo uploads (Telegram delivers
+  // each attachment as a separate Message sharing a `media_group_id`) into
+  // a single synthetic turn with all attachments merged. Timer resets on
+  // every new sibling, so as long as messages arrive faster than the
+  // DEFAULT_FLUSH_MS window apart they stay in the same bundle.
+  const mediaBuffer = createMediaGroupBuffer({
+    onFlush: (messages) => {
+      if (!messages || messages.length === 0) return;
+      // Primary = the (usually first) message with text/caption; that's
+      // where the user's actual prompt lives. Fall back to index 0 for
+      // all-media-no-text groups.
+      const primary = messages.find((m) => m.text || m.caption) || messages[0];
+      const merged = messages.flatMap((m) => extractAttachments(m));
+      const synthetic = { ...primary, _mergedAttachments: merged };
+      // Carry the primary's text verbatim (dispatchRegularMessage re-cleans
+      // the mention). Caption → text so downstream sees it uniformly.
+      if (!synthetic.text && synthetic.caption) synthetic.text = synthetic.caption;
+      dispatchRegularMessage(synthetic).catch((err) =>
+        console.error(`[${BOT_NAME}] media-group dispatch error: ${err.message}`));
+    },
+  });
+
   bot.on('message', async (ctx) => {
     if (!isWellFormedMessage(ctx.message)) {
       dbWrite(() => db.logEvent('malformed-update', {
@@ -1435,60 +1526,15 @@ function createBot(token) {
     // lookups and the transcript skill.
     recordInbound(ctx.message);
 
-    const rawText = ctx.message.text || '';
-    const cleanText = mentionRe ? rawText.replace(mentionRe, '').trim() : rawText.trim();
-
-    // Abort: skip the queue entirely. Matches bilingual natural-language
-    // cues ("stop" / "стоп" / "cancel" / "отмена" / …) and explicit
-    // slash commands (/stop, /abort, /cancel). Kills the active Claude
-    // subprocess and drains queued messages for this chat. Replies so
-    // the user sees the bot heard them — silent abort is worse than
-    // acknowledged abort.
-    if (isAbortRequest(cleanText)) {
-      const threadId = ctx.message.message_thread_id?.toString();
-      const sessionKey = getSessionKey(chatId, threadId, chatConfig);
-      const hadActive = pm.has(sessionKey) && !!pm.get(sessionKey)?.inFlight;
-      const dropped = drainQueuesForChat(chatId);
-      await pm.killChat(chatId).catch(() => {});
-      dbWrite(() => db.logEvent('abort-requested', {
-        chat_id: chatId, user_id: ctx.message.from?.id || null,
-        had_active: hadActive, queued_dropped: dropped,
-        trigger: cleanText.slice(0, 40),
-      }), 'log abort-requested');
-      const reply = hadActive || dropped
-        ? (dropped ? `Остановлено. Очередь очищена (${dropped}).` : 'Остановлено.')
-        : 'Нечего останавливать.';
-      try {
-        await tg(bot, 'sendMessage', {
-          chat_id: chatId, text: reply,
-          reply_parameters: { message_id: ctx.message.message_id, allow_sending_without_reply: true },
-          ...(threadId && { message_thread_id: threadId }),
-        }, { source: 'abort-ack', botName: BOT_NAME });
-      } catch {}
+    // Multi-photo / album upload: Telegram delivers siblings as separate
+    // Messages sharing a media_group_id. Stash each and let the buffer
+    // dispatch them together 500ms after the last sibling arrives.
+    if (ctx.message.media_group_id) {
+      mediaBuffer.add(`${chatId}:${ctx.message.media_group_id}`, ctx.message);
       return;
     }
 
-    const botAllowsCommands = !!config.bot?.allowConfigCommands;
-    const isAdminCmd = botAllowsCommands && ADMIN_CMD_RE.test(cleanText);
-    const isPairClaim = PAIR_CLAIM_RE.test(cleanText);
-    if (isAdminCmd || isPairClaim) {
-      ctx.message.text = cleanText;
-      const threadId = ctx.message.message_thread_id?.toString();
-      const sessionKey = getSessionKey(chatId, threadId, chatConfig);
-      await handleMessage(sessionKey, chatId, ctx.message, bot);
-      return;
-    }
-
-    if (!shouldHandle(ctx.message, chatConfig, botUsername)) return;
-
-    if (botUsername) {
-      ctx.message.text = cleanText;
-    }
-
-    const threadId = ctx.message.message_thread_id?.toString();
-    const sessionKey = getSessionKey(chatId, threadId, chatConfig);
-
-    await enqueue(sessionKey, chatId, ctx.message, bot);
+    await dispatchRegularMessage(ctx.message);
   });
 
   bot.on('callback_query:data', async (ctx) => {

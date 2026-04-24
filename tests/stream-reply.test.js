@@ -97,6 +97,46 @@ describe('extractAssistantText', () => {
     assert.equal(extractAssistantText(null), '');
     assert.equal(extractAssistantText({ message: {} }), '');
   });
+
+  test('trailing colon followed by invisible tool_use → ellipsis', () => {
+    const out = extractAssistantText({
+      message: { content: [
+        { type: 'text', text: 'Checking this:' },
+        { type: 'tool_use', name: 'Bash' },
+      ] },
+    });
+    assert.equal(out, 'Checking this…');
+  });
+
+  test('trailing colon + whitespace normalised', () => {
+    assert.equal(
+      extractAssistantText({ message: { content: [{ type: 'text', text: 'Doing this: \n' }] } }),
+      'Doing this…',
+    );
+  });
+
+  test('mid-sentence colons are untouched', () => {
+    assert.equal(
+      extractAssistantText({ message: { content: [{ type: 'text', text: "Here's the plan: step 1, step 2." }] } }),
+      "Here's the plan: step 1, step 2.",
+    );
+  });
+
+  test('double colon (code / emoticons) is preserved', () => {
+    assert.equal(
+      extractAssistantText({ message: { content: [{ type: 'text', text: 'use Foo::Bar::' }] } }),
+      'use Foo::Bar::',
+    );
+  });
+
+  test('normal endings (. ! ?) unchanged', () => {
+    for (const s of ['Done.', 'Got it!', 'Ready?']) {
+      assert.equal(
+        extractAssistantText({ message: { content: [{ type: 'text', text: s }] } }),
+        s,
+      );
+    }
+  });
 });
 
 describe('streamer idle → live transition', () => {
