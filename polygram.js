@@ -1246,7 +1246,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     },
     logError: (m) => console.error(`[${label}] ${m}`),
   });
-  reactor.setState('THINKING');
+  // Start at QUEUED (👀) so user sees their message was received but
+  // not yet being worked on. pm calls context.onActivate when this
+  // pending becomes the queue head (Claude is actually starting it),
+  // at which point we flip to THINKING (🤔).
+  reactor.setState('QUEUED');
 
   try {
     // Pass streamer + reactor as per-turn context. pm's callbacks pick
@@ -1254,6 +1258,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // get routed to their own streamer/reactor.
     const result = await sendToProcess(sessionKey, prompt, {
       streamer, reactor, sourceMsgId: msg.message_id,
+      onActivate: () => reactor.setState('THINKING'),
     });
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
