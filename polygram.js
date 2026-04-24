@@ -1021,11 +1021,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         old_value: oldModel, new_value: newModel,
         user: cmdUser, user_id: cmdUserId, source: 'command',
       }), 'log model change');
-      const { queued, anyActive } = requestRespawnForChat('model-change');
+      const { anyActive } = requestRespawnForChat('model-change');
       const ver = MODEL_VERSIONS[newModel] || newModel;
-      const suffix = anyActive
-        ? ` (applies after ${queued} in-flight turn${queued === 1 ? '' : 's'} complete${queued === 1 ? 's' : ''})`
-        : '';
+      const suffix = anyActive ? ` — I'll switch when I finish` : '';
       await sendReply(`Model → ${newModel} (${ver})${suffix}`);
     } else {
       await sendReply(`Unknown model. Use: opus, sonnet, haiku`);
@@ -1043,10 +1041,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         old_value: oldEffort, new_value: newEffort,
         user: cmdUser, user_id: cmdUserId, source: 'command',
       }), 'log effort change');
-      const { queued, anyActive } = requestRespawnForChat('effort-change');
-      const suffix = anyActive
-        ? ` (applies after ${queued} in-flight turn${queued === 1 ? '' : 's'} complete${queued === 1 ? 's' : ''})`
-        : '';
+      const { anyActive } = requestRespawnForChat('effort-change');
+      const suffix = anyActive ? ` — I'll switch when I finish` : '';
       await sendReply(`Effort → ${newEffort}${suffix}`);
     } else {
       await sendReply(`Unknown effort. Use: low, medium, high, xhigh, max`);
