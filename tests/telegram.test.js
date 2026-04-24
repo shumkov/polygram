@@ -284,3 +284,101 @@ describe('createSender factory', () => {
     assert.equal(row.source, 'cron');
   });
 });
+
+describe('send — thread-not-found fallback', () => {
+  beforeEach(() => { db = freshDb(); });
+  afterEach(() => cleanup());
+
+  // Fake bot that fails the first call with a thread-not-found, succeeds on retry.
+  function makeFlakyThreadBot() {
+    const calls = [];
+    let firstCall = true;
+    return {
+      calls,
+      api: {
+        raw: new Proxy({}, {
+          get: (_, method) => (params) => {
+            calls.push({ method, params });
+            if (firstCall) {
+              firstCall = false;
+              const err = new Error('Bad Request: message thread not found');
+              throw err;
+            }
+            return Promise.resolve({ message_id: 42, date: 1 });
+          },
+        }),
+      },
+    };
+  }
+
+  test('retries without thread_id when thread is missing', async () => {
+    const bot = makeFlakyThreadBot();
+    const res = await send({
+      bot, method: 'sendMessage',
+      params: { chat_id: '-100', text: 'hi', message_thread_id: 123 },
+      db, logger: silentLogger(),
+    });
+    assert.equal(res.message_id, 42);
+    assert.equal(bot.calls.length, 2);
+    assert.equal(bot.calls[0].params.message_thread_id, 123);
+    assert.equal(bot.calls[1].params.message_thread_id, undefined);
+    // Event logged.
+    const ev = db.raw.prepare('SELECT kind FROM events WHERE kind = ?').get('telegram-thread-fallback');
+    assert.equal(ev?.kind, 'telegram-thread-fallback');
+    // Message row marked sent (not failed).
+    const row = db.raw.prepare('SELECT status, msg_id FROM messages').get();
+    assert.equal(row.status, 'sent');
+    assert.equal(row.msg_id, 42);
+  });
+
+  test('propagates error if retry also fails', async () => {
+    let callCount = 0;
+    const bot = {
+      api: {
+        raw: new Proxy({}, {
+          get: () => () => {
+            callCount += 1;
+            if (callCount === 1) throw new Error('Bad Request: message thread not found');
+            throw new Error('Bad Request: chat not found');
+          },
+        }),
+      },
+    };
+    await assert.rejects(
+      () => send({
+        bot, method: 'sendMessage',
+        params: { chat_id: '-100', text: 'hi', message_thread_id: 9 },
+        db, logger: silentLogger(),
+      }),
+      /chat not found/,
+    );
+    assert.equal(callCount, 2);
+    // Row should be marked failed with the RETRY's error, not the first.
+    const row = db.raw.prepare('SELECT status, error FROM messages').get();
+    assert.equal(row.status, 'failed');
+    assert.match(row.error, /chat not found/);
+  });
+
+  test('non-thread errors do NOT trigger retry', async () => {
+    let callCount = 0;
+    const bot = {
+      api: {
+        raw: new Proxy({}, {
+          get: () => () => {
+            callCount += 1;
+            throw new Error('Forbidden: bot was blocked by the user');
+          },
+        }),
+      },
+    };
+    await assert.rejects(
+      () => send({
+        bot, method: 'sendMessage',
+        params: { chat_id: '-100', text: 'hi', message_thread_id: 9 },
+        db, logger: silentLogger(),
+      }),
+      /bot was blocked/,
+    );
+    assert.equal(callCount, 1, 'should not retry for non-thread errors');
+  });
+});

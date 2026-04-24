@@ -736,7 +736,7 @@ async function handleApprovalRequest(req) {
         chat_id: apprCfg.adminChatId,
         text: approvalCardText(row),
         reply_markup: buildApprovalKeyboard(row.id, row.callback_token),
-      }, { source: 'approval-request', botName: BOT_NAME });
+      }, { source: 'approval-request', botName: BOT_NAME, plainText: true });
       if (sent?.message_id) {
         approvals.setApproverMsgId(row.id, sent.message_id);
       }
@@ -1122,7 +1122,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     streamer = createStreamer({
       send: async (text) => tg(bot, 'sendMessage', {
         chat_id: chatId, text,
-        reply_parameters: { message_id: msg.message_id },
+        // allow_sending_without_reply: long-running turns give the user
+        // plenty of time to delete their original message. Without this
+        // flag, Telegram rejects the reply with MESSAGE_NOT_FOUND and the
+        // whole streamed answer is lost. With it, the reply simply lands
+        // as a standalone message.
+        reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
         ...(threadId && { message_thread_id: threadId }),
       }, outMetaBase),
       edit: async (messageId, text) => {
