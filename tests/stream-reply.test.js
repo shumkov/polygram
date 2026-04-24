@@ -72,15 +72,24 @@ describe('extractAssistantText', () => {
     assert.equal(out, 'one\n\ntwo');
   });
 
-  test('summarises tool_use blocks inline', () => {
+  test('skips tool_use blocks — they are noise to chat users', () => {
     const out = extractAssistantText({
       message: { content: [
         { type: 'text', text: 'checking' },
         { type: 'tool_use', name: 'Bash' },
       ] },
     });
-    assert.match(out, /checking/);
-    assert.match(out, /Calling `Bash`/);
+    assert.equal(out, 'checking');
+  });
+
+  test('tool_use-only events produce empty output', () => {
+    const out = extractAssistantText({
+      message: { content: [
+        { type: 'tool_use', name: 'Bash' },
+        { type: 'tool_use', name: 'Read' },
+      ] },
+    });
+    assert.equal(out, '');
   });
 
   test('no content or malformed event returns empty', () => {
