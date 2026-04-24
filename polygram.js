@@ -1114,48 +1114,48 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const stopTyping = startTyping(bot, chatId, threadId);
 
   const botCfg = config.bot || {};
-  const streamEnabled = botCfg.streamReplies === true;
   const outMetaBase = {
-    source: streamEnabled ? 'bot-reply-stream' : 'bot-reply',
+    source: 'bot-reply-stream',
     botName: BOT_NAME,
     model: chatConfig.model,
     effort: chatConfig.effort,
   };
 
-  let streamer = null;
-  if (streamEnabled) {
-    streamer = createStreamer({
-      send: async (text) => tg(bot, 'sendMessage', {
-        chat_id: chatId, text,
-        // allow_sending_without_reply: long-running turns give the user
-        // plenty of time to delete their original message. Without this
-        // flag, Telegram rejects the reply with MESSAGE_NOT_FOUND and the
-        // whole streamed answer is lost. With it, the reply simply lands
-        // as a standalone message.
-        reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
-        ...(threadId && { message_thread_id: threadId }),
-      }, outMetaBase),
-      edit: async (messageId, text) => {
-        try {
-          return await bot.api.editMessageText(chatId, messageId, text);
-        } catch (err) {
-          // Stream-edit failures would otherwise be invisible — edits bypass
-          // tg() so there's no messages row reflecting the attempt. Log to
-          // events so stuck streams leave a forensic trail.
-          dbWrite(() => db.logEvent('telegram-edit-failed', {
-            chat_id: chatId, msg_id: messageId,
-            api_error: err.message?.slice(0, 200),
-            bot: BOT_NAME,
-          }), 'log telegram-edit-failed');
-          throw err;
-        }
-      },
-      minChars: botCfg.streamMinChars,
-      throttleMs: botCfg.streamThrottleMs,
-      logger: { error: (m) => console.error(`[${label}] ${m}`) },
-    });
-    streamers.set(sessionKey, streamer);
-  }
+  // Streaming is unconditional as of 0.4.0 — matches OpenClaw's model and
+  // eliminates the "stuck at 15min typing" complaint from the non-streaming
+  // code path. For short responses the streamer stays idle and we fall
+  // through to the normal send path via finalize() returning streamed=false.
+  const streamer = createStreamer({
+    send: async (text) => tg(bot, 'sendMessage', {
+      chat_id: chatId, text,
+      // allow_sending_without_reply: long-running turns give the user
+      // plenty of time to delete their original message. Without this
+      // flag, Telegram rejects the reply with MESSAGE_NOT_FOUND and the
+      // whole streamed answer is lost. With it, the reply simply lands
+      // as a standalone message.
+      reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
+      ...(threadId && { message_thread_id: threadId }),
+    }, outMetaBase),
+    edit: async (messageId, text) => {
+      try {
+        return await bot.api.editMessageText(chatId, messageId, text);
+      } catch (err) {
+        // Stream-edit failures would otherwise be invisible — edits bypass
+        // tg() so there's no messages row reflecting the attempt. Log to
+        // events so stuck streams leave a forensic trail.
+        dbWrite(() => db.logEvent('telegram-edit-failed', {
+          chat_id: chatId, msg_id: messageId,
+          api_error: err.message?.slice(0, 200),
+          bot: BOT_NAME,
+        }), 'log telegram-edit-failed');
+        throw err;
+      }
+    },
+    minChars: botCfg.streamMinChars,
+    throttleMs: botCfg.streamThrottleMs,
+    logger: { error: (m) => console.error(`[${label}] ${m}`) },
+  });
+  streamers.set(sessionKey, streamer);
 
   try {
     const result = await sendToProcess(sessionKey, prompt);
@@ -1175,7 +1175,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
 
     // Streamed text path: finalise the live-edit and, if the full response
     // overflows Telegram's 4096 cap, send remainder as follow-up chunks.
-    if (streamer && parsed.text) {
+    if (parsed.text) {
       const fin = await streamer.finalize(parsed.text);
       if (fin.streamed) {
         if (parsed.text.length > TG_MAX_LEN) {
@@ -1231,14 +1231,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
 
     console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
   } catch (err) {
-    if (streamer) {
-      // Generic suffix — err.message can leak internal paths/state.
-      await streamer.finalize('', { errorSuffix: 'stream interrupted' }).catch(() => {});
-    }
+    // Generic suffix — err.message can leak internal paths/state.
+    await streamer.finalize('', { errorSuffix: 'stream interrupted' }).catch(() => {});
     throw err;
   } finally {
     stopTyping();
-    if (streamer) streamers.delete(sessionKey);
+    streamers.delete(sessionKey);
   }
 }
 

@@ -8,9 +8,9 @@
       "_comment_adminChatId": "Required when allowConfigCommands is true for pairing commands (/pair-code, /pairings, /unpair) to work. These grant cross-chat trust and are gated to the admin chat only.",
       "adminChatId": "123456789",
       "needsToken": false,
-      "streamReplies": true,
+      "_comment_stream": "Streaming is always on. `streamMinChars` sets the initial-send debounce (default 30) — short responses below that stay idle until the final result. `streamThrottleMs` sets the edit cadence (default 1000ms, min 250).",
       "streamMinChars": 30,
-      "streamThrottleMs": 500,
+      "streamThrottleMs": 1000,
       "_comment_pairedChatDefaults": "When a user sends /pair <CODE> from a private chat that isn't in config.chats yet, polygram auto-creates a chat entry using these defaults (merged over top-level `defaults`). Leave out `cwd` at your peril — without it, auto-onboarded DMs have no working directory and pairing will fail.",
       "pairedChatDefaults": {
         "agent": "admin",
