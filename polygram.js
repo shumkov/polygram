@@ -33,6 +33,7 @@ const { createStore: createPairingsStore, parseTtl: parsePairingTtl } = require(
 const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/voice');
 const { createStreamer } = require('./lib/stream-reply');
 const { isAbortRequest } = require('./lib/abort-detector');
+const { startTyping } = require('./lib/typing-indicator');
 const {
   createStore: createApprovalsStore,
   matchesAnyPattern: matchesApprovalPattern,
@@ -578,15 +579,10 @@ async function processQueue(sessionKey) {
 
 const drainQueuesForChat = (chatId) => drainQueuesForChatImpl(queues, chatId);
 
-// ─── Typing indicator ───────────────────────────────────────────────
-
-function startTyping(bot, chatId, threadId) {
-  const opts = threadId ? { message_thread_id: threadId } : {};
-  const send = () => bot.api.sendChatAction(chatId, 'typing', opts).catch(() => {});
-  send();
-  const interval = setInterval(send, 4000);
-  return () => clearInterval(interval);
-}
+// Typing indicator is imported from lib/typing-indicator — it adds a
+// per-chat circuit breaker with exponential backoff so a chat that
+// permanently 401s (bot blocked, chat deleted) doesn't have us
+// hammering sendChatAction every 4s for the full turn duration.
 
 // ─── Response parsing (stickers, reactions) ─────────────────────────
 
@@ -1112,7 +1108,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   });
 
   const prompt = formatPrompt(msg, sessionCtx, downloaded);
-  const stopTyping = startTyping(bot, chatId, threadId);
+  const stopTyping = startTyping({
+    bot, chatId, threadId,
+    logger: { error: (m) => console.error(`[${label}] ${m}`) },
+    onEvent: (e) => dbWrite(() => db.logEvent(e.kind, {
+      bot: BOT_NAME, chat_id: e.chat_id, ...(e.detail || {}),
+    }), `log ${e.kind}`),
+  });
 
   const botCfg = config.bot || {};
   const outMetaBase = {
