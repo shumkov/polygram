@@ -256,12 +256,30 @@ describe('ProcessManager stream-json handling', () => {
   });
 
   test('send timeout rejects + clears inFlight', async () => {
-    await pm.getOrSpawn('a');
+    const entry = await pm.getOrSpawn('a');
     const p = pm.send('a', 'hi', { timeoutMs: 30 });
     await assert.rejects(() => p, /Timeout/);
-    const e = pm.get('a');
-    assert.equal(e.inFlight, false);
-    assert.equal(e.pending, null);
+    // 0.3.9: idle timeout now also SIGTERMs the subprocess. Without this,
+    // a stuck claude lingers and the next send() writes stdin into a dead
+    // process — the root cause of the 1.5h hang we saw in production.
+    assert.equal(entry.proc.killed, true);
+    // The entry's pending state is cleared synchronously with the reject.
+    assert.equal(entry.pending, null);
+    assert.equal(entry.inFlight, false);
+  });
+
+  test('wall-clock ceiling fires even if idle timer keeps resetting', async () => {
+    const entry = await pm.getOrSpawn('a');
+    // Arm with a short wall-clock ceiling but a much longer idle timeout,
+    // then keep emitting assistant events to reset the idle timer every
+    // few ms. Without the wall-clock ceiling, this would never time out.
+    const p = pm.send('a', 'hi', { timeoutMs: 5000, maxTurnMs: 50 });
+    const keepAlive = setInterval(() => {
+      entry.proc.emitEvent({ type: 'assistant', message: { content: [{ type: 'text', text: 'thinking...' }] } });
+    }, 5);
+    await assert.rejects(() => p, /wall-clock ceiling/);
+    clearInterval(keepAlive);
+    assert.equal(entry.proc.killed, true);
   });
 
   test('result with error subtype surfaces error', async () => {

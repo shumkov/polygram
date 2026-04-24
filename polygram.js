@@ -515,7 +515,12 @@ async function sendToProcess(sessionKey, prompt) {
   const chatId = getChatIdFromKey(sessionKey);
   const chatConfig = config.chats[chatId];
   const timeoutMs = (chatConfig.timeout || config.defaults.timeout) * 1000;
-  return pm.send(sessionKey, prompt, { timeoutMs });
+  // Wall-clock ceiling (seconds). Overridable per-chat via chatConfig.maxTurn
+  // or globally via config.defaults.maxTurn. 30 min default is generous for
+  // long audits; stuck API calls rarely run that long without firing the
+  // idle timer first. Unit: seconds → milliseconds.
+  const maxTurnMs = (chatConfig.maxTurn || config.defaults?.maxTurn || 1800) * 1000;
+  return pm.send(sessionKey, prompt, { timeoutMs, maxTurnMs });
 }
 
 // ─── Message queue (per-chat) ───────────────────────────────────────
