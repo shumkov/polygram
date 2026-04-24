@@ -1456,9 +1456,24 @@ function createBot(token) {
         had_active: hadActive, queued_dropped: dropped,
         trigger: cleanText.slice(0, 40),
       }), 'log abort-requested');
+      // Reply in the same language the user aborted in. Cyrillic-detection
+      // is crude but reliable for ru/en (the only two cue sets we ship).
+      const lang = /[а-яё]/i.test(cleanText) ? 'ru' : 'en';
+      const strs = {
+        en: {
+          stopped: 'Stopped.',
+          withDropped: (n) => `Stopped. Cleared ${n} queued message${n === 1 ? '' : 's'}.`,
+          nothing: 'Nothing to stop.',
+        },
+        ru: {
+          stopped: 'Остановлено.',
+          withDropped: (n) => `Остановлено. Очередь очищена (${n}).`,
+          nothing: 'Нечего останавливать.',
+        },
+      }[lang];
       const reply = hadActive || dropped
-        ? (dropped ? `Остановлено. Очередь очищена (${dropped}).` : 'Остановлено.')
-        : 'Нечего останавливать.';
+        ? (dropped ? strs.withDropped(dropped) : strs.stopped)
+        : strs.nothing;
       try {
         await tg(bot, 'sendMessage', {
           chat_id: chatId, text: reply,
