@@ -576,11 +576,31 @@ const inFlightHandlers = new Map(); // sessionKey → count
 // polygram is going down, in-flight handlers reject with "Process
 // killed" / "Process exited" but those failures aren't "real" — the
 // next boot's replay will re-dispatch them. Suppressing the user-facing
-// "Sorry, I couldn't process" during shutdown removes a misleading
-// post-mortem apology that the user shouldn't have seen in the first
-// place. (The boot replay's own _isReplay flag handles the OTHER half:
-// suppressing the apology if the replay itself fails.)
+// error reply during shutdown removes a misleading post-mortem apology
+// the user shouldn't see. (The boot replay's own _isReplay flag handles
+// the OTHER half: suppressing if the replay itself fails.)
 let isShuttingDown = false;
+
+// Map a handler-error to a user-facing reply that says what happened
+// and what to do next. The technical strings come from process-manager
+// (idle / wall-clock timeouts) and node child_process (Process exited /
+// killed). Anything we don't recognise falls back to a generic line
+// with a single-line snippet of the error so the user can at least
+// distinguish unique failures from the obvious "try again" cases.
+function errorReplyText(err) {
+  const msg = err?.message || '';
+  if (/idle with no Claude activity/i.test(msg)) {
+    return '⏳ I went quiet too long without finishing. Try resending or simplifying the task.';
+  }
+  if (/wall-clock ceiling/i.test(msg)) {
+    return '⏱ This was taking too long, so I stopped. Try resending or simplifying the task.';
+  }
+  if (/Process (exited|killed)/i.test(msg)) {
+    return '💥 Something crashed on my end. Try again.';
+  }
+  const reason = msg.split('\n')[0].slice(0, 120);
+  return `Hit a snag: ${reason || 'unknown error'}. Try resending.`;
+}
 
 // Sessions the operator just /stop'd (or natural-language "стоп"). Keyed
 // by sessionKey → timestamp of abort. ANY pending that rejects within
@@ -638,7 +658,7 @@ function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
       aborted: wasAborted || undefined,
       replay: isReplay || undefined,
     }), 'log handler-error');
-    // Suppress the "Sorry, I couldn't process" reply when:
+    // Suppress the user-facing error reply when:
     //  - boot replay (user typed this minutes ago and moved on)
     //  - polygram is shutting down (the failure is "Process killed" /
     //    "Process exited" which isn't a real error — boot replay will
@@ -647,7 +667,7 @@ function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
     if (!wasAborted && !isReplay && !isShuttingDown) {
       tg(bot, 'sendMessage', {
         chat_id: chatId,
-        text: `Sorry, I couldn't process that message. The operator has been notified.`,
+        text: errorReplyText(err),
         reply_parameters: { message_id: msg.message_id },
       }, { source: 'error-reply', botName: BOT_NAME }).catch((replyErr) => {
         console.error(`[${sessionKey}] failed to send error reply: ${replyErr.message}`);
