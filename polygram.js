@@ -773,18 +773,18 @@ function formatConfigInfoText(chatConfig, show, sessionKey) {
   const modelHelp = [
     '',
     '**Models**',
-    '🧠 **opus** — глубокий анализ, code refactor, сверка из 3+ источников. ~5× стоимость sonnet.',
-    '🤖 **sonnet** — дефолт. Большинство ops, code review, document summary.',
-    '⚡ **haiku** — простые быстрые задачи, классификация, lookup.',
+    '🧠 **opus** — deep analysis, code refactor, multi-source reconciliation. ~5× sonnet cost.',
+    '🤖 **sonnet** — default. Most ops, code review, document summary.',
+    '⚡ **haiku** — quick simple tasks, classification, lookup.',
   ].join('\n');
 
   const effortHelp = [
     '',
-    '**Effort** — потолок «сколько Claude может думать». На простых вопросах он сам отвечает быстро, на сложных тратит больше токенов. Можно безопасно ставить выше — он не разгонится без нужды.',
-    '• **low** — fast replies, минимум reasoning. Casual chat, simple lookups.',
-    '• **medium** — balanced default. Подходит почти всем.',
-    '• **high** — сложные многошаговые задачи. Audit, debug, multi-source.',
-    '• **xhigh** / **max** — самые тяжёлые. Hard reasoning, edge cases.',
+    '**Effort** — ceiling on how much Claude can think. Simple questions get fast replies; hard ones spend more tokens. Safe to set higher — Claude scales down automatically when it doesn\'t need to think.',
+    '• **low** — fast replies, minimum reasoning. Casual chat, simple lookups.',
+    '• **medium** — balanced default. Fits most use cases.',
+    '• **high** — multi-step tasks. Audit, debug, multi-source analysis.',
+    '• **xhigh** / **max** — heaviest. Hard reasoning, edge cases.',
   ].join('\n');
 
   let body = head;
