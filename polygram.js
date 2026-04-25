@@ -415,7 +415,15 @@ async function downloadAttachments(bot, token, chatId, msg, attachments) {
       results.push({ ...att, path: localPath, size: att.size || buf.length });
       console.log(`[attach] ${chatId} ← ${att.kind} ${safeName} (${buf.length} bytes) → ${localPath}`);
     } catch (err) {
-      console.error(`[attach] download failed for ${att.name}: ${err.message}`);
+      // Don't drop the attachment silently — push it through with the
+      // failure noted. buildAttachmentTags renders this as
+      // <attachment-failed reason="..." /> so claude tells the user
+      // "I couldn't see your <kind>" instead of pretending it received
+      // text only. Pre-0.5.11 these were logged to console and dropped,
+      // so claude got the prompt as if no attachment was sent.
+      const reason = (err.message || 'unknown').slice(0, 200);
+      console.error(`[attach] download failed for ${att.name}: ${reason}`);
+      results.push({ ...att, path: null, error: reason });
     }
   }
   return results;

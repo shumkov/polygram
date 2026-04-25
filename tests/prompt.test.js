@@ -196,6 +196,40 @@ describe('buildReplyToBlock', () => {
   });
 });
 
+describe('buildAttachmentTags — download failures', () => {
+  test('downloaded attachment renders as <attachment ...>', () => {
+    const tags = buildAttachmentTags([
+      { kind: 'photo', name: 'p.jpg', mime_type: 'image/jpeg', size: 1234, path: '/inbox/x/1-p.jpg' },
+    ]);
+    assert.match(tags, /<attachment kind="photo" name="p\.jpg"[^>]*path="\/inbox\/x\/1-p\.jpg"/);
+    assert.doesNotMatch(tags, /attachment-failed/);
+  });
+
+  test('failed download renders as <attachment-failed ... reason="...">', () => {
+    const tags = buildAttachmentTags([
+      { kind: 'voice', name: 'v.ogg', mime_type: 'audio/ogg', error: 'HTTP 410' },
+    ]);
+    assert.match(tags, /<attachment-failed kind="voice" name="v\.ogg"[^>]*reason="HTTP 410"/);
+    assert.doesNotMatch(tags, /\spath=/);
+  });
+
+  test('mixed downloaded + failed each render with the right tag', () => {
+    const tags = buildAttachmentTags([
+      { kind: 'photo', name: 'p.jpg', mime_type: 'image/jpeg', size: 100, path: '/p.jpg' },
+      { kind: 'document', name: 'big.pdf', mime_type: 'application/pdf', error: 'content-length 60000000 exceeds per-file cap' },
+    ]);
+    assert.match(tags, /<attachment kind="photo" name="p\.jpg"/);
+    assert.match(tags, /<attachment-failed kind="document" name="big\.pdf"[^>]*reason="content-length/);
+  });
+
+  test('attachment with no path and no error still renders failed (defensive)', () => {
+    const tags = buildAttachmentTags([
+      { kind: 'video', name: 'v.mp4', mime_type: 'video/mp4' },
+    ]);
+    assert.match(tags, /<attachment-failed.*reason="no local path"/);
+  });
+});
+
 describe('buildVoiceTags', () => {
   test('empty input produces empty output', () => {
     assert.equal(buildVoiceTags([]), '');
