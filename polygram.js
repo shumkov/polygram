@@ -811,7 +811,18 @@ function buildConfigKeyboard(chatConfig, show = 'all') {
 // Card text shown above the inline keyboard. Includes plain-language
 // guidance on when to pick which model / effort, since most users
 // (especially in shared groups) don't know which option to tap.
-const MODEL_VERSIONS_DESC = { opus: 'claude-opus-4-6', sonnet: 'claude-sonnet-4-6', haiku: 'claude-haiku-4-5' };
+//
+// Model versions: polygram passes the alias ("opus", "sonnet", "haiku")
+// to claude, which resolves it to the latest snapshot. We mirror those
+// snapshots here for display only, and verify them on each release with
+// `claude --model <alias>` (probing the system:init event's `model`
+// field). Bumping is a manual step — when claude releases a new
+// snapshot the alias maps to, update this map and ship.
+const MODEL_VERSIONS_DESC = {
+  opus: 'claude-opus-4-7',
+  sonnet: 'claude-sonnet-4-6',
+  haiku: 'claude-haiku-4-5',
+};
 
 function formatConfigInfoText(chatConfig, show, sessionKey) {
   const alive = pm.has(sessionKey) && !pm.get(sessionKey).closed;
@@ -1196,7 +1207,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     ...(tid && { message_thread_id: tid }),
   });
 
-  const MODEL_VERSIONS = { opus: 'claude-opus-4-6', sonnet: 'claude-sonnet-4-6', haiku: 'claude-haiku-4-5' };
+  // Single source of truth at module scope (MODEL_VERSIONS_DESC) — see the
+  // comment there for the bump procedure.
+  const MODEL_VERSIONS = MODEL_VERSIONS_DESC;
 
   const botAllowsCommands = !!config.bot?.allowConfigCommands;
   const cmdUser = msg.from?.first_name || msg.from?.username || null;
