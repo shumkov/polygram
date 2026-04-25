@@ -1626,9 +1626,17 @@ function shouldHandle(msg, chatConfig, botUsername) {
     const text = msg.text || msg.caption || '';
     const isReplyToBot = msg.reply_to_message?.from?.username === botUsername;
     const hasMention = text.includes(`@${botUsername}`);
-    // Paired users bypass requireMention — they've been explicitly trusted
-    // in this chat by an operator, no need for a mention every time.
-    const paired = pairings && msg.from?.id
+    // A reply targeting some other user (not the bot) is a strong signal
+    // "this message is for that person, not me". Paired users normally
+    // bypass requireMention, but not in this case — without the guard a
+    // paired user saying "Gotcha!" to a teammate gets processed by the
+    // bot just because the user is paired, which is what bit us in
+    // UMI Group on 0.5.9 (bot leaked reasoning as a reply to "Gotcha!").
+    const repliesToOtherUser = !!msg.reply_to_message
+      && msg.reply_to_message.from?.username !== botUsername;
+    // Paired users bypass requireMention — operator-trusted, no @ needed
+    // every time. Skipped when they're replying to a non-bot user (above).
+    const paired = !repliesToOtherUser && pairings && msg.from?.id
       ? pairings.hasLivePairing({ bot_name: BOT_NAME, user_id: msg.from.id, chat_id: chatId })
       : false;
     if (!isReplyToBot && !hasMention && !paired) return false;
