@@ -73,3 +73,28 @@ describe('isAbortRequest — false-positive guards', () => {
     assert.equal(isAbortRequest('stop, then resume'), false);
   });
 });
+
+describe('isAbortRequest — first-sentence detection', () => {
+  test('abort phrase + period + continuation triggers', () => {
+    assert.equal(isAbortRequest("Stop. I'll ask in another session."), true);
+    assert.equal(isAbortRequest('Wait! I forgot to mention something.'), true);
+    assert.equal(isAbortRequest('Cancel? Actually no, continue.'), true);
+    assert.equal(isAbortRequest('Стоп. Я подумаю и вернусь.'), true);
+    assert.equal(isAbortRequest('Хватит! Этого достаточно.'), true);
+  });
+
+  test('with leading @-mention still triggers', () => {
+    assert.equal(isAbortRequest("@shumobot Stop. I'll ask later."), true);
+  });
+
+  test('first sentence that is NOT an exact phrase does not trigger', () => {
+    assert.equal(isAbortRequest('Stop using markdown. Plain text only.'), false);
+    assert.equal(isAbortRequest("Wait a sec. I'm typing."), false);
+  });
+
+  test('comma is not a sentence boundary (ambiguous)', () => {
+    // "Stop, look here" is ambiguous — could be "halt and look" or "halt!
+    // look here" — keep it non-abort to avoid false positives.
+    assert.equal(isAbortRequest('Stop, look at this thread'), false);
+  });
+});
