@@ -571,6 +571,17 @@ async function sendToProcess(sessionKey, prompt, context = {}) {
 const CONCURRENT_WARN_THRESHOLD = 20;
 const inFlightHandlers = new Map(); // sessionKey → count
 
+// Set true by the SIGTERM/SIGINT handler. Module-scoped so the
+// fire-and-forget catch in dispatchHandleMessage can check it: when
+// polygram is going down, in-flight handlers reject with "Process
+// killed" / "Process exited" but those failures aren't "real" — the
+// next boot's replay will re-dispatch them. Suppressing the user-facing
+// "Sorry, I couldn't process" during shutdown removes a misleading
+// post-mortem apology that the user shouldn't have seen in the first
+// place. (The boot replay's own _isReplay flag handles the OTHER half:
+// suppressing the apology if the replay itself fails.)
+let isShuttingDown = false;
+
 // Sessions the operator just /stop'd (or natural-language "стоп"). Keyed
 // by sessionKey → timestamp of abort. ANY pending that rejects within
 // ABORT_GRACE_MS of the mark is considered abort-caused — its generic
@@ -627,11 +638,13 @@ function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
       aborted: wasAborted || undefined,
       replay: isReplay || undefined,
     }), 'log handler-error');
-    // Suppress the "Sorry, I couldn't process" reply when this turn is a
-    // boot replay — the user typed this message minutes ago and has long
-    // moved on. A late apology just adds more noise to the post-restart
-    // chat (alongside the "Это снова реплей" cascade we're fixing).
-    if (!wasAborted && !isReplay) {
+    // Suppress the "Sorry, I couldn't process" reply when:
+    //  - boot replay (user typed this minutes ago and moved on)
+    //  - polygram is shutting down (the failure is "Process killed" /
+    //    "Process exited" which isn't a real error — boot replay will
+    //    re-dispatch it on next start)
+    //  - user just /stop'd (already saw their abort acknowledgement)
+    if (!wasAborted && !isReplay && !isShuttingDown) {
       tg(bot, 'sendMessage', {
         chat_id: chatId,
         text: `Sorry, I couldn't process that message. The operator has been notified.`,
@@ -2157,10 +2170,9 @@ async function main() {
   // replay picks it up. Prevents "Sorry, I couldn't process that message"
   // from showing on every restart.
   const SHUTDOWN_DRAIN_MS = 30_000;
-  let shuttingDown = false;
   const shutdown = async () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
+    if (isShuttingDown) return;
+    isShuttingDown = true;
     console.log('\nShutting down...');
     // 1. Stop accepting new inbound first so nothing new queues behind the drain.
     if (bot && bot._stop) bot._stop();
