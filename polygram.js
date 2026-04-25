@@ -2174,8 +2174,13 @@ async function main() {
     },
     // Fires after a graceful /model or /effort drain has actually
     // swapped to the new settings. Post a confirmation back to the
-    // chat so the user knows the switch happened.
-    onRespawn: (sessionKey, reason, entry) => {
+    // chat ONLY when wasDrained=true — the user actively waited for an
+    // in-flight turn to finish before the switch took effect, so the
+    // explicit "switched" message is meaningful. When the kill was
+    // immediate (queue empty), the inline-card update + button toast
+    // already convey "done", and a separate message is just noise.
+    onRespawn: (sessionKey, reason, entry, wasDrained) => {
+      if (!wasDrained) return;
       const chatId = entry.chatId;
       if (!chatId) return;
       const chatConfig = config.chats[chatId];

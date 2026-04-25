@@ -332,6 +332,40 @@ describe('ProcessManager stream-json handling', () => {
     assert.equal(res.queued, 0);
   });
 
+  test('onRespawn fires with wasDrained=false on immediate kill', async () => {
+    const calls = [];
+    const pm2 = new (require('../lib/process-manager').ProcessManager)({
+      cap: 2,
+      killTimeoutMs: 50,
+      onRespawn: (key, reason, entry, wasDrained) => calls.push({ key, reason, wasDrained }),
+      spawnFn: () => makeFakeProc(),
+    });
+    await pm2.getOrSpawn('a');
+    pm2.requestRespawn('a', 'model-change');
+    // Wait for the async kill+notify to complete.
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].wasDrained, false);
+  });
+
+  test('onRespawn fires with wasDrained=true after queue drains', async () => {
+    const calls = [];
+    const pm2 = new (require('../lib/process-manager').ProcessManager)({
+      cap: 2,
+      killTimeoutMs: 50,
+      onRespawn: (key, reason, entry, wasDrained) => calls.push({ key, reason, wasDrained }),
+      spawnFn: () => makeFakeProc(),
+    });
+    const e = await pm2.getOrSpawn('a');
+    const p = pm2.send('a', 'work');
+    pm2.requestRespawn('a', 'model-change');
+    e.proc.emitEvent({ type: 'result', subtype: 'success', result: 'done' });
+    await p;
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].wasDrained, true);
+  });
+
   test('requestRespawn while queue non-empty defers to drain', async () => {
     const entry = await pm.getOrSpawn('a');
     const p = pm.send('a', 'work');
