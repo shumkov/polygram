@@ -1,6 +1,6 @@
 {
   "name": "polygram",
-  "version": "0.4.13",
+  "version": "0.5.0",
   "description": "Telegram daemon for Claude Code that preserves the OpenClaw per-chat session model. Migration path for OpenClaw users moving to Claude Code.",
   "main": "lib/ipc-client.js",
   "bin": {
@@ -62,6 +62,7 @@
   "dependencies": {
     "better-sqlite3": "^12.9.0",
     "grammy": "^1.42.0",
-    "telegramify-markdown": "^1.3.3"
+    "markdown-it": "^14.1.1",
+    "marked": "^18.0.2"
   }
 }
