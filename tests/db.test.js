@@ -442,3 +442,65 @@ describe('chat_migrations', () => {
     assert.equal(db.resolveChatId(-100), '-200');
   });
 });
+
+// 0.5.4 — boot replay had a dedupe bug: insertOutboundPending didn't persist
+// reply_to_id, so hasOutboundReplyTo always returned false, so every restart
+// re-dispatched already-answered messages. These tests pin down the wiring
+// so we can't silently regress.
+describe('boot replay dedupe wiring', () => {
+  beforeEach(() => { db = freshDb(); });
+  afterEach(() => cleanup());
+
+  test('insertOutboundPending persists reply_to_id', () => {
+    const res = db.insertOutboundPending({
+      chat_id: '1', text: 'reply', bot_name: 'b', pending_id: -1, reply_to_id: 42,
+    });
+    db.markOutboundSent(res.lastInsertRowid, { msg_id: 100, ts: Date.now() });
+    const row = db.raw.prepare('SELECT reply_to_id FROM messages WHERE id=?').get(res.lastInsertRowid);
+    assert.equal(row.reply_to_id, 42);
+  });
+
+  test('hasOutboundReplyTo finds a sent reply by inbound msg_id', () => {
+    const res = db.insertOutboundPending({
+      chat_id: '1', text: 'r', bot_name: 'b', pending_id: -1, reply_to_id: 7,
+    });
+    db.markOutboundSent(res.lastInsertRowid, { msg_id: 200, ts: Date.now() });
+    assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 7 }), true);
+    assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 8 }), false);
+  });
+
+  test('hasOutboundReplyTo ignores pending and failed outbounds', () => {
+    const r1 = db.insertOutboundPending({ chat_id: '1', text: 'p', bot_name: 'b', pending_id: -1, reply_to_id: 9 });
+    // pending → not counted
+    assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 9 }), false);
+    db.markOutboundFailed(r1.lastInsertRowid, 'timeout');
+    // failed → still not counted
+    assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 9 }), false);
+  });
+
+  test('getReplayCandidates default window is 3 minutes (recent stays, old drops)', () => {
+    const now = Date.now();
+    db.insertMessage({
+      chat_id: '1', msg_id: 1, direction: 'in', source: 'tg',
+      text: 'recent', ts: now - 60_000, // 1 min ago
+    });
+    db.insertMessage({
+      chat_id: '1', msg_id: 2, direction: 'in', source: 'tg',
+      text: 'ancient', ts: now - 10 * 60_000, // 10 min ago
+    });
+    db.setInboundHandlerStatus({ chat_id: '1', msg_id: 1, status: 'replay-pending' });
+    db.setInboundHandlerStatus({ chat_id: '1', msg_id: 2, status: 'replay-pending' });
+    const got = db.getReplayCandidates({ chatIds: ['1'] });
+    assert.deepEqual(got.map((r) => r.msg_id), [1]);
+  });
+
+  test('getReplayCandidates excludes replay-attempted (one-shot guard)', () => {
+    const now = Date.now();
+    db.insertMessage({
+      chat_id: '1', msg_id: 1, direction: 'in', source: 'tg',
+      text: 'tried', ts: now - 30_000,
+    });
+    db.setInboundHandlerStatus({ chat_id: '1', msg_id: 1, status: 'replay-attempted' });
+    assert.equal(db.getReplayCandidates({ chatIds: ['1'] }).length, 0);
+  });
+});

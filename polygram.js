@@ -530,20 +530,29 @@ async function sendToProcess(sessionKey, prompt, context = {}) {
   const chatConfig = config.chats[chatId];
   const timeoutMs = (chatConfig.timeout || config.defaults.timeout) * 1000;
   const maxTurnMs = (chatConfig.maxTurn || config.defaults?.maxTurn || 1800) * 1000;
-  // Per-session stdin lock orders the write step, not the result-wait.
-  // pm.send's Promise executor writes stdin synchronously, so as soon as
-  // pm.send returns (not resolves — returns), the stdin write has
-  // happened. We release the lock right after that and await the result
-  // OUTSIDE the lock — otherwise one long turn would serialise the whole
-  // session, which is what we're trying to escape.
+  // Hold the per-session lock across the FULL turn (write + result wait),
+  // not just the stdin write. Claude's stream-json input mode batches any
+  // user messages that arrive while a turn is in flight into the next
+  // turn — so writing pendingB's prompt while pendingA is still being
+  // worked on causes Claude to batch B+C and emit ONE result for them,
+  // leaving pendingC stuck forever (reactor stuck on 👀, reply mis-routed,
+  // 10-min idle timer eventually fires for the orphan).
+  //
+  // We tested this directly: 3 user messages written rapidly produced
+  // result#1="A" and result#2="B\nC" — pending#3 never got a result.
+  //
+  // Holding the lock across the whole turn means Claude never has more
+  // than one user message in its stdin buffer at once, so it can't batch.
+  // Cost: slight latency for back-to-back user messages — the second one
+  // waits for the first turn to finish before starting. The reactor on
+  // the queued message stays at 👀 (QUEUED) until its turn actually
+  // starts, which is the correct UX (and what the user already expects).
   const release = await stdinLock.acquire(sessionKey);
-  let resultPromise;
   try {
-    resultPromise = pm.send(sessionKey, prompt, { timeoutMs, maxTurnMs, context });
+    return await pm.send(sessionKey, prompt, { timeoutMs, maxTurnMs, context });
   } finally {
     release();
   }
-  return resultPromise;
 }
 
 // ─── Message dispatch ───────────────────────────────────────────────
@@ -601,6 +610,7 @@ function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
   }
   handleMessage(sessionKey, chatId, msg, bot).catch((err) => {
     const wasAborted = isSessionRecentlyAborted(sessionKey);
+    const isReplay = msg._isReplay === true;
     console.error(`[${sessionKey}] Error:`, err.message);
     // Mark the row as 'failed' so boot replay doesn't re-dispatch it.
     // Exception: aborted sessions → 'aborted' (same — not replayable).
@@ -615,8 +625,13 @@ function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
       error: err.message?.slice(0, 500),
       stack: err.stack?.split('\n').slice(0, 5).join('\n'),
       aborted: wasAborted || undefined,
+      replay: isReplay || undefined,
     }), 'log handler-error');
-    if (!wasAborted) {
+    // Suppress the "Sorry, I couldn't process" reply when this turn is a
+    // boot replay — the user typed this message minutes ago and has long
+    // moved on. A late apology just adds more noise to the post-restart
+    // chat (alongside the "Это снова реплей" cascade we're fixing).
+    if (!wasAborted && !isReplay) {
       tg(bot, 'sendMessage', {
         chat_id: chatId,
         text: `Sorry, I couldn't process that message. The operator has been notified.`,
@@ -1129,9 +1144,14 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
 
   // Mark the inbound row as 'dispatched' so the boot replay loop knows
   // this turn started. Cleared to 'replied' (or 'failed') when done.
-  dbWrite(() => db.setInboundHandlerStatus({
-    chat_id: chatId, msg_id: msg.message_id, status: 'dispatched',
-  }), 'set handler_status=dispatched');
+  // Replays are pre-marked 'replay-attempted' by the boot loop and we
+  // must NOT overwrite that — it's the one-shot guard that keeps a
+  // failing-mid-flight replay from re-replaying on every subsequent boot.
+  if (!msg._isReplay) {
+    dbWrite(() => db.setInboundHandlerStatus({
+      chat_id: chatId, msg_id: msg.message_id, status: 'dispatched',
+    }), 'set handler_status=dispatched');
+  }
 
   const text = msg.text || msg.caption || '';
   const threadId = msg.message_thread_id;
@@ -1426,6 +1446,16 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // at which point we flip to THINKING (🤔).
   reactor.setState('QUEUED');
 
+  // Mark the inbound row terminal so boot replay doesn't pick it up again.
+  // Must fire down EVERY non-throwing exit path (early returns for error/
+  // NO_REPLY, streamed-reply early return, regular reply at end). 0.5.4
+  // hardened this — earlier versions only marked at the bottom of try, so
+  // streamed replies (which return at line ~1477) left handler_status
+  // stuck at 'dispatched' forever, causing replay loops on every restart.
+  const markReplied = () => dbWrite(() => db.setInboundHandlerStatus({
+    chat_id: chatId, msg_id: msg.message_id, status: 'replied',
+  }), 'set handler_status=replied');
+
   try {
     // Pass streamer + reactor as per-turn context. pm's callbacks pick
     // them off entry.pendingQueue[0].context so concurrent pendings each
@@ -1441,7 +1471,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     if (result.error) {
       console.error(`[${label}] Error (${elapsed}s):`, result.error);
       reactor.setState('ERROR');
-      if (!result.text) return;
+      if (!result.text) { markReplied(); return; }
     } else {
       // Clear the progress reaction instead of stamping 👍 — the reply
       // bubble itself is the "done" signal and a permanent thumbs-up on
@@ -1450,7 +1480,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       reactor.clear().catch(() => {});
     }
 
-    if (!result.text || result.text === 'NO_REPLY') return;
+    if (!result.text || result.text === 'NO_REPLY') { markReplied(); return; }
 
     const parsed = parseResponse(result.text);
     const outMeta = { ...outMetaBase, sessionId: result.sessionId, costUsd: result.cost };
@@ -1474,6 +1504,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           }
         }
         console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
+        markReplied();
         return;
       }
       // Not streamed (response too short) — fall through to normal path.
@@ -1512,11 +1543,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     }
 
     console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
-    // Success: mark the inbound row 'replied' so boot replay doesn't
-    // pick it up again on restart.
-    dbWrite(() => db.setInboundHandlerStatus({
-      chat_id: chatId, msg_id: msg.message_id, status: 'replied',
-    }), 'set handler_status=replied');
+    markReplied();
   } catch (err) {
     // If the user just aborted this session, silently finalise the stream
     // without the scary "⚠ stream interrupted" banner. The user has already
@@ -2256,6 +2283,19 @@ async function main() {
         }
         const chatConfig = config.chats[row.chat_id];
         if (!chatConfig) { skipped += 1; continue; }
+        // Tag the reconstructed message so dispatchHandleMessage knows
+        // (a) to suppress the "Sorry I couldn't process" error reply on
+        // failure and (b) to flag handler-error events as replay.
+        reconstructed._isReplay = true;
+        // Pre-mark 'replay-attempted' so even if this attempt is killed
+        // mid-turn by yet another restart, the next boot won't replay it
+        // again. Replay is one-shot — handleMessage will overwrite to
+        // 'replied' on success, or the catch will overwrite to 'failed'.
+        // Worst case (polygram dies before either): row stays
+        // 'replay-attempted', getReplayCandidates skips it, no loop.
+        dbWrite(() => db.setInboundHandlerStatus({
+          chat_id: row.chat_id, msg_id: row.msg_id, status: 'replay-attempted',
+        }), 'set handler_status=replay-attempted');
         const sessionKey = getSessionKey(row.chat_id, row.thread_id, chatConfig);
         dispatchHandleMessage(sessionKey, row.chat_id, reconstructed, bot);
         replayed += 1;
