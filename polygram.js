@@ -737,6 +737,29 @@ function buildApprovalKeyboard(approvalId, token) {
   };
 }
 
+// /model and /effort inline keyboard. `show` controls which row(s) appear:
+// 'model', 'effort', or 'all'. The current value gets a ✓ marker so the
+// user can see at a glance what's selected.
+const MODEL_OPTIONS = ['opus', 'sonnet', 'haiku'];
+const EFFORT_OPTIONS = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+function buildConfigKeyboard(chatConfig, show = 'all') {
+  const rows = [];
+  if (show === 'model' || show === 'all') {
+    rows.push(MODEL_OPTIONS.map((m) => ({
+      text: m === chatConfig.model ? `✓ ${m}` : m,
+      callback_data: `cfg:model:${m}`,
+    })));
+  }
+  if (show === 'effort' || show === 'all') {
+    rows.push(EFFORT_OPTIONS.map((e) => ({
+      text: e === chatConfig.effort ? `✓ ${e}` : e,
+      callback_data: `cfg:effort:${e}`,
+    })));
+  }
+  return { inline_keyboard: rows };
+}
+
 function approvalCardText(row, opts = {}) {
   // No parse_mode is used on this card — tool_name/turn_id/tool_input
   // originate from the Claude subprocess and could contain Markdown special
@@ -927,6 +950,81 @@ async function handleApprovalCallback(ctx) {
   resolveApprovalWaiter(id, status);
 }
 
+// Handles taps on the /model and /effort inline keyboard buttons. Same
+// outcome as the text-typed `/model sonnet` flow: mutate chatConfig,
+// trigger graceful respawn, log config change, edit the message to show
+// the new ✓ marker.
+async function handleConfigCallback(ctx) {
+  const data = ctx.callbackQuery?.data || '';
+  const m = String(data).match(/^cfg:(model|effort):(\S+)$/);
+  if (!m) return;
+  const setting = m[1];
+  const value = m[2];
+
+  const chatId = String(ctx.callbackQuery.message?.chat?.id || '');
+  const chatConfig = config.chats[chatId];
+  if (!chatConfig) {
+    await ctx.answerCallbackQuery({ text: 'Chat not configured', show_alert: true }).catch(() => {});
+    return;
+  }
+  if (!config.bot?.allowConfigCommands) {
+    await ctx.answerCallbackQuery({ text: 'Config commands disabled', show_alert: true }).catch(() => {});
+    return;
+  }
+
+  const validValues = setting === 'model' ? MODEL_OPTIONS : EFFORT_OPTIONS;
+  if (!validValues.includes(value)) {
+    await ctx.answerCallbackQuery({ text: `Invalid ${setting}` }).catch(() => {});
+    return;
+  }
+
+  const oldValue = chatConfig[setting];
+  if (oldValue === value) {
+    await ctx.answerCallbackQuery({ text: `Already ${value}` }).catch(() => {});
+    return;
+  }
+
+  chatConfig[setting] = value;
+  const cmdUserId = ctx.callbackQuery.from?.id || null;
+  const cmdUser = ctx.callbackQuery.from?.first_name || ctx.callbackQuery.from?.username || null;
+  dbWrite(() => db.logConfigChange({
+    chat_id: chatId, thread_id: null, field: setting,
+    old_value: oldValue, new_value: value,
+    user: cmdUser, user_id: cmdUserId, source: 'inline-button',
+  }), `log ${setting} change`);
+
+  // Graceful respawn across all sessionKeys for this chat (matches the
+  // text-command flow in handleMessage).
+  const reason = setting === 'model' ? 'model-change' : 'effort-change';
+  const prefix = chatId;
+  let anyActive = false;
+  for (const key of pm.keys()) {
+    if (key === prefix || key.startsWith(prefix + ':')) {
+      const res = pm.requestRespawn(key, reason);
+      if (!res.killed) anyActive = true;
+    }
+  }
+
+  // Re-render the card with updated ✓.
+  const ver = MODEL_VERSIONS[chatConfig.model] || chatConfig.model;
+  const newInfo = `Model: ${chatConfig.model} (${ver})\nEffort: ${chatConfig.effort}\nAgent: ${chatConfig.agent}`;
+  const showRow = setting; // /model card → only model row, /effort → only effort, /config → both.
+  // Detect original card type from existing reply_markup row count.
+  const existingRows = ctx.callbackQuery.message?.reply_markup?.inline_keyboard?.length || 0;
+  const newKeyboard = buildConfigKeyboard(chatConfig, existingRows >= 2 ? 'all' : showRow);
+  try {
+    await ctx.editMessageText(newInfo, { reply_markup: newKeyboard });
+  } catch (err) {
+    // Edit may fail if message is too old or unchanged — not fatal.
+    console.error(`[${BOT_NAME}] config-card edit failed: ${err.message}`);
+  }
+
+  const ackText = anyActive
+    ? `${setting} → ${value} — switching when finished`
+    : `${setting} → ${value}`;
+  await ctx.answerCallbackQuery({ text: ackText }).catch(() => {});
+}
+
 function startApprovalSweeper(intervalMs = 30_000) {
   return setInterval(() => {
     let rows;
@@ -1006,15 +1104,24 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const cmdUser = msg.from?.first_name || msg.from?.username || null;
   const cmdUserId = msg.from?.id || null;
 
-  const sendReply = (replyText, meta = {}) => tg(bot, 'sendMessage', {
-    chat_id: chatId, text: replyText, ...replyOpts(threadId),
-  }, { source: 'command-reply', botName: BOT_NAME, model: chatConfig.model, effort: chatConfig.effort, ...meta });
+  // sendReply accepts (text, meta?) with optional extra Telegram params
+  // pulled out via meta.params (kept separate so meta stays for DB tags).
+  const sendReply = (replyText, meta = {}) => {
+    const { params: extraParams = {}, ...metaTags } = meta;
+    return tg(bot, 'sendMessage', {
+      chat_id: chatId, text: replyText, ...replyOpts(threadId), ...extraParams,
+    }, { source: 'command-reply', botName: BOT_NAME, model: chatConfig.model, effort: chatConfig.effort, ...metaTags });
+  };
 
   if (botAllowsCommands && (text === '/model' || text === '/config' || text === '/effort')) {
     const alive = pm.has(sessionKey) && !pm.get(sessionKey).closed;
     const ver = MODEL_VERSIONS[chatConfig.model] || chatConfig.model;
     const info = `Model: ${chatConfig.model} (${ver})\nEffort: ${chatConfig.effort}\nAgent: ${chatConfig.agent}\nProcess: ${alive ? 'warm' : 'cold'}\nSession: ${getClaudeSessionId(db, sessionKey)?.slice(0, 8) || 'new'}`;
-    await sendReply(info);
+    // Inline keyboard so users tap to switch instead of typing exact
+    // names (avoids "sonet" typo problem).
+    const show = text === '/effort' ? 'effort' : text === '/model' ? 'model' : 'all';
+    const reply_markup = buildConfigKeyboard(chatConfig, show);
+    await sendReply(info, { params: { reply_markup } });
     return;
   }
   // Helper: request respawn across ALL sessionKeys owned by this chat (one
@@ -1665,7 +1772,12 @@ function createBot(token) {
 
   bot.on('callback_query:data', async (ctx) => {
     try {
-      await handleApprovalCallback(ctx);
+      const data = ctx.callbackQuery?.data || '';
+      if (data.startsWith('cfg:')) {
+        await handleConfigCallback(ctx);
+      } else {
+        await handleApprovalCallback(ctx);
+      }
     } catch (err) {
       console.error(`[${BOT_NAME}] callback_query error: ${err.message}`);
     }
