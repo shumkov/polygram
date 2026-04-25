@@ -760,6 +760,39 @@ function buildConfigKeyboard(chatConfig, show = 'all') {
   return { inline_keyboard: rows };
 }
 
+// Card text shown above the inline keyboard. Includes plain-language
+// guidance on when to pick which model / effort, since most users
+// (especially in shared groups) don't know which option to tap.
+const MODEL_VERSIONS_DESC = { opus: 'claude-opus-4-6', sonnet: 'claude-sonnet-4-6', haiku: 'claude-haiku-4-5' };
+
+function formatConfigInfoText(chatConfig, show, sessionKey) {
+  const alive = pm.has(sessionKey) && !pm.get(sessionKey).closed;
+  const ver = MODEL_VERSIONS_DESC[chatConfig.model] || chatConfig.model;
+  const head = `Model: ${chatConfig.model} (${ver})\nEffort: ${chatConfig.effort}\nAgent: ${chatConfig.agent}\nProcess: ${alive ? 'warm' : 'cold'}\nSession: ${getClaudeSessionId(db, sessionKey)?.slice(0, 8) || 'new'}`;
+
+  const modelHelp = [
+    '',
+    '**Models**',
+    '🧠 **opus** — глубокий анализ, code refactor, сверка из 3+ источников. ~5× стоимость sonnet.',
+    '🤖 **sonnet** — дефолт. Большинство ops, code review, document summary.',
+    '⚡ **haiku** — простые быстрые задачи, классификация, lookup.',
+  ].join('\n');
+
+  const effortHelp = [
+    '',
+    '**Effort** — потолок «сколько Claude может думать». На простых вопросах он сам отвечает быстро, на сложных тратит больше токенов. Можно безопасно ставить выше — он не разгонится без нужды.',
+    '• **low** — fast replies, минимум reasoning. Casual chat, simple lookups.',
+    '• **medium** — balanced default. Подходит почти всем.',
+    '• **high** — сложные многошаговые задачи. Audit, debug, multi-source.',
+    '• **xhigh** / **max** — самые тяжёлые. Hard reasoning, edge cases.',
+  ].join('\n');
+
+  let body = head;
+  if (show === 'model' || show === 'all') body += '\n' + modelHelp;
+  if (show === 'effort' || show === 'all') body += '\n' + effortHelp;
+  return body;
+}
+
 function approvalCardText(row, opts = {}) {
   // No parse_mode is used on this card — tool_name/turn_id/tool_input
   // originate from the Claude subprocess and could contain Markdown special
@@ -1005,17 +1038,29 @@ async function handleConfigCallback(ctx) {
     }
   }
 
-  // Re-render the card with updated ✓.
-  const ver = MODEL_VERSIONS[chatConfig.model] || chatConfig.model;
-  const newInfo = `Model: ${chatConfig.model} (${ver})\nEffort: ${chatConfig.effort}\nAgent: ${chatConfig.agent}`;
-  const showRow = setting; // /model card → only model row, /effort → only effort, /config → both.
-  // Detect original card type from existing reply_markup row count.
+  // Re-render the card with updated ✓ + the same help text shown initially.
+  // Detect original card type (model-only / effort-only / both) by counting
+  // rows in the existing reply_markup so the user sees the same layout
+  // they tapped into.
   const existingRows = ctx.callbackQuery.message?.reply_markup?.inline_keyboard?.length || 0;
-  const newKeyboard = buildConfigKeyboard(chatConfig, existingRows >= 2 ? 'all' : showRow);
+  const showRow = existingRows >= 2 ? 'all' : setting;
+  // chatId works as a session-key proxy here for the warm-process check
+  // (isolateTopics chats might have multiple keys but for this card we
+  // just want a representative state).
+  const newInfo = formatConfigInfoText(chatConfig, showRow, chatId);
+  const newKeyboard = buildConfigKeyboard(chatConfig, showRow);
   try {
-    await ctx.editMessageText(newInfo, { reply_markup: newKeyboard });
+    // Pre-format the markdown→HTML ourselves so editMessageText can be
+    // called with the right parse_mode (the bot.api.editMessageText path
+    // bypasses tg() / applyFormatting in the chat-action approval card,
+    // but here we DO want HTML).
+    const { toTelegramHtml } = require('./lib/telegram-format');
+    const { text: html, parseMode } = toTelegramHtml(newInfo);
+    await ctx.editMessageText(html, {
+      reply_markup: newKeyboard,
+      ...(parseMode && { parse_mode: parseMode }),
+    });
   } catch (err) {
-    // Edit may fail if message is too old or unchanged — not fatal.
     console.error(`[${BOT_NAME}] config-card edit failed: ${err.message}`);
   }
 
@@ -1114,12 +1159,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   };
 
   if (botAllowsCommands && (text === '/model' || text === '/config' || text === '/effort')) {
-    const alive = pm.has(sessionKey) && !pm.get(sessionKey).closed;
-    const ver = MODEL_VERSIONS[chatConfig.model] || chatConfig.model;
-    const info = `Model: ${chatConfig.model} (${ver})\nEffort: ${chatConfig.effort}\nAgent: ${chatConfig.agent}\nProcess: ${alive ? 'warm' : 'cold'}\nSession: ${getClaudeSessionId(db, sessionKey)?.slice(0, 8) || 'new'}`;
-    // Inline keyboard so users tap to switch instead of typing exact
-    // names (avoids "sonet" typo problem).
     const show = text === '/effort' ? 'effort' : text === '/model' ? 'model' : 'all';
+    const info = formatConfigInfoText(chatConfig, show, sessionKey);
     const reply_markup = buildConfigKeyboard(chatConfig, show);
     await sendReply(info, { params: { reply_markup } });
     return;
