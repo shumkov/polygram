@@ -241,6 +241,98 @@ describe('reassignAttachmentsToMessage — media-group coalescing', () => {
   });
 });
 
+describe('recordInbound atomicity (0.6.4)', () => {
+  beforeEach(() => { db = freshDb(); });
+  afterEach(() => cleanup());
+
+  test('attachment insert failure rolls back the message row', () => {
+    // Simulate the recordInbound shape exactly: insertMessage + N
+    // insertAttachments, all inside db.raw.transaction. We force the
+    // 2nd attachment to violate the download_status CHECK constraint.
+    // Pre-0.6.4 this left a message row with 1 attachment in DB
+    // (no transaction wrapping); 0.6.4 wraps the whole thing in
+    // db.raw.transaction so a single failure rolls back ALL inserts —
+    // the next boot replay sees no message and silently moves on
+    // rather than re-dispatching with the wrong attachment count.
+    const tx = db.raw.transaction(() => {
+      db.insertMessage({
+        chat_id: '99', thread_id: null, msg_id: 555,
+        user: 'tester', user_id: 1, text: '',
+        reply_to_id: null, direction: 'in', source: 'polygram',
+        bot_name: 'shumabit', session_id: null,
+        model: null, effort: null, turn_id: null,
+        status: null, error: null, cost_usd: null,
+        ts: Date.now(),
+      });
+      const mid = db.getInboundMessageId({ chat_id: '99', msg_id: 555 });
+      db.insertAttachment({
+        message_id: mid, chat_id: '99', msg_id: 555,
+        file_id: 'a', kind: 'photo', ts: Date.now(),
+      });
+      // Force a CHECK violation: download_status only allows
+      // 'pending'|'downloaded'|'failed'. Setting it directly via raw
+      // SQL bypasses the helper to trigger a transaction-aborting error.
+      db.raw.prepare(`
+        INSERT INTO attachments (
+          message_id, chat_id, msg_id, file_id, kind, download_status, ts
+        ) VALUES (?, '99', 555, 'b', 'photo', 'invalid-state', ?)
+      `).run(mid, Date.now());
+    });
+
+    assert.throws(() => tx(), /CHECK constraint failed/);
+
+    // Verify rollback: no message, no attachments.
+    assert.equal(db.getInboundMessageId({ chat_id: '99', msg_id: 555 }), null);
+    const orphans = db.raw.prepare(
+      "SELECT COUNT(*) as n FROM attachments WHERE chat_id = '99' AND msg_id = 555"
+    ).get();
+    assert.equal(orphans.n, 0);
+  });
+});
+
+describe('token redaction (0.6.6)', () => {
+  // Mirrors the regex used in polygram.js downloadOneAttachment to scrub
+  // bot tokens from undici/network err.message before persisting to
+  // attachments.download_error or stderr. Security-sensitive: a missed
+  // pattern leaks the bot's auth token.
+  const redact = (s) => String(s).replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot<redacted>');
+
+  test('redacts a typical Telegram bot URL token', () => {
+    const real = 'connect ECONNREFUSED https://api.telegram.org/file/bot1234567:ABCdef-xyz_123/photo.jpg';
+    const out = redact(real);
+    assert.ok(!out.includes('1234567:'), 'numeric prefix should be gone');
+    assert.ok(!out.includes('ABCdef'), 'token body should be gone');
+    assert.ok(out.includes('bot<redacted>'));
+  });
+
+  test('redacts tokens with - and _ characters', () => {
+    const tokens = [
+      'bot8300917519:AAH4EulyOx1zpRjIVUyt3QF4yJZw4gGRpak',
+      'bot111:abc-DEF_xyz-123',
+      'bot999:_-_-_-',
+    ];
+    for (const t of tokens) {
+      const out = redact(`fetch failed: ${t}/somefile`);
+      assert.ok(!out.includes(t.split(':')[1]), `should redact secret in ${t}`);
+      assert.ok(out.includes('bot<redacted>'));
+    }
+  });
+
+  test('multiple tokens in one string all redacted', () => {
+    const s = 'bot111:abc and bot222:def';
+    const out = redact(s);
+    assert.ok(!out.includes('abc'));
+    assert.ok(!out.includes('def'));
+    assert.equal((out.match(/bot<redacted>/g) || []).length, 2);
+  });
+
+  test('non-token text is preserved', () => {
+    assert.equal(redact('Plain old error message'), 'Plain old error message');
+    assert.equal(redact(''), '');
+    assert.equal(redact('HTTP 410 Gone'), 'HTTP 410 Gone');
+  });
+});
+
 describe('migrations 007 + 008 — schema state after open()', () => {
   beforeEach(() => { db = freshDb(); });
   afterEach(() => cleanup());

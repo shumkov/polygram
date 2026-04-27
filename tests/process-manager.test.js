@@ -391,6 +391,36 @@ describe('ProcessManager stream-json handling', () => {
     const res = await p;
     assert.equal(res.error, 'hit limit');
   });
+
+  test('pm.kill(sessionKey) does NOT touch sibling sessions (0.6.5 cross-topic scope)', async () => {
+    // Pre-0.6.5 polygram used pm.killChat(chatId) for /stop and /model
+    // respawn, which fanned out across every topic in the chat. Under
+    // isolateTopics=true that meant: typing "stop" in topic A killed
+    // topic B's in-flight turn, surfacing a confusing "💥 crashed"
+    // reply to topic B's user. 0.6.5 switched to pm.kill(sessionKey)
+    // and pm.requestRespawn(sessionKey, ...). Lock that in: killing
+    // topic A leaves topic B intact.
+    const a = await pm.getOrSpawn('-100:topicA');
+    const b = await pm.getOrSpawn('-100:topicB');
+    assert.ok(pm.has('-100:topicA'));
+    assert.ok(pm.has('-100:topicB'));
+    await pm.kill('-100:topicA');
+    assert.equal(pm.has('-100:topicA'), false);
+    assert.ok(pm.has('-100:topicB'), 'sibling topic must survive a single-session kill');
+    assert.equal(pm.get('-100:topicB').closed, false);
+  });
+
+  test('pm.requestRespawn(sessionKey) only touches that session', async () => {
+    // Same scope guarantee for the /model and /effort respawn paths.
+    await pm.getOrSpawn('-100:topicA');
+    await pm.getOrSpawn('-100:topicB');
+    const res = pm.requestRespawn('-100:topicA', 'model-change');
+    // topicA's queue is empty (no pm.send), so it should kill immediately.
+    assert.equal(res.killed, true);
+    // topicB is untouched.
+    assert.ok(pm.has('-100:topicB'));
+    assert.equal(pm.get('-100:topicB').needsRespawn, null);
+  });
 });
 
 describe('ProcessManager resume-fail', () => {

@@ -11,7 +11,7 @@
  *   → sends to persistent claude process via stdin (stream-json)
  *   → reads response from stdout (stream-json)
  *   → sends reply to Telegram
- *   → writes every in/out message to bridge.db (Phase 1: parallel write)
+ *   → writes every in/out message to per-bot SQLite (source of truth)
  *
  * Chat commands: /model <model>, /effort <level>, /config
  */
@@ -191,7 +191,7 @@ async function readSessionContext(sessionKey, cwd) {
   } catch { return ''; }
 }
 
-// ─── DB writes (Phase 1 — best-effort, never throws) ────────────────
+// ─── DB writes (best-effort wrapper, never throws) ──────────────────
 
 function dbWrite(fn, context) {
   if (!db) return;
@@ -238,11 +238,15 @@ function recordInbound(msg) {
     const messageId = db.getInboundMessageId({ chat_id: chatId, msg_id: msg.message_id });
     if (!messageId) return;
     // Edit-safe insert: Telegram edited_message events re-fire
-    // recordInbound with the same (chat_id, msg_id). Telegram doesn't
-    // permit replacing media in an edit (only text/caption), so if rows
-    // already exist for this message_id they're correct as-is —
-    // re-inserting would (a) duplicate them, (b) reset download_status
-    // back to 'pending' and lose the local_path we already fetched.
+    // recordInbound with the same (chat_id, msg_id). polygram doesn't
+    // currently handle media-edit cases (Bot API does support
+    // editMessageMedia, but we don't process it specially — the typical
+    // edit is text/caption). If rows already exist for this message_id
+    // they're correct as-is — re-inserting would (a) duplicate them,
+    // (b) reset download_status back to 'pending' and lose the
+    // local_path we already fetched. If we add media-edit support
+    // later, this guard needs to compare file_unique_id and replace
+    // selectively rather than skipping wholesale.
     if (db.getAttachmentsByMessage(messageId).length > 0) return;
     for (const att of attachments) {
       db.insertAttachment({
@@ -1250,13 +1254,18 @@ function startApprovalSweeper(intervalMs = 30_000) {
         id: row.id, bot: BOT_NAME, tool: row.tool_name,
       }), 'log approval-timeout');
       resolveApprovalWaiter(row.id, 'timeout', 'swept');
-      // Best-effort: edit the card to show the timeout.
+      // Best-effort: edit the card to show the timeout. Routed through
+      // tg() so the edit gets the same plain-text formatting policy as
+      // the original card post (no parse_mode injection from tool input)
+      // AND lands in the transcript like every other outbound. Pre-0.6.8
+      // this called bot.api.editMessageText directly and bypassed both.
       if (bot && row.approver_msg_id) {
-        bot.api.editMessageText(
-          row.approver_chat_id,
-          row.approver_msg_id,
-          approvalCardText(approvals.getById(row.id), { resolvedBy: '⏰ Timed out' }),
-        ).catch(() => {});
+        tg(bot, 'editMessageText', {
+          chat_id: row.approver_chat_id,
+          message_id: row.approver_msg_id,
+          text: approvalCardText(approvals.getById(row.id), { resolvedBy: '⏰ Timed out' }),
+        }, { source: 'approval-card-timeout', botName: BOT_NAME, plainText: true })
+          .catch((err) => console.error(`[${BOT_NAME}] approval-card-timeout edit: ${err.message}`));
       }
     }
   }, intervalMs);
@@ -1812,7 +1821,17 @@ function createBot(token) {
   async function onboardPairedChat(ctx, code) {
     const chatId = ctx.chat.id.toString();
     const userId = ctx.message.from?.id;
-    const send = (text) => bot.api.sendMessage(chatId, text).catch(() => {});
+    // Route through tg() so onboarding replies (success notice + error
+    // messages) get the standard write-before-send DB row, log on
+    // failure, and the same formatting policy as every other outbound.
+    // Pre-0.6.8 this was bot.api.sendMessage(...).catch(() => {}) which
+    // silently dropped failures: the user typed /pair, the code was
+    // claimed (DB mutated), but if the "Paired" reply failed to send
+    // they'd assume it didn't work and try the now-invalid code again.
+    const send = (text) => tg(bot, 'sendMessage', {
+      chat_id: chatId, text,
+    }, { source: 'pair-onboarding', botName: BOT_NAME }).catch((err) =>
+      console.error(`[${BOT_NAME}] pair-onboarding reply: ${err.message}`));
 
     if (!userId) {
       await send('No user id on request.');
