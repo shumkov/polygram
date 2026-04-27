@@ -208,7 +208,13 @@ function recordInbound(msg) {
   const chatConfig = config.chats[chatId];
   const ts = (msg.date || Math.floor(Date.now() / 1000)) * 1000;
 
-  dbWrite(() => {
+  // Atomic message + attachments write: all-or-nothing so a half-applied
+  // record can never leave a message row with zero (or partial) attachment
+  // rows that boot replay would silently treat as "no media." Wrapping in
+  // db.raw.transaction also collapses the message + N-attachment fsyncs
+  // into one commit (perf win for media groups: 7-attachment albums go
+  // from 8 sync writes to 1).
+  const writeInbound = db.raw.transaction(() => {
     db.insertMessage({
       chat_id: chatId,
       thread_id: threadId,
@@ -231,6 +237,13 @@ function recordInbound(msg) {
     // the upsert path; an explicit lookup is cheap and always correct.
     const messageId = db.getInboundMessageId({ chat_id: chatId, msg_id: msg.message_id });
     if (!messageId) return;
+    // Edit-safe insert: Telegram edited_message events re-fire
+    // recordInbound with the same (chat_id, msg_id). Telegram doesn't
+    // permit replacing media in an edit (only text/caption), so if rows
+    // already exist for this message_id they're correct as-is —
+    // re-inserting would (a) duplicate them, (b) reset download_status
+    // back to 'pending' and lose the local_path we already fetched.
+    if (db.getAttachmentsByMessage(messageId).length > 0) return;
     for (const att of attachments) {
       db.insertAttachment({
         message_id: messageId,
@@ -247,7 +260,9 @@ function recordInbound(msg) {
         ts,
       });
     }
-  }, `insert inbound ${chatId}/${msg.message_id}`);
+  });
+
+  dbWrite(() => writeInbound(), `insert inbound ${chatId}/${msg.message_id}`);
 }
 
 

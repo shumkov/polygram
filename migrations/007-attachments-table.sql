@@ -64,6 +64,19 @@ CREATE INDEX IF NOT EXISTS idx_attachments_unique_id
 -- mime_type, size, file_id, file_unique_id, and optionally transcription.
 -- Pre-0.5.x rows may not have file_unique_id. We pull what's there and
 -- leave the rest NULL.
+--
+-- Robustness: json_each() raises on malformed JSON or on a non-array
+-- root, which would roll back the entire migration transaction (one bad
+-- row blocks the upgrade). The `json_valid(...) AND json_type(...) =
+-- 'array'` guards skip those rows so the rest still backfill. Rows
+-- without a `file_id` are also skipped — the schema declares file_id
+-- NOT NULL and we'd rather drop a corrupt entry than materialise a
+-- permanently un-redownloadable row with file_id=''.
+-- Pre-filter messages in a subquery so json_each() only runs on valid
+-- JSON arrays. SQLite's json_each raises on malformed JSON or on a
+-- non-array root, and that error rolls back the whole migration. The
+-- subquery materialises only rows that pass json_valid + json_type
+-- before the join expands them.
 INSERT INTO attachments (
   message_id, chat_id, msg_id, thread_id, bot_name,
   file_id, file_unique_id, kind, name, mime_type, size_bytes,
@@ -71,7 +84,7 @@ INSERT INTO attachments (
 )
 SELECT
   m.id, m.chat_id, m.msg_id, m.thread_id, m.bot_name,
-  COALESCE(json_extract(att.value, '$.file_id'), ''),
+  json_extract(att.value, '$.file_id'),
   json_extract(att.value, '$.file_unique_id'),
   COALESCE(json_extract(att.value, '$.kind'), 'document'),
   json_extract(att.value, '$.name'),
@@ -81,9 +94,14 @@ SELECT
   'downloaded',
   json_extract(att.value, '$.transcription.text'),
   m.ts
-FROM messages m, json_each(m.attachments_json) att
-WHERE m.attachments_json IS NOT NULL
-  AND m.direction = 'in'
-  AND NOT EXISTS (
-    SELECT 1 FROM attachments a WHERE a.message_id = m.id
-  );
+FROM (
+  SELECT id, chat_id, msg_id, thread_id, bot_name, attachments_json, ts
+    FROM messages
+   WHERE direction = 'in'
+     AND attachments_json IS NOT NULL
+     AND json_valid(attachments_json) = 1
+     AND json_type(attachments_json) = 'array'
+     AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = id)
+) m, json_each(m.attachments_json) att
+WHERE json_extract(att.value, '$.file_id') IS NOT NULL
+  AND json_extract(att.value, '$.file_id') != '';

@@ -198,6 +198,34 @@ describe('reassignAttachmentsToMessage — media-group coalescing', () => {
     assert.equal(r.changes, 0);
   });
 
+  test('idempotent — re-recording a message does not duplicate attachments', () => {
+    // Simulate the edit cycle: recordInbound is called for the original
+    // message, then again for the edited_message event. The bug would
+    // be that the second call inserts another attachment row (pre-fix:
+    // every edit added N more rows for the same photos).
+    const ts = Date.now();
+    const mid = insertInbound(db, { chat_id: '1', msg_id: 1, ts });
+
+    // Simulate recordInbound's loop: getAttachmentsByMessage early-exits
+    // on second call. We model both passes here.
+    const insertOnce = () => {
+      const existing = db.getAttachmentsByMessage(mid);
+      if (existing.length > 0) return;  // edit-skip guard from polygram.js
+      db.insertAttachment({
+        message_id: mid, chat_id: '1', msg_id: 1,
+        file_id: 'fid', file_unique_id: 'u1', kind: 'photo',
+        ts,
+      });
+    };
+
+    insertOnce();
+    insertOnce();  // simulates edited_message re-firing recordInbound
+    insertOnce();  // and again
+
+    const rows = db.getAttachmentsByMessage(mid);
+    assert.equal(rows.length, 1, 'should not duplicate on edit re-fire');
+  });
+
   test('does not move rows already owned by primary', () => {
     const ts = Date.now();
     const primaryId = insertInbound(db, { chat_id: '-100', msg_id: 100, ts });
