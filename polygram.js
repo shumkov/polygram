@@ -406,102 +406,125 @@ async function transcribeVoiceAttachments(downloaded, { chatId, msgId, label, bo
   }), 'persist voice transcription');
 }
 
+// Bounded concurrency for parallel fetches. A 10-photo album used to be
+// 10× per-photo latency (each `await fetch` was serial); now in-flight
+// downloads are capped to a small pool. Telegram's per-bot rate limit is
+// ~30 req/s, so 6 concurrent fetches is comfortably under and keeps the
+// happy path responsive without burning sockets on a 100-file edge case.
+const ATTACHMENT_DOWNLOAD_CONCURRENCY = 6;
+
+// Per-attachment download. Pure function over (att, deps) → result. Pulled
+// out of the loop so downloadAttachments can run several in parallel.
+async function downloadOneAttachment(bot, token, chatId, msg, chatDir, att) {
+  // Reuse path: row already says downloaded AND the file is on disk.
+  if (att.download_status === 'downloaded' && att.local_path) {
+    try {
+      if (fs.statSync(att.local_path).size > 0) {
+        return { ...att, path: att.local_path, size: att.size_bytes || 0, error: null };
+      }
+    } catch { /* fall through to refetch */ }
+  }
+  try {
+    const fileInfo = await bot.api.getFile(att.file_id);
+    if (!fileInfo?.file_path) throw new Error('no file_path from getFile');
+    const url = `https://api.telegram.org/file/bot${token}/${fileInfo.file_path}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    // Defense in depth: re-check size at download time. Telegram can
+    // omit file_size from the Message, or its value may not match what
+    // the CDN actually serves. Trust Content-Length and fall back to
+    // buffering with a ceiling.
+    const cl = parseInt(res.headers.get('content-length') || '0', 10);
+    if (cl > MAX_FILE_BYTES) {
+      throw new Error(`content-length ${cl} exceeds per-file cap ${MAX_FILE_BYTES}`);
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > MAX_FILE_BYTES) {
+      throw new Error(`body ${buf.length} bytes exceeds per-file cap ${MAX_FILE_BYTES}`);
+    }
+    const safeName = sanitizeFilename(att.name);
+    // Embed file_unique_id so two attachments with the same msg_id+name
+    // (album, resend) can't silently overwrite each other. Telegram
+    // guarantees file_unique_id is stable and globally unique per file.
+    const uniq = att.file_unique_id ? `-${att.file_unique_id}` : '';
+    const localName = `${msg.message_id}${uniq}-${safeName}`;
+    const localPath = path.join(chatDir, localName);
+    // Atomic write: create a temp with the unique PID+timestamp suffix,
+    // fill it, then rename to the canonical name. A crash mid-write leaves
+    // a `.tmp.*` file (swept later) rather than a truncated canonical file
+    // that the EEXIST dedup branch would happily serve on next request.
+    if (fs.existsSync(localPath)) {
+      console.log(`[attach] ${chatId} ← ${att.kind} ${safeName} (already on disk, reusing)`);
+    } else {
+      const tmpPath = `${localPath}.tmp.${process.pid}.${Date.now()}`;
+      try {
+        fs.writeFileSync(tmpPath, buf, { flag: 'wx' });
+        fs.renameSync(tmpPath, localPath);
+      } catch (e) {
+        // Clean up stray tmp on any failure; if the rename fell through
+        // because another process beat us, EEXIST on the target is fine.
+        try { fs.unlinkSync(tmpPath); } catch {}
+        if (e.code !== 'EEXIST') throw e;
+        console.log(`[attach] ${chatId} ← ${att.kind} ${safeName} (race: already on disk)`);
+      }
+    }
+    console.log(`[attach] ${chatId} ← ${att.kind} ${safeName} (${buf.length} bytes) → ${localPath}`);
+    dbWrite(() => db.markAttachmentDownloaded(att.id, {
+      local_path: localPath, size_bytes: att.size_bytes || buf.length,
+    }), `markAttachmentDownloaded ${att.id}`);
+    return { ...att, path: localPath, size: att.size_bytes || buf.length, error: null };
+  } catch (err) {
+    // Don't drop the attachment silently — push it through with the
+    // failure noted. buildAttachmentTags renders this as
+    // <attachment-failed reason="..." /> so claude tells the user
+    // "I couldn't see your <kind>" instead of pretending it received
+    // text only.
+    //
+    // Token redaction: the fetch URL embeds bot${TOKEN} (Telegram CDN
+    // requirement) and some undici/network error variants stringify
+    // the request including the URL into err.message. Persisting that
+    // raw to attachments.download_error or stderr would leak the bot
+    // token to anyone with DB or log access. Strip any `bot<token>`
+    // pattern from the reason before storing/logging.
+    const raw = (err.message || 'unknown').slice(0, 200);
+    const reason = raw.replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot<redacted>');
+    console.error(`[attach] download failed for ${att.name}: ${reason}`);
+    dbWrite(() => db.markAttachmentFailed(att.id, reason),
+      `markAttachmentFailed ${att.id}`);
+    return { ...att, path: null, error: reason };
+  }
+}
+
 // 0.6.0: takes attachment ROW objects from the DB (not raw extracted
 // metadata). Each row has an `id` so we can mark status as we go.
 // On replay: a row with status='downloaded' and a local_path that's
 // still on disk is reused without re-fetching. Anything else (failed,
 // missing file, never downloaded) hits Telegram's CDN.
+//
+// 0.6.7: parallel fetches with bounded concurrency. The inner work is
+// stateless per-attachment (only writes go to DB / disk via paths
+// keyed on file_unique_id, so two parallel downloads can't collide).
+// Order of `results` is preserved by writing into a fixed-size array
+// at the original index — important so the prompt sees attachments in
+// the same order the user sent them in an album.
 async function downloadAttachments(bot, token, chatId, msg, rows) {
   if (!rows.length) return [];
   const chatDir = path.join(INBOX_DIR, String(chatId));
   fs.mkdirSync(chatDir, { recursive: true });
 
-  const results = [];
-  for (const att of rows) {
-    // Reuse path: row already says downloaded AND the file is on disk.
-    if (att.download_status === 'downloaded' && att.local_path) {
-      try {
-        if (fs.statSync(att.local_path).size > 0) {
-          results.push({
-            ...att,
-            path: att.local_path,
-            size: att.size_bytes || 0,
-            error: null,
-          });
-          continue;
-        }
-      } catch { /* fall through to refetch */ }
-    }
-    try {
-      const fileInfo = await bot.api.getFile(att.file_id);
-      if (!fileInfo?.file_path) throw new Error('no file_path from getFile');
-      const url = `https://api.telegram.org/file/bot${token}/${fileInfo.file_path}`;
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      // Defense in depth: re-check size at download time. Telegram can
-      // omit file_size from the Message, or its value may not match what
-      // the CDN actually serves. Trust Content-Length and fall back to
-      // buffering with a ceiling.
-      const cl = parseInt(res.headers.get('content-length') || '0', 10);
-      if (cl > MAX_FILE_BYTES) {
-        throw new Error(`content-length ${cl} exceeds per-file cap ${MAX_FILE_BYTES}`);
+  const results = new Array(rows.length);
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(ATTACHMENT_DOWNLOAD_CONCURRENCY, rows.length) },
+    async () => {
+      while (true) {
+        const idx = cursor++;
+        if (idx >= rows.length) return;
+        results[idx] = await downloadOneAttachment(bot, token, chatId, msg, chatDir, rows[idx]);
       }
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.length > MAX_FILE_BYTES) {
-        throw new Error(`body ${buf.length} bytes exceeds per-file cap ${MAX_FILE_BYTES}`);
-      }
-      const safeName = sanitizeFilename(att.name);
-      // Embed file_unique_id so two attachments with the same msg_id+name
-      // (album, resend) can't silently overwrite each other. Telegram
-      // guarantees file_unique_id is stable and globally unique per file.
-      const uniq = att.file_unique_id ? `-${att.file_unique_id}` : '';
-      const localName = `${msg.message_id}${uniq}-${safeName}`;
-      const localPath = path.join(chatDir, localName);
-      // Atomic write: create a temp with the unique PID+timestamp suffix,
-      // fill it, then rename to the canonical name. A crash mid-write leaves
-      // a `.tmp.*` file (swept later) rather than a truncated canonical file
-      // that the EEXIST dedup branch would happily serve on next request.
-      if (fs.existsSync(localPath)) {
-        console.log(`[attach] ${chatId} ← ${att.kind} ${safeName} (already on disk, reusing)`);
-      } else {
-        const tmpPath = `${localPath}.tmp.${process.pid}.${Date.now()}`;
-        try {
-          fs.writeFileSync(tmpPath, buf, { flag: 'wx' });
-          fs.renameSync(tmpPath, localPath);
-        } catch (e) {
-          // Clean up stray tmp on any failure; if the rename fell through
-          // because another process beat us, EEXIST on the target is fine.
-          try { fs.unlinkSync(tmpPath); } catch {}
-          if (e.code !== 'EEXIST') throw e;
-          console.log(`[attach] ${chatId} ← ${att.kind} ${safeName} (race: already on disk)`);
-        }
-      }
-      results.push({ ...att, path: localPath, size: att.size_bytes || buf.length, error: null });
-      console.log(`[attach] ${chatId} ← ${att.kind} ${safeName} (${buf.length} bytes) → ${localPath}`);
-      dbWrite(() => db.markAttachmentDownloaded(att.id, {
-        local_path: localPath, size_bytes: att.size_bytes || buf.length,
-      }), `markAttachmentDownloaded ${att.id}`);
-    } catch (err) {
-      // Don't drop the attachment silently — push it through with the
-      // failure noted. buildAttachmentTags renders this as
-      // <attachment-failed reason="..." /> so claude tells the user
-      // "I couldn't see your <kind>" instead of pretending it received
-      // text only.
-      //
-      // Token redaction: the fetch URL embeds bot${TOKEN} (Telegram CDN
-      // requirement) and some undici/network error variants stringify
-      // the request including the URL into err.message. Persisting that
-      // raw to attachments.download_error or stderr would leak the bot
-      // token to anyone with DB or log access. Strip any `bot<token>`
-      // pattern from the reason before storing/logging.
-      const raw = (err.message || 'unknown').slice(0, 200);
-      const reason = raw.replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot<redacted>');
-      console.error(`[attach] download failed for ${att.name}: ${reason}`);
-      results.push({ ...att, path: null, error: reason });
-      dbWrite(() => db.markAttachmentFailed(att.id, reason),
-        `markAttachmentFailed ${att.id}`);
-    }
-  }
+    },
+  );
+  await Promise.all(workers);
   return results;
 }
 

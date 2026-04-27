@@ -49,8 +49,18 @@ ergonomics while running on top of `claude` CLI.
 - **Voice transcription.** OpenAI Whisper API or local `whisper.cpp`,
   selectable per bot. Transcriptions land in `messages.text` so FTS
   finds them.
+- **Per-attachment table** (`attachments`, since 0.6.0) with download
+  lifecycle (`pending` → `downloaded` | `failed`), per-attachment
+  transcription, and `chat_id`/`kind`/`status` indexes for ops queries.
+  Replaces the older `attachments_json` blob — query "all PDFs Maria
+  sent last week" without scanning every message. Failed downloads
+  surface to Claude as `<attachment-failed reason="..." />` so the
+  user gets a real explanation, not silence.
 - **Content-addressed attachment storage** via Telegram's `file_unique_id`.
-  Same photo forwarded twice = one file on disk.
+  Same photo forwarded twice = one file on disk. Multi-photo albums
+  (Telegram delivers each photo as a separate message sharing
+  `media_group_id`) coalesce into one logical turn so Claude sees the
+  whole album, not just the first photo.
 - **Prompt-injection hardening.** User text wrapped in `<untrusted-input>`
   with xml-escape; attributes use `&quot;`. A partner typing
   `</channel><system>...` sees it as literal text in the prompt.
@@ -59,6 +69,22 @@ ergonomics while running on top of `claude` CLI.
 - **Step-level streaming replies** (optional per bot). Telegram message
   edits on each assistant step as Claude works through tool calls and
   reasoning.
+- **Crash-resilient handler lifecycle.** Inbound rows track a
+  `handler_status` (received → dispatched → replied | failed |
+  replay-pending). On graceful shutdown, in-flight turns are marked
+  for replay; on next boot the daemon re-dispatches anything within a
+  3-minute window, deduped against already-sent outbound replies.
+  One-shot guard prevents replay loops.
+- **Contextual error replies.** Idle timeouts, wall-clock ceilings, and
+  process crashes each get a distinct user-facing message with a
+  recovery hint, not a generic "something went wrong." Restarts and
+  user-issued aborts don't fire the apology at all.
+- **Abort detection in natural language** (`stop`, `cancel`, `wait`,
+  `стоп`, `отмена`, `хватит`, ...) plus the slash forms (`/stop`,
+  `/abort`, `/cancel`). First-sentence match catches "Stop. I'll ask
+  in another session." too. Scoped to the user's own session, so an
+  abort in one topic never disturbs sibling topics under
+  `isolateTopics`.
 
 ## Relation to existing projects
 
@@ -133,7 +159,7 @@ Output:
 
 ```
 ✅ config — bot found, 4 chat(s), admin=68861949
-✅ db — schema v5
+✅ db — schema v8
 ✅ ipc — socket responsive, bot=my-bot
 ✅ telegram — @my_bot (My Bot)
 ✅ recent-errors — no failure events in last 24h
@@ -325,7 +351,7 @@ foreign-chat clicks are rejected. Default-deny on IPC error.
 ## Development
 
 ```bash
-npm test        # 336 tests, 72 suites, node:test, no external services
+npm test        # 470 tests, 110 suites, node:test, no external services
 npm start -- --bot my-bot
 npm run split-db -- --config config.json --dry-run
 npm run ipc-smoke -- my-bot
@@ -357,7 +383,11 @@ tests/*.test.js                   node:test
 - Claude Code only. No abstraction over other AIs.
 - macOS LaunchAgent plists included; Linux systemd units are not (easy
   to adapt).
-- No marketplace plugin wrapper yet. See roadmap.
+- On FileVault-on macOS, the daemon's LaunchAgents fire via shumabit's
+  own GUI login — there's no auto-start without the keychain being
+  unlocked, so a one-time Fast User Switch into the daemon's user
+  after each reboot is the supported pattern. See
+  `skills/infrastructure/SKILL.md` in the source repo for details.
 
 ## Roadmap
 
@@ -365,8 +395,8 @@ tests/*.test.js                   node:test
   unknown chats.
 - Approvals phase 2: deny-with-reason, per-user quotas.
 - Voice phase 2: `/replay-voice` to re-transcribe with a language hint.
-- `/replay-pending` admin command for crashed-mid-send rows.
-- Marketplace plugin wrapper with slash commands for admin.
+- Per-attachment ops queries wired into `/polygram:*` slash commands
+  (search by chat/kind/time, list failed downloads).
 
 ## Licence
 
