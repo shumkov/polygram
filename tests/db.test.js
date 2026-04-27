@@ -469,13 +469,25 @@ describe('boot replay dedupe wiring', () => {
     assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 8 }), false);
   });
 
-  test('hasOutboundReplyTo ignores pending and failed outbounds', () => {
+  test('hasOutboundReplyTo ignores pending and ordinary failed outbounds', () => {
     const r1 = db.insertOutboundPending({ chat_id: '1', text: 'p', bot_name: 'b', pending_id: -1, reply_to_id: 9 });
     // pending → not counted
     assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 9 }), false);
     db.markOutboundFailed(r1.lastInsertRowid, 'timeout');
-    // failed → still not counted
+    // failed with ordinary API error → still not counted
     assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 9 }), false);
+  });
+
+  test('hasOutboundReplyTo counts crashed-mid-send rows as replied (avoid double-reply on boot replay)', () => {
+    // Polygram crashed after API call but before markOutboundSent.
+    // markStalePending swept the row to status='failed' with the
+    // 'crashed-mid-send' sentinel error. Telegram may have delivered
+    // the message; we don't know. Treating it as un-replied caused
+    // boot replay to re-dispatch the same inbound and the user got
+    // the SAME answer twice.
+    const r = db.insertOutboundPending({ chat_id: '1', text: 'reply', bot_name: 'b', pending_id: -1, reply_to_id: 42 });
+    db.markOutboundFailed(r.lastInsertRowid, 'crashed-mid-send');
+    assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 42 }), true);
   });
 
   test('getReplayCandidates default window is 3 minutes (recent stays, old drops)', () => {

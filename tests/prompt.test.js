@@ -128,17 +128,20 @@ describe('buildReplyToBlock', () => {
     assert.equal(buildReplyToBlock({}), '');
   });
 
-  test('attachment summary in DB-row reply', () => {
+  test('DB-row reply renders text only (attachment summary dropped in 0.6.5)', () => {
+    // The dbRow path used to read attachments_json and emit
+    // [photo: name.jpg] hints. That column is gone (migration 008) and
+    // per-attachment rows live in their own table now; computing a
+    // summary here would need a join the reply-to fallback path
+    // doesn't justify. canonical Telegram payload still gets a summary
+    // via the `telegram` branch — this dbRow branch only fires for
+    // resurrected/replayed messages where the live payload is gone.
     const block = buildReplyToBlock({
-      dbRow: {
-        msg_id: 3,
-        user: 'X',
-        ts: 0,
-        text: '',
-        attachments_json: JSON.stringify([{ kind: 'photo', name: 'invoice.jpg' }]),
-      },
+      dbRow: { msg_id: 3, user: 'X', ts: 0, text: 'hi' },
     });
-    assert.ok(block.includes('[photo: invoice.jpg]'));
+    assert.ok(block.includes('hi'));
+    assert.ok(!block.includes('[photo'));
+    assert.ok(!block.includes('attachment'));
   });
 
   test('long replied-to text is truncated', () => {

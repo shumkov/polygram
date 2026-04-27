@@ -487,7 +487,15 @@ async function downloadAttachments(bot, token, chatId, msg, rows) {
       // <attachment-failed reason="..." /> so claude tells the user
       // "I couldn't see your <kind>" instead of pretending it received
       // text only.
-      const reason = (err.message || 'unknown').slice(0, 200);
+      //
+      // Token redaction: the fetch URL embeds bot${TOKEN} (Telegram CDN
+      // requirement) and some undici/network error variants stringify
+      // the request including the URL into err.message. Persisting that
+      // raw to attachments.download_error or stderr would leak the bot
+      // token to anyone with DB or log access. Strip any `bot<token>`
+      // pattern from the reason before storing/logging.
+      const raw = (err.message || 'unknown').slice(0, 200);
+      const reason = raw.replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot<redacted>');
       console.error(`[attach] download failed for ${att.name}: ${reason}`);
       results.push({ ...att, path: null, error: reason });
       dbWrite(() => db.markAttachmentFailed(att.id, reason),
@@ -1495,7 +1503,19 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         chat_id: chatId, text: `Attachment(s) skipped: ${summary.slice(0, 300)}`,
         ...replyOpts(threadId),
       }, { source: 'attachment-skipped', botName: BOT_NAME });
-    } catch {}
+    } catch (err) {
+      // Surface the failure: claude is about to reply as if the photo
+      // was processed (because filterAttachments dropped it before
+      // download), and the user would otherwise have no signal that
+      // their attachment was rejected. They'd assume claude saw it
+      // and is just answering oddly.
+      console.error(`[${label}] failed to notify user of skipped attachments: ${err.message}`);
+      dbWrite(() => db.logEvent('attachment-skip-notice-failed', {
+        chat_id: chatId, msg_id: msg.message_id,
+        error: err.message?.slice(0, 200),
+        rejected_count: rejected.length,
+      }), 'log attachment-skip-notice-failed');
+    }
   }
 
   await transcribeVoiceAttachments(downloaded, {
