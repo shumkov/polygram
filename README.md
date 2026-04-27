@@ -1,5 +1,9 @@
 # polygram
 
+[![CI](https://github.com/shumkov/polygram/actions/workflows/ci.yml/badge.svg)](https://github.com/shumkov/polygram/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/shumkov/polygram/branch/main/graph/badge.svg)](https://codecov.io/gh/shumkov/polygram)
+[![npm](https://img.shields.io/npm/v/polygram.svg)](https://www.npmjs.com/package/polygram)
+
 A Telegram daemon and Claude Code plugin that preserves the per-chat
 session model from **OpenClaw**. Intended primarily as a **migration
 path** for users moving their Telegram-based ops from OpenClaw to Claude
