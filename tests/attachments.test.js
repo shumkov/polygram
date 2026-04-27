@@ -82,7 +82,11 @@ describe('filterAttachments', () => {
     assert.match(rejected[0].reason, /per-file cap/);
   });
 
-  test('file with missing/zero size is NOT rejected here (cap applies at download time)', () => {
+  test('file with missing/zero size is not rejected by per-file cap (live cap applies at download)', () => {
+    // Unknown sizes pass the per-file gate (since reported is what's
+    // checked there). The cumulative cap budgets them at worst-case
+    // (= per-file cap) — so 2 unknowns under the default 20MB total
+    // still fit. The streaming download enforces the per-file cap live.
     const atts = [
       { name: 'unsized.jpg', mime_type: 'image/jpeg' }, // no size field
       { name: 'zero.jpg', mime_type: 'image/jpeg', size: 0 },
@@ -128,5 +132,22 @@ describe('filterAttachments', () => {
     const { rejected } = filterAttachments(atts);
     assert.match(rejected[0].reason, /per-file cap/);
     assert.match(rejected[1].reason, /mime not allowed/);
+  });
+
+  test('unknown sizes count toward the cumulative budget at worst-case (per-file cap)', () => {
+    // 0.6.14: Telegram occasionally reports file_size=0 / omits size.
+    // Pre-fix, sizeForBudget was the reported value, so N unsized
+    // attachments contributed 0 to totalBytes and could blow the cap
+    // entirely once downloaded. Now sizeForBudget = maxFileBytes for
+    // unknowns, so the cap holds even in the worst case.
+    const atts = Array.from({ length: 5 }, (_, i) => ({
+      name: `u${i}.jpg`, mime_type: 'image/jpeg',
+    }));
+    const { accepted, rejected } = filterAttachments(atts);
+    // Default caps: maxFileBytes=10MB, maxTotalBytes=20MB →
+    // 2 unknowns fit (2×10MB=20MB), 3rd onward rejected by total cap.
+    assert.equal(accepted.length, 2);
+    assert.equal(rejected.length, 3);
+    for (const r of rejected) assert.match(r.reason, /total size cap/);
   });
 });

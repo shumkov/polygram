@@ -256,11 +256,20 @@ Per-bot flags:
 
 - `allowConfigCommands: true` — enables `/model`, `/effort`, `/pair-code`,
   `/pairings`, `/unpair`.
-- `streamReplies: true` — live-edit the Telegram message as Claude works.
+- `streamMinChars` (default 30) — debounce before the first stream edit.
+- `streamThrottleMs` (default 1000, min 250) — stream edit cadence.
 - `voice: { enabled, provider: "openai"|"local", ... }` — Whisper
   transcription settings.
 - `approvals: { adminChatId, timeoutMs, gatedTools, ... }` — which tool
   calls require an inline-keyboard approval and where to post the card.
+- `attachmentConcurrency` (default 6) — parallel Telegram file
+  downloads per turn. Cap is conservative against Telegram's
+  ~30 req/s/bot rate limit.
+- `queueWarnThreshold` (default 20) — fires a `queue-depth-warning`
+  event when in-flight handlers for a session exceed this.
+- `replayWindowMs` (default 180000 = 3 min) — boot replay only
+  resurrects interrupted turns younger than this. Longer outages drop
+  the queue rather than re-dispatching ancient work.
 
 See `config.example.json` for the full schema.
 
@@ -351,7 +360,7 @@ foreign-chat clicks are rejected. Default-deny on IPC error.
 ## Development
 
 ```bash
-npm test           # 481 tests, 113 suites, node:test, no external services
+npm test           # 494 tests, 114 suites, node:test, no external services
 npm run coverage   # native test coverage (Node 22+, no devDeps)
 npm start -- --bot my-bot
 npm run split-db -- --config config.json --dry-run
@@ -384,11 +393,10 @@ tests/*.test.js                   node:test
 - Claude Code only. No abstraction over other AIs.
 - macOS LaunchAgent plists included; Linux systemd units are not (easy
   to adapt).
-- On FileVault-on macOS, the daemon's LaunchAgents fire via shumabit's
-  own GUI login — there's no auto-start without the keychain being
-  unlocked, so a one-time Fast User Switch into the daemon's user
-  after each reboot is the supported pattern. See
-  `skills/infrastructure/SKILL.md` in the source repo for details.
+- On FileVault-on macOS, the daemon's LaunchAgents fire via the daemon
+  user's own GUI login — there's no auto-start without the keychain
+  being unlocked, so a one-time Fast User Switch into the daemon's
+  user after each reboot is the supported pattern.
 
 ## Roadmap
 

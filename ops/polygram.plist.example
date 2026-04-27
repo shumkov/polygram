@@ -22,7 +22,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/node</string>
-        <string>/Users/YOURNAME/polygram/bridge.js</string>
+        <string>/Users/YOURNAME/polygram/polygram.js</string>
         <string>--bot</string>
         <string>BOTNAME</string>
     </array>

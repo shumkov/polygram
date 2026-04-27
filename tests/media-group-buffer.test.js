@@ -147,4 +147,73 @@ describe('media-group-buffer', () => {
     t.advance(500);
     assert.equal(calls, 2, 'second flush still fires after first threw');
   });
+
+  test('per-group size cap forces immediate flush', () => {
+    const t = makeFakeTimer();
+    const flushed = [];
+    const buf = createMediaGroupBuffer({
+      flushMs: 10_000,
+      maxMessagesPerGroup: 3,
+      onFlush: (msgs) => flushed.push(msgs),
+      timerFn: t.timerFn,
+      clearTimerFn: t.clearTimerFn,
+      nowFn: () => 0,
+    });
+    buf.add('k', { id: 1 });
+    buf.add('k', { id: 2 });
+    assert.equal(flushed.length, 0);
+    buf.add('k', { id: 3 }); // hits cap → flush now
+    assert.equal(flushed.length, 1);
+    assert.equal(flushed[0].length, 3);
+    assert.equal(buf.size, 0);
+  });
+
+  test('total-entries cap force-flushes the oldest entry', () => {
+    const t = makeFakeTimer();
+    const flushed = [];
+    const buf = createMediaGroupBuffer({
+      flushMs: 10_000,
+      maxEntries: 2,
+      onFlush: (msgs, key) => flushed.push({ msgs, key }),
+      timerFn: t.timerFn,
+      clearTimerFn: t.clearTimerFn,
+      nowFn: () => 0,
+    });
+    buf.add('a', { id: 1 });
+    buf.add('b', { id: 2 });
+    assert.equal(buf.size, 2);
+    buf.add('c', { id: 3 }); // exceeds maxEntries → oldest ('a') flushed
+    assert.equal(flushed.length, 1);
+    assert.equal(flushed[0].key, 'a');
+    assert.equal(buf.size, 2);
+  });
+
+  test('per-group wall-clock cap flushes despite drip-feed timer reset', () => {
+    const t = makeFakeTimer();
+    let nowVal = 1_000_000;
+    const flushed = [];
+    const buf = createMediaGroupBuffer({
+      flushMs: 500,
+      maxAgeMs: 5_000,
+      onFlush: (msgs) => flushed.push(msgs),
+      timerFn: t.timerFn,
+      clearTimerFn: t.clearTimerFn,
+      nowFn: () => nowVal,
+    });
+    buf.add('k', { id: 1 });
+    // Drip-feed siblings under flushMs to keep resetting the timer.
+    for (let i = 2; i <= 6; i++) {
+      nowVal += 400; // < flushMs (500)
+      t.advance(400);
+      buf.add('k', { id: i });
+      if (flushed.length > 0) break;
+    }
+    // 5 increments × 400ms = 2000ms — still under maxAgeMs.
+    assert.equal(flushed.length, 0);
+    // Push past the wall-clock cap.
+    nowVal += 4_000;
+    t.advance(4_000);
+    buf.add('k', { id: 99 });
+    assert.equal(flushed.length, 1, 'wall-clock cap forces flush even though timer kept resetting');
+  });
 });

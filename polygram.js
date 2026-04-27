@@ -34,6 +34,7 @@ const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/voice'
 const { createStreamer } = require('./lib/stream-reply');
 const { isAbortRequest } = require('./lib/abort-detector');
 const { startTyping } = require('./lib/typing-indicator');
+const { redactBotToken } = require('./lib/net-errors');
 const { createReactionManager, classifyToolName } = require('./lib/status-reactions');
 const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
 const {
@@ -449,15 +450,46 @@ async function downloadOneAttachment(bot, token, chatId, msg, chatDir, att) {
     const url = `https://api.telegram.org/file/bot${token}/${fileInfo.file_path}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    // Defense in depth: re-check size at download time. Telegram can
-    // omit file_size from the Message, or its value may not match what
-    // the CDN actually serves. Trust Content-Length and fall back to
-    // buffering with a ceiling.
+    // Three-layer size enforcement, in order of cheapness:
+    //   1. Content-Length header — fail-fast before reading any body.
+    //   2. Streaming chunk-by-chunk accumulation — abort the moment the
+    //      cumulative byte count crosses the cap. This is the layer that
+    //      protects against an attacker omitting Content-Length: pre-0.6.14
+    //      we read the whole `res.arrayBuffer()` into RAM first and only
+    //      then checked the size. With the per-bot ATTACHMENT_DOWNLOAD_
+    //      CONCURRENCY default of 6, six unbounded reads in flight could
+    //      pin arbitrary RSS — real OOM angle for a malicious upload.
+    //   3. Final post-buffer check is now redundant but cheap; left as
+    //      defense-in-depth in case the streaming logic is ever changed.
     const cl = parseInt(res.headers.get('content-length') || '0', 10);
     if (cl > MAX_FILE_BYTES) {
       throw new Error(`content-length ${cl} exceeds per-file cap ${MAX_FILE_BYTES}`);
     }
-    const buf = Buffer.from(await res.arrayBuffer());
+    let total = 0;
+    const chunks = [];
+    if (res.body && typeof res.body.getReader === 'function') {
+      const reader = res.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > MAX_FILE_BYTES) {
+          try { await reader.cancel(); } catch {}
+          throw new Error(`stream ${total}+ bytes exceeds per-file cap ${MAX_FILE_BYTES}`);
+        }
+        chunks.push(value);
+      }
+    } else {
+      // Fallback for runtimes without WHATWG streams (shouldn't fire on
+      // Node 22+). Same arrayBuffer path as before, with the post-check.
+      const ab = await res.arrayBuffer();
+      if (ab.byteLength > MAX_FILE_BYTES) {
+        throw new Error(`body ${ab.byteLength} bytes exceeds per-file cap ${MAX_FILE_BYTES}`);
+      }
+      chunks.push(new Uint8Array(ab));
+      total = ab.byteLength;
+    }
+    const buf = Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength)));
     if (buf.length > MAX_FILE_BYTES) {
       throw new Error(`body ${buf.length} bytes exceeds per-file cap ${MAX_FILE_BYTES}`);
     }
@@ -503,10 +535,11 @@ async function downloadOneAttachment(bot, token, chatId, msg, chatDir, att) {
     // requirement) and some undici/network error variants stringify
     // the request including the URL into err.message. Persisting that
     // raw to attachments.download_error or stderr would leak the bot
-    // token to anyone with DB or log access. Strip any `bot<token>`
-    // pattern from the reason before storing/logging.
+    // token. 0.6.14: centralized in net-errors.redactBotToken which
+    // also handles URL-encoded (%3A) variants and bare token shapes
+    // missed by the original regex.
     const raw = (err.message || 'unknown').slice(0, 200);
-    const reason = raw.replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot<redacted>');
+    const reason = redactBotToken(raw);
     console.error(`[attach] download failed for ${att.name}: ${reason}`);
     dbWrite(() => db.markAttachmentFailed(att.id, reason),
       `markAttachmentFailed ${att.id}`);
@@ -779,17 +812,20 @@ function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
     console.error(`[${sessionKey}] Error:`, err.message);
     // Mark the row terminal so the right thing happens on next boot:
     // - aborted: user explicitly stopped → 'aborted' (not replayable)
-    // - shutting down: the error is "Process exited" / "Process killed"
-    //   from the SIGINT/SIGTERM tearing down claude mid-turn. Mark
-    //   'replay-pending' so the next boot picks it up via
-    //   getReplayCandidates. Pre-0.6.12 we marked 'failed' here, which
-    //   excluded the row from replay — a clean restart between user
-    //   send and reply silently dropped the turn forever.
+    // - shutting down on a NEW turn: 'replay-pending' so the next
+    //   boot picks it up via getReplayCandidates. Pre-0.6.12 we marked
+    //   'failed' here, which excluded the row from replay — a clean
+    //   restart between user send and reply silently dropped the turn.
+    // - shutting down on a REPLAY turn (msg._isReplay=true): keep
+    //   'replay-attempted' so the one-shot guard from 0.6.4 still
+    //   holds. Without this, a replay interrupted by another shutdown
+    //   would be promoted to 'replay-pending' and the next boot would
+    //   replay it AGAIN — infinite loop on chained shutdowns.
     // - everything else: 'failed' (genuine claude crash / timeout etc).
     const status = wasAborted
       ? 'aborted'
       : isShuttingDown
-        ? 'replay-pending'
+        ? (isReplay ? 'replay-attempted' : 'replay-pending')
         : 'failed';
     dbWrite(() => db.setInboundHandlerStatus({
       chat_id: chatId, msg_id: msg.message_id, status,
@@ -1162,16 +1198,21 @@ async function handleApprovalCallback(ctx) {
     id, status, by: userId, user, bot: BOT_NAME,
   });
 
-  // Edit the card to show the decision.
+  // Edit the card to show the decision. 0.6.14: routed through tg() so
+  // the edit gets the same write-before-send DB row, plain-text policy
+  // (no parse_mode injection from tool input), and logged failure
+  // surface as every other outbound. Pre-0.6.14 this called
+  // ctx.api.editMessageText directly — same bypass class as the two
+  // already-routed in 0.6.8 (approval-timeout and pair-onboarding).
   try {
     const fresh = approvals.getById(id);
-    await ctx.api.editMessageText(
-      row.approver_chat_id,
-      row.approver_msg_id,
-      approvalCardText(fresh, {
+    await tg(bot, 'editMessageText', {
+      chat_id: row.approver_chat_id,
+      message_id: row.approver_msg_id,
+      text: approvalCardText(fresh, {
         resolvedBy: `${status === 'approved' ? '✅ Approved' : '❌ Denied'} by ${user || userId}`,
       }),
-    );
+    }, { source: 'approval-card-decision', botName: BOT_NAME, plainText: true });
   } catch (err) {
     console.error(`[${BOT_NAME}] edit approval card failed: ${err.message}`);
   }

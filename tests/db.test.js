@@ -455,12 +455,26 @@ describe('boot replay dedupe wiring', () => {
     assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 8 }), false);
   });
 
-  test('hasOutboundReplyTo ignores pending and ordinary failed outbounds', () => {
+  test('hasOutboundReplyTo counts pending rows (avoid double-reply on boot replay)', () => {
+    // 0.6.14: an outbound row written by the previous polygram process
+    // that was still 'pending' at boot means the API call may have hit
+    // Telegram. Treat as replied so boot replay doesn't re-dispatch
+    // the same inbound. (markStalePending will sweep these to 'failed'
+    // with the 'crashed-mid-send' sentinel anyway, but we widen here in
+    // case replay reads before the sweep, and to make the contract
+    // robust to ordering.)
+    const r = db.insertOutboundPending({ chat_id: '1', text: 'p', bot_name: 'b', pending_id: -1, reply_to_id: 9 });
+    assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 9 }), true);
+    // Sanity: a different inbound on the same chat is unaffected.
+    assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 99 }), false);
+    void r;
+  });
+
+  test('hasOutboundReplyTo ignores ordinary failed outbounds', () => {
     const r1 = db.insertOutboundPending({ chat_id: '1', text: 'p', bot_name: 'b', pending_id: -1, reply_to_id: 9 });
-    // pending → not counted
-    assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 9 }), false);
     db.markOutboundFailed(r1.lastInsertRowid, 'timeout');
-    // failed with ordinary API error → still not counted
+    // failed with ordinary API error (not the crashed-mid-send sentinel)
+    // → not counted; replay should re-dispatch.
     assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 9 }), false);
   });
 

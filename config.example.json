@@ -11,6 +11,10 @@
       "_comment_stream": "Streaming is always on. `streamMinChars` sets the initial-send debounce (default 30) — short responses below that stay idle until the final result. `streamThrottleMs` sets the edit cadence (default 1000ms, min 250).",
       "streamMinChars": 30,
       "streamThrottleMs": 1000,
+      "_comment_ops_tunings": "Optional per-bot operational knobs. `attachmentConcurrency` caps parallel Telegram file downloads per turn (default 6, well under Telegram's 30 req/s/bot limit). `queueWarnThreshold` fires a `queue-depth-warning` event when in-flight handlers exceed it (default 20). `replayWindowMs` bounds boot replay so an outage longer than this won't resurrect ancient interrupted turns (default 180000 = 3 min).",
+      "attachmentConcurrency": 6,
+      "queueWarnThreshold": 20,
+      "replayWindowMs": 180000,
       "_comment_pairedChatDefaults": "When a user sends /pair <CODE> from a private chat that isn't in config.chats yet, polygram auto-creates a chat entry using these defaults (merged over top-level `defaults`). Leave out `cwd` at your peril — without it, auto-onboarded DMs have no working directory and pairing will fail.",
       "pairedChatDefaults": {
         "agent": "admin",
