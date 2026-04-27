@@ -71,35 +71,46 @@ describe('isTransientNetworkError', () => {
 });
 
 describe('redactBotToken', () => {
+  // Test fixtures are assembled at runtime from non-token-shaped fragments
+  // so source files don't contain the canonical Telegram token shape
+  // (`\d{8,10}:[A-Za-z0-9_-]{35}`). GitGuardian's "Telegram Bot Token"
+  // detector matches that shape regardless of the prefix being clearly
+  // fake (`1234567890`); a 0.6.14 commit fired a false-positive alert.
+  // Concatenation keeps the test meaningful (the regex still sees the
+  // canonical shape at runtime) while keeping the literal out of git.
+  const tokenDigits = '12345' + '67890';
+  const tokenSecret = 'AAE' + 'abcdefghijklm' + 'nopqrstuvwxyz' + '012345';
+  const tokenStr = `${tokenDigits}:${tokenSecret}`;
+
   test('redacts canonical bot${TOKEN} URL form', () => {
-    const s = 'fetch failed: https://api.telegram.org/bot1234567890:AAEabcdefghijklmnopqrstuvwxyz012345/sendMessage 401';
+    const s = `fetch failed: https://api.telegram.org/bot${tokenStr}/sendMessage 401`;
     const out = redactBotToken(s);
     assert.match(out, /bot<redacted>\/sendMessage/);
-    assert.doesNotMatch(out, /AAH2y3z4/);
+    assert.doesNotMatch(out, new RegExp(tokenSecret));
   });
 
-  test('redacts URL-encoded colon (bot1234%3AAAH...)', () => {
-    const s = 'request to bot987654321%3AAAH-foo-bar-baz-qux-quux-corge-grault-garply timed out';
+  test('redacts URL-encoded colon (bot…%3AAAH…)', () => {
+    const s = `request to bot${tokenDigits}%3A${tokenSecret} timed out`;
     const out = redactBotToken(s);
     assert.match(out, /bot<redacted>/);
-    assert.doesNotMatch(out, /987654321/);
+    assert.doesNotMatch(out, new RegExp(tokenDigits));
   });
 
   test('redacts bare canonical token shape anywhere in string', () => {
-    const s = 'log line: token=1234567890:AAEabcdefghijklmnopqrstuvwxyz012345 more text';
+    const s = `log line: token=${tokenStr} more text`;
     const out = redactBotToken(s);
     assert.match(out, /token=<redacted-token>/);
   });
 
   test('redacts Authorization: Bearer header form', () => {
-    const s = 'request headers: Authorization: Bearer 1234567890:AAEabcdefghijklmnopqrstuvwxyz012345 content-type: ...';
+    const s = `request headers: Authorization: Bearer ${tokenStr} content-type: ...`;
     const out = redactBotToken(s);
     assert.match(out, /Authorization: Bearer <redacted>/);
-    assert.doesNotMatch(out, /AAH2y3z4/);
+    assert.doesNotMatch(out, new RegExp(tokenSecret));
   });
 
   test('redacts bot_token=... query string form', () => {
-    const s = 'callback?bot_token=1234567890:AAEabcdefghijklmnopqrstuvwxyz012345&chat_id=42';
+    const s = `callback?bot_token=${tokenStr}&chat_id=42`;
     const out = redactBotToken(s);
     assert.match(out, /bot_token=<redacted>/);
     assert.match(out, /chat_id=42/);
@@ -116,7 +127,7 @@ describe('redactBotToken', () => {
   });
 
   test('non-string coerces to string', () => {
-    const out = redactBotToken({ toString: () => 'bot1234567890:AAEabcdefghijklmnopqrstuvwxyz012345' });
+    const out = redactBotToken({ toString: () => `bot${tokenStr}` });
     assert.match(out, /bot<redacted>/);
   });
 });
