@@ -756,12 +756,6 @@ function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
   });
 }
 
-// drainQueuesForChat is retained as a no-op for backwards compat with
-// call sites in /model, /effort, chat-migration, and abort handlers.
-// Returns 0 always; a drain isn't meaningful in the concurrent model —
-// callers that want to abort should rely on pm.killChat.
-const drainQueuesForChat = (_chatId) => 0;
-
 // Per-session lock ordering stdin writes. Module is I/O-pure.
 const stdinLock = createAsyncLock();
 
@@ -1161,17 +1155,17 @@ async function handleConfigCallback(ctx) {
     user: cmdUser, user_id: cmdUserId, source: 'inline-button',
   }), `log ${setting} change`);
 
-  // Graceful respawn across all sessionKeys for this chat (matches the
-  // text-command flow in handleMessage).
+  // Graceful respawn of the topic's session that the card is in. With
+  // isolateTopics=false sessionKey is the chat (one shared session). With
+  // isolateTopics=true sessionKey carries the topic, so other topics'
+  // in-flight turns are not disturbed and the card update + button toast
+  // only affect the user's own context. Mirrors the text-command flow in
+  // handleMessage's requestRespawnForSession.
+  const callbackThreadId = ctx.callbackQuery.message?.message_thread_id?.toString() || null;
+  const callbackSessionKey = getSessionKey(chatId, callbackThreadId, chatConfig);
   const reason = setting === 'model' ? 'model-change' : 'effort-change';
-  const prefix = chatId;
-  let anyActive = false;
-  for (const key of pm.keys()) {
-    if (key === prefix || key.startsWith(prefix + ':')) {
-      const res = pm.requestRespawn(key, reason);
-      if (!res.killed) anyActive = true;
-    }
-  }
+  const respawn = pm.requestRespawn(callbackSessionKey, reason);
+  const anyActive = !respawn.killed;
 
   // Re-render the card with updated ✓ + the same help text shown initially.
   // Detect original card type (model-only / effort-only / both) by counting
@@ -1307,23 +1301,17 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     await sendReply(info, { params: { reply_markup } });
     return;
   }
-  // Helper: request respawn across ALL sessionKeys owned by this chat (one
-  // per topic if isolateTopics=true, otherwise just the single chat-level
-  // key). Graceful: in-flight turns drain on old settings, new turns use
-  // the new settings. Returns total pending turns across all keys so the
-  // reply can tell the user.
-  const requestRespawnForChat = (reason) => {
-    const prefix = String(chatId);
-    let totalQueued = 0;
-    let anyActive = false;
-    for (const key of pm.keys()) {
-      if (key === prefix || key.startsWith(prefix + ':')) {
-        const res = pm.requestRespawn(key, reason);
-        totalQueued += res.queued;
-        if (!res.killed) anyActive = true;
-      }
-    }
-    return { queued: totalQueued, anyActive };
+  // Graceful respawn of the user's CURRENT session only. With
+  // isolateTopics=false the sessionKey is just the chat (one shared
+  // session for the whole chat — every topic respawns implicitly).
+  // With isolateTopics=true each topic is a separate session, and a
+  // /model in topic A should NOT disturb topic B's in-flight turn or
+  // post a phantom "✓ Using sonnet now" in a topic that didn't ask.
+  // Pre-0.6.5 this iterated pm.keys() by chat prefix and incorrectly
+  // fanned out across all topics under isolateTopics=true.
+  const requestRespawnForSession = (reason) => {
+    const res = pm.requestRespawn(sessionKey, reason);
+    return { queued: res.queued, anyActive: !res.killed };
   };
 
   if (botAllowsCommands && text.startsWith('/model ')) {
@@ -1337,7 +1325,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         old_value: oldModel, new_value: newModel,
         user: cmdUser, user_id: cmdUserId, source: 'command',
       }), 'log model change');
-      const { anyActive } = requestRespawnForChat('model-change');
+      const { anyActive } = requestRespawnForSession('model-change');
       const ver = MODEL_VERSIONS[newModel] || newModel;
       const suffix = anyActive ? ` — I'll switch when I finish` : '';
       await sendReply(`Model → ${newModel} (${ver})${suffix}`);
@@ -1357,7 +1345,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         old_value: oldEffort, new_value: newEffort,
         user: cmdUser, user_id: cmdUserId, source: 'command',
       }), 'log effort change');
-      const { anyActive } = requestRespawnForChat('effort-change');
+      const { anyActive } = requestRespawnForSession('effort-change');
       const suffix = anyActive ? ` — I'll switch when I finish` : '';
       await sendReply(`Effort → ${newEffort}${suffix}`);
     } else {
@@ -1870,16 +1858,24 @@ function createBot(token) {
       const threadId = msg.message_thread_id?.toString();
       const sessionKey = getSessionKey(chatId, threadId, chatConfig);
       const hadActive = pm.has(sessionKey) && !!pm.get(sessionKey)?.inFlight;
-      const dropped = drainQueuesForChat(chatId);
       // Mark BEFORE killing: the 'close' event fires almost immediately
       // after SIGTERM, and processQueue's catch needs to see the flag to
       // skip the generic error-reply. If we marked after, there'd be a
       // race where the error-reply slips through.
       if (hadActive) markSessionAborted(sessionKey);
-      await pm.killChat(chatId).catch(() => {});
+      // Kill ONLY the user's own session, not every topic in the chat.
+      // Pre-0.6.5 this was pm.killChat(chatId) which fanned out across
+      // all topics under isolateTopics=true: the user typed "stop" in
+      // topic A and the bot tore down topic B's in-flight turn, surfacing
+      // a 💥 reply to topic B's user (whose key was never marked aborted,
+      // so the abort grace window didn't apply). With isolateTopics=false
+      // the sessionKey is the chat itself, so killing one session is the
+      // same as killing the chat — behavior unchanged for the common case.
+      await pm.kill(sessionKey).catch((err) =>
+        console.error(`[${BOT_NAME}] abort kill failed: ${err.message}`));
       dbWrite(() => db.logEvent('abort-requested', {
         chat_id: chatId, user_id: msg.from?.id || null,
-        had_active: hadActive, queued_dropped: dropped,
+        had_active: hadActive,
         trigger: cleanText.slice(0, 40),
       }), 'log abort-requested');
       // Reply in the same language the user aborted in. Cyrillic-detection
@@ -2088,8 +2084,10 @@ function createBot(token) {
       config.chats[newChatId] = { ...config.chats[oldChatId] };
       delete config.chats[oldChatId];
       saveConfig();
-      const droppedMigrate = drainQueuesForChat(oldChatId);
-      if (droppedMigrate) dbWrite(() => db.logEvent('queue-drained', { chat_id: oldChatId, reason: 'chat-migrated', dropped: droppedMigrate }), 'log queue-drained');
+      // Chat migration is the one legit chat-wide kill: every session
+      // (every topic) under the old chat_id is stale and must restart
+      // under the new chat_id. Other respawn/abort paths target a
+      // single sessionKey, but here ALL sessions are invalid.
       await pm.killChat(oldChatId);
     }
   });
