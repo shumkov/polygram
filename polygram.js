@@ -201,12 +201,12 @@ function dbWrite(fn, context) {
 }
 
 // Convenience for the most common dbWrite pattern: log an event.
-// Pre-0.6.9 every call site was logEvent(KIND, {...}),
+// Pre-0.6.9 every call site was dbWrite(() => db.logEvent(KIND, {...}),
 // `log ${KIND}`) — three repeated lines for one logical operation.
 // This collapses them to logEvent(KIND, {...}). Same best-effort
 // semantics; never throws.
 function logEvent(kind, detail) {
-  logEvent(kind, detail), `log ${kind}`);
+  dbWrite(() => db.logEvent(kind, detail), `log ${kind}`);
 }
 
 function recordInbound(msg) {
@@ -1211,7 +1211,7 @@ async function handleConfigCallback(ctx) {
     chat_id: chatId, thread_id: null, field: setting,
     old_value: oldValue, new_value: value,
     user: cmdUser, user_id: cmdUserId, source: 'inline-button',
-  });
+  }), `log ${setting} change`);
 
   // Graceful respawn of the topic's session that the card is in. With
   // isolateTopics=false sessionKey is the chat (one shared session). With
@@ -1387,7 +1387,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         chat_id: chatId, thread_id: threadIdStr, field: 'model',
         old_value: oldModel, new_value: newModel,
         user: cmdUser, user_id: cmdUserId, source: 'command',
-      });
+      }), 'log model change');
       const { anyActive } = requestRespawnForSession('model-change');
       const ver = MODEL_VERSIONS[newModel] || newModel;
       const suffix = anyActive ? ` — I'll switch when I finish` : '';
@@ -1407,7 +1407,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         chat_id: chatId, thread_id: threadIdStr, field: 'effort',
         old_value: oldEffort, new_value: newEffort,
         user: cmdUser, user_id: cmdUserId, source: 'command',
-      });
+      }), 'log effort change');
       const { anyActive } = requestRespawnForSession('effort-change');
       const suffix = anyActive ? ` — I'll switch when I finish` : '';
       await sendReply(`Effort → ${newEffort}${suffix}`);
