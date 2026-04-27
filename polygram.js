@@ -786,6 +786,9 @@ function errorReplyText(err) {
   if (/Process (exited|killed)/i.test(msg)) {
     return '💥 Something crashed on my end. Try again.';
   }
+  if (/error_during_execution/i.test(msg)) {
+    return '💥 Something went wrong mid-stream. Try again.';
+  }
   const reason = msg.split('\n')[0].slice(0, 120);
   return `Hit a snag: ${reason || 'unknown error'}. Try resending.`;
 }
@@ -1761,7 +1764,16 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     if (result.error) {
       console.error(`[${label}] Error (${elapsed}s):`, result.error);
       reactor.setState('ERROR');
-      if (!result.text) { markReplied(); return; }
+      // 0.6.16: pre-fix, silently markReplied()+return — the user got an
+      // error reaction emoji on their message but no actual reply text,
+      // AND 'replied' status meant boot replay didn't re-dispatch on next
+      // boot. Worst-case: shutdown-killed turn (e.g. polygram upgrade
+      // mid-stream) → user sends "yes", sees 🤯, gets no answer ever,
+      // the row is silently lost. Promote to a thrown error so
+      // dispatchHandleMessage's catch correctly distinguishes shutdown
+      // (→ 'replay-pending', boot replay retries) from runtime failure
+      // (→ 'failed', user gets an apology with retry hint).
+      if (!result.text) throw new Error(result.error);
     } else {
       // Clear the progress reaction instead of stamping 👍 — the reply
       // bubble itself is the "done" signal and a permanent thumbs-up on
