@@ -247,6 +247,45 @@ describe('claimCode', () => {
     assert.equal(res.ok, false);
     assert.equal(res.reason, 'rate-limited');
   });
+
+  test('failed claim attempts count toward the rate limit (0.6.15)', () => {
+    // Pre-0.6.15 the rate-limit query only counted SUCCESSFUL claims
+    // (used_ts IS NOT NULL), so an attacker could probe wrong codes
+    // indefinitely. Now every claim call — including wrong-code probes
+    // that return not-found — burns quota.
+    for (let i = 0; i < CLAIM_RATE_PER_USER_PER_HOUR; i++) {
+      const r = store.claimCode({
+        code: 'BADCODE1', claimer_user_id: 6, chat_id: '-1', bot_name: 'shumabit',
+      });
+      assert.equal(r.ok, false);
+      assert.equal(r.reason, 'not-found');
+    }
+    // A real, valid code now bounces with 'rate-limited' even though
+    // the user has not yet successfully claimed anything.
+    const { code } = store.issueCode({ bot_name: 'shumabit', issued_by_user_id: 1 });
+    const res = store.claimCode({ code, claimer_user_id: 6, chat_id: '-1', bot_name: 'shumabit' });
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, 'rate-limited');
+  });
+
+  test('rate limit bucket prunes entries older than the window', () => {
+    // The in-memory bucket evicts attempts older than the 1h window on
+    // every check. Simulate by stubbing `now` to advance past the
+    // window between the burst and the next call.
+    let t = 1_000_000_000_000;
+    const advancingStore = createStore(db.raw, () => t);
+    for (let i = 0; i < CLAIM_RATE_PER_USER_PER_HOUR; i++) {
+      advancingStore.claimCode({
+        code: 'BAD', claimer_user_id: 7, chat_id: '-1', bot_name: 'shumabit',
+      });
+    }
+    // Advance past the 1-hour window — old attempts should age out.
+    t += 60 * 60 * 1000 + 1;
+    const r = advancingStore.claimCode({
+      code: 'BAD', claimer_user_id: 7, chat_id: '-1', bot_name: 'shumabit',
+    });
+    assert.equal(r.reason, 'not-found', 'should NOT be rate-limited after window');
+  });
 });
 
 describe('hasLivePairing', () => {

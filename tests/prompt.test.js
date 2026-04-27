@@ -231,6 +231,54 @@ describe('buildAttachmentTags — download failures', () => {
     ]);
     assert.match(tags, /<attachment-failed.*reason="no local path"/);
   });
+
+  test('size attribute is xml-escaped (defense-in-depth, 0.6.15)', () => {
+    // Source is normally a number from Telegram, but if a future code path
+    // passes a string with quotes (config drift, manual API call), the
+    // value should not break out of the attribute. xmlEscape coerces and
+    // encodes — verify by passing a hostile string-typed size.
+    const tags = buildAttachmentTags([
+      { kind: 'photo', name: 'p.jpg', mime_type: 'image/jpeg', size: '"><script>x</script>', path: '/p.jpg' },
+    ]);
+    assert.doesNotMatch(tags, /<script>/);
+    assert.match(tags, /size="&quot;&gt;&lt;script&gt;/);
+  });
+});
+
+describe('buildReplyToBlock — defensive attribute escapes (0.6.15)', () => {
+  test('telegram msg_id with hostile string still renders inside attribute', () => {
+    // Defense-in-depth: msg_id is normally numeric, but xmlEscape ensures
+    // a string-typed source can't break out of the attribute. Confirms
+    // the escape sites added in 0.6.15 cover msg_id, ts, replyToId, and
+    // the edited_ts attr.
+    const block = buildReplyToBlock({
+      telegram: {
+        message_id: '"><evil>',
+        from: { first_name: 'A' },
+        date: 1700000000,
+        text: 'hi',
+      },
+    });
+    assert.doesNotMatch(block, /<evil>/);
+    assert.match(block, /msg_id="&quot;&gt;&lt;evil&gt;"/);
+  });
+
+  test('replyToId with hostile string is escaped', () => {
+    const block = buildReplyToBlock({ replyToId: '"><x>' });
+    assert.doesNotMatch(block, /<x>/);
+    assert.match(block, /msg_id="&quot;&gt;&lt;x&gt;"/);
+  });
+
+  test('dbRow path also escapes msg_id and edited_ts', () => {
+    const block = buildReplyToBlock({
+      dbRow: {
+        msg_id: '"><z>', user: 'A', text: 'hi',
+        ts: 1700000000000, edited_ts: 1700000060000,
+      },
+    });
+    assert.doesNotMatch(block, /<z>/);
+    assert.match(block, /msg_id="&quot;&gt;&lt;z&gt;"/);
+  });
 });
 
 describe('buildVoiceTags', () => {

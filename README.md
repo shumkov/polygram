@@ -364,7 +364,7 @@ foreign-chat clicks are rejected. Default-deny on IPC error.
 ## Development
 
 ```bash
-npm test           # 494 tests, 114 suites, node:test, no external services
+npm test           # 500 tests, 115 suites, node:test, no external services
 npm run coverage   # native test coverage (Node 22+, no devDeps)
 npm start -- --bot my-bot
 npm run split-db -- --config config.json --dry-run
