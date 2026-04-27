@@ -777,13 +777,23 @@ function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
     const wasAborted = isSessionRecentlyAborted(sessionKey);
     const isReplay = msg._isReplay === true;
     console.error(`[${sessionKey}] Error:`, err.message);
-    // Mark the row as 'failed' so boot replay doesn't re-dispatch it.
-    // Exception: aborted sessions → 'aborted' (same — not replayable).
-    // Shutdown case handled separately in the SIGTERM handler.
+    // Mark the row terminal so the right thing happens on next boot:
+    // - aborted: user explicitly stopped → 'aborted' (not replayable)
+    // - shutting down: the error is "Process exited" / "Process killed"
+    //   from the SIGINT/SIGTERM tearing down claude mid-turn. Mark
+    //   'replay-pending' so the next boot picks it up via
+    //   getReplayCandidates. Pre-0.6.12 we marked 'failed' here, which
+    //   excluded the row from replay — a clean restart between user
+    //   send and reply silently dropped the turn forever.
+    // - everything else: 'failed' (genuine claude crash / timeout etc).
+    const status = wasAborted
+      ? 'aborted'
+      : isShuttingDown
+        ? 'replay-pending'
+        : 'failed';
     dbWrite(() => db.setInboundHandlerStatus({
-      chat_id: chatId, msg_id: msg.message_id,
-      status: wasAborted ? 'aborted' : 'failed',
-    }), 'set handler_status=failed/aborted');
+      chat_id: chatId, msg_id: msg.message_id, status,
+    }), `set handler_status=${status}`);
     logEvent('handler-error', {
       chat_id: chatId, session_key: sessionKey,
       msg_id: msg?.message_id,
@@ -1965,29 +1975,31 @@ function createBot(token) {
       });
       // Reply in the same language the user aborted in. Cyrillic-detection
       // is crude but reliable for ru/en (the only two cue sets we ship).
+      // 0.6.12 fix: pre-0.6.5 the message included a "queue cleared (N)"
+      // suffix when N > 0; that came from drainQueuesForChat which always
+      // returned 0 in the concurrent model and was deleted in 0.6.5.
+      // The reference to `dropped` here was missed, so EVERY abort hit
+      // a ReferenceError that the surrounding `catch {}` swallowed —
+      // leaving the user with no ack at all. Reduced to "stopped vs
+      // nothing-to-stop" since the queue-cleared variant was already
+      // dead.
       const lang = /[а-яё]/i.test(cleanText) ? 'ru' : 'en';
       const strs = {
-        en: {
-          stopped: 'Stopped.',
-          withDropped: (n) => `Stopped. Cleared ${n} queued message${n === 1 ? '' : 's'}.`,
-          nothing: 'Nothing to stop.',
-        },
-        ru: {
-          stopped: 'Остановлено.',
-          withDropped: (n) => `Остановлено. Очередь очищена (${n}).`,
-          nothing: 'Нечего останавливать.',
-        },
+        en: { stopped: 'Stopped.',     nothing: 'Nothing to stop.' },
+        ru: { stopped: 'Остановлено.', nothing: 'Нечего останавливать.' },
       }[lang];
-      const reply = hadActive || dropped
-        ? (dropped ? strs.withDropped(dropped) : strs.stopped)
-        : strs.nothing;
+      const reply = hadActive ? strs.stopped : strs.nothing;
       try {
         await tg(bot, 'sendMessage', {
           chat_id: chatId, text: reply,
           reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
           ...(threadId && { message_thread_id: threadId }),
         }, { source: 'abort-ack', botName: BOT_NAME });
-      } catch {}
+      } catch (err) {
+        // Don't swallow silently — if the ack itself fails, the operator
+        // needs to know (the user typed stop and saw nothing).
+        console.error(`[${BOT_NAME}] abort-ack send failed: ${err.message}`);
+      }
       return;
     }
 
