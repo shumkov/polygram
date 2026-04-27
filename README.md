@@ -110,7 +110,7 @@ Practical differences that matter for migration:
 
 ## Install
 
-Requires Node 20+.
+Requires Node 22+ (24 recommended; native test coverage is stable in 22).
 
 ```bash
 # Global binary:
@@ -351,7 +351,8 @@ foreign-chat clicks are rejected. Default-deny on IPC error.
 ## Development
 
 ```bash
-npm test        # 470 tests, 110 suites, node:test, no external services
+npm test           # 481 tests, 113 suites, node:test, no external services
+npm run coverage   # native test coverage (Node 22+, no devDeps)
 npm start -- --bot my-bot
 npm run split-db -- --config config.json --dry-run
 npm run ipc-smoke -- my-bot

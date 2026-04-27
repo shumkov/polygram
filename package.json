@@ -1,6 +1,6 @@
 {
   "name": "polygram",
-  "version": "0.6.12",
+  "version": "0.6.13",
   "description": "Telegram daemon for Claude Code that preserves the OpenClaw per-chat session model. Migration path for OpenClaw users moving to Claude Code.",
   "main": "lib/ipc-client.js",
   "bin": {
@@ -26,12 +26,14 @@
   ],
   "scripts": {
     "test": "node --test tests/*.test.js",
+    "coverage": "node --test --experimental-test-coverage tests/*.test.js",
+    "coverage:lcov": "mkdir -p coverage && node --test --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/lcov.info tests/*.test.js",
     "start": "node polygram.js",
     "split-db": "node scripts/split-db.js",
     "ipc-smoke": "node scripts/ipc-smoke.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "keywords": [
     "telegram",
