@@ -5,27 +5,12 @@
 
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
 
-const { open } = require('../lib/db');
+const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 const { send, createSender, nextPendingId } = require('../lib/telegram');
 
 let db;
 let dbPath;
-
-function freshDb() {
-  dbPath = path.join(os.tmpdir(), `telegram-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.db`);
-  return open(dbPath);
-}
-
-function cleanup() {
-  if (db) { try { db.raw.close(); } catch {} db = null; }
-  for (const suffix of ['', '-wal', '-shm']) {
-    try { fs.unlinkSync(dbPath + suffix); } catch {}
-  }
-}
 
 // ─── Fake grammy bot ────────────────────────────────────────────────
 
@@ -75,8 +60,8 @@ describe('nextPendingId', () => {
 });
 
 describe('send — success path', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('telegram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('insert pending then mark sent on success', async () => {
     const bot = makeFakeBot({ result: { message_id: 999, date: 1700000000 } });
@@ -156,8 +141,8 @@ describe('send — success path', () => {
 });
 
 describe('send — failure path', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('telegram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('marks row failed + logs event on API error', async () => {
     const bot = makeFakeBot({ error: new Error('Forbidden: bot was blocked') });
@@ -189,8 +174,8 @@ describe('send — failure path', () => {
 });
 
 describe('send — reactions skip DB row', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('telegram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('setMessageReaction does not insert message row', async () => {
     const bot = makeFakeBot({ result: true });
@@ -216,8 +201,8 @@ describe('send — reactions skip DB row', () => {
 });
 
 describe('send — DB resilience', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('telegram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('DB insert failure does not block send', async () => {
     const bot = makeFakeBot({ result: { message_id: 42, date: 1 } });
@@ -272,8 +257,8 @@ describe('send — DB resilience', () => {
 });
 
 describe('createSender factory', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('telegram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('binds db + logger', async () => {
     const bot = makeFakeBot({ result: { message_id: 7, date: 1 } });
@@ -286,8 +271,8 @@ describe('createSender factory', () => {
 });
 
 describe('send — pre-connect retry', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('telegram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   function makeFlakyPreConnectBot() {
     let first = true;
@@ -349,8 +334,8 @@ describe('send — pre-connect retry', () => {
 });
 
 describe('send — thread-not-found fallback', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('telegram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   // Fake bot that fails the first call with a thread-not-found, succeeds on retry.
   function makeFlakyThreadBot() {

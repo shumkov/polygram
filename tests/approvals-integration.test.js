@@ -5,11 +5,10 @@
 
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { open } = require('../lib/db');
+const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 const { createStore: createApprovalsStore, matchesAnyPattern } = require('../lib/approvals');
 const ipcServer = require('../lib/ipc-server');
 const ipcClient = require('../lib/ipc-client');
@@ -20,22 +19,15 @@ let db, dbPath, approvals, server, sockPath;
 let sentCards = [];
 let waiters = new Map();
 
-function freshDb() {
-  dbPath = path.join(os.tmpdir(), `aintg-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.db`);
-  return open(dbPath);
-}
-
 function cleanup() {
-  if (db) { try { db.raw.close(); } catch {} db = null; }
-  for (const suffix of ['', '-wal', '-shm']) {
-    try { fs.unlinkSync(dbPath + suffix); } catch {}
-  }
+  cleanupDb(dbPath, db);
+  db = null;
   waiters.clear();
   sentCards = [];
 }
 
 async function setup() {
-  db = freshDb();
+  ({ db, dbPath } = freshDb('aintg'));
   approvals = createApprovalsStore(db.raw);
   sockPath = path.join(os.tmpdir(), `aintg-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.sock`);
 

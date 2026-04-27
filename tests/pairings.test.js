@@ -5,11 +5,8 @@
 
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
 
-const { open } = require('../lib/db');
+const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 const {
   createStore, generateCode, normalizeCode, parseTtl,
   DEFAULT_TTL_MS, MAX_TTL_MS, MIN_TTL_MS,
@@ -19,22 +16,15 @@ const {
 let db, dbPath, store;
 let fakeNow;
 
-function freshDb() {
-  dbPath = path.join(os.tmpdir(), `pairings-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.db`);
-  return open(dbPath);
+function setup() {
+  ({ db, dbPath } = freshDb('pairings-test'));
+  fakeNow = 1_700_000_000_000;
+  store = createStore(db.raw, () => fakeNow);
 }
 
 function cleanup() {
-  if (db) { try { db.raw.close(); } catch {} db = null; }
-  for (const suffix of ['', '-wal', '-shm']) {
-    try { fs.unlinkSync(dbPath + suffix); } catch {}
-  }
-}
-
-function setup() {
-  db = freshDb();
-  fakeNow = 1_700_000_000_000;
-  store = createStore(db.raw, () => fakeNow);
+  cleanupDb(dbPath, db);
+  db = null;
 }
 
 describe('generateCode', () => {

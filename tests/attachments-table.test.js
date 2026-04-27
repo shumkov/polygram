@@ -6,26 +6,11 @@
 
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
 
-const { open } = require('../lib/db');
+const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 
 let db;
 let dbPath;
-
-function freshDb() {
-  dbPath = path.join(os.tmpdir(), `polygram-att-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.db`);
-  return open(dbPath);
-}
-
-function cleanup() {
-  if (db) { try { db.raw.close(); } catch {} db = null; }
-  for (const suffix of ['', '-wal', '-shm']) {
-    try { fs.unlinkSync(dbPath + suffix); } catch {}
-  }
-}
 
 function insertInbound(d, { chat_id, msg_id, ts = Date.now() }) {
   d.insertMessage({
@@ -41,8 +26,8 @@ function insertInbound(d, { chat_id, msg_id, ts = Date.now() }) {
 }
 
 describe('attachments table — basic CRUD', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-att')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('insertAttachment + getAttachmentsByMessage round-trip', () => {
     const mid = insertInbound(db, { chat_id: '1', msg_id: 100 });
@@ -116,8 +101,8 @@ describe('attachments table — basic CRUD', () => {
 });
 
 describe('attachments table — search + ops queries', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-att')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('searchAttachments filters by chat_id, kind, status, time range', () => {
     const now = Date.now();
@@ -154,8 +139,8 @@ describe('attachments table — search + ops queries', () => {
 });
 
 describe('reassignAttachmentsToMessage — media-group coalescing', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-att')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('moves sibling attachments to the primary message', () => {
     // Simulate a 3-photo album: each photo arrived as its own Telegram
@@ -242,8 +227,8 @@ describe('reassignAttachmentsToMessage — media-group coalescing', () => {
 });
 
 describe('recordInbound atomicity (0.6.4)', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-att')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('attachment insert failure rolls back the message row', () => {
     // Simulate the recordInbound shape exactly: insertMessage + N
@@ -334,8 +319,8 @@ describe('token redaction (0.6.6)', () => {
 });
 
 describe('migrations 007 + 008 — schema state after open()', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-att')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('attachments table exists and is queryable', () => {
     const cols = db.raw.prepare('PRAGMA table_info(attachments)').all();

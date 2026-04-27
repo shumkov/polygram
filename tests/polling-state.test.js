@@ -1,29 +1,14 @@
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
 
-const { open } = require('../lib/db');
+const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 
 let db;
 let dbPath;
 
-function freshDb() {
-  dbPath = path.join(os.tmpdir(), `polling-state-${process.pid}-${Date.now()}.db`);
-  return open(dbPath);
-}
-
-function cleanup() {
-  if (db) { try { db.raw.close(); } catch {} db = null; }
-  for (const suffix of ['', '-wal', '-shm']) {
-    try { fs.unlinkSync(dbPath + suffix); } catch {}
-  }
-}
-
 describe('polling_state persistence', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polling-state')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('getPollingOffset returns 0 for unknown bot', () => {
     assert.equal(db.getPollingOffset('never-seen'), 0);

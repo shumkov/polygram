@@ -5,27 +5,12 @@
 
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
 
-const { open } = require('../lib/db');
+const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 const history = require('../lib/history');
 
 let db;
 let dbPath;
-
-function freshDb() {
-  dbPath = path.join(os.tmpdir(), `history-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.db`);
-  return open(dbPath);
-}
-
-function cleanup() {
-  if (db) { try { db.raw.close(); } catch {} db = null; }
-  for (const suffix of ['', '-wal', '-shm']) {
-    try { fs.unlinkSync(dbPath + suffix); } catch {}
-  }
-}
 
 function seed(db, rows) {
   for (const r of rows) {
@@ -124,8 +109,8 @@ describe('parseSinceMs', () => {
 // ─── Query functions ────────────────────────────────────────────────
 
 describe('recent', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('history-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('returns chat-scoped rows in chronological (ascending) order', () => {
     const now = Date.now();
@@ -194,8 +179,8 @@ describe('recent', () => {
 });
 
 describe('around', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('history-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('returns before + anchor + after in chronological order', () => {
     const now = Date.now();
@@ -236,8 +221,8 @@ describe('around', () => {
 });
 
 describe('search', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('history-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('FTS5 token match', () => {
     const now = Date.now();
@@ -312,8 +297,8 @@ describe('search', () => {
 });
 
 describe('byUser', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('history-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('LIKE match on user', () => {
     const now = Date.now();
@@ -349,8 +334,8 @@ describe('byUser', () => {
 });
 
 describe('getMsg', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('history-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('returns row by msgId', () => {
     seed(db, [{ chat_id: '1', msg_id: 42, text: 'the one', ts: Date.now() }]);
@@ -381,8 +366,8 @@ describe('getMsg', () => {
 });
 
 describe('stats', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('history-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('groups by user + direction', () => {
     const now = Date.now();
@@ -429,8 +414,8 @@ describe('stats', () => {
 // chat in the config.
 
 describe('allowedChatIds — empty array is deny-all (not scope-disabled)', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('history-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   function seedCrossChat() {
     const now = Date.now();

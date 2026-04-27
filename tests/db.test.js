@@ -5,30 +5,16 @@
 
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
 
-const { open } = require('../lib/db');
+const { freshDb, cleanupDb } = require('./helpers/db-fixture');
+const { open } = require('../lib/db'); // a couple of tests open a 2nd connection to the same file
 
 let db;
 let dbPath;
 
-function freshDb() {
-  dbPath = path.join(os.tmpdir(), `polygram-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.db`);
-  return open(dbPath);
-}
-
-function cleanup() {
-  if (db) { try { db.raw.close(); } catch {} db = null; }
-  for (const suffix of ['', '-wal', '-shm']) {
-    try { fs.unlinkSync(dbPath + suffix); } catch {}
-  }
-}
-
 describe('schema + migrations', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('user_version is at current schema after migration', () => {
     const v = db.raw.pragma('user_version', { simple: true });
@@ -64,8 +50,8 @@ describe('schema + migrations', () => {
 });
 
 describe('insertMessage', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('writes inbound row with defaults', () => {
     db.insertMessage({ chat_id: '123', msg_id: 1, user: 'Ivan', text: 'hi', direction: 'in' });
@@ -131,8 +117,8 @@ describe('insertMessage', () => {
 });
 
 describe('outbound pending lifecycle', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('insertOutboundPending → markOutboundSent updates msg_id + status', () => {
     const res = db.insertOutboundPending({
@@ -220,8 +206,8 @@ describe('outbound pending lifecycle', () => {
 });
 
 describe('sessions', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('upsertSession inserts new row', () => {
     db.upsertSession({
@@ -271,8 +257,8 @@ describe('sessions', () => {
 });
 
 describe('events + config_changes', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('logEvent stores kind + JSON detail', () => {
     db.logEvent('spawn-fail', { chat_id: '123', code: 1, reason: 'resume-failed' });
@@ -311,8 +297,8 @@ describe('events + config_changes', () => {
 });
 
 describe('FTS5 search', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('inserted message is indexed and findable', () => {
     db.insertMessage({ chat_id: '1', msg_id: 1, user: 'Ivan', text: 'meeting tomorrow at noon', direction: 'in' });
@@ -352,8 +338,8 @@ describe('FTS5 search', () => {
 });
 
 describe('uniqueness + constraints', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('same msg_id in different chats is allowed', () => {
     db.insertMessage({ chat_id: '1', msg_id: 100, text: 'a', direction: 'in' });
@@ -371,8 +357,8 @@ describe('uniqueness + constraints', () => {
 });
 
 describe('busy_timeout + concurrent access', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('second connection can read while first writes (WAL)', () => {
     db.insertMessage({ chat_id: '1', msg_id: 1, text: 'hello', direction: 'in' });
@@ -388,8 +374,8 @@ describe('busy_timeout + concurrent access', () => {
 });
 
 describe('getMessage', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('returns null when message not found', () => {
     assert.equal(db.getMessage('999', 1), undefined);
@@ -417,8 +403,8 @@ describe('getMessage', () => {
 });
 
 describe('chat_migrations', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('logChatMigration + resolveChatId round-trip', () => {
     db.logChatMigration('-100', '-200');
@@ -448,8 +434,8 @@ describe('chat_migrations', () => {
 // re-dispatched already-answered messages. These tests pin down the wiring
 // so we can't silently regress.
 describe('boot replay dedupe wiring', () => {
-  beforeEach(() => { db = freshDb(); });
-  afterEach(() => cleanup());
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
 
   test('insertOutboundPending persists reply_to_id', () => {
     const res = db.insertOutboundPending({
