@@ -153,6 +153,66 @@ describe('attachments table — search + ops queries', () => {
   });
 });
 
+describe('reassignAttachmentsToMessage — media-group coalescing', () => {
+  beforeEach(() => { db = freshDb(); });
+  afterEach(() => cleanup());
+
+  test('moves sibling attachments to the primary message', () => {
+    // Simulate a 3-photo album: each photo arrived as its own Telegram
+    // message, recordInbound inserted message + attachment per arrival.
+    // The media-group buffer then needs to FK them all under the primary
+    // so handleMessage's lookup returns the whole album.
+    const ts = Date.now();
+    const primaryId   = insertInbound(db, { chat_id: '-100', msg_id: 100, ts });
+    const sibling1Id  = insertInbound(db, { chat_id: '-100', msg_id: 101, ts });
+    const sibling2Id  = insertInbound(db, { chat_id: '-100', msg_id: 102, ts });
+    db.insertAttachment({ message_id: primaryId,  chat_id: '-100', msg_id: 100, file_id: 'p1', kind: 'photo', ts });
+    db.insertAttachment({ message_id: sibling1Id, chat_id: '-100', msg_id: 101, file_id: 'p2', kind: 'photo', ts });
+    db.insertAttachment({ message_id: sibling2Id, chat_id: '-100', msg_id: 102, file_id: 'p3', kind: 'photo', ts });
+
+    // Pre-condition: the primary alone only has 1 attachment.
+    assert.equal(db.getAttachmentsByMessage(primaryId).length, 1);
+
+    db.reassignAttachmentsToMessage({
+      chat_id: '-100',
+      msg_ids: [101, 102],
+      target_message_id: primaryId,
+    });
+
+    // Post-condition: primary now owns all 3; siblings own 0.
+    assert.equal(db.getAttachmentsByMessage(primaryId).length, 3);
+    assert.equal(db.getAttachmentsByMessage(sibling1Id).length, 0);
+    assert.equal(db.getAttachmentsByMessage(sibling2Id).length, 0);
+    // msg_id on the moved rows is rewritten to primary's msg_id so future
+    // (chat_id, msg_id)-keyed lookups stay consistent.
+    const rows = db.getAttachmentsByMessage(primaryId);
+    for (const r of rows) {
+      assert.equal(r.msg_id, 100, 'msg_id should be rewritten to primary');
+    }
+  });
+
+  test('no-op when msg_ids is empty', () => {
+    const r = db.reassignAttachmentsToMessage({
+      chat_id: '-100', msg_ids: [], target_message_id: 1,
+    });
+    assert.equal(r.changes, 0);
+  });
+
+  test('does not move rows already owned by primary', () => {
+    const ts = Date.now();
+    const primaryId = insertInbound(db, { chat_id: '-100', msg_id: 100, ts });
+    db.insertAttachment({ message_id: primaryId, chat_id: '-100', msg_id: 100, file_id: 'p1', kind: 'photo', ts });
+    const before = db.getAttachmentsByMessage(primaryId)[0];
+    const r = db.reassignAttachmentsToMessage({
+      chat_id: '-100', msg_ids: [100], target_message_id: primaryId,
+    });
+    // The `message_id != ?` guard skips already-correctly-owned rows.
+    assert.equal(r.changes, 0);
+    const after = db.getAttachmentsByMessage(primaryId)[0];
+    assert.equal(after.id, before.id);
+  });
+});
+
 describe('migrations 007 + 008 — schema state after open()', () => {
   beforeEach(() => { db = freshDb(); });
   afterEach(() => cleanup());

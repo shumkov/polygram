@@ -1930,6 +1930,29 @@ function createBot(token) {
       // all-media-no-text groups.
       const primary = messages.find((m) => m.text || m.caption) || messages[0];
       const merged = messages.flatMap((m) => extractAttachments(m));
+
+      // 0.6.0 attachment-table regression fix: recordInbound (called per
+      // sibling on bot.on('message')) inserted each photo's row under its
+      // OWN msg_id. handleMessage looks up attachments via
+      // getAttachmentsByMessage(primary.message_id) — which only returns
+      // the primary's row. Without re-FK'ing the siblings we'd silently
+      // drop N-1 of N photos in any album, exactly the umi-assistant bug
+      // the user hit (saw 1 of 2 photos sent in a Telegram album).
+      const chatId = String(primary.chat.id);
+      const primaryDbId = db.getInboundMessageId({
+        chat_id: chatId, msg_id: primary.message_id,
+      });
+      const siblingMsgIds = messages
+        .filter((m) => m.message_id !== primary.message_id)
+        .map((m) => m.message_id);
+      if (primaryDbId && siblingMsgIds.length) {
+        dbWrite(() => db.reassignAttachmentsToMessage({
+          chat_id: chatId,
+          msg_ids: siblingMsgIds,
+          target_message_id: primaryDbId,
+        }), 'reassign media-group sibling attachments');
+      }
+
       const synthetic = { ...primary, _mergedAttachments: merged };
       // Carry the primary's text verbatim (dispatchRegularMessage re-cleans
       // the mention). Caption → text so downstream sees it uniformly.
