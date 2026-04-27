@@ -148,17 +148,38 @@ function copy(src, dst, bot, chatToBot) {
       const rows = src.raw.prepare(
         `SELECT * FROM messages WHERE chat_id IN (${ph(chatIds.length)}) OR bot_name = ?`,
       ).all(...chatIds, bot);
+      // 0.6.1: messages.attachments_json column was dropped (migration 008).
+      // Per-attachment rows live in the `attachments` table now and are
+      // copied separately below.
       const ins = dst.raw.prepare(`
         INSERT OR IGNORE INTO messages
           (id, chat_id, thread_id, msg_id, user, user_id, text, reply_to_id,
-           direction, source, bot_name, attachments_json, session_id,
+           direction, source, bot_name, session_id,
            model, effort, turn_id, status, error, cost_usd, ts, edited_ts)
         VALUES
           (@id, @chat_id, @thread_id, @msg_id, @user, @user_id, @text, @reply_to_id,
-           @direction, @source, @bot_name, @attachments_json, @session_id,
+           @direction, @source, @bot_name, @session_id,
            @model, @effort, @turn_id, @status, @error, @cost_usd, @ts, @edited_ts)
       `);
       for (const r of rows) { if (ins.run(r).changes) stats.messages++; }
+
+      // Copy per-attachment rows for the messages we just copied. FK target
+      // exists since messages were inserted in the same transaction.
+      const arows = src.raw.prepare(
+        `SELECT * FROM attachments WHERE chat_id IN (${ph(chatIds.length)})`,
+      ).all(...chatIds);
+      const aIns = dst.raw.prepare(`
+        INSERT OR IGNORE INTO attachments
+          (id, message_id, chat_id, msg_id, thread_id, bot_name,
+           file_id, file_unique_id, kind, name, mime_type, size_bytes,
+           local_path, download_status, download_error, transcription, ts)
+        VALUES
+          (@id, @message_id, @chat_id, @msg_id, @thread_id, @bot_name,
+           @file_id, @file_unique_id, @kind, @name, @mime_type, @size_bytes,
+           @local_path, @download_status, @download_error, @transcription, @ts)
+      `);
+      stats.attachments = 0;
+      for (const r of arows) { if (aIns.run(r).changes) stats.attachments++; }
 
       const srows = src.raw.prepare(`SELECT * FROM sessions WHERE chat_id IN (${ph(chatIds.length)})`).all(...chatIds);
       const sins = dst.raw.prepare(`
