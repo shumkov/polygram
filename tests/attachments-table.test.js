@@ -27,41 +27,18 @@ function cleanup() {
   }
 }
 
-function insertInbound(d, { chat_id, msg_id, attachments_json = null, ts = Date.now() }) {
+function insertInbound(d, { chat_id, msg_id, ts = Date.now() }) {
   d.insertMessage({
     chat_id, thread_id: null, msg_id,
     user: 'tester', user_id: 1,
     text: '', reply_to_id: null,
     direction: 'in', source: 'polygram', bot_name: 'shumabit',
-    attachments_json, session_id: null,
+    session_id: null,
     model: null, effort: null, turn_id: null,
     status: null, error: null, cost_usd: null, ts,
   });
   return d.getInboundMessageId({ chat_id, msg_id });
 }
-
-const BACKFILL_SQL = `
-  INSERT INTO attachments (
-    message_id, chat_id, msg_id, thread_id, bot_name,
-    file_id, file_unique_id, kind, name, mime_type, size_bytes,
-    local_path, download_status, transcription, ts
-  )
-  SELECT
-    m.id, m.chat_id, m.msg_id, m.thread_id, m.bot_name,
-    COALESCE(json_extract(att.value, '$.file_id'), ''),
-    json_extract(att.value, '$.file_unique_id'),
-    COALESCE(json_extract(att.value, '$.kind'), 'document'),
-    json_extract(att.value, '$.name'),
-    json_extract(att.value, '$.mime_type'),
-    json_extract(att.value, '$.size'),
-    json_extract(att.value, '$.path'),
-    'downloaded',
-    json_extract(att.value, '$.transcription.text'),
-    m.ts
-  FROM messages m, json_each(m.attachments_json) att
-  WHERE m.attachments_json IS NOT NULL AND m.direction = 'in'
-    AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id)
-`;
 
 describe('attachments table — basic CRUD', () => {
   beforeEach(() => { db = freshDb(); });
@@ -176,40 +153,31 @@ describe('attachments table — search + ops queries', () => {
   });
 });
 
-describe('migration 007 — backfill from attachments_json', () => {
+describe('migrations 007 + 008 — schema state after open()', () => {
   beforeEach(() => { db = freshDb(); });
   afterEach(() => cleanup());
 
-  test('backfill inserts one row per JSON item, marks downloaded, copies fields', () => {
-    const json = JSON.stringify([
-      { kind: 'photo', name: 'p.jpg', mime_type: 'image/jpeg', size: 1234, file_id: 'fid1', file_unique_id: 'u1' },
-      { kind: 'voice', name: 'v.ogg', mime_type: 'audio/ogg', size: 9876, file_id: 'fid2', file_unique_id: 'u2',
-        transcription: { text: 'hello there' } },
-    ]);
-    const mid = insertInbound(db, { chat_id: '5', msg_id: 42, attachments_json: json });
-    // Simulate pre-007: clear any auto-inserted rows then run backfill.
-    db.raw.prepare('DELETE FROM attachments WHERE message_id = ?').run(mid);
-    db.raw.prepare(BACKFILL_SQL).run();
-
-    const rows = db.getAttachmentsByMessage(mid);
-    assert.equal(rows.length, 2);
-    const photo = rows.find((r) => r.kind === 'photo');
-    const voice = rows.find((r) => r.kind === 'voice');
-    assert.equal(photo.file_unique_id, 'u1');
-    assert.equal(photo.size_bytes, 1234);
-    assert.equal(photo.download_status, 'downloaded');
-    assert.equal(voice.transcription, 'hello there');
+  test('attachments table exists and is queryable', () => {
+    const cols = db.raw.prepare('PRAGMA table_info(attachments)').all();
+    const names = cols.map((c) => c.name);
+    for (const expected of [
+      'id', 'message_id', 'chat_id', 'msg_id', 'file_id', 'file_unique_id',
+      'kind', 'name', 'mime_type', 'size_bytes', 'local_path',
+      'download_status', 'download_error', 'transcription', 'ts',
+    ]) {
+      assert.ok(names.includes(expected), `attachments.${expected} missing`);
+    }
   });
 
-  test('backfill is idempotent — re-running does not double-insert', () => {
-    const json = JSON.stringify([{ kind: 'photo', name: 'p.jpg', file_id: 'fid', size: 10 }]);
-    const mid = insertInbound(db, { chat_id: '1', msg_id: 1, attachments_json: json });
-    db.raw.prepare('DELETE FROM attachments WHERE message_id = ?').run(mid);
-    db.raw.prepare(BACKFILL_SQL).run();
-    const after1 = db.getAttachmentsByMessage(mid).length;
-    db.raw.prepare(BACKFILL_SQL).run();
-    const after2 = db.getAttachmentsByMessage(mid).length;
-    assert.equal(after1, 1);
-    assert.equal(after2, 1);
+  test('messages.attachments_json column was dropped by migration 008', () => {
+    const cols = db.raw.prepare('PRAGMA table_info(messages)').all();
+    const names = cols.map((c) => c.name);
+    assert.equal(names.includes('attachments_json'), false,
+      'attachments_json should be gone after migration 008');
+  });
+
+  test('user_version is at SCHEMA_VERSION (8)', () => {
+    const v = db.raw.pragma('user_version', { simple: true });
+    assert.ok(v >= 8, `expected user_version >= 8, got ${v}`);
   });
 });

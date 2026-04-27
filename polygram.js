@@ -220,10 +220,6 @@ function recordInbound(msg) {
       direction: 'in',
       source: 'polygram',
       bot_name: BOT_NAME,
-      // attachments_json kept temporarily as a fallback during the 0.6.0
-      // migration window; per-attachment rows below are the source of
-      // truth. Will be dropped in a follow-up minor.
-      attachments_json: attachments.length ? JSON.stringify(attachments) : null,
       model: chatConfig?.model || null,
       effort: chatConfig?.effort || null,
       ts,
@@ -380,9 +376,7 @@ async function transcribeVoiceAttachments(downloaded, { chatId, msgId, label, bo
   //     parses it back when building the prompt.
   //   - Message-level: setMessageText updates messages.text with the
   //     combined transcript so FTS finds "what Maria said" via the
-  //     normal chat search path. attachments_json is left as-is (will
-  //     be dropped in a future minor; per-attachment row is the source
-  //     of truth).
+  //     normal chat search path.
   const successful = targets.filter((a) => a.transcription?.text);
   if (!successful.length) return;
   for (const a of successful) {
@@ -393,8 +387,7 @@ async function transcribeVoiceAttachments(downloaded, { chatId, msgId, label, bo
   }
   const combinedText = successful.map((a) => a.transcription.text).join(' ').trim();
   dbWrite(() => db.setMessageText({
-    chat_id: chatId, msg_id: msgId,
-    text: combinedText, attachments_json: null,
+    chat_id: chatId, msg_id: msgId, text: combinedText,
   }), 'persist voice transcription');
 }
 
@@ -2434,18 +2427,12 @@ async function main() {
         // Attach already-recorded attachments via the media-group shortcut
         // field so extractAttachments picks them up without re-parsing
         // grammy fields that don't exist on this reconstructed object.
-        // 0.6.0: read from the per-attachment table; fall back to the
-        // legacy attachments_json blob for rows inserted before migration
-        // 007 ran (covers the small window during the upgrade).
         const attRows = db.getAttachmentsByMessage(row.id);
         if (attRows.length) {
           reconstructed._mergedAttachments = attRows.map((a) => ({
             kind: a.kind, name: a.name, mime_type: a.mime_type,
             size: a.size_bytes, file_id: a.file_id, file_unique_id: a.file_unique_id,
           }));
-        } else if (row.attachments_json) {
-          try { reconstructed._mergedAttachments = JSON.parse(row.attachments_json); }
-          catch {}
         }
         const chatConfig = config.chats[row.chat_id];
         if (!chatConfig) { skipped += 1; continue; }
