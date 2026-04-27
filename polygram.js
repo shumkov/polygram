@@ -200,6 +200,15 @@ function dbWrite(fn, context) {
   }
 }
 
+// Convenience for the most common dbWrite pattern: log an event.
+// Pre-0.6.9 every call site was logEvent(KIND, {...}),
+// `log ${KIND}`) — three repeated lines for one logical operation.
+// This collapses them to logEvent(KIND, {...}). Same best-effort
+// semantics; never throws.
+function logEvent(kind, detail) {
+  logEvent(kind, detail), `log ${kind}`);
+}
+
 function recordInbound(msg) {
   const chatId = msg.chat.id.toString();
   const threadId = msg.message_thread_id?.toString() || null;
@@ -374,17 +383,17 @@ async function transcribeVoiceAttachments(downloaded, { chatId, msgId, label, bo
       const r = await transcribeVoice(a.path, opts);
       a.transcription = r;
       console.log(`[${label}] transcribed ${a.kind} (${r.duration_sec?.toFixed?.(1) || '?'}s, ${r.text.length} chars)`);
-      dbWrite(() => db.logEvent('voice-transcribed', {
+      logEvent('voice-transcribed', {
         chat_id: chatId, msg_id: msgId,
         provider: r.provider, language: r.language,
         duration_sec: r.duration_sec, chars: r.text.length,
         cost_usd: r.cost_usd,
-      }), 'log voice-transcribed');
+      });
     } catch (err) {
       console.error(`[${label}] transcribe failed for ${a.name}: ${err.message}`);
-      dbWrite(() => db.logEvent('voice-transcribe-failed', {
+      logEvent('voice-transcribe-failed', {
         chat_id: chatId, msg_id: msgId, name: a.name, error: err.message,
-      }), 'log voice-transcribe-failed');
+      });
     }
   }));
 
@@ -415,7 +424,13 @@ async function transcribeVoiceAttachments(downloaded, { chatId, msgId, label, bo
 // downloads are capped to a small pool. Telegram's per-bot rate limit is
 // ~30 req/s, so 6 concurrent fetches is comfortably under and keeps the
 // happy path responsive without burning sockets on a 100-file edge case.
-const ATTACHMENT_DOWNLOAD_CONCURRENCY = 6;
+// Override via `config.bot.attachmentConcurrency` (per-bot) for ops-time
+// rate-limit tuning.
+const ATTACHMENT_DOWNLOAD_CONCURRENCY_DEFAULT = 6;
+function attachmentConcurrency() {
+  const v = Number(config.bot?.attachmentConcurrency);
+  return (Number.isInteger(v) && v > 0) ? v : ATTACHMENT_DOWNLOAD_CONCURRENCY_DEFAULT;
+}
 
 // Per-attachment download. Pure function over (att, deps) → result. Pulled
 // out of the loop so downloadAttachments can run several in parallel.
@@ -519,7 +534,7 @@ async function downloadAttachments(bot, token, chatId, msg, rows) {
   const results = new Array(rows.length);
   let cursor = 0;
   const workers = Array.from(
-    { length: Math.min(ATTACHMENT_DOWNLOAD_CONCURRENCY, rows.length) },
+    { length: Math.min(attachmentConcurrency(), rows.length) },
     async () => {
       while (true) {
         const idx = cursor++;
@@ -679,7 +694,14 @@ async function sendToProcess(sessionKey, prompt, context = {}) {
 //   - emit a `queue-depth-warning` event if the count ever exceeds a
 //     threshold (abnormal inbound rate, slow pre-work, stuck bot)
 //   - (future) drain on shutdown if we want clean exit
-const CONCURRENT_WARN_THRESHOLD = 20;
+// Threshold for the queue-depth-warning event (operator-tuned signal
+// for "this session is getting hammered"). Override via
+// `config.bot.queueWarnThreshold`. Below the threshold no event fires.
+const CONCURRENT_WARN_THRESHOLD_DEFAULT = 20;
+function queueWarnThreshold() {
+  const v = Number(config.bot?.queueWarnThreshold);
+  return (Number.isInteger(v) && v > 0) ? v : CONCURRENT_WARN_THRESHOLD_DEFAULT;
+}
 const inFlightHandlers = new Map(); // sessionKey → count
 
 // Set true by the SIGTERM/SIGINT handler. Module-scoped so the
@@ -744,11 +766,12 @@ function isSessionRecentlyAborted(sessionKey) {
 function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
   const count = (inFlightHandlers.get(sessionKey) || 0) + 1;
   inFlightHandlers.set(sessionKey, count);
-  if (count === CONCURRENT_WARN_THRESHOLD) {
-    dbWrite(() => db.logEvent('queue-depth-warning', {
+  const warnAt = queueWarnThreshold();
+  if (count === warnAt) {
+    logEvent('queue-depth-warning', {
       chat_id: chatId, session_key: sessionKey,
-      in_flight: count, threshold: CONCURRENT_WARN_THRESHOLD,
-    }), 'log queue-depth-warning');
+      in_flight: count, threshold: warnAt,
+    });
   }
   handleMessage(sessionKey, chatId, msg, bot).catch((err) => {
     const wasAborted = isSessionRecentlyAborted(sessionKey);
@@ -761,14 +784,14 @@ function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
       chat_id: chatId, msg_id: msg.message_id,
       status: wasAborted ? 'aborted' : 'failed',
     }), 'set handler_status=failed/aborted');
-    dbWrite(() => db.logEvent('handler-error', {
+    logEvent('handler-error', {
       chat_id: chatId, session_key: sessionKey,
       msg_id: msg?.message_id,
       error: err.message?.slice(0, 500),
       stack: err.stack?.split('\n').slice(0, 5).join('\n'),
       aborted: wasAborted || undefined,
       replay: isReplay || undefined,
-    }), 'log handler-error');
+    });
     // Suppress the user-facing error reply when:
     //  - boot replay (user typed this minutes ago and moved on)
     //  - polygram is shutting down (the failure is "Process killed" /
@@ -1081,11 +1104,11 @@ async function handleApprovalCallback(ctx) {
     return;
   }
   if (!approvalTokensEqual(row.callback_token, token)) {
-    dbWrite(() => db.logEvent('approval-token-mismatch', {
+    logEvent('approval-token-mismatch', {
       id, from_user: ctx.from?.id,
       // Don't log the sent_token — attackers guessing it don't need to know
       // which prefix they got close on.
-    }), 'log approval-token-mismatch');
+    });
     await ctx.answerCallbackQuery({ text: 'Bad token.', show_alert: true }).catch(() => {});
     return;
   }
@@ -1099,9 +1122,9 @@ async function handleApprovalCallback(ctx) {
   const apprCfg = config.bot?.approvals;
   const expectedChat = String(apprCfg?.adminChatId || '');
   if (String(ctx.chat?.id) !== expectedChat) {
-    dbWrite(() => db.logEvent('approval-foreign-chat', {
+    logEvent('approval-foreign-chat', {
       id, from_chat: ctx.chat?.id, expected: expectedChat,
-    }), 'log approval-foreign-chat');
+    });
     await ctx.answerCallbackQuery({ text: 'Not authorised here.', show_alert: true }).catch(() => {});
     return;
   }
@@ -1125,9 +1148,9 @@ async function handleApprovalCallback(ctx) {
     }).catch(() => {});
     return;
   }
-  dbWrite(() => db.logEvent('approval-resolved', {
+  logEvent('approval-resolved', {
     id, status, by: userId, user, bot: BOT_NAME,
-  }), 'log approval-resolved');
+  });
 
   // Edit the card to show the decision.
   try {
@@ -1188,7 +1211,7 @@ async function handleConfigCallback(ctx) {
     chat_id: chatId, thread_id: null, field: setting,
     old_value: oldValue, new_value: value,
     user: cmdUser, user_id: cmdUserId, source: 'inline-button',
-  }), `log ${setting} change`);
+  });
 
   // Graceful respawn of the topic's session that the card is in. With
   // isolateTopics=false sessionKey is the chat (one shared session). With
@@ -1243,16 +1266,16 @@ function startApprovalSweeper(intervalMs = 30_000) {
       // Silent failure here is invisible death — pending approvals time out
       // with no operator signal. Log loudly.
       console.error(`[approvals] sweeper DB error: ${err.message}`);
-      dbWrite(() => db.logEvent('approval-sweep-failed', {
+      logEvent('approval-sweep-failed', {
         error: err.message?.slice(0, 300),
-      }), 'log approval-sweep-failed');
+      });
       return;
     }
     for (const row of rows) {
       approvals.resolve({ id: row.id, status: 'timeout' });
-      dbWrite(() => db.logEvent('approval-timeout', {
+      logEvent('approval-timeout', {
         id: row.id, bot: BOT_NAME, tool: row.tool_name,
-      }), 'log approval-timeout');
+      });
       resolveApprovalWaiter(row.id, 'timeout', 'swept');
       // Best-effort: edit the card to show the timeout. Routed through
       // tg() so the edit gets the same plain-text formatting policy as
@@ -1364,7 +1387,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         chat_id: chatId, thread_id: threadIdStr, field: 'model',
         old_value: oldModel, new_value: newModel,
         user: cmdUser, user_id: cmdUserId, source: 'command',
-      }), 'log model change');
+      });
       const { anyActive } = requestRespawnForSession('model-change');
       const ver = MODEL_VERSIONS[newModel] || newModel;
       const suffix = anyActive ? ` — I'll switch when I finish` : '';
@@ -1384,7 +1407,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         chat_id: chatId, thread_id: threadIdStr, field: 'effort',
         old_value: oldEffort, new_value: newEffort,
         user: cmdUser, user_id: cmdUserId, source: 'command',
-      }), 'log effort change');
+      });
       const { anyActive } = requestRespawnForSession('effort-change');
       const suffix = anyActive ? ` — I'll switch when I finish` : '';
       await sendReply(`Effort → ${newEffort}${suffix}`);
@@ -1414,10 +1437,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         ttlMs: args.ttl ? parsePairingTtl(args.ttl) : undefined,
         note: args.note || null,
       });
-      dbWrite(() => db.logEvent('pair-code-issued', {
+      logEvent('pair-code-issued', {
         bot: BOT_NAME, by: issuerId, scope: out.scope,
         chat_id: out.chat_id, note: out.note,
-      }), 'log pair-code-issued');
+      });
       const ttlLabel = args.ttl || '10m';
       const chatLabel = out.chat_id ? `chat ${out.chat_id}` : 'any chat';
       await sendReply(
@@ -1449,9 +1472,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       await sendReply('Usage: /unpair <user_id>'); return;
     }
     const n = pairings.revokeByUser({ bot_name: BOT_NAME, user_id: targetId });
-    dbWrite(() => db.logEvent('pair-revoked', {
+    logEvent('pair-revoked', {
       bot: BOT_NAME, user_id: targetId, by: cmdUserId, count: n,
-    }), 'log pair-revoked');
+    });
     await sendReply(n ? `Revoked ${n} pairing(s) for user ${targetId}.` : `No active pairings for user ${targetId}.`);
     return;
   }
@@ -1463,10 +1486,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       code, claimer_user_id: cmdUserId,
       chat_id: chatId, bot_name: BOT_NAME,
     });
-    dbWrite(() => db.logEvent('pair-claim-attempt', {
+    logEvent('pair-claim-attempt', {
       bot: BOT_NAME, user_id: cmdUserId, chat_id: chatId,
       ok: res.ok, reason: res.reason,
-    }), 'log pair-claim-attempt');
+    });
     if (res.ok) {
       const chatLabel = res.chat_id ? `chat ${res.chat_id}` : `every chat ${BOT_NAME} is in`;
       await sendReply(`Paired. You can use me in ${chatLabel}.${res.note ? `\n(${res.note})` : ''}`);
@@ -1492,7 +1515,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const { accepted, rejected } = filterAttachments(rawAtts);
   for (const { att, reason } of rejected) {
     console.log(`[${label}] attachment skipped: ${att.name} (${reason})`);
-    dbWrite(() => db.logEvent('attachment-skipped', { chat_id: chatId, msg_id: msg.message_id, name: att.name, reason }), 'log attachment-skipped');
+    logEvent('attachment-skipped', { chat_id: chatId, msg_id: msg.message_id, name: att.name, reason });
   }
   const token = config.bot?.token || '';
 
@@ -1542,11 +1565,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // their attachment was rejected. They'd assume claude saw it
       // and is just answering oddly.
       console.error(`[${label}] failed to notify user of skipped attachments: ${err.message}`);
-      dbWrite(() => db.logEvent('attachment-skip-notice-failed', {
+      logEvent('attachment-skip-notice-failed', {
         chat_id: chatId, msg_id: msg.message_id,
         error: err.message?.slice(0, 200),
         rejected_count: rejected.length,
-      }), 'log attachment-skip-notice-failed');
+      });
     }
   }
 
@@ -1558,9 +1581,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const stopTyping = startTyping({
     bot, chatId, threadId,
     logger: { error: (m) => console.error(`[${label}] ${m}`) },
-    onEvent: (e) => dbWrite(() => db.logEvent(e.kind, {
+    onEvent: (e) => logEvent(e.kind, {
       bot: BOT_NAME, chat_id: e.chat_id, ...(e.detail || {}),
-    }), `log ${e.kind}`),
+    }),
   });
 
   const botCfg = config.bot || {};
@@ -1603,11 +1626,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         // Stream-edit failures would otherwise be invisible — edits
         // don't insert a messages row by default (tg() does, but we
         // want the failure path specifically surfaced). Log to events.
-        dbWrite(() => db.logEvent('telegram-edit-failed', {
+        logEvent('telegram-edit-failed', {
           chat_id: chatId, msg_id: messageId,
           api_error: err.message?.slice(0, 200),
           bot: BOT_NAME,
-        }), 'log telegram-edit-failed');
+        });
         throw err;
       }
     },
@@ -1842,10 +1865,10 @@ function createBot(token) {
       code, claimer_user_id: userId,
       chat_id: chatId, bot_name: BOT_NAME,
     });
-    dbWrite(() => db.logEvent('pair-claim-attempt', {
+    logEvent('pair-claim-attempt', {
       bot: BOT_NAME, user_id: userId, chat_id: chatId,
       ok: res.ok, reason: res.reason, via: 'auto-onboard',
-    }), 'log pair-claim-attempt');
+    });
 
     if (!res.ok) {
       const reply = res.reason === 'rate-limited'
@@ -1865,10 +1888,10 @@ function createBot(token) {
 
     const cwd = paired.cwd || firstChat.cwd;
     if (!cwd) {
-      dbWrite(() => db.logEvent('auto-onboard-failed', {
+      logEvent('auto-onboard-failed', {
         bot: BOT_NAME, chat_id: chatId, user_id: userId,
         reason: 'no-cwd',
-      }), 'log auto-onboard-failed');
+      });
       await send('Paired, but no working directory is configured. Ask the operator to set pairedChatDefaults.cwd.');
       return null;
     }
@@ -1889,10 +1912,10 @@ function createBot(token) {
     catch (err) {
       console.error(`[${BOT_NAME}] saveConfig on auto-onboard failed: ${err.message}`);
     }
-    dbWrite(() => db.logEvent('chat-auto-created', {
+    logEvent('chat-auto-created', {
       bot: BOT_NAME, chat_id: chatId, user_id: userId,
       source: 'pair-claim', model: newChat.model, effort: newChat.effort,
-    }), 'log chat-auto-created');
+    });
 
     const chatLabel = res.chat_id ? `chat ${res.chat_id}` : `every chat ${BOT_NAME} is in`;
     const suffix = res.note ? `\n(${res.note})` : '';
@@ -1935,11 +1958,11 @@ function createBot(token) {
       // same as killing the chat — behavior unchanged for the common case.
       await pm.kill(sessionKey).catch((err) =>
         console.error(`[${BOT_NAME}] abort kill failed: ${err.message}`));
-      dbWrite(() => db.logEvent('abort-requested', {
+      logEvent('abort-requested', {
         chat_id: chatId, user_id: msg.from?.id || null,
         had_active: hadActive,
         trigger: cleanText.slice(0, 40),
-      }), 'log abort-requested');
+      });
       // Reply in the same language the user aborted in. Cyrillic-detection
       // is crude but reliable for ru/en (the only two cue sets we ship).
       const lang = /[а-яё]/i.test(cleanText) ? 'ru' : 'en';
@@ -2037,11 +2060,11 @@ function createBot(token) {
 
   bot.on('message', async (ctx) => {
     if (!isWellFormedMessage(ctx.message)) {
-      dbWrite(() => db.logEvent('malformed-update', {
+      logEvent('malformed-update', {
         bot: BOT_NAME,
         update_id: ctx.update?.update_id,
         reason: 'missing chat.id / message_id',
-      }), 'log malformed-update');
+      });
       return;
     }
     const chatId = ctx.chat.id.toString();
@@ -2096,21 +2119,21 @@ function createBot(token) {
 
   bot.on('edited_message', async (ctx) => {
     if (!isWellFormedMessage(ctx.editedMessage)) {
-      dbWrite(() => db.logEvent('malformed-update', {
+      logEvent('malformed-update', {
         bot: BOT_NAME,
         update_id: ctx.update?.update_id,
         reason: 'edited_message missing chat.id / message_id',
-      }), 'log malformed-update');
+      });
       return;
     }
     const chatId = ctx.editedMessage.chat.id.toString();
     if (!knownChat(chatId)) return;
     recordInbound(ctx.editedMessage);
-    dbWrite(() => db.logEvent('message-edited', {
+    logEvent('message-edited', {
       chat_id: chatId,
       msg_id: ctx.editedMessage.message_id,
       user_id: ctx.editedMessage.from?.id || null,
-    }), 'log message-edited');
+    });
     console.log(`[${BOT_NAME}] edited ${chatId}/${ctx.editedMessage.message_id}`);
   });
 
@@ -2122,26 +2145,26 @@ function createBot(token) {
     const rawNew = ctx.message?.migrate_to_chat_id;
     const isValidId = (v) => (typeof v === 'number' && Number.isFinite(v)) || typeof v === 'bigint';
     if (!isValidId(rawOld) || !isValidId(rawNew)) {
-      dbWrite(() => db.logEvent('malformed-update', {
+      logEvent('malformed-update', {
         bot: BOT_NAME,
         update_id: ctx.update?.update_id,
         reason: 'migrate_to_chat_id missing / non-numeric',
-      }), 'log malformed-update');
+      });
       return;
     }
     const oldChatId = rawOld.toString();
     const newChatId = rawNew.toString();
     if (oldChatId === newChatId) {
-      dbWrite(() => db.logEvent('malformed-update', {
+      logEvent('malformed-update', {
         bot: BOT_NAME,
         update_id: ctx.update?.update_id,
         reason: 'migrate_to_chat_id equals current chat_id',
-      }), 'log malformed-update');
+      });
       return;
     }
     console.log(`[${BOT_NAME}] chat migrated: ${oldChatId} → ${newChatId}`);
     dbWrite(() => db.logChatMigration(oldChatId, newChatId), 'log chat-migration');
-    dbWrite(() => db.logEvent('chat-migrated', { old_chat_id: oldChatId, new_chat_id: newChatId }), 'log chat-migrated event');
+    logEvent('chat-migrated', { old_chat_id: oldChatId, new_chat_id: newChatId });
     if (config.chats[oldChatId] && !config.chats[newChatId]) {
       config.chats[newChatId] = { ...config.chats[oldChatId] };
       delete config.chats[oldChatId];
@@ -2158,12 +2181,12 @@ function createBot(token) {
     const updateId = err.ctx?.update?.update_id;
     const msgId = err.ctx?.update?.message?.message_id || err.ctx?.update?.edited_message?.message_id;
     console.error(`[${BOT_NAME}] update ${updateId} msg ${msgId} error: ${err.message}`);
-    dbWrite(() => db.logEvent('update-error', {
+    logEvent('update-error', {
       bot: BOT_NAME,
       update_id: updateId,
       msg_id: msgId,
       error: err.message?.slice(0, 300),
-    }), 'log update-error');
+    });
   });
 
   bot._setBotUsername = (u) => {
@@ -2269,12 +2292,12 @@ function startPollWatchdog(bot) {
     if (age > POLL_STALL_MS) {
       if (!stalled) {
         console.error(`[${BOT_NAME}] poll-stalled: no tick in ${Math.round(age / 1000)}s`);
-        dbWrite(() => db.logEvent('poll-stalled', { bot: BOT_NAME, stall_ms: age }), 'log poll-stalled');
+        logEvent('poll-stalled', { bot: BOT_NAME, stall_ms: age });
         stalled = true;
       }
     } else if (stalled) {
       console.log(`[${BOT_NAME}] poll-recovered after stall`);
-      dbWrite(() => db.logEvent('poll-recovered', { bot: BOT_NAME }), 'log poll-recovered');
+      logEvent('poll-recovered', { bot: BOT_NAME });
       stalled = false;
     }
   }, 30_000);
@@ -2356,7 +2379,7 @@ async function main() {
     },
     onClose: (sessionKey, code, entry) => {
       console.log(`[${entry.label}] Process exited (code ${code})`);
-      dbWrite(() => db.logEvent('process-close', { chat_id: entry.chatId, session_key: sessionKey, code }), 'log process-close');
+      logEvent('process-close', { chat_id: entry.chatId, session_key: sessionKey, code });
     },
     onStreamChunk: (sessionKey, partial, entry) => {
       // Route to the head pending's per-turn streamer. In the 0.4.8
@@ -2431,22 +2454,22 @@ async function main() {
     if (remaining > 0 && db) {
       try {
         const res = db.markReplayPending({ botName: BOT_NAME });
-        dbWrite(() => db.logEvent('shutdown-drain', {
+        logEvent('shutdown-drain', {
           bot: BOT_NAME,
           in_flight: remaining,
           replay_marked: res?.changes ?? 0,
           elapsed_ms: drainElapsed,
-        }), 'log shutdown-drain');
+        });
         console.log(`[shutdown] drained ${drainElapsed}ms, ${remaining} still in-flight, ${res?.changes ?? 0} rows marked replay-pending`);
       } catch (err) {
         console.error(`[shutdown] markReplayPending failed: ${err.message}`);
       }
     } else if (db) {
-      dbWrite(() => db.logEvent('shutdown-drain', {
+      logEvent('shutdown-drain', {
         bot: BOT_NAME,
         in_flight: 0,
         elapsed_ms: drainElapsed,
-      }), 'log shutdown-drain');
+      });
       console.log(`[shutdown] clean drain in ${drainElapsed}ms`);
     }
 
@@ -2491,13 +2514,19 @@ async function main() {
   // Boot replay: re-dispatch any inbound turns that were interrupted by
   // the previous polygram's shutdown or crash. These are rows marked
   // 'dispatched', 'processing', or 'replay-pending' (set by the SIGTERM
-  // handler) — all within the last 30 min so we don't resurrect ancient
-  // work. Dedupe against already-sent outbound replies in case the
-  // previous instance DID answer before dying.
+  // handler) — all within the last `replayWindowMs` (default 3 min) so
+  // we don't resurrect ancient work. Override via
+  // `config.bot.replayWindowMs` for ops tuning. Dedupe against
+  // already-sent outbound replies in case the previous instance DID
+  // answer before dying.
   try {
     const chatIds = Object.keys(config.chats);
     if (chatIds.length > 0) {
-      const candidates = db.getReplayCandidates({ chatIds });
+      const replayWindowMs = (() => {
+        const v = Number(config.bot?.replayWindowMs);
+        return (Number.isInteger(v) && v > 0) ? v : undefined; // undefined → use db.js default
+      })();
+      const candidates = db.getReplayCandidates({ chatIds, ...(replayWindowMs && { olderThanMs: replayWindowMs }) });
       let replayed = 0;
       let skipped = 0;
       for (const row of candidates) {
@@ -2553,9 +2582,9 @@ async function main() {
       }
       if (candidates.length > 0) {
         console.log(`[replay] ${replayed} turns re-dispatched, ${skipped} skipped (already replied or no chat config)`);
-        dbWrite(() => db.logEvent('replay-on-boot', {
+        logEvent('replay-on-boot', {
           bot: BOT_NAME, replayed, skipped, total: candidates.length,
-        }), 'log replay-on-boot');
+        });
       }
     }
   } catch (err) {
