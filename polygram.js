@@ -206,23 +206,52 @@ function recordInbound(msg) {
   const user = msg.from?.first_name || msg.from?.username || null;
   const attachments = extractAttachments(msg);
   const chatConfig = config.chats[chatId];
+  const ts = (msg.date || Math.floor(Date.now() / 1000)) * 1000;
 
-  dbWrite(() => db.insertMessage({
-    chat_id: chatId,
-    thread_id: threadId,
-    msg_id: msg.message_id,
-    user,
-    user_id: msg.from?.id || null,
-    text: msg.text || msg.caption || '',
-    reply_to_id: msg.reply_to_message?.message_id || null,
-    direction: 'in',
-    source: 'polygram',
-    bot_name: BOT_NAME,
-    attachments_json: attachments.length ? JSON.stringify(attachments) : null,
-    model: chatConfig?.model || null,
-    effort: chatConfig?.effort || null,
-    ts: (msg.date || Math.floor(Date.now() / 1000)) * 1000,
-  }), `insert inbound ${chatId}/${msg.message_id}`);
+  dbWrite(() => {
+    db.insertMessage({
+      chat_id: chatId,
+      thread_id: threadId,
+      msg_id: msg.message_id,
+      user,
+      user_id: msg.from?.id || null,
+      text: msg.text || msg.caption || '',
+      reply_to_id: msg.reply_to_message?.message_id || null,
+      direction: 'in',
+      source: 'polygram',
+      bot_name: BOT_NAME,
+      // attachments_json kept temporarily as a fallback during the 0.6.0
+      // migration window; per-attachment rows below are the source of
+      // truth. Will be dropped in a follow-up minor.
+      attachments_json: attachments.length ? JSON.stringify(attachments) : null,
+      model: chatConfig?.model || null,
+      effort: chatConfig?.effort || null,
+      ts,
+    });
+
+    if (!attachments.length) return;
+    // Look up the just-inserted (or ON-CONFLICT-updated) message row id
+    // so attachments can FK to it. lastInsertRowid is unreliable across
+    // the upsert path; an explicit lookup is cheap and always correct.
+    const messageId = db.getInboundMessageId({ chat_id: chatId, msg_id: msg.message_id });
+    if (!messageId) return;
+    for (const att of attachments) {
+      db.insertAttachment({
+        message_id: messageId,
+        chat_id: chatId,
+        msg_id: msg.message_id,
+        thread_id: threadId,
+        bot_name: BOT_NAME,
+        file_id: att.file_id,
+        file_unique_id: att.file_unique_id,
+        kind: att.kind,
+        name: att.name,
+        mime_type: att.mime_type,
+        size_bytes: att.size,
+        ts,
+      });
+    }
+  }, `insert inbound ${chatId}/${msg.message_id}`);
 }
 
 
@@ -344,30 +373,57 @@ async function transcribeVoiceAttachments(downloaded, { chatId, msgId, label, bo
     }
   }));
 
-  // Persist transcription into the inbound row so FTS search finds it.
-  // Combine all successful transcriptions into `text` and mirror the
-  // transcription data back into attachments_json.
+  // Persist transcription:
+  //   - Per-attachment: setAttachmentTranscription stores the full
+  //     transcription object (text + language + duration + provider) as
+  //     JSON in the attachments.transcription column. buildVoiceTags
+  //     parses it back when building the prompt.
+  //   - Message-level: setMessageText updates messages.text with the
+  //     combined transcript so FTS finds "what Maria said" via the
+  //     normal chat search path. attachments_json is left as-is (will
+  //     be dropped in a future minor; per-attachment row is the source
+  //     of truth).
   const successful = targets.filter((a) => a.transcription?.text);
   if (!successful.length) return;
+  for (const a of successful) {
+    if (a.id != null) {
+      dbWrite(() => db.setAttachmentTranscription(a.id, JSON.stringify(a.transcription)),
+        `setAttachmentTranscription ${a.id}`);
+    }
+  }
   const combinedText = successful.map((a) => a.transcription.text).join(' ').trim();
-  const attJson = JSON.stringify(downloaded.map((a) => ({
-    kind: a.kind, name: a.name, mime_type: a.mime_type, size: a.size,
-    path: a.path, file_unique_id: a.file_unique_id,
-    transcription: a.transcription || null,
-  })));
   dbWrite(() => db.setMessageText({
     chat_id: chatId, msg_id: msgId,
-    text: combinedText, attachments_json: attJson,
+    text: combinedText, attachments_json: null,
   }), 'persist voice transcription');
 }
 
-async function downloadAttachments(bot, token, chatId, msg, attachments) {
-  if (!attachments.length) return [];
+// 0.6.0: takes attachment ROW objects from the DB (not raw extracted
+// metadata). Each row has an `id` so we can mark status as we go.
+// On replay: a row with status='downloaded' and a local_path that's
+// still on disk is reused without re-fetching. Anything else (failed,
+// missing file, never downloaded) hits Telegram's CDN.
+async function downloadAttachments(bot, token, chatId, msg, rows) {
+  if (!rows.length) return [];
   const chatDir = path.join(INBOX_DIR, String(chatId));
   fs.mkdirSync(chatDir, { recursive: true });
 
   const results = [];
-  for (const att of attachments) {
+  for (const att of rows) {
+    // Reuse path: row already says downloaded AND the file is on disk.
+    if (att.download_status === 'downloaded' && att.local_path) {
+      try {
+        if (fs.statSync(att.local_path).size > 0) {
+          results.push({
+            ...att,
+            path: att.local_path,
+            size: att.size_bytes || 0,
+            error: null,
+          });
+          continue;
+        }
+      } catch { /* fall through to refetch */ }
+    }
     try {
       const fileInfo = await bot.api.getFile(att.file_id);
       if (!fileInfo?.file_path) throw new Error('no file_path from getFile');
@@ -412,18 +468,22 @@ async function downloadAttachments(bot, token, chatId, msg, attachments) {
           console.log(`[attach] ${chatId} ← ${att.kind} ${safeName} (race: already on disk)`);
         }
       }
-      results.push({ ...att, path: localPath, size: att.size || buf.length });
+      results.push({ ...att, path: localPath, size: att.size_bytes || buf.length, error: null });
       console.log(`[attach] ${chatId} ← ${att.kind} ${safeName} (${buf.length} bytes) → ${localPath}`);
+      dbWrite(() => db.markAttachmentDownloaded(att.id, {
+        local_path: localPath, size_bytes: att.size_bytes || buf.length,
+      }), `markAttachmentDownloaded ${att.id}`);
     } catch (err) {
       // Don't drop the attachment silently — push it through with the
       // failure noted. buildAttachmentTags renders this as
       // <attachment-failed reason="..." /> so claude tells the user
       // "I couldn't see your <kind>" instead of pretending it received
-      // text only. Pre-0.5.11 these were logged to console and dropped,
-      // so claude got the prompt as if no attachment was sent.
+      // text only.
       const reason = (err.message || 'unknown').slice(0, 200);
       console.error(`[attach] download failed for ${att.name}: ${reason}`);
       results.push({ ...att, path: null, error: reason });
+      dbWrite(() => db.markAttachmentFailed(att.id, reason),
+        `markAttachmentFailed ${att.id}`);
     }
   }
   return results;
@@ -1399,7 +1459,39 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     dbWrite(() => db.logEvent('attachment-skipped', { chat_id: chatId, msg_id: msg.message_id, name: att.name, reason }), 'log attachment-skipped');
   }
   const token = config.bot?.token || '';
-  const downloaded = accepted.length ? await downloadAttachments(bot, token, chatId, msg, accepted) : [];
+
+  // 0.6.0: pull persisted attachment rows (recordInbound inserted them
+  // upstream). Filter to the ones that survived filterAttachments.
+  // Replays / reconstructed messages may not have inserted rows yet —
+  // for that path we fall back to the in-memory `accepted` list. Both
+  // shapes have the same fields downloadAttachments consumes (kind,
+  // file_id, file_unique_id, name, mime_type) plus optionally `id` /
+  // `download_status` / `local_path` for the row variant.
+  const messageId = db.getInboundMessageId({ chat_id: chatId, msg_id: msg.message_id });
+  const allRows = messageId ? db.getAttachmentsByMessage(messageId) : [];
+  const acceptedKeys = new Set(accepted.map((a) => a.file_unique_id || a.file_id));
+  let downloadInputs;
+  if (allRows.length) {
+    downloadInputs = allRows.filter((r) => acceptedKeys.has(r.file_unique_id || r.file_id));
+  } else {
+    // Fallback for replayed turns where rows weren't persisted: synthesize
+    // row-like objects so downloadAttachments treats them as never-tried.
+    downloadInputs = accepted.map((a) => ({
+      ...a, id: null, size_bytes: a.size,
+      download_status: 'pending', local_path: null,
+    }));
+  }
+  const downloaded = downloadInputs.length
+    ? await downloadAttachments(bot, token, chatId, msg, downloadInputs)
+    : [];
+  // Decode JSON-encoded transcription on enriched rows so buildVoiceTags
+  // can read .text/.language/.duration_sec/.provider directly.
+  for (const a of downloaded) {
+    if (typeof a.transcription === 'string' && a.transcription) {
+      try { a.transcription = JSON.parse(a.transcription); }
+      catch { /* leave as string */ }
+    }
+  }
   if (rejected.length) {
     const summary = rejected.map(({ att, reason }) => `${att.name}: ${reason}`).join('; ');
     try {
@@ -2339,13 +2431,21 @@ async function main() {
           ...(row.thread_id && { message_thread_id: Number(row.thread_id) }),
           ...(row.reply_to_id && { reply_to_message: { message_id: row.reply_to_id } }),
         };
-        // Attach already-extracted attachments via the media-group shortcut
+        // Attach already-recorded attachments via the media-group shortcut
         // field so extractAttachments picks them up without re-parsing
         // grammy fields that don't exist on this reconstructed object.
-        if (row.attachments_json) {
-          try {
-            reconstructed._mergedAttachments = JSON.parse(row.attachments_json);
-          } catch {}
+        // 0.6.0: read from the per-attachment table; fall back to the
+        // legacy attachments_json blob for rows inserted before migration
+        // 007 ran (covers the small window during the upgrade).
+        const attRows = db.getAttachmentsByMessage(row.id);
+        if (attRows.length) {
+          reconstructed._mergedAttachments = attRows.map((a) => ({
+            kind: a.kind, name: a.name, mime_type: a.mime_type,
+            size: a.size_bytes, file_id: a.file_id, file_unique_id: a.file_unique_id,
+          }));
+        } else if (row.attachments_json) {
+          try { reconstructed._mergedAttachments = JSON.parse(row.attachments_json); }
+          catch {}
         }
         const chatConfig = config.chats[row.chat_id];
         if (!chatConfig) { skipped += 1; continue; }
