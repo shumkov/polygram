@@ -34,6 +34,7 @@ const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/voice'
 const { createStreamer } = require('./lib/stream-reply');
 const { chunkMarkdownText } = require('./lib/telegram-chunk');
 const { deliverReplies } = require('./lib/deliver');
+const { announce, shouldAnnounce } = require('./lib/announces');
 const { isAbortRequest } = require('./lib/abort-detector');
 const { startTyping } = require('./lib/typing-indicator');
 const { redactBotToken } = require('./lib/net-errors');
@@ -2544,6 +2545,28 @@ async function main() {
       const head = entry.pendingQueue?.[0];
       const r = head?.context?.reactor;
       if (r) r.setState(classifyToolName(toolName));
+      // 0.7.0 (Phase J): opt-in subagent announce. When Claude uses
+      // the Task tool to spawn a subagent, post a brief informational
+      // message to the chat so the user knows a heavier turn is in
+      // progress. Off by default (per-bot or per-chat
+      // `announceSubagents: true` opts in). Per-chat debounce 30s
+      // prevents announce-storms in tool-heavy turns.
+      const chatCfg = config.chats[entry.chatId] || {};
+      const optIn = chatCfg.announceSubagents != null
+        ? chatCfg.announceSubagents
+        : config.bot?.announceSubagents;
+      if (toolName === 'Task' && optIn === true) {
+        if (shouldAnnounce(entry.chatId)) {
+          announce({
+            send: (b, method, params, m) => tg(b, method, params, m),
+            bot, chatId: entry.chatId,
+            threadId: head?.context?.threadId ?? null,
+            text: '🤖 Spawning subagent…',
+            meta: { botName: BOT_NAME, source: 'subagent-announce' },
+            logger: { error: (m) => console.error(`[${entry.label}] ${m}`) },
+          });
+        }
+      }
     },
     // 0.7.0 (Phase F): each new top-level assistant message gets its
     // own bubble. When Claude emits text, then tool_use, then more
