@@ -707,6 +707,83 @@ let pm = null; // ProcessManager, created in main()
 // the assistant was mid-tool-use).
 const autosteerBuffer = createAutosteerBuffer();
 
+// 0.8.0-rc.14: track msg_ids that received the AUTOSTEERED ✍ ack, per
+// session, so we can clear those reactions when the in-flight turn
+// finishes. Pre-rc.14 the ✍ persisted forever because each autosteer
+// invocation runs in its OWN handleMessage scope (own reactor), and
+// the TRIGGER message's reactor.clear() at turn-end couldn't reach
+// across to other messages. Without this map, users see ✍ stuck on
+// every follow-up and don't know whether the bot incorporated them.
+const autosteeredMsgRefs = new Map(); // sessionKey → [{chatId, msgId}]
+
+async function clearAutosteeredReactions(sessionKey) {
+  const list = autosteeredMsgRefs.get(sessionKey);
+  if (!list || list.length === 0) return;
+  autosteeredMsgRefs.delete(sessionKey);
+  if (!bot) return;
+  for (const { chatId: cid, msgId } of list) {
+    try {
+      await tg(bot, 'setMessageReaction', {
+        chat_id: cid, message_id: msgId, reaction: [],
+      }, { source: 'autosteer-clear', botName: BOT_NAME });
+    } catch (err) {
+      // Ack-clear failures are silent — the ✍ stays on screen
+      // but doesn't block the in-flight turn's reply UX.
+    }
+  }
+}
+
+// 0.8.0-rc.14: tool-less-turn drain. PostToolBatch hook only fires
+// on tool boundaries — when a Query produces a turn that uses ZERO
+// tools (just a text answer), the autosteerBuffer never gets
+// drained and any user follow-ups buffered during that turn
+// disappear silently into the next tool-using turn (or never, if
+// the chat is purely conversational).
+//
+// Workaround: at every success exit in handleMessage, check if
+// the buffer still has items and dispatch them as a synthetic
+// next turn via pm.send. The bot replies to the drained content
+// in a fresh turn — UX-wise the user sees TWO replies (one to
+// the trigger message, one to "B + C") which is the same as if
+// they'd sent the messages without autosteer. Better than losing.
+async function drainStaleAutosteerBuffer(sessionKey, chatId, threadId) {
+  const stale = autosteerBuffer.drain(sessionKey);
+  if (stale.length === 0) return;
+  const followUpPrompt = stale.join('\n\n');
+  logEvent('autosteer-stale-drain', {
+    chat_id: chatId,
+    session_key: sessionKey,
+    message_count: stale.length,
+    text_len: followUpPrompt.length,
+  });
+  // Dispatch as a fresh pm.send via setImmediate so we don't
+  // block the current handleMessage's success-path return. No
+  // streamer / reactor — the synthetic turn gets a plain bubble
+  // reply (no streaming preview, no progress reactions). User
+  // already saw their ✍ ack on the original follow-up; this
+  // turn's existence is the substantive response.
+  setImmediate(async () => {
+    try {
+      const chatConfig = config.chats[chatId];
+      if (!chatConfig) return;
+      const result = await sendToProcess(sessionKey, followUpPrompt, {
+        streamer: null, reactor: null, sourceMsgId: null,
+      });
+      if (result?.text && bot) {
+        await tg(bot, 'sendMessage', {
+          chat_id: chatId,
+          text: result.text,
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        }, { source: 'autosteer-stale-reply', botName: BOT_NAME }).catch((err) => {
+          console.error(`[${BOT_NAME}] autosteer-stale-reply send: ${err.message}`);
+        });
+      }
+    } catch (err) {
+      console.error(`[${BOT_NAME}] autosteer-stale-drain dispatch: ${err.message}`);
+    }
+  });
+}
+
 function spawnClaude(sessionKey, ctx) {
   const { chatConfig, existingSessionId, label, chatId } = ctx;
   // 0.7.3: Claude Code's Chrome-extension integration (browser
@@ -2464,6 +2541,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     if (entry?.inFlight) {
       const ok = autosteerBuffer.append(sessionKey, prompt);
       if (ok) {
+        // Track this msg_id so the in-flight turn's success / abort
+        // / error path can clear the ✍ reaction at turn-end.
+        const refs = autosteeredMsgRefs.get(sessionKey) || [];
+        refs.push({ chatId, msgId: msg.message_id });
+        autosteeredMsgRefs.set(sessionKey, refs);
         logEvent('autosteer', {
           chat_id: chatId, msg_id: msg.message_id,
           text_len: prompt?.length ?? 0,
@@ -2567,6 +2649,16 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // every answered message is chat noise (plus triggers reaction
       // notifications for other group members).
       reactor.clear().catch(() => {});
+      // 0.8.0-rc.14: also clear ✍ reactions on every follow-up
+      // message that was autosteered into THIS turn — they live in
+      // separate handleMessage scopes whose reactors are already GC'd.
+      clearAutosteeredReactions(sessionKey).catch(() => {});
+      // rc.14: tool-less-turn drain. PostToolBatch hook fires only
+      // on tool boundaries; if this turn produced ZERO tools, the
+      // hook never fired and the autosteer buffer still has the
+      // user's follow-ups. Dispatch them as a synthetic next turn
+      // so the bot at least addresses them (better than losing).
+      drainStaleAutosteerBuffer(sessionKey, chatId, threadId).catch(() => {});
 
       // 0.8.0 Phase 2 step 4: 85%-context-full live hint. After a
       // successful turn, peek at SDK's getContextUsage(); if past
@@ -2623,6 +2715,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         && (result.metrics?.numAssistantMessages ?? 0) > 0;
       if (toolOnlyTurn) {
         await reactor.clear().catch(() => {});
+        clearAutosteeredReactions(sessionKey).catch(() => {});
+        // Tool-only turns DID fire PostToolBatch — buffer was drained
+        // — but autosteers received AFTER the last tool-result still
+        // wouldn't be merged. Defensive drain here too.
+        drainStaleAutosteerBuffer(sessionKey, chatId, threadId).catch(() => {});
         logEvent('tool-only-completion', {
           chat_id: chatId, msg_id: msg.message_id, bot: BOT_NAME,
           num_tool_uses: result.metrics?.numToolUses,
@@ -2793,6 +2890,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // the visible reaction. We DON'T set 🤯/😨 (those are for
       // unexpected errors); the user just wants their stop honored.
       await reactor.clear().catch(() => {});
+      // rc.14: clear ✍ on autosteered followups too (per-msg
+      // reactors are already GC'd in their own handleMessage scopes).
+      await clearAutosteeredReactions(sessionKey).catch(() => {});
     } else {
       await streamer.finalize('', { errorSuffix: 'stream interrupted' }).catch(() => {});
       if (/wall-clock ceiling|idle with no Claude activity/i.test(err?.message || '')) {
@@ -3007,6 +3107,9 @@ function createBot(token) {
       // (stale steer leak across abort boundary, which is what the
       // user just asked us not to do).
       autosteerBuffer.clear(sessionKey);
+      // rc.14: also clear ✍ reactions on already-autosteered
+      // messages from this aborted turn — they're now dead context.
+      clearAutosteeredReactions(sessionKey).catch(() => {});
       logEvent('abort-requested', {
         chat_id: chatId, user_id: msg.from?.id || null,
         had_active: hadActive,
