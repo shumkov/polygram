@@ -1748,12 +1748,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // at which point we flip to THINKING (🤔).
   reactor.setState('QUEUED');
 
-  // Mark the inbound row terminal so boot replay doesn't pick it up again.
-  // Must fire down EVERY non-throwing exit path (early returns for error/
-  // NO_REPLY, streamed-reply early return, regular reply at end). 0.5.4
-  // hardened this — earlier versions only marked at the bottom of try, so
-  // streamed replies (which return at line ~1477) left handler_status
-  // stuck at 'dispatched' forever, causing replay loops on every restart.
+  // Mark the inbound row terminal so boot replay doesn't pick it up
+  // again. Must fire down EVERY non-throwing exit path (early returns
+  // for error / NO_REPLY, streamed-reply preview-becomes-final, the
+  // discard+redeliver branch, regular reply at end). Earlier versions
+  // only marked at the bottom of try, so streamed-reply early returns
+  // left handler_status stuck at 'dispatched' forever and the next
+  // boot replayed every long turn.
   const markReplied = () => dbWrite(() => db.setInboundHandlerStatus({
     chat_id: chatId, msg_id: msg.message_id, status: 'replied',
   }), 'set handler_status=replied');
@@ -1800,6 +1801,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // those still markReplied silently.
     if (result.text === 'NO_REPLY') { markReplied(); return; }
     if (!result.text) {
+      // 0.7.1: if the fallback send itself fails, throw rather than
+      // silently markReplied — the user gets nothing AND the inbound
+      // is marked replied so boot replay won't redispatch. Same
+      // anti-pattern that caused msg-10794. Promote to a thrown error
+      // so dispatchHandleMessage's catch branches correctly:
+      //   shutdown   → 'replay-pending' (boot replay retries)
+      //   runtime    → 'failed' + user-visible apology via errorReplyText
       try {
         await tg(bot, 'sendMessage', {
           chat_id: chatId,
@@ -1808,7 +1816,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
         }, { ...outMetaBase, source: 'empty-response-fallback' });
       } catch (err) {
-        console.error(`[${label}] empty-response fallback send failed: ${err.message}`);
+        reactor.setState('ERROR');
+        logEvent('telegram-empty-response-fallback-failed', {
+          chat_id: chatId, msg_id: msg.message_id, bot: BOT_NAME,
+          error: err.message?.slice(0, 200),
+        });
+        throw new Error(`empty-response fallback send failed: ${err.message}`);
       }
       logEvent('telegram-empty-response-fallback', {
         chat_id: chatId, msg_id: msg.message_id, bot: BOT_NAME,
@@ -1820,7 +1833,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     const parsed = parseResponse(result.text);
     const outMeta = { ...outMetaBase, sessionId: result.sessionId, costUsd: result.cost };
 
-    // 0.7.0 streamed text path: OpenClaw's preview-becomes-final flow.
+    // OpenClaw's preview-becomes-final flow:
     //
     //   1. flushDraft() — drain any pending throttled edit so the
     //      bubble's visible state is up-to-date before deciding.
@@ -1828,12 +1841,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     //      final body. Returns rich result describing whether the
     //      preview can stand as the final reply.
     //   3a. finalEditOk:true        → preview IS final, done.
-    //   3b. overflow OR !finalEditOk → discard preview, redeliver via
-    //      deliverReplies(chunkMarkdownText(...)). This is the path
-    //      that fixes msg-10794: if the live bubble couldn't render
-    //      the full body (size or parse error), we delete it cleanly
-    //      and send the proper chunks fresh at chat bottom — no
-    //      content lost, no stranded edit-failure bubble.
+    //   3b. overflow OR !finalEditOk → discard preview, redeliver
+    //      via deliverReplies(chunkMarkdownText(...)). The bubble
+    //      couldn't render the full body (size or parse error), so
+    //      we delete it cleanly and send the proper chunks fresh at
+    //      chat bottom — no content lost, no stranded bubble.
     if (parsed.text) {
       await streamer.flushDraft();
       const fin = await streamer.finalize(parsed.text);
@@ -1868,7 +1880,24 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           delivered: r.sent.length, failed: r.failed.length,
           bot: BOT_NAME,
         });
-        console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed-redeliver(${reason}, ${chunks.length} chunks) | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
+        // 0.7.1: surface partial-failure to the user. Without this,
+        // a chunk-3-of-5 failure leaves a coherent-looking reply with
+        // a silent gap (the user reads chunks 1, 2, 4, 5 unaware
+        // that chunk 3 was dropped). Append a warning + flip the
+        // reactor to ERROR so something visible signals "look here".
+        if (r.failed.length > 0) {
+          reactor.setState('ERROR');
+          try {
+            await tg(bot, 'sendMessage', {
+              chat_id: chatId,
+              text: `⚠️ ${r.failed.length} of ${chunks.length} message parts failed to deliver. The reply may be incomplete — please retry.`,
+              ...(threadId && { message_thread_id: threadId }),
+            }, { ...outMetaBase, source: 'partial-delivery-warning' });
+          } catch (warnErr) {
+            console.error(`[${label}] partial-delivery warning failed: ${warnErr.message}`);
+          }
+        }
+        console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed-redeliver(${reason}, ${chunks.length} chunks${r.failed.length ? `, ${r.failed.length} failed` : ''}) | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
         markReplied();
         return;
       }

@@ -40,7 +40,7 @@ describe('deliverReplies — early returns', () => {
     const r = await deliverReplies({
       bot: {}, send, chatId: '1', chunks: [], logger: silentLogger(),
     });
-    assert.deepEqual(r, { sent: [], failed: [] });
+    assert.deepEqual(r, { sent: [], failed: [], results: [] });
     assert.equal(calls.length, 0);
   });
 
@@ -48,12 +48,44 @@ describe('deliverReplies — early returns', () => {
     const { send } = makeFakeSend();
     assert.deepEqual(
       await deliverReplies({ bot: {}, send, chatId: '1', chunks: null, logger: silentLogger() }),
-      { sent: [], failed: [] },
+      { sent: [], failed: [], results: [] },
     );
     assert.deepEqual(
       await deliverReplies({ bot: {}, send, chatId: '1', chunks: undefined, logger: silentLogger() }),
-      { sent: [], failed: [] },
+      { sent: [], failed: [], results: [] },
     );
+  });
+});
+
+// 0.7.1: results[] preserves correspondence with input chunks[]
+describe('deliverReplies — results array (0.7.1)', () => {
+  test('results[i] always corresponds to chunks[i]', async () => {
+    const { send } = makeFakeSend({ errorOnIndex: 1 });
+    const r = await deliverReplies({
+      bot: {}, send, chatId: '1', chunks: ['a', 'b', 'c'], logger: silentLogger(),
+    });
+    assert.equal(r.results.length, 3);
+    assert.equal(r.results[0].index, 0);
+    assert.equal(r.results[0].status, 'ok');
+    assert.equal(r.results[1].index, 1);
+    assert.equal(r.results[1].status, 'fail');
+    assert.equal(r.results[2].index, 2);
+    assert.equal(r.results[2].status, 'ok');
+    // Failed result has error, ok results have messageId.
+    assert.ok(r.results[0].messageId);
+    assert.ok(r.results[1].error);
+    assert.ok(r.results[2].messageId);
+  });
+
+  test('back-compat: sent[] and failed[] still populated', async () => {
+    const { send } = makeFakeSend({ errorOnIndex: 1 });
+    const r = await deliverReplies({
+      bot: {}, send, chatId: '1', chunks: ['a', 'b', 'c'], logger: silentLogger(),
+    });
+    // sent has 2 entries (chunks 0 and 2), failed has 1 (chunk 1).
+    assert.equal(r.sent.length, 2);
+    assert.equal(r.failed.length, 1);
+    assert.equal(r.failed[0].index, 1);
   });
 });
 

@@ -474,3 +474,139 @@ describe('ProcessManager construction', () => {
     assert.throws(() => new ProcessManager({}), /spawnFn required/);
   });
 });
+
+// ─── 0.7.0 (Phase F): assistant-message-start callback + REPLACE accumulator ─
+
+describe('ProcessManager onAssistantMessageStart + streamText REPLACE', () => {
+  let pm;
+  let chunks;
+  let starts;
+
+  beforeEach(() => {
+    chunks = [];
+    starts = [];
+    pm = new ProcessManager({
+      cap: 4,
+      killTimeoutMs: 50,
+      logger: { error: () => {}, log: () => {} },
+      spawnFn: () => makeFakeProc(),
+      onStreamChunk: (sessionKey, partial) => chunks.push(partial),
+      onAssistantMessageStart: (sessionKey) => starts.push(sessionKey),
+    });
+  });
+
+  afterEach(async () => { await pm.shutdown(); });
+
+  test('REPLACE accumulator: same-id cumulative events do not concat', async () => {
+    // Anthropic stream-json semantics: each `assistant` event carries
+    // the FULL message text-so-far (cumulative, not delta). The 0.7.0
+    // change replaced `streamText = streamText + '\n\n' + added` (which
+    // produced quadratic duplication) with `streamText = added`. A
+    // regression to the old behavior would silently double-paste content.
+    const entry = await pm.getOrSpawn('a');
+    pm.send('a', 'hi').catch(() => {});
+    entry.proc.emitEvent({
+      type: 'assistant',
+      message: { id: 'msg-1', content: [{ type: 'text', text: 'Hello' }] },
+    });
+    entry.proc.emitEvent({
+      type: 'assistant',
+      message: { id: 'msg-1', content: [{ type: 'text', text: 'Hello world' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(chunks, ['Hello', 'Hello world']);
+    // Critical: streamText is the LATEST cumulative value, not concat.
+    assert.equal(entry.pendingQueue[0].streamText, 'Hello world');
+  });
+
+  test('onAssistantMessageStart fires on message_id transition', async () => {
+    const entry = await pm.getOrSpawn('a');
+    pm.send('a', 'hi').catch(() => {});
+    // First message — should NOT fire (no previous id).
+    entry.proc.emitEvent({
+      type: 'assistant',
+      message: { id: 'msg-1', content: [{ type: 'text', text: 'first' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(starts.length, 0, 'first message should not fire start');
+    // Second message — different id, should fire ONCE.
+    entry.proc.emitEvent({
+      type: 'assistant',
+      message: { id: 'msg-2', content: [{ type: 'text', text: 'second' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(starts.length, 1, 'message_id transition should fire start');
+    assert.equal(starts[0], 'a');
+    // Same-id again — should NOT fire.
+    entry.proc.emitEvent({
+      type: 'assistant',
+      message: { id: 'msg-2', content: [{ type: 'text', text: 'second extended' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(starts.length, 1, 'same-id event should not re-fire start');
+  });
+
+  test('onAssistantMessageStart does NOT fire when streamText is still empty', async () => {
+    const entry = await pm.getOrSpawn('a');
+    pm.send('a', 'hi').catch(() => {});
+    // First event has only thinking content (no text) — extractAssistantText
+    // returns ''. streamText stays empty, lastAssistantMessageId stays null.
+    entry.proc.emitEvent({
+      type: 'assistant',
+      message: { id: 'msg-1', content: [{ type: 'thinking', thinking: 'pondering' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+    // Different message id arrives with text — but since streamText was
+    // empty, this is the first real message text. Should NOT fire start.
+    entry.proc.emitEvent({
+      type: 'assistant',
+      message: { id: 'msg-2', content: [{ type: 'text', text: 'now actual content' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(starts.length, 0, 'first text emission should not fire start');
+    assert.equal(chunks.length, 1);
+    assert.equal(chunks[0], 'now actual content');
+  });
+
+  test('onAssistantMessageStart does NOT fire when message.id is missing', async () => {
+    const entry = await pm.getOrSpawn('a');
+    pm.send('a', 'hi').catch(() => {});
+    entry.proc.emitEvent({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'first' }] },
+    });
+    entry.proc.emitEvent({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'second' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+    // Without id-based boundary detection we can't tell if these are
+    // separate messages. Conservatively: don't fire start.
+    assert.equal(starts.length, 0);
+  });
+
+  test('cumulative semantics: thinking-only event between text events keeps last text', async () => {
+    // Realistic stream-json sequence: text → thinking → text (same msg).
+    // The thinking event has no text blocks, so extractAssistantText
+    // returns ''. The `if (added)` skip preserves streamText unchanged.
+    // A subsequent text event must REPLACE with the new cumulative,
+    // not concat onto the stale one.
+    const entry = await pm.getOrSpawn('a');
+    pm.send('a', 'hi').catch(() => {});
+    entry.proc.emitEvent({
+      type: 'assistant',
+      message: { id: 'msg-x', content: [{ type: 'text', text: 'partial' }] },
+    });
+    entry.proc.emitEvent({
+      type: 'assistant',
+      message: { id: 'msg-x', content: [{ type: 'thinking', thinking: 'meta' }] },
+    });
+    entry.proc.emitEvent({
+      type: 'assistant',
+      message: { id: 'msg-x', content: [{ type: 'text', text: 'partial extended' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(chunks, ['partial', 'partial extended']);
+    assert.equal(entry.pendingQueue[0].streamText, 'partial extended');
+  });
+});

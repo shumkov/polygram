@@ -32,9 +32,19 @@ describe('chunkText — early returns', () => {
     assert.deepEqual(chunkText(null, 100), []);
     assert.deepEqual(chunkText(undefined, 100), []);
   });
-  test('limit ≤ 0 returns input unsplit', () => {
-    assert.deepEqual(chunkText('hello', 0), ['hello']);
-    assert.deepEqual(chunkText('hello', -5), ['hello']);
+  test('limit ≤ 0 throws RangeError (footgun guard)', () => {
+    // 0.7.1: a misread config value (e.g. typoed `linit: 0`) that
+    // previously silently returned [text] would let an oversized body
+    // pass through and trip Telegram's 400 cap. Throw instead.
+    assert.throws(() => chunkText('hello', 0), /positive/);
+    assert.throws(() => chunkText('hello', -5), /positive/);
+    assert.throws(() => chunkText('hello', NaN), /positive/);
+    assert.throws(() => chunkText('hello', undefined), /positive/);
+  });
+  test('non-string text throws TypeError', () => {
+    assert.throws(() => chunkText(123, 100), /must be a string/);
+    assert.throws(() => chunkText({}, 100), /must be a string/);
+    assert.throws(() => chunkText([], 100), /must be a string/);
   });
   test('text shorter than limit returns single chunk', () => {
     assert.deepEqual(chunkText('hello', 100), ['hello']);
