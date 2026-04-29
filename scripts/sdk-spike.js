@@ -241,28 +241,34 @@ gates[8.5] = async () => {
 gates[9] = async () => {
   const name = 'canUseTool callback fires; opts.toolUseID + opts.signal real';
   let saw = null;
+  // Stronger prompt: tool result is the ONLY way to answer.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'spike-canusetool-'));
+  fs.writeFileSync(path.join(tmp, 'answer.txt'), 'spike-marker-9999\n');
   try {
-    await singleTurn('list ~/Desktop please using ls', {
-      model: 'claude-haiku-4-5',
-      effort: 'low',
-      permissionMode: 'default',  // require canUseTool
-      allowDangerouslySkipPermissions: false,
-      canUseTool: async (toolName, input, opts) => {
-        saw = {
-          toolName,
-          inputKeys: Object.keys(input || {}),
-          optKeys: Object.keys(opts || {}),
-          hasSignal: !!opts?.signal,
-          hasToolUseID: typeof opts?.toolUseID === 'string',
-          hasTitle: 'title' in opts,
-          hasDecisionReason: 'decisionReason' in opts,
-        };
-        return { behavior: 'deny', message: 'spike: deny' };
+    await singleTurn(
+      'Use the Bash tool to run `cat answer.txt` (the file is in your current working directory) and report what you read.',
+      {
+        cwd: tmp,
+        model: 'claude-haiku-4-5',
+        effort: 'low',
+        permissionMode: 'default',
+        allowDangerouslySkipPermissions: false,
+        canUseTool: async (toolName, input, opts) => {
+          saw = {
+            toolName,
+            inputKeys: Object.keys(input || {}),
+            optKeys: Object.keys(opts || {}).sort(),
+            hasSignal: !!opts?.signal,
+            hasToolUseID: typeof opts?.toolUseID === 'string',
+            hasTitle: 'title' in opts,
+            hasDecisionReason: 'decisionReason' in opts,
+          };
+          return { behavior: 'deny', message: 'spike: deny' };
+        },
       },
-    });
-  } catch (e) {
-    // expected: deny + interrupted often errors
-  }
+    );
+  } catch (e) { /* expected */ }
+  try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
   if (saw) record(9, name, 'PASS', saw);
   else record(9, name, 'FAIL', 'canUseTool was never called');
 };
