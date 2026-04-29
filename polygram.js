@@ -1903,13 +1903,18 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     }
     try {
       const u = await q.getContextUsage();
-      const pct = ((u?.percentage ?? 0) * 100).toFixed(0);
+      // SDK returns percentage in 0-100 scale (verified rc.3 prod
+      // — saw "77" for a 77%-used context). Display directly.
+      const pct = (u?.percentage ?? 0).toFixed(0);
       const total = (u?.totalTokens ?? 0).toLocaleString();
       const max = (u?.maxTokens ?? 0).toLocaleString();
       const lines = [`📚 Context: ${total} / ${max} tokens (${pct}%)`];
       if (u?.model) lines.push(`Model: ${u.model}`);
       if (u?.isAutoCompactEnabled && u?.autoCompactThreshold) {
-        const thrPct = (u.autoCompactThreshold * 100).toFixed(0);
+        // autoCompactThreshold scale is currently unverified; assume
+        // matches percentage (0-100). If it turns out to be 0-1 we'll
+        // see something like "Auto-compact at 0%" and can flip back.
+        const thrPct = u.autoCompactThreshold.toFixed(0);
         lines.push(`Auto-compact at ${thrPct}%.`);
       }
       // Top-3 categories by token cost so the user knows where the
@@ -2523,11 +2528,15 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         const q = entry?.query;
         if (q && typeof q.getContextUsage === 'function') {
           q.getContextUsage().then((usage) => {
+            // SDK returns percentage in 0-100 scale, not 0-1.
+            // Pre-rc.4 we treated it as a 0-1 ratio and multiplied
+            // by 100, which displayed "7700% full" for a 77%-used
+            // context (and fired below the intended 85% threshold).
             const pct = usage?.percentage ?? 0;
-            if (pct < 0.85) return;
+            if (pct < 85) return;
             return tg(bot, 'sendMessage', {
               chat_id: chatId,
-              text: `📚 Context window ${(pct * 100).toFixed(0)}% full. Send /new to start fresh — older messages will start dropping soon.`,
+              text: `📚 Context window ${pct.toFixed(0)}% full. Send /new to start fresh — older messages will start dropping soon.`,
               ...(threadId ? { message_thread_id: threadId } : {}),
             }, { source: 'context-full-hint', botName: BOT_NAME });
           }).catch((err) => {
