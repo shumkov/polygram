@@ -793,6 +793,10 @@ function buildSdkOptions(sessionKey, ctx) {
     try {
       agentBundle = agentLoader.loadAgent(chatConfig.agent, {
         homeDir: CHILD_HOME,
+        // Pass cwd so the loader checks Claude Code's project-level
+        // path (`<cwd>/.claude/agents/<name>.md`) before the
+        // user-level path or polygram's directory convention.
+        cwd: chatConfig.cwd,
         logger: console,
       });
     } catch (err) {
@@ -2782,7 +2786,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     const abortedByUser = isSessionRecentlyAborted(sessionKey);
     if (abortedByUser) {
       await streamer.finalize('').catch(() => {});
-      // Leave reaction as-is — no 🤯 / 😨; user asked for stop.
+      // 0.8.0-rc.13: clear the in-flight emoji on abort so the user
+      // sees a clean message after their /stop ack — pre-rc.13 the
+      // last 👀 / 🤔 / ✍ stayed stuck on the message indefinitely
+      // because reactor.stop() (in finally) only kills timers, not
+      // the visible reaction. We DON'T set 🤯/😨 (those are for
+      // unexpected errors); the user just wants their stop honored.
+      await reactor.clear().catch(() => {});
     } else {
       await streamer.finalize('', { errorSuffix: 'stream interrupted' }).catch(() => {});
       if (/wall-clock ceiling|idle with no Claude activity/i.test(err?.message || '')) {
@@ -2992,6 +3002,11 @@ function createBot(token) {
         await stopTarget.kill(sessionKey).catch((err) =>
           console.error(`[${BOT_NAME}] abort kill failed: ${err.message}`));
       }
+      // 0.8.0-rc.13: drop any buffered autosteer follow-ups for this
+      // session — otherwise they'd be injected into the NEXT turn
+      // (stale steer leak across abort boundary, which is what the
+      // user just asked us not to do).
+      autosteerBuffer.clear(sessionKey);
       logEvent('abort-requested', {
         chat_id: chatId, user_id: msg.from?.id || null,
         had_active: hadActive,
