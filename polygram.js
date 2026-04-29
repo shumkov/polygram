@@ -1725,14 +1725,18 @@ async function handleConfigCallback(ctx) {
   const callbackThreadId = ctx.callbackQuery.message?.message_thread_id?.toString() || null;
   const callbackSessionKey = getSessionKey(chatId, callbackThreadId, chatConfig);
   const reason = setting === 'model' ? 'model-change' : 'effort-change';
+  // Feature-detect on the routed pm for this specific session, not on
+  // the router itself (the router exposes every method as a forwarding
+  // shim so `typeof pm.X` is always 'function').
+  const pmForCb = pm.pickFor(callbackSessionKey);
   let respawn;
-  if (typeof pm.requestRespawn === 'function') {
-    respawn = pm.requestRespawn(callbackSessionKey, reason);
-  } else if (setting === 'effort' && typeof pm.applyFlagSettings === 'function') {
-    const ok = await pm.applyFlagSettings(callbackSessionKey, { effortLevel: value });
+  if (typeof pmForCb.requestRespawn === 'function') {
+    respawn = pmForCb.requestRespawn(callbackSessionKey, reason);
+  } else if (setting === 'effort' && typeof pmForCb.applyFlagSettings === 'function') {
+    const ok = await pmForCb.applyFlagSettings(callbackSessionKey, { effortLevel: value });
     respawn = { killed: ok };
-  } else if (setting === 'model' && typeof pm.setModel === 'function') {
-    const ok = await pm.setModel(callbackSessionKey, value);
+  } else if (setting === 'model' && typeof pmForCb.setModel === 'function') {
+    const ok = await pmForCb.setModel(callbackSessionKey, value);
     respawn = { killed: ok };
   } else {
     respawn = { killed: false };
@@ -1891,8 +1895,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // usage report. Only meaningful under SDK pm (CLI pm has no
   // getContextUsage equivalent); CLI path replies with a hint.
   if (botAllowsCommands && text === '/context') {
-    if (!USE_SDK) {
-      await sendReply('📚 /context requires the SDK pm (set POLYGRAM_USE_SDK=1 to enable).');
+    if (!pm.isSdkFor(sessionKey)) {
+      await sendReply('📚 /context requires the SDK pm. This chat is on the CLI pm path.');
       return;
     }
     const entry = pm.get(sessionKey);
@@ -1937,9 +1941,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   }
   if (botAllowsCommands && (text === '/new' || text === '/reset')) {
     let drained = 0;
-    if (typeof pm.resetSession === 'function') {
+    const target = pm.pickFor(sessionKey);
+    if (typeof target.resetSession === 'function') {
       try {
-        const r = await pm.resetSession(sessionKey, { reason: text.slice(1) });
+        const r = await target.resetSession(sessionKey, { reason: text.slice(1) });
         drained = r?.drainedPendings ?? 0;
       } catch (err) {
         console.error(`[${label}] resetSession ${text}: ${err.message}`);
@@ -1970,15 +1975,16 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   if (botAllowsCommands && text.startsWith('/steer ')) {
     const steerText = text.slice(7).trim();
     if (!steerText) { await sendReply('Usage: /steer <text>'); return; }
-    if (!USE_SDK || typeof pm.steer !== 'function') {
-      await sendReply('🛞 /steer requires the SDK pm (set POLYGRAM_USE_SDK=1 to enable).');
+    const target = pm.pickFor(sessionKey);
+    if (typeof target.steer !== 'function') {
+      await sendReply('🛞 /steer requires the SDK pm. This chat is on the CLI pm path.');
       return;
     }
     if (!pm.has(sessionKey)) {
       await sendReply('🛞 No active session — /steer only works mid-turn. Send a message first, then /steer while it\'s thinking.');
       return;
     }
-    const ok = pm.steer(sessionKey, steerText);
+    const ok = target.steer(sessionKey, steerText);
     if (ok) {
       logEvent('steer-command', {
         chat_id: chatId, text_len: steerText.length,
@@ -2006,16 +2012,17 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   //   applyFlagSettings — no respawn needed, change takes effect for
   //   the rest of the in-flight turn AND all future ones.
   const applyConfigChange = async (reason, setting, value) => {
-    if (typeof pm.requestRespawn === 'function') {
-      const res = pm.requestRespawn(sessionKey, reason);
+    const target = pm.pickFor(sessionKey);
+    if (typeof target.requestRespawn === 'function') {
+      const res = target.requestRespawn(sessionKey, reason);
       return { queued: res.queued, anyActive: !res.killed };
     }
-    if (setting === 'effort' && typeof pm.applyFlagSettings === 'function') {
-      const ok = await pm.applyFlagSettings(sessionKey, { effortLevel: value });
+    if (setting === 'effort' && typeof target.applyFlagSettings === 'function') {
+      const ok = await target.applyFlagSettings(sessionKey, { effortLevel: value });
       return { queued: 0, anyActive: !ok };
     }
-    if (setting === 'model' && typeof pm.setModel === 'function') {
-      const ok = await pm.setModel(sessionKey, value);
+    if (setting === 'model' && typeof target.setModel === 'function') {
+      const ok = await target.setModel(sessionKey, value);
       return { queued: 0, anyActive: !ok };
     }
     return { queued: 0, anyActive: false };
@@ -2411,11 +2418,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const chatAutosteer = chatConfig.autosteer != null
     ? chatConfig.autosteer
     : config.bot?.autosteer;
-  const autosteerEnabled = USE_SDK && chatAutosteer !== false;
-  if (autosteerEnabled && typeof pm.steer === 'function' && pm.has(sessionKey)) {
+  const autosteerTarget = pm.pickFor(sessionKey);
+  const autosteerEnabled = chatAutosteer !== false
+    && typeof autosteerTarget.steer === 'function';
+  if (autosteerEnabled && pm.has(sessionKey)) {
     const entry = pm.get(sessionKey);
     if (entry?.inFlight) {
-      const ok = pm.steer(sessionKey, prompt);
+      const ok = autosteerTarget.steer(sessionKey, prompt);
       if (ok) {
         // Quiet ack — no chat-bubble reply, just a reaction so the
         // user sees their message was incorporated. The in-flight
@@ -2493,8 +2502,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // Only fires when pm.resetSession is available (SDK pm
       // path); CLI pm doesn't have the method.
       const cls = classifyError(result.error);
-      if (cls.autoRecover === 'reset_session' && typeof pm.resetSession === 'function') {
-        pm.resetSession(sessionKey, { reason: cls.kind })
+      const recoverTarget = pm.pickFor(sessionKey);
+      if (cls.autoRecover === 'reset_session' && typeof recoverTarget.resetSession === 'function') {
+        recoverTarget.resetSession(sessionKey, { reason: cls.kind })
           .catch((err) => console.error(`[${label}] auto-reset failed: ${err.message}`));
         logEvent('auto-recover', {
           chat_id: chatId, kind: cls.kind, action: 'reset_session',
@@ -2523,7 +2533,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // SDK pm only — CLI pm has no equivalent (no Query object,
       // no getContextUsage). Per-bot opt-out via
       // config.bot.contextHint = false.
-      if (USE_SDK && config.bot?.contextHint !== false) {
+      if (pm.isSdkFor(sessionKey) && config.bot?.contextHint !== false) {
         const entry = pm.get(sessionKey);
         const q = entry?.query;
         if (q && typeof q.getContextUsage === 'function') {
@@ -2903,14 +2913,15 @@ function createBot(token) {
       // sessionKey is the chat itself, so killing one session is
       // the same as killing the chat — behavior unchanged for the
       // common case.
-      if (USE_SDK && typeof pm.interrupt === 'function') {
-        await pm.interrupt(sessionKey).catch((err) =>
+      const stopTarget = pm.pickFor(sessionKey);
+      if (typeof stopTarget.interrupt === 'function') {
+        await stopTarget.interrupt(sessionKey).catch((err) =>
           console.error(`[${BOT_NAME}] interrupt failed: ${err.message}`));
-        if (typeof pm.drainQueue === 'function') {
-          pm.drainQueue(sessionKey, 'INTERRUPTED');
+        if (typeof stopTarget.drainQueue === 'function') {
+          stopTarget.drainQueue(sessionKey, 'INTERRUPTED');
         }
       } else {
-        await pm.kill(sessionKey).catch((err) =>
+        await stopTarget.kill(sessionKey).catch((err) =>
           console.error(`[${BOT_NAME}] abort kill failed: ${err.message}`));
       }
       logEvent('abort-requested', {
@@ -3351,17 +3362,37 @@ async function main() {
   });
 
   const cap = config.maxWarmProcesses || DEFAULT_MAX_WARM_PROCS;
-  // 0.8.0 Phase 3: pick pm implementation via env flag. Default
-  // (POLYGRAM_USE_SDK unset) keeps the CLI-based pm — same as 0.7.x.
-  // Set POLYGRAM_USE_SDK=1 to switch to the SDK-backed pm.
-  // Phase 5 soak: enable on umi-assistant first, watch for
-  // regressions, then enable on shumabit.
-  const PMClass = USE_SDK ? ProcessManagerSdk : ProcessManager;
-  const spawnFn = USE_SDK ? buildSdkOptions : spawnClaude;
-  console.log(`[polygram] using ${USE_SDK ? 'SDK' : 'CLI'} ProcessManager`);
-  pm = new PMClass({
+
+  // 0.8.0-rc.6: per-chat pm selection. Three modes:
+  //   1. POLYGRAM_USE_SDK=1 with no POLYGRAM_SDK_CHATS list  → all chats SDK
+  //   2. POLYGRAM_SDK_CHATS=id1,id2,...                       → those chats
+  //      use SDK; everyone else uses CLI (both pms live in the daemon)
+  //   3. neither set                                          → all chats CLI
+  // The per-chat mode lets us soak SDK pm against real traffic in one
+  // chat (Ivan's DM) while keeping partner-facing chats on the
+  // battle-tested CLI path. When both pms run, killChat /shutdown
+  // broadcast to both; everything else routes per-sessionKey via
+  // pickPmFor() based on the chat's set membership.
+  const sdkChatIdSet = new Set(
+    String(process.env.POLYGRAM_SDK_CHATS || '')
+      .split(',').map((s) => s.trim()).filter(Boolean)
+  );
+  const sdkAllChats = USE_SDK && sdkChatIdSet.size === 0;
+  const sdkSomeChats = sdkChatIdSet.size > 0;
+  const sdkActive = sdkAllChats || sdkSomeChats;
+
+  function pickPmKindFor(sessionKey) {
+    if (sdkAllChats) return 'sdk';
+    if (!sdkSomeChats) return 'cli';
+    const chatId = String(getChatIdFromKey(sessionKey) ?? '');
+    return sdkChatIdSet.has(chatId) ? 'sdk' : 'cli';
+  }
+
+  // Shared callbacks: identical instance passed to both pms so a
+  // chat's lifecycle events look the same regardless of which pm
+  // is handling it.
+  const pmOpts = {
     cap,
-    spawnFn,
     db,
     logger: console,
     onInit: (sessionKey, event, entry) => {
@@ -3476,7 +3507,104 @@ async function main() {
         ...(threadId && { message_thread_id: threadId }),
       }, { source: 'respawn-confirm', botName: BOT_NAME }).catch(() => {});
     },
-  });
+  };
+
+  // Instantiate the actual pm(s). When sdkActive is false we still
+  // build a CLI pm; SDK pm is null. When sdkActive is true we always
+  // build BOTH so chats outside the SDK list still get the CLI path.
+  const cliPm = new ProcessManager({ ...pmOpts, spawnFn: spawnClaude });
+  const sdkPm = sdkActive
+    ? new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions })
+    : null;
+
+  // Routing pm: same surface as a single pm, but per-method routing
+  // through pickPmKindFor(sessionKey). Methods that don't take a
+  // sessionKey (killChat by chatId, shutdown) broadcast to both.
+  // For optional methods (steer / setModel / applyFlagSettings /
+  // requestRespawn / drainQueue / interrupt / resetSession) we
+  // forward when the routed pm has the method and return a
+  // sentinel otherwise — so feature-detection at the call site
+  // still works via `typeof pm.pickFor(sessionKey).X === 'function'`.
+  pm = (() => {
+    function routedPm(sessionKey) {
+      return pickPmKindFor(sessionKey) === 'sdk' && sdkPm ? sdkPm : cliPm;
+    }
+    const router = {
+      pickFor: routedPm,
+      isSdkFor(sessionKey) {
+        return pickPmKindFor(sessionKey) === 'sdk' && !!sdkPm;
+      },
+      has(sessionKey) { return routedPm(sessionKey).has(sessionKey); },
+      get(sessionKey) { return routedPm(sessionKey).get(sessionKey); },
+      getOrSpawn(sessionKey, ctx) { return routedPm(sessionKey).getOrSpawn(sessionKey, ctx); },
+      send(sessionKey, prompt, opts) { return routedPm(sessionKey).send(sessionKey, prompt, opts); },
+      kill(sessionKey) { return routedPm(sessionKey).kill(sessionKey); },
+      async killChat(chatId) {
+        const tasks = [cliPm.killChat(chatId)];
+        if (sdkPm) tasks.push(sdkPm.killChat(chatId));
+        await Promise.all(tasks);
+      },
+      async shutdown() {
+        const tasks = [cliPm.shutdown()];
+        if (sdkPm) tasks.push(sdkPm.shutdown());
+        await Promise.all(tasks);
+      },
+      // Optional methods. The router returns a function — but the
+      // function returns a sentinel if the routed pm doesn't have
+      // the method. Sites that want feature-detection should use
+      // `pm.pickFor(sessionKey)` and check `typeof X === 'function'`
+      // there instead of probing `pm.X` directly.
+      steer(sessionKey, ...args) {
+        const target = routedPm(sessionKey);
+        return typeof target.steer === 'function' ? target.steer(sessionKey, ...args) : false;
+      },
+      resetSession(sessionKey, opts) {
+        const target = routedPm(sessionKey);
+        return typeof target.resetSession === 'function'
+          ? target.resetSession(sessionKey, opts)
+          : Promise.resolve({ closed: false, drainedPendings: 0 });
+      },
+      applyFlagSettings(sessionKey, settings) {
+        const target = routedPm(sessionKey);
+        return typeof target.applyFlagSettings === 'function'
+          ? target.applyFlagSettings(sessionKey, settings)
+          : Promise.resolve(false);
+      },
+      setModel(sessionKey, model) {
+        const target = routedPm(sessionKey);
+        return typeof target.setModel === 'function'
+          ? target.setModel(sessionKey, model)
+          : Promise.resolve(false);
+      },
+      requestRespawn(sessionKey, reason) {
+        const target = routedPm(sessionKey);
+        return typeof target.requestRespawn === 'function'
+          ? target.requestRespawn(sessionKey, reason)
+          : { killed: false, queued: 0 };
+      },
+      drainQueue(sessionKey, errCode) {
+        const target = routedPm(sessionKey);
+        return typeof target.drainQueue === 'function'
+          ? target.drainQueue(sessionKey, errCode)
+          : 0;
+      },
+      interrupt(sessionKey) {
+        const target = routedPm(sessionKey);
+        return typeof target.interrupt === 'function'
+          ? target.interrupt(sessionKey)
+          : Promise.resolve();
+      },
+    };
+    return router;
+  })();
+
+  if (sdkAllChats) {
+    console.log('[polygram] using SDK ProcessManager (all chats)');
+  } else if (sdkSomeChats) {
+    console.log(`[polygram] router active: SDK pm for chats {${Array.from(sdkChatIdSet).join(',')}}, CLI pm for everyone else`);
+  } else {
+    console.log('[polygram] using CLI ProcessManager');
+  }
 
   console.log(`polygram (LRU cap=${cap}, SQLite source of truth)`);
   console.log(`Chats: ${Object.entries(config.chats).map(([id, c]) => `${c.name} (${c.model}/${c.effort})`).join(', ')}`);
