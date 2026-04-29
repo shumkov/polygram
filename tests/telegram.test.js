@@ -685,3 +685,64 @@ describe('linkPreview meta flag', () => {
     assert.equal(calls[0].link_preview_options, undefined);
   });
 });
+
+describe('429 rate-limit retry', () => {
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-tg')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  test('on 429 with retry_after, sleeps and retries once', async () => {
+    let count = 0;
+    const startTs = Date.now();
+    const bot = {
+      api: { raw: new Proxy({}, {
+        get: () => (params) => {
+          count += 1;
+          if (count === 1) {
+            const err = Object.assign(new Error('Too Many Requests: retry after 1'), {
+              parameters: { retry_after: 1 },
+            });
+            throw err;
+          }
+          return Promise.resolve({ message_id: 999, date: 1700000000 });
+        },
+      }) },
+    };
+    const res = await send({
+      bot, method: 'sendMessage',
+      params: { chat_id: '1', text: 'hi' },
+      db, logger: silentLogger(),
+    });
+    assert.equal(res.message_id, 999);
+    assert.equal(count, 2, 'one retry after 429');
+    const elapsed = Date.now() - startTs;
+    assert.ok(elapsed >= 900, 'should have slept ~1s, elapsed=' + elapsed);
+    // Event recorded
+    const ev = db.raw.prepare("SELECT kind, detail_json FROM events WHERE kind = 'telegram-rate-limit'").get();
+    assert.ok(ev);
+    const detail = JSON.parse(ev.detail_json);
+    assert.equal(detail.retry_after_ms, 1000);
+  });
+
+  test('429 retry that ALSO 429s propagates', async () => {
+    let count = 0;
+    const bot = {
+      api: { raw: new Proxy({}, {
+        get: () => () => {
+          count += 1;
+          throw Object.assign(new Error('Too Many Requests: retry after 0'), {
+            parameters: { retry_after: 0 },
+          });
+        },
+      }) },
+    };
+    await assert.rejects(
+      () => send({
+        bot, method: 'sendMessage',
+        params: { chat_id: '1', text: 'hi' },
+        db, logger: silentLogger(),
+      }),
+      /Too Many Requests/,
+    );
+    assert.equal(count, 2, 'tried once + one retry, then gave up');
+  });
+});

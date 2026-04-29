@@ -266,3 +266,48 @@ describe('splitTelegramCaption', () => {
     assert.equal(TELEGRAM_MAX_CAPTION_LENGTH, 1024);
   });
 });
+
+// ─── 0.7.0: 429 rate-limit handling ───────────────────────────────
+
+const { isRateLimitError, getRetryAfterMs } = require('../lib/telegram-format');
+
+describe('isRateLimitError', () => {
+  test('matches Telegram 429 wording', () => {
+    assert.ok(isRateLimitError(new Error('Too Many Requests: retry after 5')));
+    assert.ok(isRateLimitError(new Error('429: too many requests')));
+    assert.ok(isRateLimitError(new Error('retry after 12 seconds')));
+  });
+
+  test('does NOT match unrelated errors', () => {
+    assert.ok(!isRateLimitError(new Error('chat not found')));
+    assert.ok(!isRateLimitError(new Error('forbidden')));
+  });
+
+  test('null/undefined safe', () => {
+    assert.equal(isRateLimitError(null), false);
+    assert.equal(isRateLimitError(undefined), false);
+  });
+});
+
+describe('getRetryAfterMs', () => {
+  test('reads from err.parameters.retry_after (grammy shape)', () => {
+    const err = Object.assign(new Error('rate'), { parameters: { retry_after: 7 } });
+    assert.equal(getRetryAfterMs(err), 7000);
+  });
+
+  test('reads from err.error_parameters.retry_after (alt shape)', () => {
+    const err = Object.assign(new Error('rate'), { error_parameters: { retry_after: 3 } });
+    assert.equal(getRetryAfterMs(err), 3000);
+  });
+
+  test('parses from message text', () => {
+    assert.equal(getRetryAfterMs(new Error('Too Many Requests: retry after 4')), 4000);
+    assert.equal(getRetryAfterMs(new Error('retry after 30 seconds — slow down')), 30000);
+  });
+
+  test('returns null when not parseable', () => {
+    assert.equal(getRetryAfterMs(new Error('Too Many Requests')), null);
+    assert.equal(getRetryAfterMs(new Error('chat not found')), null);
+    assert.equal(getRetryAfterMs(null), null);
+  });
+});

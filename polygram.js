@@ -2545,6 +2545,16 @@ async function main() {
       const r = head?.context?.reactor;
       if (r) r.setState(classifyToolName(toolName));
     },
+    // 0.7.0 (Phase F): each new top-level assistant message gets its
+    // own bubble. When Claude emits text, then tool_use, then more
+    // text in a NEW assistant message (typical of tool-heavy turns),
+    // the previous bubble's content stays visible as a "thinking out
+    // loud" intermediate; the new message starts fresh below.
+    onAssistantMessageStart: (sessionKey, entry) => {
+      const head = entry.pendingQueue?.[0];
+      const s = head?.context?.streamer;
+      if (s) s.forceNewMessage();
+    },
     // Fires after a graceful /model or /effort drain has actually
     // swapped to the new settings. Post a confirmation back to the
     // chat ONLY when wasDrained=true — the user actively waited for an
