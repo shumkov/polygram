@@ -1587,6 +1587,41 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     await sendReply(info, { params: { reply_markup } });
     return;
   }
+  // 0.8.0 Phase 2 step 7: /new and /reset slash commands. Both close
+  // the current Query (if any), clear the claude_session_id from the
+  // sessions table, and post "✨ Started a fresh session." Next user
+  // message starts a fresh subprocess with no resume.
+  //
+  // Equivalent UX to OpenClaw's /new and /reset handlers
+  // (pi-embedded:40594 BARE_SESSION_RESET_PROMPT). Required by the
+  // 85%-context-full hint (Phase 2 step 4) and by classifier-driven
+  // auto-recovery (step 8) — both reference these commands.
+  if (botAllowsCommands && (text === '/new' || text === '/reset')) {
+    let drained = 0;
+    if (typeof pm.resetSession === 'function') {
+      try {
+        const r = await pm.resetSession(sessionKey, { reason: text.slice(1) });
+        drained = r?.drainedPendings ?? 0;
+      } catch (err) {
+        console.error(`[${label}] resetSession ${text}: ${err.message}`);
+      }
+    } else {
+      // CLI pm fallback: kill the session; sessions table cleared
+      // via clearSessionId in pm's proc.on('close') resume-fail
+      // path (lib/process-manager.js:457). We force the path by
+      // setting the kill rationale so the close handler treats it
+      // as a successful reset.
+      try { await pm.kill(sessionKey); }
+      catch (err) { console.error(`[${label}] kill on ${text}: ${err.message}`); }
+      try { db.clearSessionId(sessionKey); } catch { /* swallow */ }
+    }
+    logEvent('session-reset-command', {
+      chat_id: chatId, command: text, drained_pendings: drained,
+      user: cmdUser, user_id: cmdUserId,
+    });
+    await sendReply('✨ Started a fresh session.');
+    return;
+  }
   // Graceful respawn of the user's CURRENT session only. With
   // isolateTopics=false the sessionKey is just the chat (one shared
   // session for the whole chat — every topic respawns implicitly).
@@ -2018,6 +2053,21 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     if (result.error) {
       console.error(`[${label}] Error (${elapsed}s):`, result.error);
       reactor.setState('ERROR');
+      // 0.8.0 Phase 2 step 8: classifier-driven auto-recovery. If
+      // the error kind has autoRecover === 'reset_session' (i.e.
+      // role_ordering / context_overflow / missing_tool_input),
+      // tell pm to reset the session NOW so the user's NEXT
+      // message starts fresh — without them having to type /new.
+      // Only fires when pm.resetSession is available (SDK pm
+      // path); CLI pm doesn't have the method.
+      const cls = classifyError(result.error);
+      if (cls.autoRecover === 'reset_session' && typeof pm.resetSession === 'function') {
+        pm.resetSession(sessionKey, { reason: cls.kind })
+          .catch((err) => console.error(`[${label}] auto-reset failed: ${err.message}`));
+        logEvent('auto-recover', {
+          chat_id: chatId, kind: cls.kind, action: 'reset_session',
+        });
+      }
       // 0.6.16: pre-fix, silently markReplied()+return — the user got an
       // error reaction emoji on their message but no actual reply text,
       // AND 'replied' status meant boot replay didn't re-dispatch on next
@@ -2249,7 +2299,7 @@ function createBot(token) {
   // Cached once @botUsername is known — was recompiling per inbound msg.
   let mentionRe = null;
   // Hoisted admin-command matcher; was re-allocated per message.
-  const ADMIN_CMD_RE = /^\/(model|effort|config|pair-code|pairings|unpair)(\s|$)/;
+  const ADMIN_CMD_RE = /^\/(model|effort|config|pair-code|pairings|unpair|new|reset)(\s|$)/;
   const PAIR_CLAIM_RE = /^\/pair\s+\S+/;
 
   // The filter in main() guarantees config.chats only contains chats owned
@@ -2894,6 +2944,33 @@ async function main() {
       const head = entry.pendingQueue?.[0];
       const s = head?.context?.streamer;
       if (s) s.forceNewMessage();
+    },
+    // 0.8.0 Phase 2 step 5: SDK auto-compaction observability. Fires
+    // when SDK emits SDKCompactBoundaryMessage (between turns or
+    // mid-turn — see Phase 0 gate 8.5). Surfaces a quiet system
+    // status note to the chat so the user knows context was
+    // reorganised. Off by default per-bot (announceCompact !== true).
+    // Only fires under SDK pm — the CLI pm has no equivalent event.
+    onCompactBoundary: async (sessionKey, msg, entry) => {
+      const chatCfg = config.chats[entry.chatId] || {};
+      const optIn = chatCfg.announceCompact != null
+        ? chatCfg.announceCompact
+        : config.bot?.announceCompact;
+      if (optIn !== true) return;
+      const meta = msg.compact_metadata || {};
+      const summary = meta.pre_tokens && meta.post_tokens
+        ? ` (${(meta.pre_tokens / 1000).toFixed(0)}K → ${(meta.post_tokens / 1000).toFixed(0)}K tokens)`
+        : '';
+      const threadId = entry.threadId || undefined;
+      try {
+        await tg(bot, 'sendMessage', {
+          chat_id: entry.chatId,
+          text: `🗜️ Memory compacted${summary} — earlier context summarised.`,
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        }, { source: 'compact-boundary', botName: BOT_NAME });
+      } catch (err) {
+        console.error(`[${entry.label}] compact-boundary post: ${err.message}`);
+      }
     },
     // Fires after a graceful /model or /effort drain has actually
     // swapped to the new settings. Post a confirmation back to the
