@@ -844,6 +844,14 @@ let isShuttingDown = false;
 // distinguish unique failures from the obvious "try again" cases.
 function errorReplyText(err) {
   const msg = err?.message || '';
+  // 0.7.6 (item H): queue overflow has a typed err.code so we don't have
+  // to grep error text. The dropped pending is OLDER than the current
+  // queue depth; its sender has likely sent more recent messages we're
+  // still working on. Tell them this one was skipped without making it
+  // sound like a crash.
+  if (err?.code === 'QUEUE_OVERFLOW') {
+    return '⏭ Couldn\'t keep up — this message was skipped while I was processing newer ones. Resend if it still matters.';
+  }
   if (/idle with no Claude activity/i.test(msg)) {
     return '⏳ I went quiet too long without finishing. Try resending or simplifying the task.';
   }
@@ -1892,6 +1900,32 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       onFirstStream: () => reactor.setState('THINKING'),
     });
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+
+    // 0.7.6 (item F): persist per-turn telemetry. Stream-json result
+    // events carry total_cost_usd + duration_ms; sumUsage rolled up
+    // input/output/cache token counts from per-message usage. One row
+    // per dispatched user message; queryable via turn_metrics table.
+    if (result.metrics) {
+      dbWrite(() => db.insertTurnMetric({
+        chat_id: chatId,
+        thread_id: threadId,
+        msg_id: msg.message_id,
+        session_id: result.sessionId,
+        bot_name: BOT_NAME,
+        model: chatConfig.model,
+        effort: chatConfig.effort,
+        input_tokens: result.metrics.inputTokens,
+        output_tokens: result.metrics.outputTokens,
+        cache_creation_tokens: result.metrics.cacheCreationTokens,
+        cache_read_tokens: result.metrics.cacheReadTokens,
+        cost_usd: result.cost,
+        duration_ms: result.duration,
+        num_assistant_messages: result.metrics.numAssistantMessages,
+        num_tool_uses: result.metrics.numToolUses,
+        result_subtype: result.metrics.resultSubtype,
+        error: result.error || null,
+      }), 'insert turn_metric');
+    }
 
     stopTyping();
 
