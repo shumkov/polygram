@@ -40,6 +40,7 @@ const { startTyping } = require('./lib/typing-indicator');
 const { redactBotToken } = require('./lib/net-errors');
 const { createReactionManager, classifyToolName } = require('./lib/status-reactions');
 const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
+const { classify: classifyError, isTransientHttpError } = require('./lib/error-classify');
 const {
   createStore: createApprovalsStore,
   matchesAnyPattern: matchesApprovalPattern,
@@ -842,30 +843,19 @@ let isShuttingDown = false;
 // killed). Anything we don't recognise falls back to a generic line
 // with a single-line snippet of the error so the user can at least
 // distinguish unique failures from the obvious "try again" cases.
+// 0.7.7: errorReplyText delegates to lib/error-classify.js so the
+// regex tables live in one place and stay in sync with future SDK
+// error subtypes (the 0.8.0 migration extends the classifier rather
+// than adding more if-branches here).
+//
+// classify() returns { kind, userMessage, isTransient, autoRecover }.
+// `userMessage: null` is a deliberate "suppress reply" signal —
+// today only used by INTERRUPTED in the abort-grace window. Callers
+// that already gate on isSessionRecentlyAborted will short-circuit
+// before reaching here, but we honour `null` defensively.
 function errorReplyText(err) {
-  const msg = err?.message || '';
-  // 0.7.6 (item H): queue overflow has a typed err.code so we don't have
-  // to grep error text. The dropped pending is OLDER than the current
-  // queue depth; its sender has likely sent more recent messages we're
-  // still working on. Tell them this one was skipped without making it
-  // sound like a crash.
-  if (err?.code === 'QUEUE_OVERFLOW') {
-    return '⏭ Couldn\'t keep up — this message was skipped while I was processing newer ones. Resend if it still matters.';
-  }
-  if (/idle with no Claude activity/i.test(msg)) {
-    return '⏳ I went quiet too long without finishing. Try resending or simplifying the task.';
-  }
-  if (/wall-clock ceiling/i.test(msg)) {
-    return '⏱ This was taking too long, so I stopped. Try resending or simplifying the task.';
-  }
-  if (/Process (exited|killed)/i.test(msg)) {
-    return '💥 Something crashed on my end. Try again.';
-  }
-  if (/error_during_execution/i.test(msg)) {
-    return '💥 Something went wrong mid-stream. Try again.';
-  }
-  const reason = msg.split('\n')[0].slice(0, 120);
-  return `Hit a snag: ${reason || 'unknown error'}. Try resending.`;
+  const { userMessage } = classifyError(err);
+  return userMessage; // may be null — caller must handle
 }
 
 // Sessions the operator just /stop'd (or natural-language "стоп"). Keyed
@@ -945,13 +935,21 @@ function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
     //    re-dispatch it on next start)
     //  - user just /stop'd (already saw their abort acknowledgement)
     if (!wasAborted && !isReplay && !isShuttingDown) {
-      tg(bot, 'sendMessage', {
-        chat_id: chatId,
-        text: errorReplyText(err),
-        reply_parameters: { message_id: msg.message_id },
-      }, { source: 'error-reply', botName: BOT_NAME }).catch((replyErr) => {
-        console.error(`[${sessionKey}] failed to send error reply: ${replyErr.message}`);
-      });
+      // 0.7.7: errorReplyText may return null when the classifier
+      // says "suppress reply" (e.g. INTERRUPTED inside abort grace —
+      // user already saw their /stop ack). Skip the send call in
+      // that case rather than dispatching empty text (which would
+      // 400 at the lib/telegram.js empty-text guard added in 0.7.4).
+      const replyText = errorReplyText(err);
+      if (replyText) {
+        tg(bot, 'sendMessage', {
+          chat_id: chatId,
+          text: replyText,
+          reply_parameters: { message_id: msg.message_id },
+        }, { source: 'error-reply', botName: BOT_NAME }).catch((replyErr) => {
+          console.error(`[${sessionKey}] failed to send error reply: ${replyErr.message}`);
+        });
+      }
     }
   }).finally(() => {
     const n = (inFlightHandlers.get(sessionKey) || 1) - 1;
