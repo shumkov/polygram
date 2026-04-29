@@ -961,19 +961,21 @@ const stdinLock = createAsyncLock();
 // hammering sendChatAction every 4s for the full turn duration.
 
 // ─── Response parsing (stickers, reactions) ─────────────────────────
-
+// Implementation lives in lib/parse-response.js so tests can require it
+// without starting a bot (polygram.js is a top-level script that calls
+// main() at bottom). The wrapper here supplies the runtime stickerMap /
+// emojiToSticker that the parser looks up against.
+//
+// 0.7.5: parser also recognises a literal `[sticker:NAME]` pattern in
+// addition to single-emoji shortcuts. Claude reads its own past outbound
+// rows on session resume, sees `[sticker:working]` (the placeholder
+// deriveOutboundText synthesises for sendSticker rows), and starts
+// mimicking the format as plain text. Without the new branch the
+// placeholder was rendered verbatim in the chat instead of swapped for
+// the actual sticker.
+const { parseResponse: parseResponseImpl } = require('./lib/parse-response');
 function parseResponse(text) {
-  const trimmed = text.trim();
-  const emojiOnly = /^\p{Emoji_Presentation}$/u.test(trimmed) || /^\p{Emoji}\uFE0F?$/u.test(trimmed);
-
-  if (emojiOnly && trimmed) {
-    if (emojiToSticker[trimmed]) {
-      return { text: '', sticker: emojiToSticker[trimmed], stickerLabel: trimmed, reaction: null };
-    }
-    return { text: '', sticker: null, stickerLabel: null, reaction: trimmed };
-  }
-
-  return { text: trimmed, sticker: null, stickerLabel: null, reaction: null };
+  return parseResponseImpl(text, { stickerMap, emojiToSticker });
 }
 
 // ─── Cron/IPC send ─────────────────────────────────────────────────
