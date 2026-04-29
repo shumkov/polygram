@@ -1596,6 +1596,49 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // (pi-embedded:40594 BARE_SESSION_RESET_PROMPT). Required by the
   // 85%-context-full hint (Phase 2 step 4) and by classifier-driven
   // auto-recovery (step 8) — both reference these commands.
+  // 0.8.0 Phase 2 step 9: /context slash command. On-demand context-
+  // usage report. Only meaningful under SDK pm (CLI pm has no
+  // getContextUsage equivalent); CLI path replies with a hint.
+  if (botAllowsCommands && text === '/context') {
+    if (!USE_SDK) {
+      await sendReply('📚 /context requires the SDK pm (set POLYGRAM_USE_SDK=1 to enable).');
+      return;
+    }
+    const entry = pm.get(sessionKey);
+    const q = entry?.query;
+    if (!q || typeof q.getContextUsage !== 'function') {
+      await sendReply('📚 No active session yet — send a message first, then /context.');
+      return;
+    }
+    try {
+      const u = await q.getContextUsage();
+      const pct = ((u?.percentage ?? 0) * 100).toFixed(0);
+      const total = (u?.totalTokens ?? 0).toLocaleString();
+      const max = (u?.maxTokens ?? 0).toLocaleString();
+      const lines = [`📚 Context: ${total} / ${max} tokens (${pct}%)`];
+      if (u?.model) lines.push(`Model: ${u.model}`);
+      if (u?.isAutoCompactEnabled && u?.autoCompactThreshold) {
+        const thrPct = (u.autoCompactThreshold * 100).toFixed(0);
+        lines.push(`Auto-compact at ${thrPct}%.`);
+      }
+      // Top-3 categories by token cost so the user knows where the
+      // budget is going. SDK exposes a rich breakdown in
+      // u.categories — we just summarise.
+      if (Array.isArray(u?.categories) && u.categories.length) {
+        const top = [...u.categories]
+          .filter((c) => Number.isFinite(c?.tokens) && c.tokens > 0)
+          .sort((a, b) => b.tokens - a.tokens)
+          .slice(0, 3)
+          .map((c) => `  • ${c.label || c.name || '?'}: ${c.tokens.toLocaleString()}`);
+        if (top.length) lines.push('Top categories:', ...top);
+      }
+      await sendReply(lines.join('\n'));
+    } catch (err) {
+      console.error(`[${label}] /context failed: ${err.message}`);
+      await sendReply(`📚 Couldn't fetch context info: ${err.message}`);
+    }
+    return;
+  }
   if (botAllowsCommands && (text === '/new' || text === '/reset')) {
     let drained = 0;
     if (typeof pm.resetSession === 'function') {
@@ -1620,6 +1663,37 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       user: cmdUser, user_id: cmdUserId,
     });
     await sendReply('✨ Started a fresh session.');
+    return;
+  }
+  // 0.8.0 Phase 2 step 1: /steer <text> — mid-turn steering. Pushes
+  // a priority:'now' user message onto the active Query so Claude
+  // sees it without waiting for the in-flight turn to fully
+  // complete. SDK pm only — CLI pm has no steer primitive (its
+  // stream-json transport is request-response, not interruptible
+  // mid-turn). Falls back to /new under CLI pm.
+  if (botAllowsCommands && text.startsWith('/steer ')) {
+    const steerText = text.slice(7).trim();
+    if (!steerText) { await sendReply('Usage: /steer <text>'); return; }
+    if (!USE_SDK || typeof pm.steer !== 'function') {
+      await sendReply('🛞 /steer requires the SDK pm (set POLYGRAM_USE_SDK=1 to enable).');
+      return;
+    }
+    if (!pm.has(sessionKey)) {
+      await sendReply('🛞 No active session — /steer only works mid-turn. Send a message first, then /steer while it\'s thinking.');
+      return;
+    }
+    const ok = pm.steer(sessionKey, steerText);
+    if (ok) {
+      logEvent('steer-command', {
+        chat_id: chatId, text_len: steerText.length,
+        user: cmdUser, user_id: cmdUserId,
+      });
+      // Quiet ack so user knows it landed; the actual response will
+      // arrive as the in-flight turn's continuation.
+      await sendReply('🛞 Steering applied. Watching for the response.');
+    } else {
+      await sendReply('🛞 Couldn\'t apply steer — session may have just closed.');
+    }
     return;
   }
   // Graceful respawn of the user's CURRENT session only. With
@@ -2007,6 +2081,52 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     chat_id: chatId, msg_id: msg.message_id, status: 'replied',
   }), 'set handler_status=replied');
 
+  // 0.8.0 Phase 2 step 1 — AUTOSTEER. If SDK pm is active AND there's
+  // already an in-flight turn for this session AND autosteer isn't
+  // disabled in config, route this user message via pm.steer()
+  // instead of pm.send(). Matches OpenClaw's default UX: typing a
+  // follow-up while the bot is mid-reply MERGES into the active
+  // turn rather than queueing as a separate response. Saves a turn,
+  // saves tokens, feels more conversational.
+  //
+  // Opt-out: config.bot.autosteer === false (or per-chat
+  // chatConfig.autosteer === false). CLI pm always falls through
+  // to the queue-FIFO path (no steer primitive on stream-json).
+  //
+  // The steered message gets a 🛞 reaction so the user knows it
+  // landed; no separate reply is generated (the in-flight turn's
+  // response covers both messages, OpenClaw-style).
+  const chatAutosteer = chatConfig.autosteer != null
+    ? chatConfig.autosteer
+    : config.bot?.autosteer;
+  const autosteerEnabled = USE_SDK && chatAutosteer !== false;
+  if (autosteerEnabled && typeof pm.steer === 'function' && pm.has(sessionKey)) {
+    const entry = pm.get(sessionKey);
+    if (entry?.inFlight) {
+      const ok = pm.steer(sessionKey, prompt);
+      if (ok) {
+        // Quiet ack — no chat-bubble reply, just a reaction so the
+        // user sees their message was incorporated. The in-flight
+        // turn's response will address both questions.
+        tg(bot, 'setMessageReaction', {
+          chat_id: chatId,
+          message_id: msg.message_id,
+          reaction: [{ type: 'emoji', emoji: '🛞' }],
+        }, { source: 'autosteer-ack', botName: BOT_NAME }).catch((err) => {
+          console.error(`[${label}] autosteer reaction: ${err.message}`);
+        });
+        logEvent('autosteer', {
+          chat_id: chatId, msg_id: msg.message_id,
+          text_len: prompt?.length ?? 0,
+        });
+        stopTyping();
+        reactor.stop();
+        markReplied();
+        return;
+      }
+    }
+  }
+
   try {
     // Pass streamer + reactor as per-turn context. pm's callbacks pick
     // them off entry.pendingQueue[0].context so concurrent pendings each
@@ -2323,7 +2443,7 @@ function createBot(token) {
   // Cached once @botUsername is known — was recompiling per inbound msg.
   let mentionRe = null;
   // Hoisted admin-command matcher; was re-allocated per message.
-  const ADMIN_CMD_RE = /^\/(model|effort|config|pair-code|pairings|unpair|new|reset)(\s|$)/;
+  const ADMIN_CMD_RE = /^\/(model|effort|config|pair-code|pairings|unpair|new|reset|context|steer)(\s|$)/;
   const PAIR_CLAIM_RE = /^\/pair\s+\S+/;
 
   // The filter in main() guarantees config.chats only contains chats owned
