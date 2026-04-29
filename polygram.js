@@ -204,6 +204,49 @@ function dbWrite(fn, context) {
   }
 }
 
+// 0.7.4 (item I): per-chat allowlist of available reactions.
+//
+// Telegram groups can restrict which emojis members may use as
+// reactions via `available_reactions`. When the bot is in such a group
+// and tries to apply a reaction outside the allowlist, the API returns
+// REACTION_INVALID and the user sees no progress signal at all.
+//
+// We probe via getChat() once per chat (cached forever — admins rarely
+// change the setting and we'll learn of changes the next bot restart),
+// derive the allowlist (or null = "default Telegram set, no
+// restriction"), and pass it into createReactionManager so resolveEmoji
+// can pick the best-allowed emoji from each state's chain.
+const reactionAllowlistCache = new Map();
+async function getReactionAllowlist(bot, chatId) {
+  if (reactionAllowlistCache.has(chatId)) return reactionAllowlistCache.get(chatId);
+  let allowlist = null;
+  try {
+    const chat = await bot.api.getChat(chatId);
+    const ar = chat?.available_reactions;
+    // Telegram returns:
+    //   - undefined / { type: 'all' }  → no restriction (all emojis allowed)
+    //   - { type: 'some', reactions: [{type, emoji}, ...] } → restricted
+    //   - { type: 'none' }              → reactions disabled entirely
+    if (ar?.type === 'some' && Array.isArray(ar.reactions)) {
+      allowlist = new Set(ar.reactions
+        .filter((r) => r?.type === 'emoji' && r.emoji)
+        .map((r) => r.emoji));
+    } else if (ar?.type === 'none') {
+      // Empty set — resolveEmoji will return null, the apply callback
+      // will short-circuit, and we won't waste API calls on a chat
+      // where reactions can't render at all.
+      allowlist = new Set();
+    }
+    // 'all' / undefined → leave allowlist null (chain[0] always wins).
+  } catch (err) {
+    console.error(`[reactions] getChat ${chatId} failed: ${err.message}`);
+    // On failure, cache null (assume default set) so we don't retry on
+    // every turn. A bot restart re-probes.
+  }
+  reactionAllowlistCache.set(chatId, allowlist);
+  return allowlist;
+}
+
 // Convenience for the most common dbWrite pattern: log an event.
 // Pre-0.6.9 every call site was dbWrite(() => db.logEvent(KIND, {...}),
 // `log ${KIND}`) — three repeated lines for one logical operation.
@@ -379,16 +422,23 @@ function extractAttachments(msg) {
 
 async function transcribeVoiceAttachments(downloaded, { chatId, msgId, label, botApi, threadId }) {
   const voiceCfg = config.bot?.voice || config.voice;
-  if (!voiceCfg?.enabled) return;
+  if (!voiceCfg?.enabled) return { ackEmitted: false };
   const provider = voiceCfg.provider || 'openai';
   const providerCfg = voiceCfg[provider] || {};
   const targets = downloaded.filter((a) => isVoiceAttachment(a) && a.path);
-  if (!targets.length) return;
+  if (!targets.length) return { ackEmitted: false };
 
   // Acknowledge receipt with a reaction so the user knows we heard them.
   // Cheap, robust (no state), and survives transcription failure.
+  // 0.7.4 (item G): we report `ackEmitted: true` so the caller can skip
+  // the reactor's QUEUED → 👀 transition. Pre-fix, 👂 was visible for
+  // ~milliseconds before 👀 overwrote it on the same message — wasted
+  // API call and confusing flicker. Now 👂 stays until Claude actually
+  // starts work and the reactor flips to THINKING (🤔).
   const ack = voiceCfg.ackReaction || '👂';
+  let ackEmitted = false;
   if (ack && botApi) {
+    ackEmitted = true;
     tg(botApi, 'setMessageReaction', {
       chat_id: chatId, message_id: msgId,
       reaction: [{ type: 'emoji', emoji: ack }],
@@ -432,7 +482,7 @@ async function transcribeVoiceAttachments(downloaded, { chatId, msgId, label, bo
   //     combined transcript so FTS finds "what Maria said" via the
   //     normal chat search path.
   const successful = targets.filter((a) => a.transcription?.text);
-  if (!successful.length) return;
+  if (!successful.length) return { ackEmitted };
   for (const a of successful) {
     if (a.id != null) {
       dbWrite(() => db.setAttachmentTranscription(a.id, JSON.stringify(a.transcription)),
@@ -443,6 +493,7 @@ async function transcribeVoiceAttachments(downloaded, { chatId, msgId, label, bo
   dbWrite(() => db.setMessageText({
     chat_id: chatId, msg_id: msgId, text: combinedText,
   }), 'persist voice transcription');
+  return { ackEmitted };
 }
 
 // Bounded concurrency for parallel fetches. A 10-photo album used to be
@@ -1649,9 +1700,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     }
   }
 
-  await transcribeVoiceAttachments(downloaded, {
+  const voiceAck = await transcribeVoiceAttachments(downloaded, {
     chatId, msgId: msg.message_id, label, botApi: bot, threadId,
-  });
+  }) || { ackEmitted: false };
 
   const prompt = formatPrompt(msg, sessionCtx, downloaded);
   const stopTyping = startTyping({
@@ -1784,6 +1835,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // notifications), updates in place, one emoji per message. Uses
   // setMessageReaction which skips the DB row (the tg() wrapper
   // short-circuits that method), so no transcript spam.
+  // 0.7.4 (item I): probe the chat's available_reactions allowlist on
+  // first turn (cached after). resolveEmoji uses this to pick the best
+  // emoji from each state's chain that's actually permitted in this
+  // group, falling back to a generic set (👍/👀/🔥) before giving up.
+  const availableEmojis = await getReactionAllowlist(bot, chatId);
   const reactor = createReactionManager({
     apply: async (emoji) => {
       const params = {
@@ -1794,13 +1850,20 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       await tg(bot, 'setMessageReaction', params,
         { source: 'status-reaction', botName: BOT_NAME });
     },
+    availableEmojis,
     logError: (m) => console.error(`[${label}] ${m}`),
   });
   // Start at QUEUED (👀) so user sees their message was received but
   // not yet being worked on. pm calls context.onActivate when this
   // pending becomes the queue head (Claude is actually starting it),
   // at which point we flip to THINKING (🤔).
-  reactor.setState('QUEUED');
+  // 0.7.4 (item G): if voice ack (👂) was just emitted by
+  // transcribeVoiceAttachments, skip QUEUED — its 👀 would overwrite the
+  // ack within milliseconds, wasting an API call and flickering. Let 👂
+  // stay until THINKING flips it to 🤔 when Claude actually starts work.
+  if (!voiceAck.ackEmitted) {
+    reactor.setState('QUEUED');
+  }
 
   // Mark the inbound row terminal so boot replay doesn't pick it up
   // again. Must fire down EVERY non-throwing exit path (early returns
@@ -1819,7 +1882,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // get routed to their own streamer/reactor.
     const result = await sendToProcess(sessionKey, prompt, {
       streamer, reactor, sourceMsgId: msg.message_id,
-      onActivate: () => reactor.setState('THINKING'),
+      // 0.7.4 (item B): fire THINKING when Claude actually starts
+      // emitting (first assistant text or tool_use). Pre-fix, onActivate
+      // (queue-head transition) flipped to THINKING the moment we wrote
+      // stdin, even though Claude could spend hundreds of ms loading.
+      // Result: long flat 🤔 with nothing happening; users assumed stall.
+      onFirstStream: () => reactor.setState('THINKING'),
     });
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 

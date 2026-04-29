@@ -37,6 +37,19 @@ describe('classifyToolName', () => {
     assert.equal(classifyToolName(''), 'TOOL');
     assert.equal(classifyToolName(null), 'TOOL');
   });
+  // 0.7.4 (item C): substring matching catches MCP/skill-prefixed tools
+  // that the old regex-anchored classifier missed.
+  test('substring match catches MCP browser/playwright tools as WEB', () => {
+    assert.equal(classifyToolName('mcp__plugin_playwright__browser_click'), 'WEB');
+    assert.equal(classifyToolName('mcp__plugin_playwright__browser_navigate'), 'WEB');
+  });
+  test('TodoWrite stays WRITING even though it contains "write"', () => {
+    // Order-dependence guard: WRITING must check before CODING.
+    assert.equal(classifyToolName('TodoWrite'), 'WRITING');
+  });
+  test('Skill tool maps to WRITING', () => {
+    assert.equal(classifyToolName('Skill'), 'WRITING');
+  });
 });
 
 describe('resolveEmoji', () => {
@@ -132,5 +145,67 @@ describe('createReactionManager — availableEmojis filter', () => {
     // No reaction could be resolved, nothing was applied. Same as "idle".
     assert.deepEqual(applied, []);
     assert.equal(m.currentEmoji, null);
+  });
+
+  // 0.7.4 (item J): generic fallback (👍/👀/🔥) when the state's chain
+  // has nothing in the allowlist but a generic emoji is permitted. Better
+  // to show *some* signal than none at all.
+  test('falls back to generic 👍 for CODING when only 👍 allowed', async () => {
+    const { m, applied } = makeHarness({
+      availableEmojis: new Set(['👍']),
+    });
+    m.setState('CODING');
+    await new Promise(r => setTimeout(r, 5));
+    assert.deepEqual(applied, ['👍']);
+  });
+});
+
+describe('createReactionManager — stall timers (item A)', () => {
+  test('promotes to STALL after stallMs of silence', async () => {
+    const applied = [];
+    const m = createReactionManager({
+      apply: async (emoji) => { applied.push(emoji); },
+      throttleMs: 5,
+      stallMs: 30,
+      freezeMs: 10_000, // far beyond test
+    });
+    m.setState('THINKING');
+    await new Promise(r => setTimeout(r, 60));
+    // Should have flushed 🤔, then auto-promoted to 🥱.
+    assert.equal(applied[0], '🤔');
+    assert.equal(applied[applied.length - 1], '🥱');
+  });
+
+  test('subsequent setState resets the stall clock', async () => {
+    const applied = [];
+    const m = createReactionManager({
+      apply: async (emoji) => { applied.push(emoji); },
+      throttleMs: 5,
+      stallMs: 40,
+      freezeMs: 10_000,
+    });
+    m.setState('THINKING');
+    await new Promise(r => setTimeout(r, 25));  // < stallMs
+    m.setState('CODING');                       // resets stall clock
+    await new Promise(r => setTimeout(r, 25));  // < stallMs again
+    // Should NOT have stalled — combined elapsed is 50ms but neither
+    // window alone exceeded stallMs.
+    assert.ok(!applied.includes('🥱'));
+  });
+
+  test('terminal state cancels pending stall', async () => {
+    const applied = [];
+    const m = createReactionManager({
+      apply: async (emoji) => { applied.push(emoji); },
+      throttleMs: 5,
+      stallMs: 30,
+      freezeMs: 10_000,
+    });
+    m.setState('THINKING');
+    await new Promise(r => setTimeout(r, 10));
+    m.setState('DONE');
+    await new Promise(r => setTimeout(r, 50));
+    assert.ok(!applied.includes('🥱'));
+    assert.ok(applied.includes('👍'));
   });
 });
