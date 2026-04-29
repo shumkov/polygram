@@ -576,3 +576,112 @@ describe('MESSAGE_NOT_MODIFIED filter', () => {
     );
   });
 });
+
+// ─── 0.7.0: link-preview opt-out ──────────────────────────────────
+
+describe('linkPreview meta flag', () => {
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-tg')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  test('meta.linkPreview=false adds link_preview_options.is_disabled to sendMessage', async () => {
+    const calls = [];
+    const bot = {
+      api: { raw: new Proxy({}, { get: () => (params) => {
+        calls.push(params);
+        return Promise.resolve({ message_id: 1, date: 1700000000 });
+      } }) },
+    };
+    await send({
+      bot, method: 'sendMessage',
+      params: { chat_id: '1', text: 'see http://example.com' },
+      db, meta: { linkPreview: false }, logger: silentLogger(),
+    });
+    assert.deepEqual(calls[0].link_preview_options, { is_disabled: true });
+  });
+
+  test('meta.linkPreview=false also applies to editMessageText', async () => {
+    const calls = [];
+    const bot = {
+      api: { raw: new Proxy({}, { get: () => (params) => {
+        calls.push(params);
+        return Promise.resolve({ message_id: 1, date: 1700000000 });
+      } }) },
+    };
+    await send({
+      bot, method: 'editMessageText',
+      params: { chat_id: '1', message_id: 42, text: 'updated' },
+      db, meta: { linkPreview: false }, logger: silentLogger(),
+    });
+    assert.deepEqual(calls[0].link_preview_options, { is_disabled: true });
+  });
+
+  test('meta.linkPreview not set: no link_preview_options', async () => {
+    const calls = [];
+    const bot = {
+      api: { raw: new Proxy({}, { get: () => (params) => {
+        calls.push(params);
+        return Promise.resolve({ message_id: 1, date: 1700000000 });
+      } }) },
+    };
+    await send({
+      bot, method: 'sendMessage',
+      params: { chat_id: '1', text: 'hi' },
+      db, logger: silentLogger(),
+    });
+    assert.equal(calls[0].link_preview_options, undefined);
+  });
+
+  test('meta.linkPreview=true does NOT touch params (only false opts out)', async () => {
+    const calls = [];
+    const bot = {
+      api: { raw: new Proxy({}, { get: () => (params) => {
+        calls.push(params);
+        return Promise.resolve({ message_id: 1, date: 1700000000 });
+      } }) },
+    };
+    await send({
+      bot, method: 'sendMessage',
+      params: { chat_id: '1', text: 'hi' },
+      db, meta: { linkPreview: true }, logger: silentLogger(),
+    });
+    assert.equal(calls[0].link_preview_options, undefined);
+  });
+
+  test('caller-set link_preview_options is preserved (not overwritten)', async () => {
+    const calls = [];
+    const bot = {
+      api: { raw: new Proxy({}, { get: () => (params) => {
+        calls.push(params);
+        return Promise.resolve({ message_id: 1, date: 1700000000 });
+      } }) },
+    };
+    await send({
+      bot, method: 'sendMessage',
+      params: {
+        chat_id: '1', text: 'hi',
+        link_preview_options: { url: 'http://example.com', prefer_small_media: true },
+      },
+      db, meta: { linkPreview: false }, logger: silentLogger(),
+    });
+    // Caller-supplied options win.
+    assert.deepEqual(calls[0].link_preview_options, {
+      url: 'http://example.com', prefer_small_media: true,
+    });
+  });
+
+  test('does NOT apply to non-message methods (e.g. setMessageReaction)', async () => {
+    const calls = [];
+    const bot = {
+      api: { raw: new Proxy({}, { get: () => (params) => {
+        calls.push(params);
+        return Promise.resolve({ ok: true });
+      } }) },
+    };
+    await send({
+      bot, method: 'setMessageReaction',
+      params: { chat_id: '1', message_id: 5, reaction: [] },
+      db, meta: { linkPreview: false }, logger: silentLogger(),
+    });
+    assert.equal(calls[0].link_preview_options, undefined);
+  });
+});

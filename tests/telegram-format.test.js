@@ -224,3 +224,45 @@ describe('isMessageNotModifiedError', () => {
     }
   });
 });
+
+// ─── 0.7.0: splitTelegramCaption ─────────────────────────────────
+
+const { splitTelegramCaption, TELEGRAM_MAX_CAPTION_LENGTH } = require('../lib/telegram-format');
+
+describe('splitTelegramCaption', () => {
+  test('empty input returns both undefined', () => {
+    assert.deepEqual(splitTelegramCaption(''), { caption: undefined, followUpText: undefined });
+    assert.deepEqual(splitTelegramCaption(null), { caption: undefined, followUpText: undefined });
+    assert.deepEqual(splitTelegramCaption(undefined), { caption: undefined, followUpText: undefined });
+    assert.deepEqual(splitTelegramCaption('   '), { caption: undefined, followUpText: undefined });
+  });
+
+  test('text within 1024 chars goes as caption', () => {
+    const r = splitTelegramCaption('short caption');
+    assert.equal(r.caption, 'short caption');
+    assert.equal(r.followUpText, undefined);
+  });
+
+  test('text exactly 1024 chars goes as caption', () => {
+    const text = 'a'.repeat(1024);
+    const r = splitTelegramCaption(text);
+    assert.equal(r.caption, text);
+    assert.equal(r.followUpText, undefined);
+  });
+
+  test('text over 1024 chars goes as followUp (no caption)', () => {
+    const text = 'a'.repeat(1025);
+    const r = splitTelegramCaption(text);
+    assert.equal(r.caption, undefined);
+    assert.equal(r.followUpText, text);
+  });
+
+  test('trims input before checking length', () => {
+    const r = splitTelegramCaption('  hello  ');
+    assert.equal(r.caption, 'hello');
+  });
+
+  test('TELEGRAM_MAX_CAPTION_LENGTH constant matches Telegram cap', () => {
+    assert.equal(TELEGRAM_MAX_CAPTION_LENGTH, 1024);
+  });
+});

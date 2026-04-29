@@ -65,8 +65,35 @@ describe('isTransientNetworkError', () => {
     assert.equal(isTransientNetworkError(nameErr('TimeoutError')), true);
     assert.equal(isTransientNetworkError(nameErr('FetchError')), true);
   });
+
+  test('0.7.0 undici codes are transient', () => {
+    for (const code of ['UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+      'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_ABORTED',
+      'ECONNABORTED', 'ERR_NETWORK', 'ESOCKETTIMEDOUT']) {
+      assert.equal(isTransientNetworkError(codeErr(code)), true, 'code ' + code);
+    }
+  });
+
+  test('0.7.0 undici error names are transient', () => {
+    for (const name of ['ConnectTimeoutError', 'HeadersTimeoutError', 'BodyTimeoutError']) {
+      assert.equal(isTransientNetworkError(nameErr(name)), true, 'name ' + name);
+    }
+  });
+
+  test('0.7.0 message-snippet matchers (no code/name)', () => {
+    // undici sometimes throws a generic Error('fetch failed') with
+    // no code or name set on the outer error.
+    assert.equal(isTransientNetworkError(new Error('fetch failed')), true);
+    assert.equal(isTransientNetworkError(new Error('TypeError: fetch failed')), true);
+    assert.equal(isTransientNetworkError(new Error('undici socket disconnected')), true);
+    assert.equal(isTransientNetworkError(new Error('Network error during request')), true);
+    assert.equal(isTransientNetworkError(new Error('Network request for getUpdates failed')), true);
+  });
+
   test('random errors return false', () => {
     assert.equal(isTransientNetworkError(new Error('weird')), false);
+    assert.equal(isTransientNetworkError(new Error('Bad Request: chat not found')), false);
+    assert.equal(isTransientNetworkError(new Error('Forbidden: bot was kicked')), false);
   });
 });
 

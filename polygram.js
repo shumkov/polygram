@@ -1649,11 +1649,18 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   });
 
   const botCfg = config.bot || {};
+  // 0.7.0: per-chat / per-bot link-preview opt-out (port from OpenClaw).
+  // chat-level wins over bot-level. Default (both undefined) preserves
+  // Telegram's native auto-preview behavior.
+  const linkPreview = chatConfig.linkPreview != null
+    ? chatConfig.linkPreview
+    : botCfg.linkPreview;
   const outMetaBase = {
     source: 'bot-reply-stream',
     botName: BOT_NAME,
     model: chatConfig.model,
     effort: chatConfig.effort,
+    ...(linkPreview === false ? { linkPreview: false } : {}),
   };
 
   // Streaming is unconditional as of 0.4.0 — matches OpenClaw's model and
@@ -1783,7 +1790,31 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       reactor.clear().catch(() => {});
     }
 
-    if (!result.text || result.text === 'NO_REPLY') { markReplied(); return; }
+    // 0.7.0: empty-response fallback (port from OpenClaw —
+    // EMPTY_RESPONSE_FALLBACK at reply-CdjLMJxg.js:40323). When
+    // Claude finishes WITHOUT producing any text (e.g. only tool
+    // calls, or aborted before writing the assistant message), send
+    // a placeholder so the user doesn't see silence with no reaction.
+    // NO_REPLY is an explicit "stay silent" signal from the agent —
+    // those still markReplied silently.
+    if (result.text === 'NO_REPLY') { markReplied(); return; }
+    if (!result.text) {
+      try {
+        await tg(bot, 'sendMessage', {
+          chat_id: chatId,
+          text: 'No response generated. Please try again.',
+          ...(threadId && { message_thread_id: threadId }),
+          reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
+        }, { ...outMetaBase, source: 'empty-response-fallback' });
+      } catch (err) {
+        console.error(`[${label}] empty-response fallback send failed: ${err.message}`);
+      }
+      logEvent('telegram-empty-response-fallback', {
+        chat_id: chatId, msg_id: msg.message_id, bot: BOT_NAME,
+      });
+      markReplied();
+      return;
+    }
 
     const parsed = parseResponse(result.text);
     const outMeta = { ...outMetaBase, sessionId: result.sessionId, costUsd: result.cost };
