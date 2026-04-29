@@ -11,9 +11,10 @@ const { extractAssistantText } = require('../lib/process-manager');
 
 const silent = { error: () => {} };
 
-function makeHarness({ minChars = 30, throttleMs = 500 } = {}) {
+function makeHarness({ minChars = 30, throttleMs = 500, deleteMessageImpl = null, editImpl = null } = {}) {
   const sent = [];
   const edits = [];
+  const deletes = [];
   let now = 0;
   const timers = [];
 
@@ -23,9 +24,12 @@ function makeHarness({ minChars = 30, throttleMs = 500 } = {}) {
       sent.push({ id, text });
       return { message_id: id };
     },
-    edit: async (msgId, text) => {
+    edit: editImpl || (async (msgId, text) => {
       edits.push({ msgId, text });
-    },
+    }),
+    deleteMessage: deleteMessageImpl || (async (msgId) => {
+      deletes.push(msgId);
+    }),
     minChars,
     throttleMs,
     clock: () => now,
@@ -51,7 +55,7 @@ function makeHarness({ minChars = 30, throttleMs = 500 } = {}) {
     }
   }
 
-  return { s, sent, edits, advance, timers, tick: (ms) => { now += ms; } };
+  return { s, sent, edits, deletes, advance, timers, tick: (ms) => { now += ms; } };
 }
 
 describe('extractAssistantText', () => {
@@ -232,5 +236,196 @@ describe('streamer finalize', () => {
     const r2 = await h.s.finalize('final');
     assert.equal(r1.streamed, true);
     assert.equal(r2.streamed, false, 'second finalize is a no-op');
+  });
+});
+
+// ─── 0.7.0: rich finalize result + new methods ─────────────────────
+
+describe('streamer finalize — finalEditOk / overflow signals (0.7.0)', () => {
+  test('idle → finalize: streamed=false, finalEditOk=false, overflow=false', async () => {
+    const h = makeHarness({ minChars: 100 });
+    await h.s.onChunk('short');  // below minChars
+    const r = await h.s.finalize('still short');
+    assert.equal(r.streamed, false);
+    assert.equal(r.finalEditOk, false);
+    assert.equal(r.overflow, false);
+  });
+
+  test('live → finalize fits: finalEditOk=true, overflow=false', async () => {
+    const h = makeHarness({ minChars: 10 });
+    await h.s.onChunk('streaming start text here');
+    const r = await h.s.finalize('the complete final answer here');
+    assert.equal(r.streamed, true);
+    assert.equal(r.finalEditOk, true);
+    assert.equal(r.overflow, false);
+    assert.equal(r.finalText, 'the complete final answer here');
+  });
+
+  test('live → finalize body > maxLen: streamed=true, finalEditOk=false, overflow=true', async () => {
+    const h = makeHarness({ minChars: 10 });
+    await h.s.onChunk('initial streamed text');
+    // Caller passes the FULL final text; if it exceeds maxLen, finalize
+    // signals overflow back so caller can discard + redeliver.
+    const huge = 'x'.repeat(5000);
+    const r = await h.s.finalize(huge);
+    assert.equal(r.streamed, true);
+    assert.equal(r.finalEditOk, false);
+    assert.equal(r.overflow, true);
+    assert.equal(r.finalText, huge);
+    // Critical: NO edit was attempted — leaves the bubble in its
+    // last-streamed state so the caller can discard cleanly.
+    // (One initial send, NO edits.)
+    assert.equal(h.edits.length, 0);
+  });
+
+  test('live → finalize edit fails: finalEditOk=false, overflow=false', async () => {
+    let editCallCount = 0;
+    const h = makeHarness({
+      minChars: 10,
+      editImpl: async () => {
+        editCallCount += 1;
+        throw new Error("Bad Request: can't parse entities: x");
+      },
+    });
+    await h.s.onChunk('initial streamed text');
+    const r = await h.s.finalize('the final answer');
+    assert.equal(r.streamed, true);
+    assert.equal(r.finalEditOk, false);
+    assert.equal(r.overflow, false);
+    // Edit was attempted (and failed).
+    assert.equal(editCallCount, 1);
+  });
+
+  test('live → finalize body matches currentText: finalEditOk=true with no edit call', async () => {
+    const h = makeHarness({ minChars: 10 });
+    await h.s.onChunk('exact same content');
+    // Pass the SAME text — no edit needed.
+    const r = await h.s.finalize('exact same content');
+    assert.equal(r.streamed, true);
+    assert.equal(r.finalEditOk, true);
+    // No edit because content is unchanged.
+    assert.equal(h.edits.length, 0);
+  });
+});
+
+describe('streamer.discard()', () => {
+  test('deletes the bubble and transitions to finalized', async () => {
+    const h = makeHarness({ minChars: 10 });
+    await h.s.onChunk('streaming content');
+    assert.equal(h.s.state, 'live');
+    assert.ok(h.s.msgId != null);
+    const r = await h.s.discard();
+    assert.equal(r.deleted, true);
+    assert.equal(r.msgId, 100);
+    assert.equal(h.s.state, 'finalized');
+    assert.equal(h.s.msgId, null);
+    assert.deepEqual(h.deletes, [100]);
+  });
+
+  test('idle → discard: no-op (no bubble to delete)', async () => {
+    const h = makeHarness({ minChars: 100 });
+    const r = await h.s.discard();
+    // State was idle (never went live). No deletion to perform.
+    assert.equal(h.deletes.length, 0);
+  });
+
+  test('discard cancels pending edit timer', async () => {
+    const h = makeHarness({ minChars: 10, throttleMs: 1000 });
+    await h.s.onChunk('first chunk live');
+    await h.s.onChunk('first chunk live plus more');  // schedules a delayed edit
+    assert.equal(h.timers.length, 1);
+    await h.s.discard();
+    assert.equal(h.timers.length, 0, 'pending edit should be cancelled');
+  });
+
+  test('deleteMessage failure is non-fatal — discard still finalizes', async () => {
+    const h = makeHarness({
+      minChars: 10,
+      deleteMessageImpl: async () => {
+        throw new Error('message to delete not found');
+      },
+    });
+    await h.s.onChunk('streaming content');
+    const r = await h.s.discard();
+    assert.equal(r.deleted, false);
+    // Still transitioned to finalized; caller should redeliver
+    // independently of whether the bubble actually went away.
+    assert.equal(h.s.state, 'finalized');
+  });
+
+  test('subsequent finalize after discard returns streamed=false', async () => {
+    const h = makeHarness({ minChars: 10 });
+    await h.s.onChunk('streaming');
+    await h.s.discard();
+    const r = await h.s.finalize('whatever');
+    assert.equal(r.streamed, false);
+  });
+});
+
+describe('streamer.forceNewMessage()', () => {
+  test('next onChunk creates a new bubble', async () => {
+    const h = makeHarness({ minChars: 10 });
+    await h.s.onChunk('first turn content');
+    assert.equal(h.s.msgId, 100);
+    h.s.forceNewMessage();
+    assert.equal(h.s.state, 'idle');
+    assert.equal(h.s.msgId, null);
+    await h.s.onChunk('second turn content');
+    // Second send fires; new message_id assigned.
+    assert.equal(h.sent.length, 2);
+    assert.equal(h.s.msgId, 101);
+  });
+
+  test('forceNewMessage cancels pending edit but does NOT delete the old bubble', async () => {
+    const h = makeHarness({ minChars: 10, throttleMs: 1000 });
+    await h.s.onChunk('first chunk live');
+    await h.s.onChunk('first chunk live plus more');
+    h.s.forceNewMessage();
+    // No delete called — old bubble stays intact for caller to manage.
+    assert.equal(h.deletes.length, 0);
+    assert.equal(h.timers.length, 0);
+  });
+
+  test('forceNewMessage from idle is a no-op', async () => {
+    const h = makeHarness({ minChars: 100 });
+    h.s.forceNewMessage();
+    assert.equal(h.s.state, 'idle');
+    assert.equal(h.sent.length, 0);
+  });
+});
+
+describe('streamer.flushDraft()', () => {
+  test('drains pending edit before returning', async () => {
+    const h = makeHarness({ minChars: 10, throttleMs: 1000 });
+    await h.s.onChunk('first chunk live');
+    await h.s.onChunk('first chunk live plus more');
+    assert.equal(h.timers.length, 1);
+    assert.equal(h.edits.length, 0);
+    await h.s.flushDraft();
+    assert.equal(h.timers.length, 0);
+    assert.equal(h.edits.length, 1, 'pending edit fired during flushDraft');
+  });
+
+  test('no-op when nothing pending', async () => {
+    const h = makeHarness({ minChars: 10 });
+    await h.s.onChunk('content here');
+    await h.s.flushDraft();  // nothing scheduled
+    assert.equal(h.edits.length, 0);
+  });
+});
+
+describe('streamer.archive()', () => {
+  test('returns current msgId snapshot', async () => {
+    const h = makeHarness({ minChars: 10 });
+    await h.s.onChunk('streaming content');
+    const snap = h.s.archive();
+    assert.equal(snap.msgId, 100);
+    assert.match(snap.currentText, /streaming/);
+  });
+
+  test('idle archive returns null msgId', async () => {
+    const h = makeHarness({ minChars: 100 });
+    const snap = h.s.archive();
+    assert.equal(snap.msgId, null);
   });
 });
