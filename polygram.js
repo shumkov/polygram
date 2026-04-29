@@ -640,6 +640,19 @@ let pm = null; // ProcessManager, created in main()
 
 function spawnClaude(sessionKey, ctx) {
   const { chatConfig, existingSessionId, label, chatId } = ctx;
+  // 0.7.3: Claude Code's Chrome-extension integration (browser
+  // automation via the "Claude in Chrome" extension) is OPT-IN and
+  // NOT enabled by default in `claude`. Polygram lets chats turn it
+  // on via `config.chats.<id>.chrome: true` (chat-level wins) or
+  // `config.bot.chrome: true` (per-bot default). When opting in, the
+  // extension must be installed in the daemon-user's Chrome and the
+  // user must have a live Aqua session (so Chrome is running). Falls
+  // back to --no-chrome for chats that don't opt in (matches our
+  // pre-0.7.3 default — defensive against any "enabled by default"
+  // that might have been set in claude's persistent state).
+  const wantChrome = chatConfig.chrome != null
+    ? chatConfig.chrome === true
+    : config.bot?.chrome === true;
   const args = [
     '-p',
     '--input-format', 'stream-json',
@@ -648,7 +661,7 @@ function spawnClaude(sessionKey, ctx) {
     '--model', chatConfig.model || config.defaults.model,
     '--effort', chatConfig.effort || config.defaults.effort,
     '--permission-mode', 'bypassPermissions',
-    '--no-chrome',
+    wantChrome ? '--chrome' : '--no-chrome',
   ];
   if (chatConfig.agent) args.push('--agent', chatConfig.agent);
   if (existingSessionId) args.push('--resume', existingSessionId);

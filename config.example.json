@@ -15,6 +15,8 @@
       "attachmentConcurrency": 6,
       "queueWarnThreshold": 20,
       "replayWindowMs": 180000,
+      "_comment_chrome": "Opt-in to Claude Code's Chrome-extension browser-automation integration. Default false. Requires the 'Claude in Chrome' extension installed in the daemon-user's Chrome browser AND a live GUI session (Chrome must be running). See https://code.claude.com/docs/en/chrome. Per-chat override via `config.chats.<id>.chrome`.",
+      "chrome": false,
       "_comment_pairedChatDefaults": "When a user sends /pair <CODE> from a private chat that isn't in config.chats yet, polygram auto-creates a chat entry using these defaults (merged over top-level `defaults`). Leave out `cwd` at your peril — without it, auto-onboarded DMs have no working directory and pairing will fail.",
       "pairedChatDefaults": {
         "agent": "admin",
