@@ -25,6 +25,14 @@ const { migrateJsonToDb, getClaudeSessionId } = require('./lib/sessions');
 const { buildPrompt } = require('./lib/prompt');
 const { filterAttachments, MAX_FILE_BYTES } = require('./lib/attachments');
 const { ProcessManager } = require('./lib/process-manager');
+// 0.8.0 Phase 3: SDK-backed pm available behind POLYGRAM_USE_SDK=1.
+// Both implementations expose the same public API (constructor +
+// callbacks), so the rest of polygram.js doesn't branch beyond the
+// pick-at-startup. Phase 4 deletes the CLI version after Phase 5
+// soak proves SDK stable. See docs/0.8.0-architecture-decisions.md.
+const { ProcessManagerSdk } = require('./lib/process-manager-sdk');
+const agentLoader = require('./lib/agent-loader');
+const USE_SDK = process.env.POLYGRAM_USE_SDK === '1';
 const { createSender } = require('./lib/telegram');
 const { createAsyncLock } = require('./lib/async-lock');
 const { sweepInbox } = require('./lib/inbox');
@@ -750,6 +758,86 @@ function spawnClaude(sessionKey, ctx) {
     if (m) console.error(`[${label}] stderr: ${m.slice(0, 200)}`);
   });
   return proc;
+}
+
+/**
+ * 0.8.0 Phase 3 — SDK pm spawn factory.
+ *
+ * Replacement for `spawnClaude` when POLYGRAM_USE_SDK=1. Returns
+ * SdkOptions for the SDK pm to pass to `query({ prompt, options })`.
+ * The SDK pm wraps this in its inputController + iteration loop;
+ * polygram only needs to compose the Options object.
+ *
+ * Per v4 plan §6.5.7 — explicit env enumeration (Options.env is
+ * SHADOW per Phase 0 gate 33), bypassPermissions +
+ * allowDangerouslySkipPermissions both set for forward-compat,
+ * agent-loader composes per-chat agent into systemPrompt + skills +
+ * mcpServers, optional resume sessionId for continuity.
+ */
+function buildSdkOptions(sessionKey, ctx) {
+  const { chatConfig, existingSessionId, label, chatId } = ctx;
+
+  // Per-chat agent (D14): if pinned, load & compose. Failure is
+  // non-fatal — chat falls back to defaults; logged for ops.
+  let agentBundle = null;
+  if (chatConfig.agent) {
+    try {
+      agentBundle = agentLoader.loadAgent(chatConfig.agent, {
+        homeDir: CHILD_HOME,
+        logger: console,
+      });
+    } catch (err) {
+      console.error(`[${label}] agent-loader: ${err.message}`);
+      logEvent('agent-load-failed', {
+        chat_id: chatId, agent: chatConfig.agent, error: err.message,
+      });
+    }
+  }
+
+  console.log(`[${label}] Spawning SDK Query (${chatConfig.model}/${chatConfig.effort})`);
+
+  // Env: SHADOW semantics (gate 33) — must enumerate every var
+  // pollygram needs in the spawned worker.
+  const botConfig = config.bot || {};
+  const childEnv = filterEnv(process.env);
+  childEnv.HOME = CHILD_HOME;
+  childEnv.CLAUDE_CHANNEL_BOT = BOT_NAME;
+  if (process.env.POLYGRAM_IPC_SECRET) {
+    childEnv.POLYGRAM_IPC_SECRET = process.env.POLYGRAM_IPC_SECRET;
+  }
+  if (botConfig.needsToken) {
+    childEnv.TELEGRAM_BOT_TOKEN = botConfig.token || '';
+  }
+
+  const baseOpts = {
+    model: chatConfig.model || config.defaults.model,
+    effort: chatConfig.effort || config.defaults.effort,
+    cwd: chatConfig.cwd,
+    env: childEnv,
+    permissionMode: 'bypassPermissions',
+    allowDangerouslySkipPermissions: true,
+    executable: 'node',
+    ...(existingSessionId && { resume: existingSessionId }),
+    ...(process.env.POLYGRAM_CLAUDE_BIN && {
+      pathToClaudeCodeExecutable: process.env.POLYGRAM_CLAUDE_BIN,
+    }),
+  };
+
+  // Compose with agent overlay + chat-level config. agent-loader
+  // precedence: chatConfig > agent > defaults. The chatConfig keys
+  // we care about for SDK options are model/effort/cwd/thinking;
+  // others (agent, chrome, isolateTopics) are polygram-only.
+  return agentLoader.composeSdkOptions(
+    {
+      // chat-level overrides — only the keys SDK understands.
+      model: chatConfig.model,
+      effort: chatConfig.effort,
+      cwd: chatConfig.cwd,
+      ...(chatConfig.thinking && { thinking: chatConfig.thinking }),
+    },
+    agentBundle,
+    baseOpts,
+  );
 }
 
 function buildSpawnContext(sessionKey) {
@@ -2733,9 +2821,17 @@ async function main() {
   });
 
   const cap = config.maxWarmProcesses || DEFAULT_MAX_WARM_PROCS;
-  pm = new ProcessManager({
+  // 0.8.0 Phase 3: pick pm implementation via env flag. Default
+  // (POLYGRAM_USE_SDK unset) keeps the CLI-based pm — same as 0.7.x.
+  // Set POLYGRAM_USE_SDK=1 to switch to the SDK-backed pm.
+  // Phase 5 soak: enable on umi-assistant first, watch for
+  // regressions, then enable on shumabit.
+  const PMClass = USE_SDK ? ProcessManagerSdk : ProcessManager;
+  const spawnFn = USE_SDK ? buildSdkOptions : spawnClaude;
+  console.log(`[polygram] using ${USE_SDK ? 'SDK' : 'CLI'} ProcessManager`);
+  pm = new PMClass({
     cap,
-    spawnFn: spawnClaude,
+    spawnFn,
     db,
     logger: console,
     onInit: (sessionKey, event, entry) => {
