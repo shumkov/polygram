@@ -3492,14 +3492,15 @@ async function main() {
       // 0.7.0 (Phase J): opt-in subagent announce. When Claude uses
       // the Task tool to spawn a subagent, post a brief informational
       // message to the chat so the user knows a heavier turn is in
-      // progress. Off by default (per-bot or per-chat
-      // `announceSubagents: true` opts in). Per-chat debounce 30s
-      // prevents announce-storms in tool-heavy turns.
+      // progress. ON by default (rc.9+) — set per-chat
+      // `announceSubagents: false` (or per-bot) to silence.
+      // Per-chat debounce 30s prevents announce-storms in tool-heavy
+      // turns.
       const chatCfg = config.chats[entry.chatId] || {};
-      const optIn = chatCfg.announceSubagents != null
-        ? chatCfg.announceSubagents
-        : config.bot?.announceSubagents;
-      if (toolName === 'Task' && optIn === true) {
+      const optOut = chatCfg.announceSubagents != null
+        ? chatCfg.announceSubagents === false
+        : config.bot?.announceSubagents === false;
+      if (toolName === 'Task' && !optOut) {
         if (shouldAnnounce(entry.chatId)) {
           announce({
             send: (b, method, params, m) => tg(b, method, params, m),
