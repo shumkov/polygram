@@ -2565,6 +2565,26 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // those still markReplied silently.
     if (result.text === 'NO_REPLY') { markReplied(); return; }
     if (!result.text) {
+      // 0.8.0-rc.7: tool-only completion is NOT an error. Under SDK
+      // pm, a turn that ends after running tools (no closing text
+      // block) leaves result.text empty even though the bot DID
+      // respond — via tool side effects the user already saw. Don't
+      // post a "No response generated" apology in that case; it's
+      // confusing and it spams the chat. Just clear the reactor
+      // (otherwise 👀 stays stuck — reactor.stop() doesn't remove
+      // the emoji visually) and silently mark replied.
+      const toolOnlyTurn = (result.metrics?.numToolUses ?? 0) > 0
+        && (result.metrics?.numAssistantMessages ?? 0) > 0;
+      if (toolOnlyTurn) {
+        await reactor.clear().catch(() => {});
+        logEvent('tool-only-completion', {
+          chat_id: chatId, msg_id: msg.message_id, bot: BOT_NAME,
+          num_tool_uses: result.metrics?.numToolUses,
+          num_assistant_messages: result.metrics?.numAssistantMessages,
+        });
+        markReplied();
+        return;
+      }
       // 0.7.1: if the fallback send itself fails, throw rather than
       // silently markReplied — the user gets nothing AND the inbound
       // is marked replied so boot replay won't redispatch. Same
@@ -2590,6 +2610,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       logEvent('telegram-empty-response-fallback', {
         chat_id: chatId, msg_id: msg.message_id, bot: BOT_NAME,
       });
+      // 0.8.0-rc.7: clear the THINKING/QUEUED emoji on the user's
+      // message so 👀 doesn't stay stuck after the apology lands.
+      // reactor.stop() (in the finally block) only kills timers; it
+      // does NOT remove the visible emoji. Without this clear, the
+      // user sees 👀 next to their message indefinitely.
+      await reactor.clear().catch(() => {});
       markReplied();
       return;
     }
