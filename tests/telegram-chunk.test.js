@@ -424,4 +424,32 @@ describe('chunkMarkdownText — defensive post-pass enforces limit', () => {
     assert.equal(joined.length, text.length);
     assert.equal(joined, text);
   });
+
+  // 0.8.0-rc.1: production saw repeated 400 message-too-long after the
+  // 0.7.9 fix shipped — root cause was the daemon hadn't been
+  // restarted, but to never silently regress this, every adversarial
+  // shape we can think of is locked into the suite. If any of these
+  // ever overflow, fail loud BEFORE the chunk reaches Telegram.
+  for (const [label, build] of [
+    ['long pre + fence + long body', () => 'a'.repeat(2000) + '\n```python\n' + 'b'.repeat(10000) + '\n```\nfooter'],
+    ['20k-char single-word in fence', () => '```\n' + 'x'.repeat(20000) + '\n```'],
+    ['post-fence long no-whitespace text', () => '```\nint x = 1;\n```\n' + 'y'.repeat(8000)],
+    ['long underscore_separated identifiers in fence', () => '```python\n' + 'verylongidentifierwithoutanybreaks_'.repeat(500) + '\n```'],
+    ['3000 emoji surrogate pairs', () => '😀'.repeat(3000)],
+    ['five 1500-char fences in sequence', () => ('```\n' + 'a'.repeat(1500) + '\n```\n').repeat(5)],
+    ['8000-char URL inside markdown-link parens', () => '[label](http://example.com/' + 'p'.repeat(8000) + ')'],
+    ['~8190 chars no whitespace at all', () => 'x'.repeat(8190)],
+    ['12k chars w/ a single \\n at offset 4090', () => 'a'.repeat(4090) + '\n' + 'b'.repeat(8000)],
+    ['fenced block, body has no newlines, must split', () => '```js\n' + 'longline_no_newlines'.repeat(500) + '\n```'],
+  ]) {
+    test(`adversarial: ${label}`, () => {
+      const chunks = chunkMarkdownText(build(), 4096);
+      for (const c of chunks) {
+        assert.ok(
+          c.length <= 4096,
+          `[${label}] produced chunk of length ${c.length} > 4096`,
+        );
+      }
+    });
+  }
 });
