@@ -2084,6 +2084,30 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // every answered message is chat noise (plus triggers reaction
       // notifications for other group members).
       reactor.clear().catch(() => {});
+
+      // 0.8.0 Phase 2 step 4: 85%-context-full live hint. After a
+      // successful turn, peek at SDK's getContextUsage(); if past
+      // 85%, post a quiet hint so the user knows /new will help.
+      // SDK pm only — CLI pm has no equivalent (no Query object,
+      // no getContextUsage). Per-bot opt-out via
+      // config.bot.contextHint = false.
+      if (USE_SDK && config.bot?.contextHint !== false) {
+        const entry = pm.get(sessionKey);
+        const q = entry?.query;
+        if (q && typeof q.getContextUsage === 'function') {
+          q.getContextUsage().then((usage) => {
+            const pct = usage?.percentage ?? 0;
+            if (pct < 0.85) return;
+            return tg(bot, 'sendMessage', {
+              chat_id: chatId,
+              text: `📚 Context window ${(pct * 100).toFixed(0)}% full. Send /new to start fresh — older messages will start dropping soon.`,
+              ...(threadId ? { message_thread_id: threadId } : {}),
+            }, { source: 'context-full-hint', botName: BOT_NAME });
+          }).catch((err) => {
+            console.error(`[${label}] context-hint failed: ${err.message}`);
+          });
+        }
+      }
     }
 
     // 0.7.0: empty-response fallback (port from OpenClaw —
@@ -2423,16 +2447,36 @@ function createBot(token) {
       // skip the generic error-reply. If we marked after, there'd be a
       // race where the error-reply slips through.
       if (hadActive) markSessionAborted(sessionKey);
-      // Kill ONLY the user's own session, not every topic in the chat.
-      // Pre-0.6.5 this was pm.killChat(chatId) which fanned out across
-      // all topics under isolateTopics=true: the user typed "stop" in
-      // topic A and the bot tore down topic B's in-flight turn, surfacing
-      // a 💥 reply to topic B's user (whose key was never marked aborted,
-      // so the abort grace window didn't apply). With isolateTopics=false
-      // the sessionKey is the chat itself, so killing one session is the
-      // same as killing the chat — behavior unchanged for the common case.
-      await pm.kill(sessionKey).catch((err) =>
-        console.error(`[${BOT_NAME}] abort kill failed: ${err.message}`));
+      // 0.8.0 Phase 2 step 2: under SDK pm, prefer interrupt() +
+      // drainQueue() — keeps the Query alive (cheap to reuse for
+      // the user's next message), no respawn cost. Falls back to
+      // pm.kill() under CLI pm, which is the original behaviour.
+      //
+      // Why both: interrupt() cancels the in-flight turn at SDK
+      // level WITHOUT tearing down the subprocess; drainQueue()
+      // rejects every queued pending with err.code='INTERRUPTED'
+      // so the abort-grace classifier suppresses error replies.
+      //
+      // Kill ONLY the user's own session, not every topic in the
+      // chat. Pre-0.6.5 this was pm.killChat(chatId) which fanned
+      // out across all topics under isolateTopics=true: the user
+      // typed "stop" in topic A and the bot tore down topic B's
+      // in-flight turn, surfacing a 💥 reply to topic B's user
+      // (whose key was never marked aborted, so the abort grace
+      // window didn't apply). With isolateTopics=false the
+      // sessionKey is the chat itself, so killing one session is
+      // the same as killing the chat — behavior unchanged for the
+      // common case.
+      if (USE_SDK && typeof pm.interrupt === 'function') {
+        await pm.interrupt(sessionKey).catch((err) =>
+          console.error(`[${BOT_NAME}] interrupt failed: ${err.message}`));
+        if (typeof pm.drainQueue === 'function') {
+          pm.drainQueue(sessionKey, 'INTERRUPTED');
+        }
+      } else {
+        await pm.kill(sessionKey).catch((err) =>
+          console.error(`[${BOT_NAME}] abort kill failed: ${err.message}`));
+      }
       logEvent('abort-requested', {
         chat_id: chatId, user_id: msg.from?.id || null,
         had_active: hadActive,
