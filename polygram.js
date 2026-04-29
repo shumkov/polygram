@@ -2568,9 +2568,14 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // successful turn, peek at SDK's getContextUsage(); if past
       // 85%, post a quiet hint so the user knows /new will help.
       // SDK pm only — CLI pm has no equivalent (no Query object,
-      // no getContextUsage). Per-bot opt-out via
-      // config.bot.contextHint = false.
-      if (pm.isSdkFor(sessionKey) && config.bot?.contextHint !== false) {
+      // no getContextUsage). OPT-IN per-chat or per-bot
+      // (rc.12+) — most chats don't want the noise. Per-chat takes
+      // precedence over per-bot so admins (Ivan DM) can opt in
+      // without forcing it on every other chat.
+      const chatCtxHint = chatConfig.contextHint != null
+        ? chatConfig.contextHint
+        : config.bot?.contextHint;
+      if (pm.isSdkFor(sessionKey) && chatCtxHint === true) {
         const entry = pm.get(sessionKey);
         const q = entry?.query;
         if (q && typeof q.getContextUsage === 'function') {
@@ -3523,24 +3528,26 @@ async function main() {
     // 0.8.0 Phase 2 step 5: SDK auto-compaction observability. Fires
     // when SDK emits SDKCompactBoundaryMessage (between turns or
     // mid-turn — see Phase 0 gate 8.5). Surfaces a quiet system
-    // status note to the chat so the user knows context was
-    // reorganised. Off by default per-bot (announceCompact !== true).
+    // status note to the chat so the user knows the bot is busy
+    // reorganising context (compaction can take seconds, during
+    // which the bot looks unresponsive). ON by default (rc.12+) —
+    // set per-chat or per-bot `announceCompact: false` to silence.
     // Only fires under SDK pm — the CLI pm has no equivalent event.
+    //
+    // Wording is intentionally non-technical — the user doesn't
+    // care about "compaction" or "tokens"; they just want to know
+    // the bot didn't hang.
     onCompactBoundary: async (sessionKey, msg, entry) => {
       const chatCfg = config.chats[entry.chatId] || {};
-      const optIn = chatCfg.announceCompact != null
-        ? chatCfg.announceCompact
-        : config.bot?.announceCompact;
-      if (optIn !== true) return;
-      const meta = msg.compact_metadata || {};
-      const summary = meta.pre_tokens && meta.post_tokens
-        ? ` (${(meta.pre_tokens / 1000).toFixed(0)}K → ${(meta.post_tokens / 1000).toFixed(0)}K tokens)`
-        : '';
+      const optOut = chatCfg.announceCompact != null
+        ? chatCfg.announceCompact === false
+        : config.bot?.announceCompact === false;
+      if (optOut) return;
       const threadId = entry.threadId || undefined;
       try {
         await tg(bot, 'sendMessage', {
           chat_id: entry.chatId,
-          text: `🗜️ Memory compacted${summary} — earlier context summarised.`,
+          text: '💭 Catching up on history, one moment…',
           ...(threadId ? { message_thread_id: threadId } : {}),
         }, { source: 'compact-boundary', botName: BOT_NAME });
       } catch (err) {
