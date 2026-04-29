@@ -3604,6 +3604,14 @@ async function main() {
       const head = entry.pendingQueue?.[0];
       const s = head?.context?.streamer;
       if (s) s.onChunk(partial).catch(() => {});
+      // 0.8.0-rc.16: heartbeat the reactor so long text generation
+      // doesn't trip the 10s STALL → 🥱 / 30s TIMEOUT → 😨 promotion.
+      // Pre-rc.16 the reactor only got setState calls at turn start
+      // (THINKING) and per-tool (CODING/TOOL/...); pure text turns
+      // hit STALL within 10s of streaming. heartbeat() re-arms the
+      // stall timers without changing the visible emoji.
+      const r = head?.context?.reactor;
+      if (r && typeof r.heartbeat === 'function') r.heartbeat();
     },
     onToolUse: (sessionKey, toolName, entry) => {
       const head = entry.pendingQueue?.[0];
