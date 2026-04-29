@@ -2412,9 +2412,15 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // chatConfig.autosteer === false). CLI pm always falls through
   // to the queue-FIFO path (no steer primitive on stream-json).
   //
-  // The steered message gets a 🛞 reaction so the user knows it
+  // The steered message gets a ✍ reaction so the user knows it
   // landed; no separate reply is generated (the in-flight turn's
   // response covers both messages, OpenClaw-style).
+  //
+  // Reaction emoji must be from Telegram's curated allowlist
+  // (~60 standard emoji per core.telegram.org/bots/api#availablereactions).
+  // 🛞 (steering wheel) is NOT on it — Telegram returns
+  // 400: REACTION_INVALID. ✍ ("writing/noting") is on the list and
+  // conveys "incorporating this".
   const chatAutosteer = chatConfig.autosteer != null
     ? chatConfig.autosteer
     : config.bot?.autosteer;
@@ -2432,7 +2438,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         tg(bot, 'setMessageReaction', {
           chat_id: chatId,
           message_id: msg.message_id,
-          reaction: [{ type: 'emoji', emoji: '🛞' }],
+          reaction: [{ type: 'emoji', emoji: '✍' }],
         }, { source: 'autosteer-ack', botName: BOT_NAME }).catch((err) => {
           console.error(`[${label}] autosteer reaction: ${err.message}`);
         });
@@ -2441,7 +2447,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           text_len: prompt?.length ?? 0,
         });
         stopTyping();
-        reactor.stop();
+        // 0.8.0-rc.8: clear() instead of stop() so the THINKING/QUEUED
+        // 👀 reaction set by the reactor at QUEUED-state actually
+        // disappears from the user's message. reactor.stop() only
+        // cancels timers; the visible emoji persists indefinitely
+        // without an explicit clear() — that's why production showed
+        // 👀 stuck on every steered follow-up under rc.6/rc.7.
+        await reactor.clear().catch(() => {});
         markReplied();
         return;
       }
