@@ -32,6 +32,8 @@ const { parseBotArg, parseDbArg, filterConfigToBot } = require('./lib/config-sco
 const { createStore: createPairingsStore, parseTtl: parsePairingTtl } = require('./lib/pairings');
 const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/voice');
 const { createStreamer } = require('./lib/stream-reply');
+const { chunkMarkdownText } = require('./lib/telegram-chunk');
+const { deliverReplies } = require('./lib/deliver');
 const { isAbortRequest } = require('./lib/abort-detector');
 const { startTyping } = require('./lib/typing-indicator');
 const { redactBotToken } = require('./lib/net-errors');
@@ -909,22 +911,6 @@ function parseResponse(text) {
   return { text: trimmed, sticker: null, stickerLabel: null, reaction: null };
 }
 
-// ─── Reply chunking ─────────────────────────────────────────────────
-
-function chunkText(text, maxLen = TG_MAX_LEN) {
-  if (text.length <= maxLen) return [text];
-  const chunks = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLen) { chunks.push(remaining); break; }
-    let splitAt = remaining.lastIndexOf('\n', maxLen);
-    if (splitAt < maxLen * 0.3) splitAt = maxLen;
-    chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).replace(/^\n/, '');
-  }
-  return chunks;
-}
-
 // ─── Cron/IPC send ─────────────────────────────────────────────────
 
 // Allowlist of Telegram Bot API methods external callers (cron) may invoke.
@@ -1710,6 +1696,21 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         throw err;
       }
     },
+    deleteMessage: async (messageId) => {
+      // 0.7.0: route preview-discard through tg() so the action is
+      // visible in the events log and gets the same retry/network
+      // protections as other API calls. Failure is non-fatal: stale
+      // bubble at chat top is acceptable when the actual reply has
+      // already been redelivered as fresh chunks.
+      try {
+        await tg(bot, 'deleteMessage', {
+          chat_id: chatId, message_id: messageId,
+        }, { source: 'bot-reply-stream-discard', botName: BOT_NAME });
+      } catch (err) {
+        console.error(`[${label}] discard preview failed: ${err.message}`);
+        throw err;
+      }
+    },
     minChars: botCfg.streamMinChars,
     throttleMs: botCfg.streamThrottleMs,
     logger: { error: (m) => console.error(`[${label}] ${m}`) },
@@ -1787,29 +1788,60 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     const parsed = parseResponse(result.text);
     const outMeta = { ...outMetaBase, sessionId: result.sessionId, costUsd: result.cost };
 
-    // Streamed text path: finalise the live-edit and, if the full response
-    // overflows Telegram's 4096 cap, send remainder as follow-up chunks.
+    // 0.7.0 streamed text path: OpenClaw's preview-becomes-final flow.
+    //
+    //   1. flushDraft() — drain any pending throttled edit so the
+    //      bubble's visible state is up-to-date before deciding.
+    //   2. finalize(parsed.text) — try to bring the bubble to the
+    //      final body. Returns rich result describing whether the
+    //      preview can stand as the final reply.
+    //   3a. finalEditOk:true        → preview IS final, done.
+    //   3b. overflow OR !finalEditOk → discard preview, redeliver via
+    //      deliverReplies(chunkMarkdownText(...)). This is the path
+    //      that fixes msg-10794: if the live bubble couldn't render
+    //      the full body (size or parse error), we delete it cleanly
+    //      and send the proper chunks fresh at chat bottom — no
+    //      content lost, no stranded edit-failure bubble.
     if (parsed.text) {
+      await streamer.flushDraft();
       const fin = await streamer.finalize(parsed.text);
       if (fin.streamed) {
-        if (parsed.text.length > TG_MAX_LEN) {
-          const rest = parsed.text.slice(TG_MAX_LEN - 3);
-          for (const chunk of chunkText(rest)) {
-            try {
-              await tg(bot, 'sendMessage', {
-                chat_id: chatId, text: chunk,
-                ...(threadId && { message_thread_id: threadId }),
-              }, outMeta);
-            } catch (err) {
-              console.error(`[${label}] overflow sendMessage failed: ${err.message}`);
-            }
-          }
+        if (fin.finalEditOk) {
+          // Preview was successfully edited to the final text.
+          // No follow-up messages needed.
+          console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
+          markReplied();
+          return;
         }
-        console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
+        // Preview can't hold the final body (overflow OR last edit
+        // failed even after our HTML→plain fallback). Delete it and
+        // send the body as proper chunks.
+        try { await streamer.discard(); }
+        catch (err) { console.error(`[${label}] discard failed: ${err.message}`); }
+        const chunks = chunkMarkdownText(parsed.text, TG_MAX_LEN);
+        const r = await deliverReplies({
+          bot,
+          send: (b, method, params, m) => tg(b, method, params, m),
+          chatId,
+          threadId,
+          chunks,
+          replyToMessageId: msg.message_id,
+          meta: outMeta,
+          logger: { error: (m) => console.error(`[${label}] ${m}`) },
+        });
+        const reason = fin.overflow ? 'overflow' : 'edit-failed';
+        logEvent('telegram-stream-redeliver', {
+          chat_id: chatId, msg_id: msg.message_id,
+          reason, chunks: chunks.length,
+          delivered: r.sent.length, failed: r.failed.length,
+          bot: BOT_NAME,
+        });
+        console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed-redeliver(${reason}, ${chunks.length} chunks) | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
         markReplied();
         return;
       }
-      // Not streamed (response too short) — fall through to normal path.
+      // Not streamed (response too short — never crossed minChars).
+      // Fall through to the normal send path below.
     }
 
     if (parsed.reaction) {
@@ -1829,19 +1861,20 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         console.error(`[${label}] sendSticker failed: ${err.message}`);
       });
     } else if (parsed.text) {
-      const chunks = chunkText(parsed.text);
-      for (let i = 0; i < chunks.length; i++) {
-        const params = {
-          chat_id: chatId, text: chunks[i],
-          ...(threadId && { message_thread_id: threadId }),
-        };
-        if (i === 0) params.reply_parameters = { message_id: msg.message_id };
-        try {
-          await tg(bot, 'sendMessage', params, outMeta);
-        } catch (err) {
-          console.error(`[${label}] sendMessage failed (chunk ${i + 1}/${chunks.length}): ${err.message}`);
-        }
-      }
+      // 0.7.0: use markdown-aware chunker + deliverReplies primitive.
+      // The old chunkText was newline/byte-only; chunkMarkdownText also
+      // respects code-fence boundaries (closes + reopens across chunks).
+      const chunks = chunkMarkdownText(parsed.text, TG_MAX_LEN);
+      await deliverReplies({
+        bot,
+        send: (b, method, params, m) => tg(b, method, params, m),
+        chatId,
+        threadId,
+        chunks,
+        replyToMessageId: msg.message_id,
+        meta: outMeta,
+        logger: { error: (m) => console.error(`[${label}] ${m}`) },
+      });
     }
 
     console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
