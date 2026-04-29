@@ -389,3 +389,39 @@ describe('scanParenAwareBreakpoints', () => {
     assert.ok(r.lastWhitespace < 5 || r.lastWhitespace > 15);
   });
 });
+
+describe('chunkMarkdownText — defensive post-pass enforces limit', () => {
+  // Production saw chunks of 4097-4500 chars hitting Telegram's 400
+  // "message is too long" because the fence-splitting "force the
+  // break" path can produce overflow chunks. The post-pass at end
+  // of chunkMarkdownText byte-cuts any chunk still > limit.
+
+  test('every chunk is <= limit even for plain text with no break points', () => {
+    // 10000 chars, no whitespace at all — softBreak fails, no fences,
+    // and the loop produces hard-cuts at limit. Without the post-pass
+    // the final remaining could overflow if the loop's emergency
+    // break ever fires.
+    const text = 'x'.repeat(10000);
+    const chunks = chunkMarkdownText(text, 4096);
+    for (const c of chunks) assert.ok(c.length <= 4096, `chunk len ${c.length} > 4096`);
+  });
+
+  test('single fence body too long for a clean split is hard-cut by post-pass', () => {
+    // 10000-char fence body. The fence-splitting code may produce
+    // overflow when adding the close marker pushes past limit.
+    const fence = '```\n' + 'y'.repeat(10000) + '\n```';
+    const chunks = chunkMarkdownText(fence, 4096);
+    for (const c of chunks) assert.ok(c.length <= 4096, `chunk len ${c.length} > 4096`);
+  });
+
+  test('reassembly preserves all input bytes (modulo fence reopen markers)', () => {
+    // Plain text — no fence reopen — re-joining chunks must equal
+    // input. Chunker drops a single whitespace at chunk boundaries
+    // when brokeOnSeparator; account for that.
+    const text = 'a'.repeat(5000);
+    const chunks = chunkMarkdownText(text, 1024);
+    const joined = chunks.join('');
+    assert.equal(joined.length, text.length);
+    assert.equal(joined, text);
+  });
+});
