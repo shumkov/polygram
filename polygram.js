@@ -2460,28 +2460,25 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     if (entry?.inFlight) {
       const ok = autosteerBuffer.append(sessionKey, prompt);
       if (ok) {
-        // Quiet ack — no chat-bubble reply, just a reaction so the
-        // user sees their message was incorporated. The in-flight
-        // turn's response will address both questions.
-        tg(bot, 'setMessageReaction', {
-          chat_id: chatId,
-          message_id: msg.message_id,
-          reaction: [{ type: 'emoji', emoji: '✍' }],
-        }, { source: 'autosteer-ack', botName: BOT_NAME }).catch((err) => {
-          console.error(`[${label}] autosteer reaction: ${err.message}`);
-        });
         logEvent('autosteer', {
           chat_id: chatId, msg_id: msg.message_id,
           text_len: prompt?.length ?? 0,
         });
         stopTyping();
-        // 0.8.0-rc.8: clear() instead of stop() so the THINKING/QUEUED
-        // 👀 reaction set by the reactor at QUEUED-state actually
-        // disappears from the user's message. reactor.stop() only
-        // cancels timers; the visible emoji persists indefinitely
-        // without an explicit clear() — that's why production showed
-        // 👀 stuck on every steered follow-up under rc.6/rc.7.
-        await reactor.clear().catch(() => {});
+        // 0.8.0-rc.11: route the ✍ ack through the reactor's
+        // serialized apply chain. Pre-rc.11 we used a direct
+        // setMessageReaction(✍) racing with the reactor's
+        // QUEUED→👀 apply AND a follow-up reactor.clear() — three
+        // concurrent network calls, final state was whichever
+        // landed last at Telegram. Symptom: 👀 sometimes stuck,
+        // ✍ sometimes vanished, reactions disappeared "almost
+        // immediately" or got stuck arbitrarily.
+        //
+        // setState('AUTOSTEERED') is terminal so it bypasses the
+        // 800ms throttle and flushes synchronously through
+        // applyChain — so it serializes after any in-flight
+        // QUEUED apply and lands as the final visible reaction.
+        await reactor.setState('AUTOSTEERED');
         markReplied();
         return;
       }
