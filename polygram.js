@@ -31,6 +31,7 @@ const { ProcessManager } = require('./lib/process-manager');
 // pick-at-startup. Phase 4 deletes the CLI version after Phase 5
 // soak proves SDK stable. See docs/0.8.0-architecture-decisions.md.
 const { ProcessManagerSdk } = require('./lib/process-manager-sdk');
+const { createAutosteerBuffer } = require('./lib/autosteer-buffer');
 const agentLoader = require('./lib/agent-loader');
 const USE_SDK = process.env.POLYGRAM_USE_SDK === '1';
 const { createSender } = require('./lib/telegram');
@@ -698,6 +699,14 @@ function formatPrompt(msg, sessionCtx, attachments = []) {
 
 let pm = null; // ProcessManager, created in main()
 
+// 0.8.0-rc.9: per-session autosteer buffer. Holds user follow-ups
+// that arrive mid-turn so the SDK pm's PostToolBatch hook can drain
+// them into `additionalContext` on each tool boundary. Replaces the
+// rc.6/rc.7 approach of pushing priority:'now' SDKUserMessages
+// directly (which violated the SDK's m87 transcript-shape gate when
+// the assistant was mid-tool-use).
+const autosteerBuffer = createAutosteerBuffer();
+
 function spawnClaude(sessionKey, ctx) {
   const { chatConfig, existingSessionId, label, chatId } = ctx;
   // 0.7.3: Claude Code's Chrome-extension integration (browser
@@ -817,6 +826,40 @@ function buildSdkOptions(sessionKey, ctx) {
   const useCanUseTool = apprCfg && apprCfg.adminChatId
     && Array.isArray(apprCfg.gatedTools) && apprCfg.gatedTools.length > 0;
 
+  // 0.8.0-rc.9: PostToolBatch hook drains the autosteer buffer for
+  // this session and injects queued user follow-ups as
+  // `additionalContext` on each tool boundary. Framing matters:
+  // wrapping in `<channel source="user-followup">…</channel>` is
+  // what Claude is trained to trust as legitimate out-of-band user
+  // context (verified live via post-tool-batch-spike-v2.mjs); the
+  // earlier `<user_message_during_turn>` framing tripped the
+  // model's prompt-injection defense and got refused.
+  const postToolBatchHook = async () => {
+    try {
+      const drained = autosteerBuffer.drain(sessionKey);
+      if (drained.length === 0) return { continue: true };
+      const additionalContext = autosteerBuffer.formatForHook(drained);
+      logEvent('autosteer-hook-drained', {
+        chat_id: ctx?.chatId ?? null,
+        session_key: sessionKey,
+        message_count: drained.length,
+      });
+      return {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: 'PostToolBatch',
+          additionalContext,
+        },
+      };
+    } catch (err) {
+      console.error(`[${sessionKey}] PostToolBatch hook error: ${err.message}`);
+      // Never throw out of a hook — the SDK may treat it as a hard
+      // fail (`stop_hook_prevented` result subtype). Drop the
+      // queued messages on the floor; the user can re-send.
+      return { continue: true };
+    }
+  };
+
   const baseOpts = {
     model: chatConfig.model || config.defaults.model,
     effort: chatConfig.effort || config.defaults.effort,
@@ -828,6 +871,9 @@ function buildSdkOptions(sessionKey, ctx) {
     permissionMode: useCanUseTool ? 'default' : 'bypassPermissions',
     allowDangerouslySkipPermissions: !useCanUseTool,
     ...(useCanUseTool && { canUseTool: makeCanUseTool(sessionKey) }),
+    hooks: {
+      PostToolBatch: [{ hooks: [postToolBatchHook] }],
+    },
     executable: 'node',
     ...(existingSessionId && { resume: existingSessionId }),
     ...(process.env.POLYGRAM_CLAUDE_BIN && {
@@ -1966,38 +2012,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     await sendReply('✨ Started a fresh session.');
     return;
   }
-  // 0.8.0 Phase 2 step 1: /steer <text> — mid-turn steering. Pushes
-  // a priority:'now' user message onto the active Query so Claude
-  // sees it without waiting for the in-flight turn to fully
-  // complete. SDK pm only — CLI pm has no steer primitive (its
-  // stream-json transport is request-response, not interruptible
-  // mid-turn). Falls back to /new under CLI pm.
-  if (botAllowsCommands && text.startsWith('/steer ')) {
-    const steerText = text.slice(7).trim();
-    if (!steerText) { await sendReply('Usage: /steer <text>'); return; }
-    const target = pm.pickFor(sessionKey);
-    if (typeof target.steer !== 'function') {
-      await sendReply('🛞 /steer requires the SDK pm. This chat is on the CLI pm path.');
-      return;
-    }
-    if (!pm.has(sessionKey)) {
-      await sendReply('🛞 No active session — /steer only works mid-turn. Send a message first, then /steer while it\'s thinking.');
-      return;
-    }
-    const ok = target.steer(sessionKey, steerText);
-    if (ok) {
-      logEvent('steer-command', {
-        chat_id: chatId, text_len: steerText.length,
-        user: cmdUser, user_id: cmdUserId,
-      });
-      // Quiet ack so user knows it landed; the actual response will
-      // arrive as the in-flight turn's continuation.
-      await sendReply('🛞 Steering applied. Watching for the response.');
-    } else {
-      await sendReply('🛞 Couldn\'t apply steer — session may have just closed.');
-    }
-    return;
-  }
+  // 0.8.0-rc.9: /steer command removed. Mid-turn user input is
+  // handled implicitly by autosteer — any follow-up message during
+  // an in-flight SDK turn flows through autosteerBuffer +
+  // PostToolBatch hook. No explicit command needed; matches Claude
+  // Code interactive UX where you just keep typing.
   // Graceful application of a model/effort change to the user's CURRENT
   // session only. With isolateTopics=false the sessionKey is just the
   // chat (one shared session for the whole chat — every topic
@@ -2424,13 +2443,22 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const chatAutosteer = chatConfig.autosteer != null
     ? chatConfig.autosteer
     : config.bot?.autosteer;
-  const autosteerTarget = pm.pickFor(sessionKey);
+  // 0.8.0-rc.9: autosteer now drives through autosteerBuffer +
+  // PostToolBatch hook (in buildSdkOptions), not pm.steer's direct
+  // inputController push. The hook fires on every tool boundary
+  // and injects queued follow-ups as <channel source="user-followup">
+  // additionalContext — the SDK-trusted framing that survives the
+  // m87 transcript-shape gate.
+  //
+  // We still gate on the SDK pm path: under CLI pm there's no
+  // PostToolBatch hook surface, so autosteer falls through to the
+  // regular FIFO send (same UX as 0.7.x).
   const autosteerEnabled = chatAutosteer !== false
-    && typeof autosteerTarget.steer === 'function';
+    && pm.isSdkFor(sessionKey);
   if (autosteerEnabled && pm.has(sessionKey)) {
     const entry = pm.get(sessionKey);
     if (entry?.inFlight) {
-      const ok = autosteerTarget.steer(sessionKey, prompt);
+      const ok = autosteerBuffer.append(sessionKey, prompt);
       if (ok) {
         // Quiet ack — no chat-bubble reply, just a reaction so the
         // user sees their message was incorporated. The in-flight
@@ -2807,7 +2835,7 @@ function createBot(token) {
   // Cached once @botUsername is known — was recompiling per inbound msg.
   let mentionRe = null;
   // Hoisted admin-command matcher; was re-allocated per message.
-  const ADMIN_CMD_RE = /^\/(model|effort|config|pair-code|pairings|unpair|new|reset|context|steer)(\s|$)/;
+  const ADMIN_CMD_RE = /^\/(model|effort|config|pair-code|pairings|unpair|new|reset|context)(\s|$)/;
   const PAIR_CLAIM_RE = /^\/pair\s+\S+/;
 
   // The filter in main() guarantees config.chats only contains chats owned
