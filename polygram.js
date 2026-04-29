@@ -1709,16 +1709,34 @@ async function handleConfigCallback(ctx) {
     user: cmdUser, user_id: cmdUserId, source: 'inline-button',
   }), `log ${setting} change`);
 
-  // Graceful respawn of the topic's session that the card is in. With
+  // Graceful application of the change to the topic's session. With
   // isolateTopics=false sessionKey is the chat (one shared session). With
   // isolateTopics=true sessionKey carries the topic, so other topics'
   // in-flight turns are not disturbed and the card update + button toast
-  // only affect the user's own context. Mirrors the text-command flow in
-  // handleMessage's requestRespawnForSession.
+  // only affect the user's own context.
+  //
+  // CLI pm: requestRespawn drains pending turns then kills the process;
+  //   the next user message spawns fresh with the updated chatConfig.
+  // SDK pm: applies live to the running Query via setModel /
+  //   applyFlagSettings — no respawn needed, change takes effect for the
+  //   rest of the in-flight turn AND all future ones. Falls back to
+  //   {killed: false} if neither method is available, leaving the new
+  //   chatConfig value to be picked up by the next cold spawn.
   const callbackThreadId = ctx.callbackQuery.message?.message_thread_id?.toString() || null;
   const callbackSessionKey = getSessionKey(chatId, callbackThreadId, chatConfig);
   const reason = setting === 'model' ? 'model-change' : 'effort-change';
-  const respawn = pm.requestRespawn(callbackSessionKey, reason);
+  let respawn;
+  if (typeof pm.requestRespawn === 'function') {
+    respawn = pm.requestRespawn(callbackSessionKey, reason);
+  } else if (setting === 'effort' && typeof pm.applyFlagSettings === 'function') {
+    const ok = await pm.applyFlagSettings(callbackSessionKey, { effortLevel: value });
+    respawn = { killed: ok };
+  } else if (setting === 'model' && typeof pm.setModel === 'function') {
+    const ok = await pm.setModel(callbackSessionKey, value);
+    respawn = { killed: ok };
+  } else {
+    respawn = { killed: false };
+  }
   const anyActive = !respawn.killed;
 
   // Re-render the card with updated ✓ + the same help text shown initially.
@@ -1969,17 +1987,33 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     }
     return;
   }
-  // Graceful respawn of the user's CURRENT session only. With
-  // isolateTopics=false the sessionKey is just the chat (one shared
-  // session for the whole chat — every topic respawns implicitly).
-  // With isolateTopics=true each topic is a separate session, and a
-  // /model in topic A should NOT disturb topic B's in-flight turn or
-  // post a phantom "✓ Using sonnet now" in a topic that didn't ask.
-  // Pre-0.6.5 this iterated pm.keys() by chat prefix and incorrectly
-  // fanned out across all topics under isolateTopics=true.
-  const requestRespawnForSession = (reason) => {
-    const res = pm.requestRespawn(sessionKey, reason);
-    return { queued: res.queued, anyActive: !res.killed };
+  // Graceful application of a model/effort change to the user's CURRENT
+  // session only. With isolateTopics=false the sessionKey is just the
+  // chat (one shared session for the whole chat — every topic
+  // respawns implicitly). With isolateTopics=true each topic is a
+  // separate session, and a /model in topic A should NOT disturb
+  // topic B's in-flight turn or post a phantom "✓ Using sonnet now"
+  // in a topic that didn't ask.
+  //
+  // CLI pm: requestRespawn drains pending turns then kills the process;
+  //   the next user message spawns fresh with the updated chatConfig.
+  // SDK pm: applies live to the running Query via setModel /
+  //   applyFlagSettings — no respawn needed, change takes effect for
+  //   the rest of the in-flight turn AND all future ones.
+  const applyConfigChange = async (reason, setting, value) => {
+    if (typeof pm.requestRespawn === 'function') {
+      const res = pm.requestRespawn(sessionKey, reason);
+      return { queued: res.queued, anyActive: !res.killed };
+    }
+    if (setting === 'effort' && typeof pm.applyFlagSettings === 'function') {
+      const ok = await pm.applyFlagSettings(sessionKey, { effortLevel: value });
+      return { queued: 0, anyActive: !ok };
+    }
+    if (setting === 'model' && typeof pm.setModel === 'function') {
+      const ok = await pm.setModel(sessionKey, value);
+      return { queued: 0, anyActive: !ok };
+    }
+    return { queued: 0, anyActive: false };
   };
 
   if (botAllowsCommands && text.startsWith('/model ')) {
@@ -1993,7 +2027,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         old_value: oldModel, new_value: newModel,
         user: cmdUser, user_id: cmdUserId, source: 'command',
       }), 'log model change');
-      const { anyActive } = requestRespawnForSession('model-change');
+      const { anyActive } = await applyConfigChange('model-change', 'model', newModel);
       const ver = MODEL_VERSIONS[newModel] || newModel;
       const suffix = anyActive ? ` — I'll switch when I finish` : '';
       await sendReply(`Model → ${newModel} (${ver})${suffix}`);
@@ -2013,7 +2047,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         old_value: oldEffort, new_value: newEffort,
         user: cmdUser, user_id: cmdUserId, source: 'command',
       }), 'log effort change');
-      const { anyActive } = requestRespawnForSession('effort-change');
+      const { anyActive } = await applyConfigChange('effort-change', 'effort', newEffort);
       const suffix = anyActive ? ` — I'll switch when I finish` : '';
       await sendReply(`Effort → ${newEffort}${suffix}`);
     } else {
