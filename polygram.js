@@ -2698,6 +2698,40 @@ async function main() {
     process.exit(1);
   }
 
+  // 0.8.0 Phase 1 step 11: belt-and-suspenders unhandledRejection
+  // logger. The new pm wraps every Query iteration in try/catch so
+  // SDK throws never leak — but if a callback ever does throw async
+  // (canUseTool body, onResult handler, etc.) the rejection could
+  // escape to the global handler. Without this, Node's default is to
+  // exit the process. With this, we log + persist and keep running
+  // so other chats are unaffected.
+  process.on('unhandledRejection', (reason, promise) => {
+    const reasonStr = reason instanceof Error
+      ? `${reason.message}\n${(reason.stack || '').split('\n').slice(0, 3).join('\n')}`
+      : String(reason);
+    console.error(`[polygram] unhandledRejection: ${reasonStr.slice(0, 1000)}`);
+    try {
+      db.logEvent('unhandled-rejection', {
+        reason: String(reason instanceof Error ? reason.message : reason).slice(0, 500),
+        bot_name: BOT_NAME,
+      });
+    } catch { /* swallow — db might be closing */ }
+  });
+  // Same defensive posture for uncaughtException — Node's default is
+  // exit on these. We want to log + persist + survive (the affected
+  // chat's iteration loop will have rejected its pendings via the
+  // catch in pm's _runIteration, so user-visible UX is "their turn
+  // failed", not "bot died").
+  process.on('uncaughtException', (err) => {
+    console.error(`[polygram] uncaughtException: ${err?.message}\n${err?.stack?.split('\n').slice(0, 5).join('\n')}`);
+    try {
+      db.logEvent('uncaught-exception', {
+        message: String(err?.message || err).slice(0, 500),
+        bot_name: BOT_NAME,
+      });
+    } catch { /* swallow */ }
+  });
+
   const cap = config.maxWarmProcesses || DEFAULT_MAX_WARM_PROCS;
   pm = new ProcessManager({
     cap,
