@@ -39,14 +39,17 @@ describe('filterAttachments', () => {
     assert.match(rejected[1].reason, /unknown/);
   });
 
-  test('enforces max count', () => {
-    const atts = Array.from({ length: 7 }, (_, i) => ({
+  test('no count cap — only size caps gate acceptance', () => {
+    // Removed the artificial MAX_COUNT=5 cap. With per-file (10 MB)
+    // and total-size (20 MB) caps already in place, count was a
+    // redundant guard that surprised users sending Telegram albums
+    // (up to 10 photos per message).
+    const atts = Array.from({ length: 12 }, (_, i) => ({
       name: `p${i}.jpg`, mime_type: 'image/jpeg', size: 10,
     }));
     const { accepted, rejected } = filterAttachments(atts);
-    assert.equal(accepted.length, 5);
-    assert.equal(rejected.length, 2);
-    assert.match(rejected[0].reason, /max count/);
+    assert.equal(accepted.length, 12);
+    assert.equal(rejected.length, 0);
   });
 
   test('enforces total size cap across multiple files', () => {
@@ -96,14 +99,15 @@ describe('filterAttachments', () => {
     assert.equal(rejected.length, 0);
   });
 
-  test('customizable limits via opts', () => {
+  test('customizable total-size cap via opts', () => {
     const atts = [
-      { name: 'a', mime_type: 'image/jpeg', size: 10 },
-      { name: 'b', mime_type: 'image/jpeg', size: 10 },
+      { name: 'a', mime_type: 'image/jpeg', size: 100 },
+      { name: 'b', mime_type: 'image/jpeg', size: 100 },
     ];
-    const { accepted, rejected } = filterAttachments(atts, { maxCount: 1 });
+    const { accepted, rejected } = filterAttachments(atts, { maxTotalBytes: 150 });
     assert.equal(accepted.length, 1);
     assert.equal(rejected.length, 1);
+    assert.match(rejected[0].reason, /total size cap/);
   });
 
   test('single blob near but under per-file cap fits', () => {
