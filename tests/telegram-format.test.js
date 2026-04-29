@@ -159,3 +159,68 @@ describe('toTelegramMarkdown alias still works (back-compat)', () => {
     assert.match(r.text, /<b>bold<\/b>/);
   });
 });
+
+// ─── 0.7.0: Telegram error classification ──────────────────────────
+
+const { isHtmlParseError, isMessageNotModifiedError } = require('../lib/telegram-format');
+
+describe('isHtmlParseError', () => {
+  test('matches canonical Telegram parse-error wording', () => {
+    const cases = [
+      "Bad Request: can't parse entities: Unmatched tag",
+      "Bad Request: parse entities: Unsupported tag",
+      "Bad Request: can't find end of the entity",
+      "Telegram: Bad Request: CAN'T PARSE ENTITIES",
+    ];
+    for (const msg of cases) {
+      assert.ok(isHtmlParseError(new Error(msg)), 'should match: ' + msg);
+    }
+  });
+
+  test('does NOT match unrelated errors', () => {
+    const cases = [
+      'Forbidden: bot was kicked',
+      'Bad Request: chat not found',
+      'message is not modified',
+      'Network request for sendMessage failed',
+      'Bad Request: text too long',
+    ];
+    for (const msg of cases) {
+      assert.ok(!isHtmlParseError(new Error(msg)), 'should NOT match: ' + msg);
+    }
+  });
+
+  test('handles err.description (grammy shape)', () => {
+    const err = { description: "Bad Request: can't parse entities: x" };
+    assert.ok(isHtmlParseError(err));
+  });
+
+  test('null/undefined safe', () => {
+    assert.equal(isHtmlParseError(null), false);
+    assert.equal(isHtmlParseError(undefined), false);
+  });
+});
+
+describe('isMessageNotModifiedError', () => {
+  test('matches the literal Telegram wording', () => {
+    const cases = [
+      'Bad Request: message is not modified',
+      '400: Bad Request: message is not modified: nothing changed',
+      'Bad Request: MESSAGE_NOT_MODIFIED',
+    ];
+    for (const msg of cases) {
+      assert.ok(isMessageNotModifiedError(new Error(msg)), 'should match: ' + msg);
+    }
+  });
+
+  test('does NOT match other 400 errors', () => {
+    const cases = [
+      'Bad Request: chat not found',
+      "Bad Request: can't parse entities",
+      'Bad Request: message text is empty',
+    ];
+    for (const msg of cases) {
+      assert.ok(!isMessageNotModifiedError(new Error(msg)), 'should NOT match: ' + msg);
+    }
+  });
+});

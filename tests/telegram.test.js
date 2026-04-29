@@ -430,3 +430,149 @@ describe('send — thread-not-found fallback', () => {
     assert.equal(callCount, 1, 'should not retry for non-thread errors');
   });
 });
+
+// ─── 0.7.0: HTML→plain fallback ─────────────────────────────────────
+
+describe('HTML→plain parse fallback', () => {
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-tg')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  test('retries as plain text when Telegram rejects HTML with parse error', async () => {
+    let callCount = 0;
+    const calls = [];
+    const bot = {
+      api: {
+        raw: new Proxy({}, {
+          get: (_, method) => (params) => {
+            callCount += 1;
+            calls.push({ params: { ...params } });
+            // First call (HTML) fails with parse error; second (plain) succeeds.
+            if (callCount === 1) {
+              const err = new Error("Bad Request: can't parse entities: Unmatched tag");
+              throw err;
+            }
+            return Promise.resolve({ message_id: 999, date: 1700000000 });
+          },
+        }),
+      },
+    };
+    const res = await send({
+      bot, method: 'sendMessage',
+      params: { chat_id: '1', text: 'Some **bold** content' },
+      db, logger: silentLogger(),
+    });
+    assert.equal(res.message_id, 999);
+    assert.equal(callCount, 2);
+    // First call had parse_mode set; second did not.
+    assert.equal(calls[0].params.parse_mode, 'HTML');
+    assert.equal(calls[1].params.parse_mode, undefined);
+    // Second call's text is the raw markdown, not the converted HTML.
+    assert.match(calls[1].params.text, /\*\*bold\*\*/);
+    // Event logged.
+    const ev = db.raw.prepare("SELECT kind FROM events WHERE kind = 'telegram-html-fallback'").get();
+    assert.ok(ev, 'expected telegram-html-fallback event');
+  });
+
+  test('DOES NOT retry as plain on non-parse errors', async () => {
+    let callCount = 0;
+    const bot = {
+      api: {
+        raw: new Proxy({}, {
+          get: () => () => {
+            callCount += 1;
+            throw new Error('Forbidden: bot was kicked');
+          },
+        }),
+      },
+    };
+    await assert.rejects(
+      () => send({
+        bot, method: 'sendMessage',
+        params: { chat_id: '1', text: 'hi' },
+        db, logger: silentLogger(),
+      }),
+      /kicked/,
+    );
+    assert.equal(callCount, 1, 'no fallback for non-parse errors');
+  });
+
+  test('DOES NOT retry as plain when caller passed plainText meta (no formatting was applied)', async () => {
+    let callCount = 0;
+    const bot = {
+      api: {
+        raw: new Proxy({}, {
+          get: () => () => {
+            callCount += 1;
+            throw new Error("Bad Request: can't parse entities: x");
+          },
+        }),
+      },
+    };
+    // plainText:true means applyFormatting skipped — there's no parse_mode
+    // to fall back from. The error must propagate.
+    await assert.rejects(
+      () => send({
+        bot, method: 'sendMessage',
+        params: { chat_id: '1', text: '<b>hi</b>' },
+        db, meta: { plainText: true }, logger: silentLogger(),
+      }),
+      /can't parse/,
+    );
+    assert.equal(callCount, 1);
+  });
+});
+
+describe('MESSAGE_NOT_MODIFIED filter', () => {
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-tg')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  test('editMessageText: 400 message-not-modified is swallowed as success', async () => {
+    let callCount = 0;
+    const bot = {
+      api: {
+        raw: new Proxy({}, {
+          get: () => () => {
+            callCount += 1;
+            throw new Error('Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message');
+          },
+        }),
+      },
+    };
+    const res = await send({
+      bot, method: 'editMessageText',
+      params: { chat_id: '1', message_id: 42, text: 'unchanged' },
+      db, logger: silentLogger(),
+    });
+    // Synthetic success; message_id is what we passed.
+    assert.equal(res.message_id, 42);
+    assert.equal(res._notModified, true);
+    assert.equal(callCount, 1, 'no retry — swallowed on first attempt');
+    // Event logged so ops can spot a hot debounce loop.
+    const ev = db.raw.prepare("SELECT kind FROM events WHERE kind = 'telegram-edit-skip-not-modified'").get();
+    assert.ok(ev, 'expected telegram-edit-skip-not-modified event');
+  });
+
+  test('sendMessage: not-modified error is NOT swallowed (sendMessage cannot produce it)', async () => {
+    // If a sendMessage somehow returns this error, treat it like any
+    // other 400 — propagate. The filter is editMessageText-specific
+    // because the streamer's debounced edit loop is the only path that
+    // generates spurious no-op edits.
+    const bot = {
+      api: {
+        raw: new Proxy({}, {
+          get: () => () => {
+            throw new Error('Bad Request: message is not modified');
+          },
+        }),
+      },
+    };
+    await assert.rejects(
+      () => send({
+        bot, method: 'sendMessage',
+        params: { chat_id: '1', text: 'hi' },
+        db, logger: silentLogger(),
+      }),
+      /not modified/,
+    );
+  });
+});
