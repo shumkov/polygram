@@ -429,3 +429,45 @@ describe('streamer.archive()', () => {
     assert.equal(snap.msgId, null);
   });
 });
+
+// 0.7.2: forceNewMessage tracks superseded bubbles for end-of-turn cleanup
+describe('streamer.getArchived() (0.7.2)', () => {
+  test('initial state: archived is empty', () => {
+    const h = makeHarness({ minChars: 10 });
+    assert.deepEqual(h.s.getArchived(), []);
+  });
+
+  test('forceNewMessage pushes the live bubble msgId to archived', async () => {
+    const h = makeHarness({ minChars: 10 });
+    await h.s.onChunk('first message text streaming');
+    assert.equal(h.s.msgId, 100);
+    h.s.forceNewMessage();
+    assert.deepEqual(h.s.getArchived(), [100]);
+  });
+
+  test('multiple forceNewMessage calls accumulate', async () => {
+    const h = makeHarness({ minChars: 10 });
+    await h.s.onChunk('first message text streaming');
+    h.s.forceNewMessage();
+    await h.s.onChunk('second message text streaming');
+    h.s.forceNewMessage();
+    await h.s.onChunk('third message text streaming');
+    assert.deepEqual(h.s.getArchived(), [100, 101]);
+  });
+
+  test('forceNewMessage from idle does NOT push (no bubble to archive)', () => {
+    const h = makeHarness({ minChars: 100 });
+    h.s.forceNewMessage();
+    assert.deepEqual(h.s.getArchived(), []);
+  });
+
+  test('getArchived returns a copy (caller can mutate without affecting internal state)', async () => {
+    const h = makeHarness({ minChars: 10 });
+    await h.s.onChunk('first message text streaming');
+    h.s.forceNewMessage();
+    const snap1 = h.s.getArchived();
+    snap1.push(999);
+    const snap2 = h.s.getArchived();
+    assert.deepEqual(snap2, [100]);
+  });
+});

@@ -1664,21 +1664,34 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     ...(linkPreview === false ? { linkPreview: false } : {}),
   };
 
+  // 0.7.2: only the FIRST bubble in a turn quotes the user's message
+  // via reply_parameters. When a tool-heavy turn produces multiple
+  // assistant messages (each spawning its own bubble via
+  // forceNewMessage), subsequent bubbles shouldn't re-quote the user
+  // — the chat would show N copies of the same quoted message stacked
+  // vertically. After the first send, the flag flips and subsequent
+  // initial-sends omit reply_parameters.
+  let firstBubbleSent = false;
   // Streaming is unconditional as of 0.4.0 — matches OpenClaw's model and
   // eliminates the "stuck at 15min typing" complaint from the non-streaming
   // code path. For short responses the streamer stays idle and we fall
   // through to the normal send path via finalize() returning streamed=false.
   const streamer = createStreamer({
-    send: async (text) => tg(bot, 'sendMessage', {
-      chat_id: chatId, text,
-      // allow_sending_without_reply: long-running turns give the user
-      // plenty of time to delete their original message. Without this
-      // flag, Telegram rejects the reply with MESSAGE_NOT_FOUND and the
-      // whole streamed answer is lost. With it, the reply simply lands
-      // as a standalone message.
-      reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
-      ...(threadId && { message_thread_id: threadId }),
-    }, outMetaBase),
+    send: async (text) => {
+      const params = {
+        chat_id: chatId, text,
+        ...(threadId && { message_thread_id: threadId }),
+      };
+      if (!firstBubbleSent) {
+        // allow_sending_without_reply: long-running turns give the user
+        // plenty of time to delete their original message. Without this
+        // flag, Telegram rejects the reply with MESSAGE_NOT_FOUND and the
+        // whole streamed answer is lost.
+        params.reply_parameters = { message_id: msg.message_id, allow_sending_without_reply: true };
+        firstBubbleSent = true;
+      }
+      return tg(bot, 'sendMessage', params, outMetaBase);
+    },
     edit: async (messageId, text) => {
       try {
         // Route edits through tg() so applyFormatting runs (MarkdownV2
@@ -1724,6 +1737,34 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     logger: { error: (m) => console.error(`[${label}] ${m}`) },
   });
   // streamer is registered with this turn via pm.send's context (below)
+
+  // 0.7.2: clean up bubbles superseded by forceNewMessage() — the
+  // intermediate "thinking out loud" assistant messages that fired in
+  // a tool-heavy turn. Without this, every tool-result cycle leaves a
+  // permanent bubble in the chat (see the screenshot from the post-
+  // 0.7.1 deploy where six bubbles appeared for one logical turn).
+  // Matches OpenClaw's archivedAnswerPreviews end-of-turn cleanup.
+  // Call AFTER finalize/discard decisions so we never delete the
+  // bubble that's the final reply.
+  async function cleanupArchivedBubbles() {
+    const archived = streamer.getArchived?.() || [];
+    if (archived.length === 0) return;
+    for (const messageId of archived) {
+      try {
+        await tg(bot, 'deleteMessage', {
+          chat_id: chatId, message_id: messageId,
+        }, { source: 'bot-reply-archived-cleanup', botName: BOT_NAME });
+      } catch (err) {
+        // Non-fatal — message may be >48h old or already gone.
+        // Operator-visible only via the events table.
+        console.error(`[${label}] archived-cleanup ${messageId}: ${err.message}`);
+      }
+    }
+    logEvent('telegram-archived-cleanup', {
+      chat_id: chatId, msg_id: msg.message_id, count: archived.length,
+      bot: BOT_NAME,
+    });
+  }
 
   // Status reactions on the user's message: 👀 queued → 🤔 thinking →
   // 👨‍💻 coding / ⚡ web / 🔥 tool → 👍 done / 🤯 error. Silent (no
@@ -1853,6 +1894,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         if (fin.finalEditOk) {
           // Preview was successfully edited to the final text.
           // No follow-up messages needed.
+          await cleanupArchivedBubbles();
           console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
           markReplied();
           return;
@@ -1897,6 +1939,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
             console.error(`[${label}] partial-delivery warning failed: ${warnErr.message}`);
           }
         }
+        await cleanupArchivedBubbles();
         console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed-redeliver(${reason}, ${chunks.length} chunks${r.failed.length ? `, ${r.failed.length} failed` : ''}) | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
         markReplied();
         return;
