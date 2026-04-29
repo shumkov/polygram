@@ -62,13 +62,31 @@ jobs:
       #
       # Do NOT set NODE_AUTH_TOKEN (not even empty). npm's OIDC path only
       # activates when no auth token env is present.
+      # Pre-release tags (e.g. v0.8.0-rc.1) publish under the `next`
+      # dist-tag so `npm install polygram` (default = latest) keeps
+      # pulling the last stable. Stable tags (v0.8.0) publish under
+      # `latest` as usual. The deploy skill pins exact versions, so
+      # the dist-tag only matters for casual installers.
       - name: Publish to npm (OIDC)
-        run: npx -y npm@latest publish --access public
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          case "$PKG_VERSION" in
+            *-*) DIST_TAG="next" ;;
+            *)   DIST_TAG="latest" ;;
+          esac
+          echo "Publishing $PKG_VERSION under dist-tag $DIST_TAG"
+          npx -y npm@latest publish --access public --tag "$DIST_TAG"
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          case "$PKG_VERSION" in
+            *-*) PRERELEASE_FLAG="--prerelease" ;;
+            *)   PRERELEASE_FLAG="" ;;
+          esac
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
-            --generate-notes
+            --generate-notes \
+            $PRERELEASE_FLAG
