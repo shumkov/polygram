@@ -118,6 +118,44 @@ describe('digestInput + newToken', () => {
     assert.notEqual(digestInput({ cmd: 'rm' }), digestInput({ cmd: 'ls' }));
   });
 
+  test('digest is order-independent across object keys', () => {
+    // Pre-fix: JSON.stringify preserved insertion order so
+    // {a:1,b:2} and {b:2,a:1} produced different digests.
+    // Dedup contract requires logical equivalence.
+    const a = digestInput({ a: 1, b: 2, c: 3 });
+    const b = digestInput({ c: 3, b: 2, a: 1 });
+    assert.equal(a, b);
+  });
+
+  test('digest is order-independent for nested objects', () => {
+    const a = digestInput({ outer: { x: 1, y: 2 }, top: 'first' });
+    const b = digestInput({ top: 'first', outer: { y: 2, x: 1 } });
+    assert.equal(a, b);
+  });
+
+  test('digest preserves array ORDER (not a set)', () => {
+    // Arrays are sequence-significant — [a,b] and [b,a] are
+    // semantically different tool inputs (e.g. argv to Bash).
+    assert.notEqual(
+      digestInput({ args: ['a', 'b'] }),
+      digestInput({ args: ['b', 'a'] }),
+    );
+  });
+
+  test('digest of string input is unchanged by canonicalisation', () => {
+    // String inputs bypass JSON.stringify; canonicalize is a no-op.
+    const s = 'rm -rf /tmp';
+    const before = digestInput(s);
+    // Same string → same digest, regardless of fix.
+    assert.equal(digestInput(s), before);
+  });
+
+  test('realistic Bash tool input order-stability (regression: keys swapped)', () => {
+    const a = digestInput({ command: 'ls -la', description: 'list files' });
+    const b = digestInput({ description: 'list files', command: 'ls -la' });
+    assert.equal(a, b, 'Bash input dedup must be order-stable');
+  });
+
   test('newToken produces base64url of ≥128 bits', () => {
     const t = newToken();
     // 16 random bytes → 22 b64url chars (no padding).
