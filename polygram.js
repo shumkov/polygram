@@ -41,6 +41,7 @@ const {
   approvalCardText,
 } = require('./lib/approval-ui');
 const { makeSessionStartHook } = require('./lib/history-preload');
+const { formatContextReply, maybeContextFullHint } = require('./lib/context-format');
 const agentLoader = require('./lib/agent-loader');
 const USE_SDK = process.env.POLYGRAM_USE_SDK === '1';
 const { createSender } = require('./lib/telegram');
@@ -1955,32 +1956,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     }
     try {
       const u = await q.getContextUsage();
-      // SDK returns percentage in 0-100 scale (verified rc.3 prod
-      // — saw "77" for a 77%-used context). Display directly.
-      const pct = (u?.percentage ?? 0).toFixed(0);
-      const total = (u?.totalTokens ?? 0).toLocaleString();
-      const max = (u?.maxTokens ?? 0).toLocaleString();
-      const lines = [`📚 Context: ${total} / ${max} tokens (${pct}%)`];
-      if (u?.model) lines.push(`Model: ${u.model}`);
-      if (u?.isAutoCompactEnabled && u?.autoCompactThreshold) {
-        // autoCompactThreshold scale is currently unverified; assume
-        // matches percentage (0-100). If it turns out to be 0-1 we'll
-        // see something like "Auto-compact at 0%" and can flip back.
-        const thrPct = u.autoCompactThreshold.toFixed(0);
-        lines.push(`Auto-compact at ${thrPct}%.`);
-      }
-      // Top-3 categories by token cost so the user knows where the
-      // budget is going. SDK exposes a rich breakdown in
-      // u.categories — we just summarise.
-      if (Array.isArray(u?.categories) && u.categories.length) {
-        const top = [...u.categories]
-          .filter((c) => Number.isFinite(c?.tokens) && c.tokens > 0)
-          .sort((a, b) => b.tokens - a.tokens)
-          .slice(0, 3)
-          .map((c) => `  • ${c.label || c.name || '?'}: ${c.tokens.toLocaleString()}`);
-        if (top.length) lines.push('Top categories:', ...top);
-      }
-      await sendReply(lines.join('\n'));
+      await sendReply(formatContextReply(u));
     } catch (err) {
       console.error(`[${label}] /context failed: ${err.message}`);
       await sendReply(`📚 Couldn't fetch context info: ${err.message}`);
@@ -2642,25 +2618,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         const q = entry?.query;
         if (q && typeof q.getContextUsage === 'function') {
           q.getContextUsage().then((usage) => {
-            // SDK returns percentage in 0-100 scale, not 0-1.
-            // Pre-rc.4 we treated it as a 0-1 ratio and multiplied
-            // by 100, which displayed "7700% full" for a 77%-used
-            // context (and fired below the intended 85% threshold).
-            const pct = usage?.percentage ?? 0;
-            if (pct < 85) return;
-            // rc.22: three-choice hint. The original "send /new"
-            // message implied the only path forward was a hard
-            // reset. Now offer all three options the user actually
-            // has — start fresh, compact with their preserve
-            // instructions, or keep going (auto-compact eventually
-            // fires).
-            const text = [
-              `📚 Context window ${pct.toFixed(0)}% full. Three options:`,
-              '',
-              '• `/new` — start fresh; this conversation ends.',
-              '• `/compact` — summarise older messages. Add a hint after the command (e.g. `/compact keep the Q3 commission decisions`) and that becomes the compactor\'s guidance.',
-              '• Keep chatting — I\'ll auto-compact when needed; key context is preserved automatically.',
-            ].join('\n');
+            const text = maybeContextFullHint(usage);
+            if (!text) return;
             return tg(bot, 'sendMessage', {
               chat_id: chatId,
               text,
