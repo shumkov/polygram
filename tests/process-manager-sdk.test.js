@@ -100,6 +100,144 @@ describe('makeInputController', () => {
     ic.close();
     assert.throws(() => ic.push({ id: 1 }), { code: 'INPUT_CLOSED' });
   });
+
+  test('push wakes a pending waiter directly (bypasses queue)', async () => {
+    const ic = makeInputController({ queueCap: 5 });
+    // Start an awaiter BEFORE any push — queue empty, hits waiter path.
+    const p = ic.iter.next();
+    ic.push({ id: 'wakeup' });
+    const r = await p;
+    assert.equal(r.done, false);
+    assert.equal(r.value.id, 'wakeup');
+    // Queue should be empty (delivered directly, not buffered).
+    assert.equal(ic.size, 0);
+  });
+
+  test('multiple awaiters resolve FIFO as pushes arrive', async () => {
+    const ic = makeInputController({ queueCap: 5 });
+    const p1 = ic.iter.next();
+    const p2 = ic.iter.next();
+    const p3 = ic.iter.next();
+    ic.push({ id: 1 });
+    ic.push({ id: 2 });
+    ic.push({ id: 3 });
+    const [r1, r2, r3] = await Promise.all([p1, p2, p3]);
+    assert.equal(r1.value.id, 1);
+    assert.equal(r2.value.id, 2);
+    assert.equal(r3.value.id, 3);
+  });
+
+  test('size reflects queued depth', () => {
+    const ic = makeInputController({ queueCap: 10 });
+    assert.equal(ic.size, 0);
+    ic.push({ id: 1 });
+    ic.push({ id: 2 });
+    assert.equal(ic.size, 2);
+  });
+
+  test('close resolves all waiting awaiters as done:true', async () => {
+    const ic = makeInputController();
+    const p1 = ic.iter.next();
+    const p2 = ic.iter.next();
+    ic.close();
+    const r1 = await p1;
+    const r2 = await p2;
+    assert.equal(r1.done, true);
+    assert.equal(r2.done, true);
+    assert.equal(r1.value, undefined);
+  });
+
+  test('next() after close (queue empty) returns done:true immediately', async () => {
+    const ic = makeInputController();
+    ic.close();
+    const r = await ic.iter.next();
+    assert.equal(r.done, true);
+  });
+
+  test('next() after close still drains items already buffered', async () => {
+    // Pushed items survive close: drain them, THEN done:true.
+    const ic = makeInputController({ queueCap: 5 });
+    ic.push({ id: 1 });
+    ic.push({ id: 2 });
+    ic.close();
+    const r1 = await ic.iter.next();
+    const r2 = await ic.iter.next();
+    const r3 = await ic.iter.next();
+    assert.equal(r1.value.id, 1);
+    assert.equal(r2.value.id, 2);
+    assert.equal(r3.done, true);
+  });
+
+  test('return() also closes (idempotent with close)', async () => {
+    const ic = makeInputController();
+    const p = ic.iter.next();
+    await ic.iter.return();
+    const r = await p;
+    assert.equal(r.done, true);
+    // Subsequent push throws.
+    assert.throws(() => ic.push({ id: 1 }), { code: 'INPUT_CLOSED' });
+  });
+
+  test('close is idempotent', () => {
+    const ic = makeInputController();
+    ic.close();
+    assert.doesNotThrow(() => ic.close());
+  });
+
+  test('onDrop callback may throw — push survives, drop continues', () => {
+    const ic = makeInputController({ queueCap: 1 });
+    let dropCount = 0;
+    ic.onDrop(() => { dropCount += 1; throw new Error('drop callback boom'); });
+    ic.push({ id: 1 });
+    // Each push past cap drops the oldest and fires the callback.
+    assert.doesNotThrow(() => ic.push({ id: 2 }));
+    assert.doesNotThrow(() => ic.push({ id: 3 }));
+    assert.equal(dropCount, 2);
+  });
+
+  test('onDrop replacement: latest registered callback receives drops', () => {
+    const ic = makeInputController({ queueCap: 1 });
+    const first = [];
+    const second = [];
+    ic.onDrop((m) => first.push(m));
+    ic.push({ id: 1 });
+    ic.push({ id: 2 });                        // drops id=1 → first
+    ic.onDrop((m) => second.push(m));
+    ic.push({ id: 3 });                        // drops id=2 → second
+    assert.deepEqual(first.map((m) => m.id), [1]);
+    assert.deepEqual(second.map((m) => m.id), [2]);
+  });
+
+  test('queueCap default is exposed and reasonable', () => {
+    // Smoke check: caller can construct with default and push without
+    // hitting cap on small bursts.
+    const ic = makeInputController();
+    for (let i = 0; i < 10; i++) ic.push({ id: i });
+    assert.equal(ic.size, 10);
+  });
+
+  test('rapid push+iterate interleave maintains order across the boundary', async () => {
+    // Realistic shape: SDK pm worker pushes user msgs while a for-await
+    // consumer drains. Order must be preserved even when pushes
+    // arrive between awaits.
+    const ic = makeInputController({ queueCap: 10 });
+    const collected = [];
+    ic.push({ id: 'a' });
+    const consumer = (async () => {
+      for await (const m of ic.iter) {
+        collected.push(m.id);
+        if (m.id === 'd') break;
+      }
+    })();
+    // Interleave pushes between microtasks.
+    await new Promise((r) => setImmediate(r));
+    ic.push({ id: 'b' });
+    await new Promise((r) => setImmediate(r));
+    ic.push({ id: 'c' });
+    ic.push({ id: 'd' });
+    await consumer;
+    assert.deepEqual(collected, ['a', 'b', 'c', 'd']);
+  });
 });
 
 describe('ProcessManagerSdk — basic happy path', () => {
