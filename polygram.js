@@ -2022,10 +2022,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         chat_id: chatId, text_len: text.length,
         user: cmdUser, user_id: cmdUserId,
       });
-      const preserveBit = text.length > '/compact'.length
-        ? ' with your preservation instructions'
-        : '';
-      await sendReply(`🗜️ Compacting${preserveBit}…`);
+      const hasHint = text.length > '/compact'.length + 1;
+      await sendReply(hasHint
+        ? '🗜️ Compacting with your hint…'
+        : '🗜️ Compacting…');
     } catch (err) {
       console.error(`[${label}] /compact push: ${err.message}`);
       await sendReply(`🗜️ Couldn't trigger compact: ${err.message}`);
@@ -2658,7 +2658,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
               `📚 Context window ${pct.toFixed(0)}% full. Three options:`,
               '',
               '• `/new` — start fresh; this conversation ends.',
-              '• `/compact <preserve text>` — summarise older messages, keep what you specify.',
+              '• `/compact` — summarise older messages. Add a hint after the command (e.g. `/compact keep the Q3 commission decisions`) and that becomes the compactor\'s guidance.',
               '• Keep chatting — I\'ll auto-compact when needed; key context is preserved automatically.',
             ].join('\n');
             return tg(bot, 'sendMessage', {
