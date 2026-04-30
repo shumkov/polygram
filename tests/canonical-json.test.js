@@ -200,3 +200,68 @@ describe('canonicalizeToolInput — edge cases', () => {
     assert.deepEqual(Object.keys(input.nested), ['y', 'x']);
   });
 });
+
+describe('canonicalizeToolInput — DoS / safety', () => {
+  test('circular reference throws cleanly (no stack overflow)', () => {
+    const a = { a: 1 };
+    a.self = a;
+    // Pre-fix this recursed until "Maximum call stack size exceeded"
+    // — could crash the daemon if any tool input ever self-references.
+    assert.throws(() => canonicalizeToolInput(a), /circular/i);
+  });
+
+  test('circular reference inside a nested array throws cleanly', () => {
+    const arr = [];
+    arr.push(arr);
+    assert.throws(() => canonicalizeToolInput({ args: arr }), /circular/i);
+  });
+
+  test('two distinct references to the same object are NOT confused with circular', () => {
+    // Shared subtree (DAG, not circular) should round-trip fine.
+    const shared = { id: 'shared' };
+    const input = { left: shared, right: shared };
+    const result = canonicalizeToolInput(input);
+    // Both references serialised; key order canonical.
+    assert.equal(result, '{"left":{"id":"shared"},"right":{"id":"shared"}}');
+  });
+
+  test('two distinct references to the same array (DAG) round-trip', () => {
+    const shared = [1, 2, 3];
+    const input = { a: shared, b: shared };
+    const result = canonicalizeToolInput(input);
+    assert.equal(result, '{"a":[1,2,3],"b":[1,2,3]}');
+  });
+
+  test('deeply nested object (within stack limits) succeeds', () => {
+    // Build 100-deep nested object — well within stack limits.
+    let cur = { v: 'leaf' };
+    for (let i = 0; i < 100; i++) cur = { wrap: cur };
+    assert.doesNotThrow(() => canonicalizeToolInput(cur));
+  });
+});
+
+describe('canonicalizeToolInput — non-plain-object handling', () => {
+  // These document current behaviour. Tool inputs from the SDK are
+  // pure JSON values (string/number/bool/null/array/object) so
+  // these never appear in practice, but pinning the contract
+  // catches anyone who relies on a different behaviour later.
+
+  test('Date becomes empty object — does NOT preserve via toJSON', () => {
+    // Known limitation: sortRec recurses into objects with no
+    // enumerable own keys. Date.prototype.toJSON is not invoked
+    // by Object.keys iteration. Documents the gap; if a tool ever
+    // surfaces a Date we'd want to add toJSON-aware handling.
+    const result = canonicalizeToolInput({ d: new Date('2026-01-01T00:00:00Z') });
+    assert.equal(result, '{"d":{}}');
+  });
+
+  test('function values are dropped (matches JSON.stringify default)', () => {
+    const result = canonicalizeToolInput({ f: () => 1, b: 2 });
+    assert.equal(result, '{"b":2}');
+  });
+
+  test('undefined-valued keys are dropped (matches JSON.stringify default)', () => {
+    const result = canonicalizeToolInput({ a: undefined, b: 2 });
+    assert.equal(result, '{"b":2}');
+  });
+});
