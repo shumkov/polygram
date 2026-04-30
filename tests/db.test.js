@@ -517,6 +517,93 @@ describe('boot replay dedupe wiring', () => {
   });
 });
 
+describe('insertTurnMetric', () => {
+  // F-telemetry — one row per dispatched user turn, queryable via the
+  // turn_metrics table. polygram.js inserts after every Result
+  // message; this test pins the field round-trip.
+  beforeEach(() => { ({ db, dbPath } = freshDb('turn-metric')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  test('happy-path roundtrip: full row inserts cleanly', () => {
+    db.insertTurnMetric({
+      chat_id: '1', thread_id: null, msg_id: 100,
+      session_id: 'sess-1', bot_name: 'testbot',
+      model: 'sonnet', effort: 'medium',
+      input_tokens: 100, output_tokens: 50,
+      cache_creation_tokens: 10, cache_read_tokens: 200,
+      cost_usd: 0.0042, duration_ms: 1234,
+      num_assistant_messages: 2, num_tool_uses: 1,
+      result_subtype: 'success', error: null,
+    });
+    const row = db.raw.prepare('SELECT * FROM turn_metrics WHERE msg_id = 100').get();
+    assert.equal(row.chat_id, '1');
+    assert.equal(row.session_id, 'sess-1');
+    assert.equal(row.input_tokens, 100);
+    assert.equal(row.cache_read_tokens, 200);
+    assert.equal(row.cost_usd, 0.0042);
+    assert.equal(row.result_subtype, 'success');
+  });
+
+  test('numeric chat_id is stringified', () => {
+    db.insertTurnMetric({ chat_id: 12345, msg_id: 1, bot_name: 'b' });
+    const row = db.raw.prepare('SELECT chat_id FROM turn_metrics WHERE msg_id = 1').get();
+    assert.equal(row.chat_id, '12345');
+  });
+
+  test('thread_id null vs non-null both accepted', () => {
+    db.insertTurnMetric({ chat_id: '1', thread_id: null, msg_id: 1, bot_name: 'b' });
+    db.insertTurnMetric({ chat_id: '1', thread_id: 42, msg_id: 2, bot_name: 'b' });
+    const r1 = db.raw.prepare('SELECT thread_id FROM turn_metrics WHERE msg_id = 1').get();
+    const r2 = db.raw.prepare('SELECT thread_id FROM turn_metrics WHERE msg_id = 2').get();
+    assert.equal(r1.thread_id, null);
+    assert.equal(r2.thread_id, '42');     // stringified
+  });
+
+  test('null/undefined optional fields stored as NULL (not 0/empty)', () => {
+    db.insertTurnMetric({ chat_id: '1', msg_id: 1, bot_name: 'b' });
+    const row = db.raw.prepare('SELECT * FROM turn_metrics WHERE msg_id = 1').get();
+    assert.equal(row.input_tokens, null);
+    assert.equal(row.output_tokens, null);
+    assert.equal(row.cost_usd, null);
+    assert.equal(row.num_assistant_messages, null);
+    assert.equal(row.num_tool_uses, null);
+    assert.equal(row.result_subtype, null);
+  });
+
+  test('default ts is now (within 5 seconds)', () => {
+    const before = Date.now();
+    db.insertTurnMetric({ chat_id: '1', msg_id: 1, bot_name: 'b' });
+    const row = db.raw.prepare('SELECT ts FROM turn_metrics WHERE msg_id = 1').get();
+    assert.ok(row.ts >= before);
+    assert.ok(row.ts <= Date.now() + 5000);
+  });
+
+  test('explicit ts is honored', () => {
+    db.insertTurnMetric({ chat_id: '1', msg_id: 1, bot_name: 'b', ts: 1_700_000_000_000 });
+    const row = db.raw.prepare('SELECT ts FROM turn_metrics WHERE msg_id = 1').get();
+    assert.equal(row.ts, 1_700_000_000_000);
+  });
+
+  test('error result subtype: row still records (negative-path telemetry)', () => {
+    db.insertTurnMetric({
+      chat_id: '1', msg_id: 1, bot_name: 'b',
+      result_subtype: 'error_during_execution',
+      error: 'HTTP 503',
+    });
+    const row = db.raw.prepare('SELECT result_subtype, error FROM turn_metrics WHERE msg_id = 1').get();
+    assert.equal(row.result_subtype, 'error_during_execution');
+    assert.equal(row.error, 'HTTP 503');
+  });
+
+  test('multiple rows accumulate (no UPSERT — every turn is a new row)', () => {
+    for (let i = 0; i < 5; i++) {
+      db.insertTurnMetric({ chat_id: '1', msg_id: 100 + i, bot_name: 'b' });
+    }
+    const count = db.raw.prepare("SELECT COUNT(*) AS n FROM turn_metrics WHERE chat_id='1'").get();
+    assert.equal(count.n, 5);
+  });
+});
+
 describe('setMessageText', () => {
   // Used by polygram's stream-reply when an outbound message is edited:
   // sets messages.text to the final rendered content so the DB reflects
