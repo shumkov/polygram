@@ -449,6 +449,147 @@ describe('ProcessManagerSdk — subagent filter (Phase 1 step 7)', () => {
     await promise;
     assert.deepEqual(chunks, ['main reply']);  // subagent text omitted
   });
+
+  test('subagent tool_use does NOT fire onToolUse', async () => {
+    const tools = [];
+    const localFq = makeFakeQuery();
+    const localPm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => localFq.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+      onToolUse: (_k, name) => tools.push(name),
+    });
+    await localPm.getOrSpawn('c');
+    localFq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = localPm.send('c', 'q');
+    await new Promise((r) => setImmediate(r));
+
+    // Subagent fires Read — must be filtered.
+    localFq.emitEvent({
+      type: 'assistant',
+      parent_tool_use_id: 'task-1',
+      message: { id: 'sub-tool', content: [{ type: 'tool_use', name: 'Read', input: {} }] },
+    });
+    // Top-level fires Bash — must register.
+    localFq.emitEvent({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { id: 'top-tool', content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls' } }] },
+    });
+    localFq.emitEvent({
+      type: 'result', subtype: 'success', result: 'done',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+    assert.deepEqual(tools, ['Bash'], 'Read from subagent must be filtered');
+    await localPm.shutdown();
+  });
+
+  test('subagent usage does NOT count toward turn token metrics', async () => {
+    const localFq = makeFakeQuery();
+    const localPm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => localFq.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+    });
+    await localPm.getOrSpawn('c');
+    localFq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = localPm.send('c', 'q');
+    await new Promise((r) => setImmediate(r));
+
+    // Subagent burns 5000 input tokens — should NOT count (filtered).
+    localFq.emitEvent({
+      type: 'assistant',
+      parent_tool_use_id: 'task-1',
+      message: {
+        id: 'sub-msg',
+        usage: { input_tokens: 5000, output_tokens: 1000 },
+        content: [{ type: 'text', text: 'subagent output' }],
+      },
+    });
+    // Top-level uses 100/20 — only this should count via per-message map.
+    localFq.emitEvent({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        id: 'top-msg',
+        usage: { input_tokens: 100, output_tokens: 20 },
+        content: [{ type: 'text', text: 'main reply' }],
+      },
+    });
+    // Result usage is the SDK's authoritative aggregate (subagent
+    // tokens roll up here for billing) — pm passes it through. The
+    // per-MESSAGE telemetry map is what we're verifying isn't
+    // polluted by subagent ids.
+    localFq.emitEvent({
+      type: 'result', subtype: 'success', result: 'main reply',
+      session_id: 's', total_cost_usd: 0.01, duration_ms: 1,
+      usage: { input_tokens: 5100, output_tokens: 1020,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    const r = await promise;
+    // numAssistantMessages counts only TOP-LEVEL messages.
+    assert.equal(r.metrics.numAssistantMessages, 1, 'subagent message must not count');
+    await localPm.shutdown();
+  });
+
+  test('subagent text + tool_use do NOT trigger fireFirstStream', async () => {
+    const localFq = makeFakeQuery();
+    let firstStreamFired = false;
+    const localPm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => localFq.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+    });
+    await localPm.getOrSpawn('c');
+    localFq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = localPm.send('c', 'q', {
+      context: { onFirstStream: () => { firstStreamFired = true; } },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    // 3 subagent events back-to-back — none should fire firstStream.
+    for (let i = 0; i < 3; i++) {
+      localFq.emitEvent({
+        type: 'assistant',
+        parent_tool_use_id: `task-${i}`,
+        message: { id: `sub-${i}`, content: [{ type: 'text', text: `chunk ${i}` }] },
+      });
+      localFq.emitEvent({
+        type: 'assistant',
+        parent_tool_use_id: `task-${i}`,
+        message: { id: `sub-tool-${i}`, content: [{ type: 'tool_use', name: 'Read', input: {} }] },
+      });
+    }
+    await new Promise((r) => setImmediate(r));
+    assert.equal(firstStreamFired, false, 'subagents must not fire firstStream');
+
+    // Top-level finally arrives → firstStream now fires.
+    localFq.emitEvent({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { id: 'top', content: [{ type: 'text', text: 'real' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(firstStreamFired, true);
+
+    localFq.emitEvent({
+      type: 'result', subtype: 'success', result: 'real',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+    await localPm.shutdown();
+  });
 });
 
 describe('ProcessManagerSdk — LRU eviction (G14)', () => {
