@@ -248,4 +248,91 @@ describe('chat_tool_decisions — deletion', () => {
     });
     assert.equal(miss, null);
   });
+
+  test('deleteChatToolDecision with WRONG bot_name does NOT delete', () => {
+    const result = db.insertChatToolDecision({
+      bot_name: 'shumabit', chat_id: 'c1', tool_name: 'Bash',
+      match_type: 'exact', input_pattern: '{}', decision: 'allow',
+    });
+    const id = result.lastInsertRowid;
+    db.deleteChatToolDecision({ bot_name: 'umi-assistant', chat_id: 'c1', id });
+    const hit = db.lookupChatToolDecision({
+      bot_name: 'shumabit', chat_id: 'c1', tool_name: 'Bash',
+      canonical_input: '{}',
+    });
+    assert.ok(hit, 'cross-bot delete must not affect rows owned by another bot');
+  });
+
+  test('deleteChatToolDecision with WRONG chat_id does NOT delete', () => {
+    const result = db.insertChatToolDecision({
+      bot_name: 'shumabit', chat_id: 'c1', tool_name: 'Bash',
+      match_type: 'exact', input_pattern: '{}', decision: 'allow',
+    });
+    const id = result.lastInsertRowid;
+    db.deleteChatToolDecision({ bot_name: 'shumabit', chat_id: 'c2', id });
+    const hit = db.lookupChatToolDecision({
+      bot_name: 'shumabit', chat_id: 'c1', tool_name: 'Bash',
+      canonical_input: '{}',
+    });
+    assert.ok(hit);
+  });
+
+  test('deleteChatToolDecision with non-existent id is a no-op', () => {
+    const result = db.deleteChatToolDecision({ bot_name: 'b', chat_id: 'c', id: 99999 });
+    assert.equal(result.changes, 0);
+  });
+});
+
+describe('chat_tool_decisions — lookup priority', () => {
+  test('first-inserted decision wins when multiple match', () => {
+    // Two exact-match decisions for the same input — first row by id
+    // wins (no ORDER BY → SQLite scans in insertion order).
+    db.insertChatToolDecision({
+      bot_name: 'b', chat_id: 'c', tool_name: 'Bash',
+      match_type: 'exact', input_pattern: '{}', decision: 'allow',
+    });
+    db.insertChatToolDecision({
+      bot_name: 'b', chat_id: 'c', tool_name: 'Bash',
+      match_type: 'exact', input_pattern: '{}', decision: 'deny',
+    });
+    const hit = db.lookupChatToolDecision({
+      bot_name: 'b', chat_id: 'c', tool_name: 'Bash',
+      canonical_input: '{}',
+    });
+    assert.equal(hit.decision, 'allow', 'first-inserted (id ASC) wins');
+  });
+
+  test('exact + prefix overlap: prefix wins ONLY if exact does not match', () => {
+    // Pre-insert: exact='{"cmd":"ls"}' allow; prefix='{"cmd":"' deny.
+    // Lookup canonical_input='{"cmd":"ls"}' — exact matches → allow.
+    db.insertChatToolDecision({
+      bot_name: 'b', chat_id: 'c', tool_name: 'Bash',
+      match_type: 'exact', input_pattern: '{"cmd":"ls"}', decision: 'allow',
+    });
+    db.insertChatToolDecision({
+      bot_name: 'b', chat_id: 'c', tool_name: 'Bash',
+      match_type: 'prefix', input_pattern: '{"cmd":"', decision: 'deny',
+    });
+    const hit = db.lookupChatToolDecision({
+      bot_name: 'b', chat_id: 'c', tool_name: 'Bash',
+      canonical_input: '{"cmd":"ls"}',
+    });
+    // First row wins by id ASC; both match this input.
+    assert.equal(hit.decision, 'allow');
+  });
+
+  test('canonical_input null/undefined does not crash', () => {
+    db.insertChatToolDecision({
+      bot_name: 'b', chat_id: 'c', tool_name: 'Bash',
+      match_type: 'prefix', input_pattern: 'something', decision: 'allow',
+    });
+    assert.doesNotThrow(() => db.lookupChatToolDecision({
+      bot_name: 'b', chat_id: 'c', tool_name: 'Bash',
+      canonical_input: null,
+    }));
+    assert.doesNotThrow(() => db.lookupChatToolDecision({
+      bot_name: 'b', chat_id: 'c', tool_name: 'Bash',
+      canonical_input: undefined,
+    }));
+  });
 });
