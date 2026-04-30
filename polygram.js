@@ -32,6 +32,7 @@ const { ProcessManager } = require('./lib/process-manager');
 // soak proves SDK stable. See docs/0.8.0-architecture-decisions.md.
 const { ProcessManagerSdk } = require('./lib/process-manager-sdk');
 const { createAutosteerBuffer, makePostToolBatchHook } = require('./lib/autosteer-buffer');
+const { createAutosteeredRefs } = require('./lib/autosteered-refs');
 const { makeRouterPolicy, createPmRouter } = require('./lib/pm-router');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
@@ -724,23 +725,18 @@ const autosteerBuffer = createAutosteerBuffer();
 // the TRIGGER message's reactor.clear() at turn-end couldn't reach
 // across to other messages. Without this map, users see ✍ stuck on
 // every follow-up and don't know whether the bot incorporated them.
-const autosteeredMsgRefs = new Map(); // sessionKey → [{chatId, msgId}]
+const autosteeredRefs = createAutosteeredRefs({
+  applyClear: async ({ chatId, msgId }) => {
+    if (!bot) return;
+    await tg(bot, 'setMessageReaction', {
+      chat_id: chatId, message_id: msgId, reaction: [],
+    }, { source: 'autosteer-clear', botName: BOT_NAME });
+  },
+  logger: { error: (m) => console.error(`[${BOT_NAME}] ${m}`) },
+});
 
 async function clearAutosteeredReactions(sessionKey) {
-  const list = autosteeredMsgRefs.get(sessionKey);
-  if (!list || list.length === 0) return;
-  autosteeredMsgRefs.delete(sessionKey);
-  if (!bot) return;
-  for (const { chatId: cid, msgId } of list) {
-    try {
-      await tg(bot, 'setMessageReaction', {
-        chat_id: cid, message_id: msgId, reaction: [],
-      }, { source: 'autosteer-clear', botName: BOT_NAME });
-    } catch (err) {
-      // Ack-clear failures are silent — the ✍ stays on screen
-      // but doesn't block the in-flight turn's reply UX.
-    }
-  }
+  return autosteeredRefs.clear(sessionKey);
 }
 
 // 0.8.0-rc.14: tool-less-turn drain. PostToolBatch hook only fires
@@ -2485,9 +2481,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       if (ok) {
         // Track this msg_id so the in-flight turn's success / abort
         // / error path can clear the ✍ reaction at turn-end.
-        const refs = autosteeredMsgRefs.get(sessionKey) || [];
-        refs.push({ chatId, msgId: msg.message_id });
-        autosteeredMsgRefs.set(sessionKey, refs);
+        autosteeredRefs.add(sessionKey, { chatId, msgId: msg.message_id });
         logEvent('autosteer', {
           chat_id: chatId, msg_id: msg.message_id,
           text_len: prompt?.length ?? 0,
