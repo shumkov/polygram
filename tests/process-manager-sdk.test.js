@@ -592,6 +592,190 @@ describe('ProcessManagerSdk — subagent filter (Phase 1 step 7)', () => {
   });
 });
 
+describe('ProcessManagerSdk — resetSession (G9 primitive)', () => {
+  // Closes v6 plan §7.1 G9 unit gate (context-overflow auto-recovery).
+  // Polygram's classifier wires resetSession on role_ordering /
+  // context_overflow / missing_tool_input kinds. Pin every contract
+  // resetSession promises to its caller.
+
+  test('unknown session returns no-op result', async () => {
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => makeFakeQuery().query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+    });
+    const r = await pm.resetSession('never-spawned');
+    assert.deepEqual(r, { closed: false, drainedPendings: 0 });
+    await pm.shutdown();
+  });
+
+  test('drains pending queue with RESET_SESSION code', async () => {
+    const fq = makeFakeQuery();
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+    });
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const p1 = pm.send('c', 'a');
+    const p2 = pm.send('c', 'b');
+    await new Promise((r) => setImmediate(r));
+
+    const r = await pm.resetSession('c', { reason: 'context_overflow' });
+    assert.equal(r.drainedPendings, 2);
+    const e1 = await p1.catch((e) => e);
+    const e2 = await p2.catch((e) => e);
+    assert.equal(e1.code, 'RESET_SESSION');
+    assert.equal(e2.code, 'RESET_SESSION');
+    await pm.shutdown();
+  });
+
+  test('closes the Query and removes from procs map', async () => {
+    const fq = makeFakeQuery();
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+    });
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(pm.has('c'), true);
+
+    await pm.resetSession('c', { reason: 'role_ordering' });
+    assert.equal(pm.has('c'), false);
+    assert.equal(fq.closed, true, 'Query.close must be called');
+    await pm.shutdown();
+  });
+
+  test('clears persisted claude_session_id via db.clearSessionId', async () => {
+    const cleared = [];
+    const db = {
+      ...mockDb(),
+      clearSessionId: (key) => cleared.push(key),
+    };
+    const fq = makeFakeQuery();
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db,
+      logger: { error: () => {}, log: () => {} },
+    });
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    await new Promise((r) => setImmediate(r));
+    await pm.resetSession('c', { reason: 'auth_expired' });
+    assert.deepEqual(cleared, ['c']);
+    await pm.shutdown();
+  });
+
+  test('survives db.clearSessionId throwing — still closes & drains', async () => {
+    const errors = [];
+    const db = {
+      ...mockDb(),
+      clearSessionId: () => { throw new Error('db locked'); },
+    };
+    const fq = makeFakeQuery();
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db,
+      logger: { error: (m) => errors.push(m), log: () => {} },
+    });
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    await new Promise((r) => setImmediate(r));
+    const r = await pm.resetSession('c', { reason: 'context_overflow' });
+    assert.equal(r.closed, true);
+    assert.equal(pm.has('c'), false);
+    assert.ok(errors.some((m) => /clearSessionId/.test(m)));
+    await pm.shutdown();
+  });
+
+  test('logs session-reset telemetry event', async () => {
+    const events = [];
+    const fq = makeFakeQuery();
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db: { logEvent: (kind, detail) => events.push({ kind, detail }) },
+      logger: { error: () => {}, log: () => {} },
+    });
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    pm.send('c', 'a').catch(() => {});
+    await new Promise((r) => setImmediate(r));
+    await pm.resetSession('c', { reason: 'context_overflow' });
+    const ev = events.find((e) => e.kind === 'session-reset');
+    assert.ok(ev, 'session-reset event must fire');
+    assert.equal(ev.detail.session_key, 'c');
+    assert.equal(ev.detail.reason, 'context_overflow');
+    assert.equal(ev.detail.drained_pendings, 1);
+    assert.equal(ev.detail.closed, true);
+    await pm.shutdown();
+  });
+
+  test('signals parked LRU waiter so a new spawn unparks', async () => {
+    const fqs = [makeFakeQuery(), makeFakeQuery(), makeFakeQuery()];
+    let idx = 0;
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fqs[idx++].query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+    });
+    // Fill cap with in-flight entries.
+    await pm.getOrSpawn('c1');
+    fqs[0].emitEvent({ type: 'system', subtype: 'init', session_id: 's1' });
+    pm.send('c1', 'a').catch(() => {});
+    await pm.getOrSpawn('c2');
+    fqs[1].emitEvent({ type: 'system', subtype: 'init', session_id: 's2' });
+    pm.send('c2', 'b').catch(() => {});
+    await new Promise((r) => setImmediate(r));
+
+    // Park c3.
+    const parked = pm.getOrSpawn('c3');
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Reset c1 — signals LRU waiter, c3 unparks.
+    await pm.resetSession('c1', { reason: 'context_overflow' });
+    fqs[2].emitEvent({ type: 'system', subtype: 'init', session_id: 's3' });
+    await parked;
+    assert.equal(pm.has('c3'), true);
+    await pm.shutdown();
+  });
+
+  test('idempotent: second resetSession on same key is a no-op', async () => {
+    const fq = makeFakeQuery();
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+    });
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    await new Promise((r) => setImmediate(r));
+    const r1 = await pm.resetSession('c', { reason: 'first' });
+    const r2 = await pm.resetSession('c', { reason: 'second' });
+    assert.equal(r1.closed, true);
+    assert.deepEqual(r2, { closed: false, drainedPendings: 0 });
+    await pm.shutdown();
+  });
+});
+
 describe('ProcessManagerSdk — LRU eviction (G14)', () => {
   // v6 plan §7.1 G14: cap=2, spawn 3 chats, oldest evicts cleanly.
   // Pins the contract pre-SDK-pm-rollout to partner chats.
