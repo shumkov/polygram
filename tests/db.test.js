@@ -516,3 +516,80 @@ describe('boot replay dedupe wiring', () => {
     assert.equal(db.getReplayCandidates({ chatIds: ['1'] }).length, 0);
   });
 });
+
+describe('setMessageText', () => {
+  // Used by polygram's stream-reply when an outbound message is edited:
+  // sets messages.text to the final rendered content so the DB reflects
+  // what the user actually saw (not the pre-edit placeholder).
+  beforeEach(() => { ({ db, dbPath } = freshDb('set-text')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  test('updates the matching row\'s text', () => {
+    db.insertMessage({
+      chat_id: '1', msg_id: 100, direction: 'out', source: 'polygram',
+      bot_name: 'testbot', text: 'placeholder…',
+    });
+    db.setMessageText({ chat_id: '1', msg_id: 100, text: 'final answer' });
+    const row = db.getMessage('1', 100);
+    assert.equal(row.text, 'final answer');
+  });
+
+  test('handles null text by writing empty string (no NOT NULL violation)', () => {
+    db.insertMessage({
+      chat_id: '1', msg_id: 100, direction: 'out', source: 'polygram',
+      bot_name: 'testbot', text: 'placeholder',
+    });
+    assert.doesNotThrow(() => db.setMessageText({ chat_id: '1', msg_id: 100, text: null }));
+    const row = db.getMessage('1', 100);
+    assert.equal(row.text, '');
+  });
+
+  test('numeric chat_id is normalised to string before lookup', () => {
+    // chat_id is stored as TEXT; setMessageText should coerce.
+    db.insertMessage({
+      chat_id: 100, msg_id: 1, direction: 'out', source: 'polygram',
+      bot_name: 'testbot', text: 'p',
+    });
+    db.setMessageText({ chat_id: 100, msg_id: 1, text: 'updated' });
+    const row = db.getMessage(100, 1);
+    assert.equal(row.text, 'updated');
+  });
+
+  test('non-matching chat_id/msg_id is a no-op (no error, no creates)', () => {
+    db.insertMessage({
+      chat_id: '1', msg_id: 100, direction: 'out', source: 'polygram',
+      bot_name: 'testbot', text: 'unchanged',
+    });
+    const res = db.setMessageText({ chat_id: '999', msg_id: 999, text: 'never lands' });
+    assert.equal(res.changes, 0);
+    const original = db.getMessage('1', 100);
+    assert.equal(original.text, 'unchanged');
+    const ghost = db.getMessage('999', 999);
+    assert.equal(ghost, undefined);
+  });
+
+  test('chat_id + msg_id is the composite key — same msg_id in different chats are independent', () => {
+    db.insertMessage({
+      chat_id: '1', msg_id: 5, direction: 'out', source: 'polygram',
+      bot_name: 'testbot', text: 'chat-1 msg',
+    });
+    db.insertMessage({
+      chat_id: '2', msg_id: 5, direction: 'out', source: 'polygram',
+      bot_name: 'testbot', text: 'chat-2 msg',
+    });
+    db.setMessageText({ chat_id: '1', msg_id: 5, text: 'edited chat 1' });
+    assert.equal(db.getMessage('1', 5).text, 'edited chat 1');
+    assert.equal(db.getMessage('2', 5).text, 'chat-2 msg');
+  });
+
+  test('long text passes through (no truncation)', () => {
+    const long = 'x'.repeat(10_000);
+    db.insertMessage({
+      chat_id: '1', msg_id: 100, direction: 'out', source: 'polygram',
+      bot_name: 'testbot', text: 'short',
+    });
+    db.setMessageText({ chat_id: '1', msg_id: 100, text: long });
+    const row = db.getMessage('1', 100);
+    assert.equal(row.text.length, 10_000);
+  });
+});
