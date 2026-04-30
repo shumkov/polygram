@@ -3730,6 +3730,18 @@ async function main() {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  // rc.28: also catch SIGHUP. The shumabit deploy path runs polygram
+  // inside `tmux new-session`; on `launchctl kickstart -k` the
+  // shumabit-start launcher does `tmux kill-session -t polygram`
+  // FIRST, then `pkill polygram --bot` 1s later. tmux kill-session
+  // closes polygram's controlling pty → SIGHUP, not SIGTERM. Without
+  // this listener, the shutdown drain never fires; in-flight rows
+  // never flip to 'replay-pending'; boot-replay still picks them up
+  // via the 'dispatched' status (3-min window), but anything that's
+  // been mid-tool-use longer than the replayWindowMs gets silently
+  // dropped. Surface symptom: bot stops responding after deploy on
+  // long agent runs (the §7.4 incident).
+  process.on('SIGHUP', shutdown);
 
   try {
     // Fresh per-boot secret, persisted 0600 for same-UID readers (cron
