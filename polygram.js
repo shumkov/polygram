@@ -34,6 +34,12 @@ const { ProcessManagerSdk } = require('./lib/process-manager-sdk');
 const { createAutosteerBuffer, makePostToolBatchHook } = require('./lib/autosteer-buffer');
 const { makeRouterPolicy, createPmRouter } = require('./lib/pm-router');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
+const {
+  buildApprovalKeyboard,
+  buildApprovalKeyboardWithAlways,
+  formatToolInputForCard,
+  approvalCardText,
+} = require('./lib/approval-ui');
 const agentLoader = require('./lib/agent-loader');
 const USE_SDK = process.env.POLYGRAM_USE_SDK === '1';
 const { createSender } = require('./lib/telegram');
@@ -1232,51 +1238,9 @@ async function handleSendOverIpc(req) {
 }
 
 // ─── Approvals ─────────────────────────────────────────────────────
-
-// Format a tool_input for the inline keyboard card. Clip aggressively so
-// the card doesn't exceed Telegram's 4096-char limit.
-function formatToolInputForCard(input) {
-  let s;
-  try { s = typeof input === 'string' ? input : JSON.stringify(input, null, 2); }
-  catch { s = String(input); }
-  if (s.length <= 1200) return s;
-  return s.slice(0, 900) + '\n…[clipped]…\n' + s.slice(-200);
-}
-
-function buildApprovalKeyboard(approvalId, token) {
-  return {
-    inline_keyboard: [[
-      { text: '✅ Approve', callback_data: `approve:${approvalId}:${token}` },
-      { text: '❌ Deny',    callback_data: `deny:${approvalId}:${token}` },
-    ]],
-  };
-}
-
-// 0.8.0 Phase 2 step 6: 4-button approval keyboard for SDK canUseTool
-// flow. Adds "Always allow" and "Always deny" rows that persist the
-// decision into chat_tool_decisions (via callback_query handler),
-// so subsequent invocations of the same tool with the same input
-// short-circuit without prompting.
-//
-// Callback_data conventions:
-//   approve:<id>:<token>          — one-time allow
-//   deny:<id>:<token>             — one-time deny
-//   approve-always:<id>:<token>   — allow + persist
-//   deny-always:<id>:<token>      — deny + persist
-function buildApprovalKeyboardWithAlways(approvalId, token) {
-  return {
-    inline_keyboard: [
-      [
-        { text: '✅ Approve', callback_data: `approve:${approvalId}:${token}` },
-        { text: '❌ Deny',    callback_data: `deny:${approvalId}:${token}` },
-      ],
-      [
-        { text: '🔁 Always allow', callback_data: `approve-always:${approvalId}:${token}` },
-        { text: '🚫 Always deny',  callback_data: `deny-always:${approvalId}:${token}` },
-      ],
-    ],
-  };
-}
+// rc.20: pure UI builders moved to lib/approval-ui.js for testability.
+// Imported above (buildApprovalKeyboard, buildApprovalKeyboardWithAlways,
+// approvalCardText, formatToolInputForCard).
 
 // /model and /effort inline keyboard. `show` controls which row(s) appear:
 // 'model', 'effort', or 'all'. The current value gets a ✓ marker so the
@@ -1345,28 +1309,7 @@ function formatConfigInfoText(chatConfig, show, sessionKey) {
   return body;
 }
 
-function approvalCardText(row, opts = {}) {
-  // No parse_mode is used on this card — tool_name/turn_id/tool_input
-  // originate from the Claude subprocess and could contain Markdown special
-  // chars or tg:// links crafted for phishing. Plain text renders as-is.
-  const heading = opts.resolvedBy
-    ? opts.resolvedBy
-    : `Approval needed — ${row.tool_name}`;
-  const body = formatToolInputForCard(
-    typeof row.tool_input_json === 'string'
-      ? safeParse(row.tool_input_json)
-      : row.tool_input_json,
-  );
-  const ttl = Math.max(0, Math.round((row.timeout_ts - Date.now()) / 1000));
-  const footer = opts.resolvedBy
-    ? ''
-    : `\n\n⏱ expires in ${ttl}s`;
-  return `${heading}\nChat: ${row.requester_chat_id}\nTurn: ${row.turn_id || '-'}\n\n${body}${footer}`;
-}
-
-function safeParse(s) {
-  try { return JSON.parse(s); } catch { return s; }
-}
+// rc.20: approvalCardText + safeParse moved to lib/approval-ui.js.
 
 // 0.8.0-rc.18+: canonicalizeToolInput moved to lib/canonical-json.js
 // for testability. Same function, no behavior change.
