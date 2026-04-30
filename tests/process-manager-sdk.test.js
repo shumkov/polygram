@@ -1066,6 +1066,190 @@ describe('ProcessManagerSdk — LRU eviction (G14)', () => {
   });
 });
 
+describe('ProcessManagerSdk — onThinking (rc.29 extended-thinking signal)', () => {
+  // The fix for "👀 sits for 10+ s under effort=high before 🤔 fires".
+  // pm-sdk now listens for SDKPartialAssistantMessage stream_events
+  // (requires Options.includePartialMessages: true) and fires
+  // onThinking on the FIRST content_block_start with type='thinking'.
+  // polygram wires this to reactor.setState('THINKING').
+
+  test('fires onThinking on first content_block_start type=thinking', async () => {
+    const fq = makeFakeQuery();
+    const calls = [];
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+      onThinking: (sessionKey, entry) => calls.push({ sessionKey, entry }),
+    });
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = pm.send('c', 'long task');
+    await new Promise((r) => setImmediate(r));
+
+    fq.emitEvent({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'thinking', thinking: '' },
+      },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(calls.length, 1, 'onThinking must fire exactly once');
+    assert.equal(calls[0].sessionKey, 'c');
+
+    fq.emitEvent({
+      type: 'assistant',
+      message: { id: 'm1', usage: { input_tokens: 1, output_tokens: 1 },
+                 content: [{ type: 'text', text: 'done' }] },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'done',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+    await pm.shutdown();
+  });
+
+  test('subsequent thinking blocks do NOT re-fire onThinking (idempotent)', async () => {
+    const fq = makeFakeQuery();
+    const calls = [];
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+      onThinking: () => calls.push('fired'),
+    });
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = pm.send('c', 'q');
+    await new Promise((r) => setImmediate(r));
+
+    // 3 thinking starts in a row — only the first should fire.
+    for (let i = 0; i < 3; i++) {
+      fq.emitEvent({
+        type: 'stream_event',
+        event: { type: 'content_block_start', index: i,
+                 content_block: { type: 'thinking', thinking: '' } },
+      });
+    }
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(calls.length, 1, 'only first thinking start fires');
+
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: '',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+    await pm.shutdown();
+  });
+
+  test('non-thinking stream_events do NOT fire onThinking', async () => {
+    const fq = makeFakeQuery();
+    const calls = [];
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+      onThinking: () => calls.push('fired'),
+    });
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = pm.send('c', 'q');
+    await new Promise((r) => setImmediate(r));
+
+    // Various non-thinking stream_events.
+    fq.emitEvent({
+      type: 'stream_event',
+      event: { type: 'content_block_start', index: 0,
+               content_block: { type: 'text', text: '' } },
+    });
+    fq.emitEvent({
+      type: 'stream_event',
+      event: { type: 'content_block_start', index: 1,
+               content_block: { type: 'tool_use', id: 't', name: 'Read', input: {} } },
+    });
+    fq.emitEvent({
+      type: 'stream_event',
+      event: { type: 'message_start', message: {} },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(calls.length, 0, 'only thinking content_block fires onThinking');
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: '',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+    await pm.shutdown();
+  });
+
+  test('next turn re-arms thinkingFired (fires once per pending)', async () => {
+    const fq = makeFakeQuery();
+    const calls = [];
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+      onThinking: () => calls.push('fired'),
+    });
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+
+    // Turn 1.
+    const p1 = pm.send('c', 't1');
+    await new Promise((r) => setImmediate(r));
+    fq.emitEvent({
+      type: 'stream_event',
+      event: { type: 'content_block_start', index: 0,
+               content_block: { type: 'thinking', thinking: '' } },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: '',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await p1;
+
+    // Turn 2 — should fire AGAIN.
+    const p2 = pm.send('c', 't2');
+    await new Promise((r) => setImmediate(r));
+    fq.emitEvent({
+      type: 'stream_event',
+      event: { type: 'content_block_start', index: 0,
+               content_block: { type: 'thinking', thinking: '' } },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: '',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await p2;
+
+    assert.equal(calls.length, 2, 'onThinking fires once per turn');
+    await pm.shutdown();
+  });
+});
+
 describe('ProcessManagerSdk — compact_boundary (D6 / §5)', () => {
   let pm;
   let fq;

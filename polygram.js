@@ -959,6 +959,14 @@ function buildSdkOptions(sessionKey, ctx) {
     permissionMode: useCanUseTool ? 'default' : 'bypassPermissions',
     allowDangerouslySkipPermissions: !useCanUseTool,
     ...(useCanUseTool && { canUseTool: makeCanUseTool(sessionKey) }),
+    // rc.29: enable partial messages so pm-sdk can detect thinking
+    // blocks during the extended-thinking phase (before any text or
+    // tool_use arrives). Without this, the reactor stays at 👀 for
+    // the full thinking duration. With this, pm-sdk's onThinking
+    // callback fires within ~100-500ms of pm.send, giving the user
+    // a fast 👀 → 🤔 transition matching Claude Code CLI's
+    // "Thinking..." spinner.
+    includePartialMessages: true,
     hooks: {
       PostToolBatch: [{ hooks: [postToolBatchHook] }],
       ...(sessionStartHook && {
@@ -3583,6 +3591,20 @@ async function main() {
       // to speak".
       const r = head?.context?.reactor;
       if (r && typeof r.heartbeat === 'function') r.heartbeat();
+    },
+    // rc.29: extended-thinking → 🤔 transition. Fires the moment the
+    // model's first content_block_start with type='thinking' arrives
+    // via stream_event. Pre-rc.29 we waited for first text/tool_use,
+    // which under effort=high means the reactor sat at 👀 for 10+ s
+    // before flipping. Now the user sees 👀 → 🤔 within ~100-500ms
+    // of pm.send, matching Claude Code CLI's "Thinking..." UX.
+    onThinking: (sessionKey, entry) => {
+      const head = entry.pendingQueue?.[0];
+      const r = head?.context?.reactor;
+      if (r && typeof r.setState === 'function') r.setState('THINKING');
+      logEvent('thinking-started', {
+        chat_id: entry.chatId, session_key: sessionKey,
+      });
     },
     // 0.8.0 Phase 2 step 5: SDK auto-compaction observability. Fires
     // when SDK emits SDKCompactBoundaryMessage (between turns or
