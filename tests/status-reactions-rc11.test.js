@@ -188,6 +188,153 @@ describe('reactor — heartbeat (rc.16)', () => {
   });
 });
 
+describe('reactor — rc.32 thinking deepening cascade', () => {
+  // Progressive deepening: setState('THINKING') auto-promotes through
+  // THINKING_DEEPER (🤨, 8s) → THINKING_DEEPEST (🧐, 20s). State change
+  // (CODING/TOOL/etc) clears it. Pre-rc.32 behaviour: stay at 🤔 the
+  // entire thinking phase, then yawn at 45s.
+
+  test('THINKING auto-promotes to THINKING_DEEPER after thinkingDeeperMs', async () => {
+    const calls = [];
+    const r = createReactionManager({
+      apply: async (e) => calls.push(e),
+      throttleMs: 0,
+      thinkingDeeperMs: 30,
+      thinkingDeepestMs: 200,
+      stallMs: 5000,
+    });
+    await r.setState('THINKING');
+    await new Promise((res) => setTimeout(res, 60));
+    assert.equal(r.currentState, 'THINKING_DEEPER');
+    assert.ok(calls.includes('🤨'), `🤨 should have fired; got ${JSON.stringify(calls)}`);
+    r.stop();
+  });
+
+  test('THINKING auto-promotes to THINKING_DEEPEST after thinkingDeepestMs', async () => {
+    const calls = [];
+    const r = createReactionManager({
+      apply: async (e) => calls.push(e),
+      throttleMs: 0,
+      thinkingDeeperMs: 20,
+      thinkingDeepestMs: 60,
+      stallMs: 5000,
+    });
+    await r.setState('THINKING');
+    await new Promise((res) => setTimeout(res, 100));
+    assert.equal(r.currentState, 'THINKING_DEEPEST');
+    assert.ok(calls.includes('🧐'), `🧐 should have fired; got ${JSON.stringify(calls)}`);
+    r.stop();
+  });
+
+  test('CODING fires before deepening — cancels both deeper + deepest', async () => {
+    const calls = [];
+    const r = createReactionManager({
+      apply: async (e) => calls.push(e),
+      throttleMs: 0,
+      thinkingDeeperMs: 30,
+      thinkingDeepestMs: 80,
+      stallMs: 5000,
+    });
+    await r.setState('THINKING');
+    await new Promise((res) => setTimeout(res, 5));
+    await r.setState('CODING');
+    await new Promise((res) => setTimeout(res, 100));
+    // Should never have promoted to deeper or deepest.
+    assert.equal(calls.includes('🤨'), false);
+    assert.equal(calls.includes('🧐'), false);
+    assert.equal(r.currentState, 'CODING');
+    r.stop();
+  });
+
+  test('mid-cascade CODING cancels remaining deepening', async () => {
+    const calls = [];
+    const r = createReactionManager({
+      apply: async (e) => calls.push(e),
+      throttleMs: 0,
+      thinkingDeeperMs: 20,
+      thinkingDeepestMs: 80,
+      stallMs: 5000,
+    });
+    await r.setState('THINKING');
+    await new Promise((res) => setTimeout(res, 40));
+    // Should have promoted to DEEPER but not yet DEEPEST.
+    assert.equal(r.currentState, 'THINKING_DEEPER');
+    await r.setState('CODING');
+    await new Promise((res) => setTimeout(res, 100));
+    // Deepest should NOT have fired after CODING took over.
+    assert.equal(calls.includes('🧐'), false);
+    assert.equal(r.currentState, 'CODING');
+    r.stop();
+  });
+
+  test('explicit re-setState THINKING re-arms cascade fresh', async () => {
+    const calls = [];
+    const r = createReactionManager({
+      apply: async (e) => calls.push(e),
+      throttleMs: 0,
+      thinkingDeeperMs: 30,
+      thinkingDeepestMs: 80,
+      stallMs: 5000,
+    });
+    await r.setState('THINKING');
+    await new Promise((res) => setTimeout(res, 40));
+    assert.equal(r.currentState, 'THINKING_DEEPER');
+    // User effectively went CODING then back to THINKING — fresh cascade.
+    await r.setState('CODING');
+    await r.setState('THINKING');
+    // Wait briefly — should NOT be at DEEPER yet (cascade restarted).
+    await new Promise((res) => setTimeout(res, 10));
+    assert.equal(r.currentState, 'THINKING');
+    // Now wait past threshold — DEEPER should fire again.
+    await new Promise((res) => setTimeout(res, 40));
+    assert.equal(r.currentState, 'THINKING_DEEPER');
+    r.stop();
+  });
+
+  test('stop() cancels pending deepening', async () => {
+    const calls = [];
+    const r = createReactionManager({
+      apply: async (e) => calls.push(e),
+      throttleMs: 0,
+      thinkingDeeperMs: 30,
+      thinkingDeepestMs: 80,
+      stallMs: 5000,
+    });
+    await r.setState('THINKING');
+    r.stop();
+    await new Promise((res) => setTimeout(res, 100));
+    assert.equal(calls.includes('🤨'), false);
+    assert.equal(calls.includes('🧐'), false);
+  });
+
+  test('STALL still fires from a deepened state', async () => {
+    const calls = [];
+    const r = createReactionManager({
+      apply: async (e) => calls.push(e),
+      throttleMs: 0,
+      thinkingDeeperMs: 10,
+      thinkingDeepestMs: 30,
+      stallMs: 80,
+      freezeMs: 1000,
+    });
+    await r.setState('THINKING');
+    await new Promise((res) => setTimeout(res, 130));
+    // STALL is in STALL_PROMOTABLE for THINKING_DEEPER/DEEPEST too.
+    assert.ok(calls.includes('🥱'), `STALL should fire from a deepened state; got ${JSON.stringify(calls)}`);
+    r.stop();
+  });
+
+  test('default thresholds match Ivan-DM-calibrated values', () => {
+    const {
+      DEFAULT_THINKING_DEEPER_MS,
+      DEFAULT_THINKING_DEEPEST_MS,
+    } = require('../lib/status-reactions');
+    // 8s / 20s per Ivan DM 14-day data: catches 5-15s and 15-30s bands.
+    assert.equal(DEFAULT_THINKING_DEEPER_MS, 8000);
+    assert.equal(DEFAULT_THINKING_DEEPEST_MS, 20000);
+  });
+});
+
 describe('reactor — rc.25 default timing thresholds', () => {
   // Pins the bumped defaults so accidental regression to the
   // pre-rc.25 values (10s STALL / 30s TIMEOUT) is caught.

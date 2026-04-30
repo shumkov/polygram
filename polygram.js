@@ -2429,7 +2429,20 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // 0.7.4 (item G) voice-ack guard preserved: if 👂 is up from
   // voice transcription, don't overwrite it. Let onFirstStream
   // promote to 🤔 when Claude actually starts work.
-  if (!voiceAck.ackEmitted) {
+  //
+  // rc.32 second guard: skip THINKING if we're going to autosteer
+  // this message. Pre-fix, autosteer messages briefly showed
+  // 🤔 → ✍ (THINKING set here, then AUTOSTEERED set inside the
+  // autosteer block ~50 lines below). The flash was visible to
+  // users. Detect the autosteer pre-condition (SDK pm active AND
+  // session in-flight AND chat hasn't opted out) and skip.
+  const willAutosteer = pm.has(sessionKey)
+    && pm.get(sessionKey)?.inFlight
+    && pm.isSdkFor(sessionKey)
+    && (chatConfig.autosteer != null
+      ? chatConfig.autosteer !== false
+      : config.bot?.autosteer !== false);
+  if (!voiceAck.ackEmitted && !willAutosteer) {
     reactor.setState('THINKING');
   }
 
