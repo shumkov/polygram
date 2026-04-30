@@ -948,9 +948,27 @@ function buildSdkOptions(sessionKey, ctx) {
       })
     : null;
 
+  // rc.29 (refined): map effort → thinking. SDK's `effort` knob alone
+  // does NOT enable extended thinking — it only "works WITH" thinking.
+  // Without an explicit `thinking` config, the model emits no thinking
+  // content blocks, our onThinking callback never fires, and the
+  // reactor stays at 👀 until first text/tool. Mapping:
+  //   low    → disabled (fastest replies)
+  //   medium → adaptive (Claude decides when to think)
+  //   high   → adaptive (same; effort biases depth)
+  //   xhigh  → adaptive
+  //   max    → adaptive
+  // Chat configs can override by setting `thinking` directly in
+  // chatConfig (composeSdkOptions passes it through).
+  const effortValue = chatConfig.effort || config.defaults.effort;
+  const derivedThinking = effortValue === 'low'
+    ? { type: 'disabled' }
+    : { type: 'adaptive' };
+
   const baseOpts = {
     model: chatConfig.model || config.defaults.model,
-    effort: chatConfig.effort || config.defaults.effort,
+    effort: effortValue,
+    thinking: derivedThinking,
     cwd: chatConfig.cwd,
     env: childEnv,
     // permissionMode 'default' when canUseTool is wired (so the SDK
