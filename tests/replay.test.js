@@ -82,3 +82,118 @@ describe('replay — getReplayCandidates + dedupe', () => {
     assert.equal(rows.find((r) => r.msg_id === 102).handler_status, 'replied', 'replied rows untouched');
   });
 });
+
+describe('replay — markStalePending (G6 outbound-pending sweep)', () => {
+  // markStalePending operates on the OUTBOUND `status` column, not the
+  // inbound `handler_status`. It flips rows where `status='pending'`
+  // (an outbound row inserted before the daemon crashed mid-send) to
+  // 'failed' so dedupe (hasOutboundReplyTo) can count them as "we
+  // probably already sent this — don't re-dispatch the inbound".
+
+  beforeEach(() => { ({ db, dbPath } = freshDb('replay-stale')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  function insertOutboundPending(opts) {
+    db.raw.prepare(
+      `INSERT INTO messages (chat_id, msg_id, user, text, direction, source, bot_name,
+        status, ts, model, effort)
+        VALUES (?, ?, NULL, ?, 'out', 'polygram', ?, 'pending', ?, 'sonnet', 'medium')`,
+    ).run(opts.chat_id, opts.msg_id, opts.text || 'reply', opts.bot_name || 'testbot', opts.ts || Date.now());
+  }
+
+  test('flips OLD pending outbound rows to failed; keeps fresh ones', () => {
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    insertOutboundPending({ chat_id: '1', msg_id: 1000, ts: oneHourAgo });
+    insertOutboundPending({ chat_id: '1', msg_id: 1001 });   // fresh
+    const res = db.markStalePending(60_000);
+    assert.equal(res.changes, 1);
+    const old = db.raw.prepare("SELECT status, error FROM messages WHERE msg_id=1000").get();
+    const fresh = db.raw.prepare("SELECT status FROM messages WHERE msg_id=1001").get();
+    assert.equal(old.status, 'failed');
+    assert.match(old.error, /crashed/i);
+    assert.equal(fresh.status, 'pending');
+  });
+
+  test('does NOT flip rows in non-pending statuses', () => {
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    db.raw.prepare(
+      `INSERT INTO messages (chat_id, msg_id, user, text, direction, source, bot_name,
+        status, ts, model, effort)
+        VALUES ('1', 2000, NULL, 'sent reply', 'out', 'polygram', 'testbot', 'sent', ?, 'sonnet', 'medium')`,
+    ).run(oneHourAgo);
+    db.raw.prepare(
+      `INSERT INTO messages (chat_id, msg_id, user, text, direction, source, bot_name,
+        status, ts, model, effort)
+        VALUES ('1', 2001, NULL, 'failed reply', 'out', 'polygram', 'testbot', 'failed', ?, 'sonnet', 'medium')`,
+    ).run(oneHourAgo);
+    const res = db.markStalePending(60_000);
+    assert.equal(res.changes, 0);
+  });
+
+  test('botName filter scopes the sweep', () => {
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    insertOutboundPending({ chat_id: '1', msg_id: 1000, ts: oneHourAgo, bot_name: 'testbot' });
+    insertOutboundPending({ chat_id: '1', msg_id: 1001, ts: oneHourAgo, bot_name: 'otherbot' });
+    const res = db.markStalePending(60_000, 'testbot');
+    assert.equal(res.changes, 1, 'only testbot rows flipped');
+    const us = db.raw.prepare("SELECT status FROM messages WHERE msg_id=1000").get();
+    const them = db.raw.prepare("SELECT status FROM messages WHERE msg_id=1001").get();
+    assert.equal(us.status, 'failed');
+    assert.equal(them.status, 'pending');
+  });
+
+  test('default olderThanMs (60s) used when not specified', () => {
+    insertOutboundPending({ chat_id: '1', msg_id: 1000, ts: Date.now() - 45_000 });
+    insertOutboundPending({ chat_id: '1', msg_id: 1001, ts: Date.now() - 120_000 });
+    const res = db.markStalePending();
+    assert.equal(res.changes, 1, 'only the 120s-old row flipped');
+    const r45 = db.raw.prepare("SELECT status FROM messages WHERE msg_id=1000").get();
+    const r120 = db.raw.prepare("SELECT status FROM messages WHERE msg_id=1001").get();
+    assert.equal(r45.status, 'pending');
+    assert.equal(r120.status, 'failed');
+  });
+});
+
+describe('replay — getReplayCandidates edge cases', () => {
+  beforeEach(() => { ({ db, dbPath } = freshDb('replay-edge')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  test('limit caps the result count', () => {
+    for (let i = 0; i < 10; i++) {
+      insertInbound(db, { chat_id: '1', msg_id: 100 + i, text: `q${i}`, handler_status: 'dispatched' });
+    }
+    const rows = db.getReplayCandidates({ chatIds: ['1'], limit: 3 });
+    assert.equal(rows.length, 3);
+  });
+
+  test('default limit (100) caps very large queues', () => {
+    for (let i = 0; i < 150; i++) {
+      insertInbound(db, { chat_id: '1', msg_id: 100 + i, text: `q${i}`, handler_status: 'dispatched' });
+    }
+    const rows = db.getReplayCandidates({ chatIds: ['1'] });
+    assert.equal(rows.length, 100);
+  });
+
+  test('empty chatIds returns no rows', () => {
+    insertInbound(db, { chat_id: '1', msg_id: 100, text: 'q', handler_status: 'dispatched' });
+    const rows = db.getReplayCandidates({ chatIds: [] });
+    assert.equal(rows.length, 0);
+  });
+
+  test('chatIds matching no rows returns empty', () => {
+    insertInbound(db, { chat_id: '1', msg_id: 100, text: 'q', handler_status: 'dispatched' });
+    const rows = db.getReplayCandidates({ chatIds: ['9999'] });
+    assert.equal(rows.length, 0);
+  });
+
+  test('rows returned in chronological order (oldest first)', () => {
+    // Stay within the 3-min default olderThanMs window.
+    const baseTs = Date.now() - 60 * 1000;       // 60s ago
+    insertInbound(db, { chat_id: '1', msg_id: 102, text: 'third', handler_status: 'dispatched', ts: baseTs + 200 });
+    insertInbound(db, { chat_id: '1', msg_id: 100, text: 'first', handler_status: 'dispatched', ts: baseTs });
+    insertInbound(db, { chat_id: '1', msg_id: 101, text: 'second', handler_status: 'dispatched', ts: baseTs + 100 });
+    const rows = db.getReplayCandidates({ chatIds: ['1'] });
+    assert.deepEqual(rows.map((r) => r.msg_id), [100, 101, 102],
+      'replay must process oldest first to preserve user intent ordering');
+  });
+});
