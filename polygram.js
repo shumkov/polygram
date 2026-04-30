@@ -1987,6 +1987,51 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     }
     return;
   }
+  // 0.8.0-rc.22: /compact <preserve text> — manual SDK compaction with
+  // user-supplied preservation instructions. The SDK's CLI binary
+  // recognises "/compact" as a slash command via streamInput.push
+  // (verified by scripts/spikes/compact-via-streaminput.mjs: PreCompact
+  // hook fires with trigger:'manual', compact_boundary event lands).
+  // We push the raw text "/compact <instructions>" through the SDK's
+  // input controller; the SDK handles parsing + compaction internally.
+  if (botAllowsCommands && text.startsWith('/compact')) {
+    if (!pm.isSdkFor(sessionKey)) {
+      await sendReply('🗜️ /compact requires the SDK pm. This chat is on the CLI pm path.');
+      return;
+    }
+    if (!pm.has(sessionKey)) {
+      await sendReply('🗜️ No active session — /compact only works once a turn has started.');
+      return;
+    }
+    const entry = pm.get(sessionKey);
+    if (!entry?.inputController?.push) {
+      await sendReply('🗜️ Session not ready for /compact (no input controller).');
+      return;
+    }
+    // Push the literal "/compact ..." text into the input stream.
+    // The SDK parses leading "/" as a slash command and triggers
+    // manual compaction; user's preserve instructions land in
+    // PreCompactHookInput.custom_instructions.
+    try {
+      entry.inputController.push({
+        type: 'user',
+        message: { role: 'user', content: text },
+        parent_tool_use_id: null,
+      });
+      logEvent('compact-command', {
+        chat_id: chatId, text_len: text.length,
+        user: cmdUser, user_id: cmdUserId,
+      });
+      const preserveBit = text.length > '/compact'.length
+        ? ' with your preservation instructions'
+        : '';
+      await sendReply(`🗜️ Compacting${preserveBit}…`);
+    } catch (err) {
+      console.error(`[${label}] /compact push: ${err.message}`);
+      await sendReply(`🗜️ Couldn't trigger compact: ${err.message}`);
+    }
+    return;
+  }
   if (botAllowsCommands && (text === '/new' || text === '/reset')) {
     let drained = 0;
     const target = pm.pickFor(sessionKey);
@@ -2603,9 +2648,22 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
             // context (and fired below the intended 85% threshold).
             const pct = usage?.percentage ?? 0;
             if (pct < 85) return;
+            // rc.22: three-choice hint. The original "send /new"
+            // message implied the only path forward was a hard
+            // reset. Now offer all three options the user actually
+            // has — start fresh, compact with their preserve
+            // instructions, or keep going (auto-compact eventually
+            // fires).
+            const text = [
+              `📚 Context window ${pct.toFixed(0)}% full. Three options:`,
+              '',
+              '• `/new` — start fresh; this conversation ends.',
+              '• `/compact <preserve text>` — summarise older messages, keep what you specify.',
+              '• Keep chatting — I\'ll auto-compact when needed; key context is preserved automatically.',
+            ].join('\n');
             return tg(bot, 'sendMessage', {
               chat_id: chatId,
-              text: `📚 Context window ${pct.toFixed(0)}% full. Send /new to start fresh — older messages will start dropping soon.`,
+              text,
               ...(threadId ? { message_thread_id: threadId } : {}),
             }, { source: 'context-full-hint', botName: BOT_NAME });
           }).catch((err) => {
@@ -2868,7 +2926,7 @@ function createBot(token) {
   // Cached once @botUsername is known — was recompiling per inbound msg.
   let mentionRe = null;
   // Hoisted admin-command matcher; was re-allocated per message.
-  const ADMIN_CMD_RE = /^\/(model|effort|config|pair-code|pairings|unpair|new|reset|context)(\s|$)/;
+  const ADMIN_CMD_RE = /^\/(model|effort|config|pair-code|pairings|unpair|new|reset|context|compact)(\s|$)/;
   const PAIR_CLAIM_RE = /^\/pair\s+\S+/;
 
   // The filter in main() guarantees config.chats only contains chats owned
