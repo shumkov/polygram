@@ -948,27 +948,9 @@ function buildSdkOptions(sessionKey, ctx) {
       })
     : null;
 
-  // rc.29 (refined): map effort → thinking. SDK's `effort` knob alone
-  // does NOT enable extended thinking — it only "works WITH" thinking.
-  // Without an explicit `thinking` config, the model emits no thinking
-  // content blocks, our onThinking callback never fires, and the
-  // reactor stays at 👀 until first text/tool. Mapping:
-  //   low    → disabled (fastest replies)
-  //   medium → adaptive (Claude decides when to think)
-  //   high   → adaptive (same; effort biases depth)
-  //   xhigh  → adaptive
-  //   max    → adaptive
-  // Chat configs can override by setting `thinking` directly in
-  // chatConfig (composeSdkOptions passes it through).
-  const effortValue = chatConfig.effort || config.defaults.effort;
-  const derivedThinking = effortValue === 'low'
-    ? { type: 'disabled' }
-    : { type: 'adaptive' };
-
   const baseOpts = {
     model: chatConfig.model || config.defaults.model,
-    effort: effortValue,
-    thinking: derivedThinking,
+    effort: chatConfig.effort || config.defaults.effort,
     cwd: chatConfig.cwd,
     env: childEnv,
     // permissionMode 'default' when canUseTool is wired (so the SDK
@@ -977,14 +959,6 @@ function buildSdkOptions(sessionKey, ctx) {
     permissionMode: useCanUseTool ? 'default' : 'bypassPermissions',
     allowDangerouslySkipPermissions: !useCanUseTool,
     ...(useCanUseTool && { canUseTool: makeCanUseTool(sessionKey) }),
-    // rc.29: enable partial messages so pm-sdk can detect thinking
-    // blocks during the extended-thinking phase (before any text or
-    // tool_use arrives). Without this, the reactor stays at 👀 for
-    // the full thinking duration. With this, pm-sdk's onThinking
-    // callback fires within ~100-500ms of pm.send, giving the user
-    // a fast 👀 → 🤔 transition matching Claude Code CLI's
-    // "Thinking..." spinner.
-    includePartialMessages: true,
     hooks: {
       PostToolBatch: [{ hooks: [postToolBatchHook] }],
       ...(sessionStartHook && {
@@ -2452,6 +2426,25 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     reactor.setState('QUEUED');
   }
 
+  // rc.31: timer-based 👀 → 🤔 transition. After 300ms in QUEUED,
+  // promote to THINKING regardless of whether the SDK has emitted
+  // any stream events yet. Reasoning: THINKING is "the bot is
+  // working on your reply" — a generic processing signal, NOT
+  // specifically about extended-thinking content blocks. Pre-rc.31
+  // we waited for first text/tool_use, which under effort=high
+  // could mean 10+ s sitting at 👀 with no visible progress.
+  //
+  // Guarded on `currentState === 'QUEUED'` so we don't downgrade
+  // a more-specific state (CODING/TOOL/...) if a tool fires
+  // within 300ms of pm.send.
+  //
+  // unref() so a long-pending timer doesn't keep the event loop
+  // alive past shutdown drain.
+  const thinkingPromote = setTimeout(() => {
+    if (reactor.currentState === 'QUEUED') reactor.setState('THINKING');
+  }, 300);
+  thinkingPromote.unref?.();
+
   // Mark the inbound row terminal so boot replay doesn't pick it up
   // again. Must fire down EVERY non-throwing exit path (early returns
   // for error / NO_REPLY, streamed-reply preview-becomes-final, the
@@ -3610,20 +3603,13 @@ async function main() {
       const r = head?.context?.reactor;
       if (r && typeof r.heartbeat === 'function') r.heartbeat();
     },
-    // rc.29: extended-thinking → 🤔 transition. Fires the moment the
-    // model's first content_block_start with type='thinking' arrives
-    // via stream_event. Pre-rc.29 we waited for first text/tool_use,
-    // which under effort=high means the reactor sat at 👀 for 10+ s
-    // before flipping. Now the user sees 👀 → 🤔 within ~100-500ms
-    // of pm.send, matching Claude Code CLI's "Thinking..." UX.
-    onThinking: (sessionKey, entry) => {
-      const head = entry.pendingQueue?.[0];
-      const r = head?.context?.reactor;
-      if (r && typeof r.setState === 'function') r.setState('THINKING');
-      logEvent('thinking-started', {
-        chat_id: entry.chatId, session_key: sessionKey,
-      });
-    },
+    // rc.29 onThinking removed — replaced by simpler timer-based
+    // approach in handleMessage (post-QUEUED setState). The
+    // SDK-thinking-block detection added complexity (partial-message
+    // bandwidth, thinking config mapping) without solving the actual
+    // user-visible problem ("show me the bot is working"). The lib-
+    // side handler in pm-sdk stays for any future caller; polygram
+    // doesn't wire it.
     // 0.8.0 Phase 2 step 5: SDK auto-compaction observability. Fires
     // when SDK emits SDKCompactBoundaryMessage (between turns or
     // mid-turn — see Phase 0 gate 8.5). Surfaces a quiet system
