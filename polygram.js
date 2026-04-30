@@ -31,7 +31,8 @@ const { ProcessManager } = require('./lib/process-manager');
 // pick-at-startup. Phase 4 deletes the CLI version after Phase 5
 // soak proves SDK stable. See docs/0.8.0-architecture-decisions.md.
 const { ProcessManagerSdk } = require('./lib/process-manager-sdk');
-const { createAutosteerBuffer } = require('./lib/autosteer-buffer');
+const { createAutosteerBuffer, makePostToolBatchHook } = require('./lib/autosteer-buffer');
+const { makeRouterPolicy, createPmRouter } = require('./lib/pm-router');
 const agentLoader = require('./lib/agent-loader');
 const USE_SDK = process.env.POLYGRAM_USE_SDK === '1';
 const { createSender } = require('./lib/telegram');
@@ -907,39 +908,19 @@ function buildSdkOptions(sessionKey, ctx) {
   const useCanUseTool = apprCfg && apprCfg.adminChatId
     && Array.isArray(apprCfg.gatedTools) && apprCfg.gatedTools.length > 0;
 
-  // 0.8.0-rc.9: PostToolBatch hook drains the autosteer buffer for
-  // this session and injects queued user follow-ups as
-  // `additionalContext` on each tool boundary. Framing matters:
-  // wrapping in `<channel source="user-followup">…</channel>` is
-  // what Claude is trained to trust as legitimate out-of-band user
-  // context (verified live via post-tool-batch-spike-v2.mjs); the
-  // earlier `<user_message_during_turn>` framing tripped the
-  // model's prompt-injection defense and got refused.
-  const postToolBatchHook = async () => {
-    try {
-      const drained = autosteerBuffer.drain(sessionKey);
-      if (drained.length === 0) return { continue: true };
-      const additionalContext = autosteerBuffer.formatForHook(drained);
-      logEvent('autosteer-hook-drained', {
-        chat_id: ctx?.chatId ?? null,
-        session_key: sessionKey,
-        message_count: drained.length,
-      });
-      return {
-        continue: true,
-        hookSpecificOutput: {
-          hookEventName: 'PostToolBatch',
-          additionalContext,
-        },
-      };
-    } catch (err) {
-      console.error(`[${sessionKey}] PostToolBatch hook error: ${err.message}`);
-      // Never throw out of a hook — the SDK may treat it as a hard
-      // fail (`stop_hook_prevented` result subtype). Drop the
-      // queued messages on the floor; the user can re-send.
-      return { continue: true };
-    }
-  };
+  // 0.8.0-rc.9 (factored to lib/autosteer-buffer.js in rc.17): the
+  // PostToolBatch hook drains the autosteer buffer for THIS session
+  // and injects queued user follow-ups as `additionalContext` on
+  // each tool boundary, wrapped in `<channel source="user-followup">`
+  // which Claude is trained to trust as legitimate out-of-band user
+  // context.
+  const postToolBatchHook = makePostToolBatchHook({
+    buffer: autosteerBuffer,
+    sessionKey,
+    chatId: ctx?.chatId ?? null,
+    logEvent,
+    logger: console,
+  });
 
   const baseOpts = {
     model: chatConfig.model || config.defaults.model,
@@ -3559,20 +3540,15 @@ async function main() {
   // battle-tested CLI path. When both pms run, killChat /shutdown
   // broadcast to both; everything else routes per-sessionKey via
   // pickPmFor() based on the chat's set membership.
-  const sdkChatIdSet = new Set(
-    String(process.env.POLYGRAM_SDK_CHATS || '')
-      .split(',').map((s) => s.trim()).filter(Boolean)
-  );
-  const sdkAllChats = USE_SDK && sdkChatIdSet.size === 0;
-  const sdkSomeChats = sdkChatIdSet.size > 0;
-  const sdkActive = sdkAllChats || sdkSomeChats;
-
-  function pickPmKindFor(sessionKey) {
-    if (sdkAllChats) return 'sdk';
-    if (!sdkSomeChats) return 'cli';
-    const chatId = String(getChatIdFromKey(sessionKey) ?? '');
-    return sdkChatIdSet.has(chatId) ? 'sdk' : 'cli';
-  }
+  // rc.17: router policy + proxy live in lib/pm-router.js for
+  // testability. Policy parses env config and produces
+  // pickPmKindFor; createPmRouter wraps the cli/sdk pms with the
+  // routed surface.
+  const { sdkActive, sdkAllChats, sdkSomeChats, sdkChatIdSet, pickPmKindFor } = makeRouterPolicy({
+    useSdkAll: USE_SDK,
+    sdkChats: String(process.env.POLYGRAM_SDK_CHATS || '').split(','),
+    getChatIdFromKey,
+  });
 
   // Shared callbacks: identical instance passed to both pms so a
   // chat's lifecycle events look the same regardless of which pm
@@ -3715,85 +3691,9 @@ async function main() {
     : null;
 
   // Routing pm: same surface as a single pm, but per-method routing
-  // through pickPmKindFor(sessionKey). Methods that don't take a
-  // sessionKey (killChat by chatId, shutdown) broadcast to both.
-  // For optional methods (steer / setModel / applyFlagSettings /
-  // requestRespawn / drainQueue / interrupt / resetSession) we
-  // forward when the routed pm has the method and return a
-  // sentinel otherwise — so feature-detection at the call site
-  // still works via `typeof pm.pickFor(sessionKey).X === 'function'`.
-  pm = (() => {
-    function routedPm(sessionKey) {
-      return pickPmKindFor(sessionKey) === 'sdk' && sdkPm ? sdkPm : cliPm;
-    }
-    const router = {
-      pickFor: routedPm,
-      isSdkFor(sessionKey) {
-        return pickPmKindFor(sessionKey) === 'sdk' && !!sdkPm;
-      },
-      has(sessionKey) { return routedPm(sessionKey).has(sessionKey); },
-      get(sessionKey) { return routedPm(sessionKey).get(sessionKey); },
-      getOrSpawn(sessionKey, ctx) { return routedPm(sessionKey).getOrSpawn(sessionKey, ctx); },
-      send(sessionKey, prompt, opts) { return routedPm(sessionKey).send(sessionKey, prompt, opts); },
-      kill(sessionKey) { return routedPm(sessionKey).kill(sessionKey); },
-      async killChat(chatId) {
-        const tasks = [cliPm.killChat(chatId)];
-        if (sdkPm) tasks.push(sdkPm.killChat(chatId));
-        await Promise.all(tasks);
-      },
-      async shutdown() {
-        const tasks = [cliPm.shutdown()];
-        if (sdkPm) tasks.push(sdkPm.shutdown());
-        await Promise.all(tasks);
-      },
-      // Optional methods. The router returns a function — but the
-      // function returns a sentinel if the routed pm doesn't have
-      // the method. Sites that want feature-detection should use
-      // `pm.pickFor(sessionKey)` and check `typeof X === 'function'`
-      // there instead of probing `pm.X` directly.
-      steer(sessionKey, ...args) {
-        const target = routedPm(sessionKey);
-        return typeof target.steer === 'function' ? target.steer(sessionKey, ...args) : false;
-      },
-      resetSession(sessionKey, opts) {
-        const target = routedPm(sessionKey);
-        return typeof target.resetSession === 'function'
-          ? target.resetSession(sessionKey, opts)
-          : Promise.resolve({ closed: false, drainedPendings: 0 });
-      },
-      applyFlagSettings(sessionKey, settings) {
-        const target = routedPm(sessionKey);
-        return typeof target.applyFlagSettings === 'function'
-          ? target.applyFlagSettings(sessionKey, settings)
-          : Promise.resolve(false);
-      },
-      setModel(sessionKey, model) {
-        const target = routedPm(sessionKey);
-        return typeof target.setModel === 'function'
-          ? target.setModel(sessionKey, model)
-          : Promise.resolve(false);
-      },
-      requestRespawn(sessionKey, reason) {
-        const target = routedPm(sessionKey);
-        return typeof target.requestRespawn === 'function'
-          ? target.requestRespawn(sessionKey, reason)
-          : { killed: false, queued: 0 };
-      },
-      drainQueue(sessionKey, errCode) {
-        const target = routedPm(sessionKey);
-        return typeof target.drainQueue === 'function'
-          ? target.drainQueue(sessionKey, errCode)
-          : 0;
-      },
-      interrupt(sessionKey) {
-        const target = routedPm(sessionKey);
-        return typeof target.interrupt === 'function'
-          ? target.interrupt(sessionKey)
-          : Promise.resolve();
-      },
-    };
-    return router;
-  })();
+  // through pickPmKindFor(sessionKey). Per-method semantics
+  // documented in lib/pm-router.js.
+  pm = createPmRouter({ cliPm, sdkPm, pickPmKindFor });
 
   if (sdkAllChats) {
     console.log('[polygram] using SDK ProcessManager (all chats)');
