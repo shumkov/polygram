@@ -141,3 +141,116 @@ describe('approval-waiters — capacity + dedup', () => {
     );
   });
 });
+
+describe('approval-waiters — defensive edge cases', () => {
+  test('rejectAllForSession with no matching sessionKey returns 0', () => {
+    const w = createApprovalWaiters({ logger: { error: () => {} } });
+    w.park({ toolUseId: 'x', sessionKey: 'c1' });
+    const n = w.rejectAllForSession('c2');
+    assert.equal(n, 0);
+    assert.equal(w.size, 1);                                // c1 untouched
+    w.resolveByClick('x', { behavior: 'allow' });
+  });
+
+  test('rejectAll on empty waiter map returns 0', () => {
+    const w = createApprovalWaiters({ logger: { error: () => {} } });
+    assert.equal(w.rejectAll(), 0);
+  });
+
+  test('rejectAllForSession with custom code propagates', async () => {
+    const w = createApprovalWaiters({ logger: { error: () => {} } });
+    const p = w.park({ toolUseId: 'x', sessionKey: 'c1' });
+    w.rejectAllForSession('c1', 'CUSTOM_CODE');
+    const e = await p.catch((err) => err);
+    assert.equal(e.code, 'CUSTOM_CODE');
+  });
+
+  test('rejectAll with custom code propagates', async () => {
+    const w = createApprovalWaiters({ logger: { error: () => {} } });
+    const p = w.park({ toolUseId: 'x', sessionKey: 'c1' });
+    w.rejectAll('OPERATOR_KILL');
+    const e = await p.catch((err) => err);
+    assert.equal(e.code, 'OPERATOR_KILL');
+  });
+
+  test('stopTimeoutSweeper without start is a no-op', () => {
+    const w = createApprovalWaiters({ logger: { error: () => {} } });
+    assert.doesNotThrow(() => w.stopTimeoutSweeper());
+  });
+
+  test('signal aborted BEFORE resolveByClick — click on abandoned waiter returns false', async () => {
+    const w = createApprovalWaiters({ logger: { error: () => {} } });
+    const ctrl = new AbortController();
+    const p = w.park({ toolUseId: 'tu', sessionKey: 'c', signal: ctrl.signal });
+    ctrl.abort();
+    const err = await p.catch((e) => e);
+    assert.equal(err.code, 'ABORTED');
+    // Late click should be a no-op (waiter already gone).
+    assert.equal(w.resolveByClick('tu', { behavior: 'allow' }), false);
+  });
+
+  test('signal already aborted at park time — promise rejects without crash', async () => {
+    // AbortSignal.aborted=true at construction time. The `once` listener
+    // should still fire (or rejection should otherwise propagate).
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const w = createApprovalWaiters({ logger: { error: () => {} } });
+    const p = w.park({ toolUseId: 'tu', sessionKey: 'c', signal: ctrl.signal });
+    // Implementations vary — some signals fire synchronously when
+    // already-aborted, some wait until next tick. Either way, the
+    // promise must settle (reject) — never hang.
+    const err = await Promise.race([
+      p.catch((e) => e),
+      new Promise((res) => setTimeout(() => res({ code: 'TIMEOUT_GUARD' }), 200)),
+    ]);
+    assert.notEqual(err.code, 'TIMEOUT_GUARD',
+      'signal abort must propagate even when aborted at park time');
+  });
+
+  test('size goes back to 0 after every cleanup path', async () => {
+    const w = createApprovalWaiters({ logger: { error: () => {} } });
+    // Path 1: click
+    const p1 = w.park({ toolUseId: 'a', sessionKey: 'c1' });
+    w.resolveByClick('a', { behavior: 'allow' });
+    await p1;
+    assert.equal(w.size, 0);
+    // Path 2: signal
+    const ctrl = new AbortController();
+    const p2 = w.park({ toolUseId: 'b', sessionKey: 'c1', signal: ctrl.signal });
+    ctrl.abort();
+    await p2.catch(() => {});
+    assert.equal(w.size, 0);
+    // Path 4: rejectAllForSession
+    const p4 = w.park({ toolUseId: 'd', sessionKey: 'c1' });
+    w.rejectAllForSession('c1');
+    await p4.catch(() => {});
+    assert.equal(w.size, 0);
+    // Path 5: rejectAll
+    const p5 = w.park({ toolUseId: 'e', sessionKey: 'c1' });
+    w.rejectAll();
+    await p5.catch(() => {});
+    assert.equal(w.size, 0);
+  });
+
+  test('cap-rejected park does not occupy a slot', () => {
+    const w = createApprovalWaiters({ logger: { error: () => {} }, maxWaiters: 1 });
+    w.park({ toolUseId: 'a', sessionKey: 'c' });
+    assert.throws(() => w.park({ toolUseId: 'b', sessionKey: 'c' }), { code: 'WAITER_CAP' });
+    // Only the first park lives.
+    assert.equal(w.size, 1);
+    // Original waiter still resolvable.
+    w.resolveByClick('a', { behavior: 'deny' });
+    assert.equal(w.size, 0);
+  });
+
+  test('introspection getter exposes live size, not stale', () => {
+    const w = createApprovalWaiters({ logger: { error: () => {} } });
+    assert.equal(w.size, 0);
+    w.park({ toolUseId: '1', sessionKey: 'c' });
+    assert.equal(w.size, 1);
+    w.park({ toolUseId: '2', sessionKey: 'c' });
+    assert.equal(w.size, 2);
+    w.resolveByClick('1', { behavior: 'allow' });
+    assert.equal(w.size, 1);
+  });
+});
