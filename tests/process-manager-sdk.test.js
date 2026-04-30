@@ -451,6 +451,189 @@ describe('ProcessManagerSdk — subagent filter (Phase 1 step 7)', () => {
   });
 });
 
+describe('ProcessManagerSdk — LRU eviction (G14)', () => {
+  // v6 plan §7.1 G14: cap=2, spawn 3 chats, oldest evicts cleanly.
+  // Pins the contract pre-SDK-pm-rollout to partner chats.
+
+  test('cap=2: spawning third chat evicts oldest idle entry', async () => {
+    const fqs = [makeFakeQuery(), makeFakeQuery(), makeFakeQuery()];
+    let spawnIdx = 0;
+    const events = [];
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fqs[spawnIdx++].query,
+      logger: { error: () => {}, log: () => {} },
+      // Capture lru/evict events.
+      db: { logEvent: (kind, detail) => events.push({ kind, detail }) },
+    });
+
+    // chat-1 spawned.
+    await pm.getOrSpawn('chat-1');
+    fqs[0].emitEvent({ type: 'system', subtype: 'init', session_id: 's1' });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(pm.size, 1);
+
+    // chat-2 spawned. lastUsedTs guarantees chat-1 is older.
+    await new Promise((r) => setTimeout(r, 5));
+    await pm.getOrSpawn('chat-2');
+    fqs[1].emitEvent({ type: 'system', subtype: 'init', session_id: 's2' });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(pm.size, 2);
+
+    // chat-3 — at cap, must evict oldest (chat-1, idle).
+    await new Promise((r) => setTimeout(r, 5));
+    await pm.getOrSpawn('chat-3');
+    fqs[2].emitEvent({ type: 'system', subtype: 'init', session_id: 's3' });
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(pm.size, 2);
+    assert.ok(!pm.has('chat-1'), 'chat-1 should be evicted');
+    assert.ok(pm.has('chat-2'));
+    assert.ok(pm.has('chat-3'));
+    assert.ok(events.some((e) => e.kind === 'evict' && e.detail.session_key === 'chat-1'));
+
+    await pm.shutdown();
+  });
+
+  test('in-flight entry is NOT evicted; idle one with later lastUsedTs is', async () => {
+    const fqs = [makeFakeQuery(), makeFakeQuery(), makeFakeQuery()];
+    let spawnIdx = 0;
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fqs[spawnIdx++].query,
+      logger: { error: () => {}, log: () => {} },
+    });
+
+    // chat-1 spawned and KEPT in-flight (no result event).
+    await pm.getOrSpawn('chat-1');
+    fqs[0].emitEvent({ type: 'system', subtype: 'init', session_id: 's1' });
+    pm.send('chat-1', 'in-flight prompt').catch(() => {});
+    await new Promise((r) => setImmediate(r));
+    // Verify in-flight.
+    assert.equal(pm.get('chat-1').inFlight, true);
+
+    // chat-2 spawned, finished, idle.
+    await pm.getOrSpawn('chat-2');
+    fqs[1].emitEvent({ type: 'system', subtype: 'init', session_id: 's2' });
+    await new Promise((r) => setImmediate(r));
+
+    // chat-3 — must evict chat-2 (idle), NOT chat-1 (in-flight).
+    await pm.getOrSpawn('chat-3');
+    fqs[2].emitEvent({ type: 'system', subtype: 'init', session_id: 's3' });
+    await new Promise((r) => setImmediate(r));
+
+    assert.ok(pm.has('chat-1'), 'chat-1 in-flight must be preserved');
+    assert.ok(!pm.has('chat-2'), 'chat-2 idle must be evicted');
+    assert.ok(pm.has('chat-3'));
+
+    await pm.shutdown();
+  });
+
+  test('all entries in-flight: getOrSpawn parks until a slot opens', async () => {
+    const fqs = [makeFakeQuery(), makeFakeQuery(), makeFakeQuery()];
+    let spawnIdx = 0;
+    const events = [];
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fqs[spawnIdx++].query,
+      logger: { error: () => {}, log: () => {} },
+      db: { logEvent: (kind, detail) => events.push({ kind, detail }) },
+    });
+
+    // Both slots filled with in-flight entries.
+    await pm.getOrSpawn('chat-1');
+    fqs[0].emitEvent({ type: 'system', subtype: 'init', session_id: 's1' });
+    pm.send('chat-1', 'p1').catch(() => {});
+    await pm.getOrSpawn('chat-2');
+    fqs[1].emitEvent({ type: 'system', subtype: 'init', session_id: 's2' });
+    pm.send('chat-2', 'p2').catch(() => {});
+    await new Promise((r) => setImmediate(r));
+    assert.equal(pm.get('chat-1').inFlight, true);
+    assert.equal(pm.get('chat-2').inFlight, true);
+
+    // Third spawn should park.
+    let parked = true;
+    const thirdSpawn = pm.getOrSpawn('chat-3').then(() => { parked = false; });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(parked, true, 'chat-3 must park while all entries in-flight');
+    assert.ok(events.some((e) => e.kind === 'lru-wait'));
+    assert.ok(events.some((e) => e.kind === 'lru-full'));
+
+    // Free a slot via kill — chat-3 parked spawn should resume.
+    await pm.kill('chat-1');
+    await thirdSpawn;
+    assert.ok(pm.has('chat-3'));
+
+    await pm.shutdown();
+  });
+
+  test('evict-close-timeout fires when query.close exceeds queryCloseTimeoutMs', async () => {
+    const fqs = [makeFakeQuery(), makeFakeQuery(), makeFakeQuery()];
+    let spawnIdx = 0;
+    // Override fqs[0].query.close to hang forever — pm should
+    // race it against queryCloseTimeoutMs and log the timeout.
+    fqs[0].query.close = () => new Promise(() => {});
+
+    const events = [];
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 25,                           // tight for the test
+      spawnFn: () => fqs[spawnIdx++].query,
+      logger: { error: () => {}, log: () => {} },
+      db: { logEvent: (kind, detail) => events.push({ kind, detail }) },
+    });
+
+    await pm.getOrSpawn('chat-1');
+    fqs[0].emitEvent({ type: 'system', subtype: 'init', session_id: 's1' });
+    await pm.getOrSpawn('chat-2');
+    fqs[1].emitEvent({ type: 'system', subtype: 'init', session_id: 's2' });
+    await new Promise((r) => setImmediate(r));
+
+    // Trigger eviction — chat-1's hung close() exceeds timeout.
+    await pm.getOrSpawn('chat-3');
+    fqs[2].emitEvent({ type: 'system', subtype: 'init', session_id: 's3' });
+    await new Promise((r) => setTimeout(r, 80));         // > queryCloseTimeoutMs
+
+    const evictTimeout = events.find((e) => e.kind === 'evict-close-timeout');
+    assert.ok(evictTimeout, 'evict-close-timeout event must fire');
+    assert.equal(evictTimeout.detail.session_key, 'chat-1');
+    // Evicted entry still removed from procs map regardless.
+    assert.ok(!pm.has('chat-1'));
+
+    await pm.shutdown();
+  });
+
+  test('shutdown signals all parked LRU waiters with rejection', async () => {
+    const fqs = [makeFakeQuery(), makeFakeQuery(), makeFakeQuery()];
+    let spawnIdx = 0;
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fqs[spawnIdx++].query,
+      logger: { error: () => {}, log: () => {} },
+    });
+
+    await pm.getOrSpawn('chat-1');
+    fqs[0].emitEvent({ type: 'system', subtype: 'init', session_id: 's1' });
+    pm.send('chat-1', 'p1').catch(() => {});
+    await pm.getOrSpawn('chat-2');
+    fqs[1].emitEvent({ type: 'system', subtype: 'init', session_id: 's2' });
+    pm.send('chat-2', 'p2').catch(() => {});
+    await new Promise((r) => setImmediate(r));
+
+    // Park chat-3 — both slots in-flight.
+    const parked = pm.getOrSpawn('chat-3');
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Shutdown should reject the parked waiter.
+    await pm.shutdown();
+    await assert.rejects(parked, /shutdown/);
+  });
+});
+
 describe('ProcessManagerSdk — compact_boundary (D6 / §5)', () => {
   let pm;
   let fq;
