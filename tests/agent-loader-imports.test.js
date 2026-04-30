@@ -203,3 +203,80 @@ describe('agent-loader — caching', () => {
     }
   });
 });
+
+
+describe('agent-loader — name validation (path traversal)', () => {
+  // Chat configs can specify `agent: <name>`; pre-fix the name was
+  // path.join'd directly so `../../foo` escaped .claude/agents/.
+  // Operator-controlled input, so threat is operator typo — but
+  // contract is "agent names live in .claude/agents only".
+  //
+  // Invalid names route to resolveAgentLocation() returning null,
+  // which causes loadAgent() to throw AGENT_NOT_FOUND. That's the
+  // same error you'd see for a typo that names a non-existent
+  // agent — caller already handles it.
+
+  const expectRejected = (name, opts = {}) => assert.throws(
+    () => loadAgent(name, { homeDir: tmpHome, cwd: tmpCwd, ...opts }),
+    { code: 'AGENT_NOT_FOUND' },
+  );
+
+  test('rejects "../" traversal even when target file exists', () => {
+    fs.writeFileSync(path.join(tmpHome, 'secret.md'), 'should-never-load');
+    expectRejected('../../secret', { cwd: tmpHome });
+  });
+
+  test('rejects names with forward slash', () => {
+    fs.writeFileSync(path.join(tmpCwd, '.claude', 'agents', 'inner.md'), 'x');
+    expectRejected('subdir/inner');
+  });
+
+  test('rejects empty string', () => {
+    expectRejected('');
+  });
+
+  test('rejects names starting with a dot', () => {
+    fs.writeFileSync(path.join(tmpCwd, '.claude', 'agents', '.hidden.md'), 'x');
+    expectRejected('.hidden');
+  });
+
+  test('rejects "." and ".." literally', () => {
+    expectRejected('.');
+    expectRejected('..');
+  });
+
+  test('rejects names with spaces', () => {
+    expectRejected('foo bar');
+  });
+
+  test('accepts ordinary names with hyphen + underscore', () => {
+    fs.writeFileSync(
+      path.join(tmpCwd, '.claude', 'agents', 'shumabit-finance_v2.md'),
+      '---\nname: x\n---\nbody',
+    );
+    const bundle = loadAgent('shumabit-finance_v2', { homeDir: tmpHome, cwd: tmpCwd });
+    assert.ok(bundle, 'legitimate name should resolve');
+    assert.match(bundle.systemPrompt, /body/);
+  });
+
+  test('accepts dotted version names (single dots inside)', () => {
+    fs.writeFileSync(
+      path.join(tmpCwd, '.claude', 'agents', 'finance.v2.md'),
+      '---\nname: x\n---\nbody',
+    );
+    const bundle = loadAgent('finance.v2', { homeDir: tmpHome, cwd: tmpCwd });
+    assert.ok(bundle);
+  });
+
+  test('rejects double-dot anywhere (e.g. "fin..v2")', () => {
+    expectRejected('fin..v2');
+  });
+
+  test('rejects backslash (Windows-style path separator)', () => {
+    expectRejected('foo\\bar');
+  });
+
+  test('rejects absolute path', () => {
+    expectRejected('/etc/passwd');
+  });
+});
