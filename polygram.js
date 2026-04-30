@@ -43,6 +43,7 @@ const {
 } = require('./lib/approval-ui');
 const { makeSessionStartHook } = require('./lib/history-preload');
 const { formatContextReply, maybeContextFullHint } = require('./lib/context-format');
+const { appendDisplayHint, appendDisplayHintCliArgs } = require('./lib/telegram-prompt');
 const agentLoader = require('./lib/agent-loader');
 const USE_SDK = process.env.POLYGRAM_USE_SDK === '1';
 const { createSender } = require('./lib/telegram');
@@ -817,6 +818,10 @@ function spawnClaude(sessionKey, ctx) {
   ];
   if (chatConfig.agent) args.push('--agent', chatConfig.agent);
   if (existingSessionId) args.push('--resume', existingSessionId);
+  // Polygram-side display constraints — same hint the SDK pm appends
+  // via Options.systemPrompt. Keeps the table-width rule in
+  // infrastructure, not in agent docs.
+  args.push(...appendDisplayHintCliArgs());
 
   console.log(`[${label}] Spawning process (${chatConfig.model}/${chatConfig.effort})`);
 
@@ -970,7 +975,7 @@ function buildSdkOptions(sessionKey, ctx) {
   // precedence: chatConfig > agent > defaults. The chatConfig keys
   // we care about for SDK options are model/effort/cwd/thinking;
   // others (agent, chrome, isolateTopics) are polygram-only.
-  return agentLoader.composeSdkOptions(
+  const composed = agentLoader.composeSdkOptions(
     {
       // chat-level overrides — only the keys SDK understands.
       model: chatConfig.model,
@@ -981,6 +986,13 @@ function buildSdkOptions(sessionKey, ctx) {
     agentBundle,
     baseOpts,
   );
+
+  // Append polygram's display constraints to the systemPrompt.
+  // Infrastructure-layer hint — the agent's own prompt covers
+  // business logic; polygram adds "your output renders in Telegram,
+  // here's the width budget for tables".
+  composed.systemPrompt = appendDisplayHint(composed.systemPrompt);
+  return composed;
 }
 
 function buildSpawnContext(sessionKey) {
