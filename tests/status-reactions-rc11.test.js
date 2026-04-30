@@ -187,3 +187,36 @@ describe('reactor — heartbeat (rc.16)', () => {
     assert.equal(calls.includes('🥱'), true, 'STALL should fire after stallMs without heartbeat');
   });
 });
+
+describe('reactor — rc.25 default timing thresholds', () => {
+  // Pins the bumped defaults so accidental regression to the
+  // pre-rc.25 values (10s STALL / 30s TIMEOUT) is caught.
+  // The 30s TIMEOUT was firing on Ivan DM during routine multi-step
+  // agent runs even though the bot was actively replying.
+  const {
+    DEFAULT_STALL_MS,
+    DEFAULT_FREEZE_MS,
+  } = require('../lib/status-reactions');
+
+  test('DEFAULT_STALL_MS is at least 30s (not OpenClaw\'s aggressive 10s)', () => {
+    assert.ok(DEFAULT_STALL_MS >= 30_000,
+      `DEFAULT_STALL_MS=${DEFAULT_STALL_MS} too aggressive; SDK pm thinks > 10s routinely`);
+  });
+
+  test('DEFAULT_FREEZE_MS is at least 90s (was 30s pre-rc.25 — too aggressive)', () => {
+    assert.ok(DEFAULT_FREEZE_MS >= 90_000,
+      `DEFAULT_FREEZE_MS=${DEFAULT_FREEZE_MS} too aggressive for SDK pm long agent runs`);
+  });
+
+  test('DEFAULT_FREEZE_MS still bounded (under 10 min — pm has its own hard timeout)', () => {
+    // Sanity: don't drift to "never fire". 5-minute pm idle timeout
+    // is the real backstop; reactor should fire well before that to
+    // give a visible signal to the user.
+    assert.ok(DEFAULT_FREEZE_MS < 10 * 60_000,
+      `DEFAULT_FREEZE_MS=${DEFAULT_FREEZE_MS} too lax`);
+  });
+
+  test('STALL fires before FREEZE (yawn before scary face)', () => {
+    assert.ok(DEFAULT_STALL_MS < DEFAULT_FREEZE_MS);
+  });
+});

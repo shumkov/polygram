@@ -3589,6 +3589,13 @@ async function main() {
       const head = entry.pendingQueue?.[0];
       const s = head?.context?.streamer;
       if (s) s.forceNewMessage();
+      // rc.25: heartbeat at every assistant-message boundary too. A
+      // long thinking phase (effort=high, 30+ s before first chunk)
+      // doesn't fire onStreamChunk. Without this, the freeze timer
+      // could expire while the model is "still thinking but about
+      // to speak".
+      const r = head?.context?.reactor;
+      if (r && typeof r.heartbeat === 'function') r.heartbeat();
     },
     // 0.8.0 Phase 2 step 5: SDK auto-compaction observability. Fires
     // when SDK emits SDKCompactBoundaryMessage (between turns or
