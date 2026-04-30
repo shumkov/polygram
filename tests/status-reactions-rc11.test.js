@@ -17,6 +17,40 @@ const assert = require('node:assert/strict');
 
 const { createReactionManager, STATES } = require('../lib/status-reactions');
 
+describe('reactor — rc.24 no-throttle: every setState lands', () => {
+  test('rapid QUEUED → THINKING → CODING all reach Telegram', async () => {
+    // Pre-rc.24 the 800ms throttle would squash THINKING when
+    // the user typed → onFirstStream → onToolUse fired in <30ms.
+    const calls = [];
+    const r = createReactionManager({
+      apply: async (emoji) => calls.push(emoji),
+    });
+    r.setState('QUEUED');
+    r.setState('THINKING');
+    r.setState('CODING');
+    // applyChain serializes; wait for all three to land.
+    await new Promise((res) => setTimeout(res, 50));
+    assert.deepEqual(calls, ['👀', '🤔', '👨‍💻']);
+  });
+
+  test('every setState fires apply (no squashing of intermediate states)', async () => {
+    const calls = [];
+    const r = createReactionManager({
+      apply: async (emoji) => calls.push(emoji),
+    });
+    r.setState('THINKING');
+    r.setState('CODING');
+    r.setState('TOOL');
+    r.setState('WRITING');
+    r.setState('THINKING');
+    await new Promise((res) => setTimeout(res, 30));
+    // All five should land in invocation order.
+    assert.equal(calls.length, 5);
+    assert.equal(calls[0], '🤔');                    // THINKING
+    assert.equal(calls[4], '🤔');                    // back to THINKING
+  });
+});
+
 describe('reactor — applyChain serialization (rc.11)', () => {
   test('concurrent flushes complete in setState invocation order', async () => {
     const calls = [];
