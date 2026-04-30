@@ -190,7 +190,7 @@ describe('reactor — heartbeat (rc.16)', () => {
 
 describe('reactor — rc.32 thinking deepening cascade', () => {
   // Progressive deepening: setState('THINKING') auto-promotes through
-  // THINKING_DEEPER (🤨, 8s) → THINKING_DEEPEST (🧐, 20s). State change
+  // THINKING_DEEPER (🤨, 12s) → THINKING_DEEPEST (🧐, 30s). State change
   // (CODING/TOOL/etc) clears it. Pre-rc.32 behaviour: stay at 🤔 the
   // entire thinking phase, then yawn at 45s.
 
@@ -329,9 +329,12 @@ describe('reactor — rc.32 thinking deepening cascade', () => {
       DEFAULT_THINKING_DEEPER_MS,
       DEFAULT_THINKING_DEEPEST_MS,
     } = require('../lib/status-reactions');
-    // 8s / 20s per Ivan DM 14-day data: catches 5-15s and 15-30s bands.
-    assert.equal(DEFAULT_THINKING_DEEPER_MS, 8000);
-    assert.equal(DEFAULT_THINKING_DEEPEST_MS, 20000);
+    // 12s / 30s per Ivan DM 14-day data + rc.35 "less eager" tuning:
+    // 12s lets the entire 5-15s bracket (33%) resolve on plain 🤔;
+    // 30s lets the 15-30s bracket (25%) resolve on 🤨 without a
+    // second cascade. STALL still fires at 45s for the long 17%.
+    assert.equal(DEFAULT_THINKING_DEEPER_MS, 12000);
+    assert.equal(DEFAULT_THINKING_DEEPEST_MS, 30000);
   });
 });
 
