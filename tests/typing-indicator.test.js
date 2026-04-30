@@ -134,3 +134,84 @@ describe('startTyping — circuit breaker', () => {
     assert.equal(s?.failures ?? 0, 0, 'server errors should not open the circuit');
   });
 });
+
+describe('typing-indicator — state management', () => {
+  beforeEach(() => resetChatTypingState());
+
+  test('getChatTypingState returns undefined for chats never typed to', () => {
+    assert.equal(getChatTypingState(99999), undefined);
+  });
+
+  test('resetChatTypingState() with no args clears ALL chats', async () => {
+    let calls = 0;
+    const bot = { api: { sendChatAction: async () => {
+      calls += 1;
+      const e = new Error('blocked'); e.error_code = 401; throw e;
+    } } };
+    const stop1 = startTyping({ bot, chatId: 1, intervalMs: 100 });
+    const stop2 = startTyping({ bot, chatId: 2, intervalMs: 100 });
+    await new Promise((r) => setTimeout(r, 20));
+    stop1(); stop2();
+    assert.ok(getChatTypingState(1));
+    assert.ok(getChatTypingState(2));
+    resetChatTypingState();
+    assert.equal(getChatTypingState(1), undefined);
+    assert.equal(getChatTypingState(2), undefined);
+    assert.ok(calls > 0);
+  });
+
+  test('resetChatTypingState(chatId) clears only that chat', async () => {
+    const bot = { api: { sendChatAction: async () => {
+      const e = new Error('blocked'); e.error_code = 401; throw e;
+    } } };
+    const stop1 = startTyping({ bot, chatId: 'a', intervalMs: 100 });
+    const stop2 = startTyping({ bot, chatId: 'b', intervalMs: 100 });
+    await new Promise((r) => setTimeout(r, 20));
+    stop1(); stop2();
+    assert.ok(getChatTypingState('a'));
+    assert.ok(getChatTypingState('b'));
+    resetChatTypingState('a');
+    assert.equal(getChatTypingState('a'), undefined);
+    assert.ok(getChatTypingState('b'), 'b should remain untouched');
+  });
+
+  test('per-chat state isolation: failures on chat A do not affect chat B', async () => {
+    let aCalls = 0;
+    let bCalls = 0;
+    const bot = { api: { sendChatAction: async (chatId) => {
+      if (String(chatId) === 'a') {
+        aCalls += 1;
+        const e = new Error('blocked'); e.error_code = 401; throw e;
+      } else {
+        bCalls += 1;
+        // success
+      }
+    } } };
+    const stopA = startTyping({ bot, chatId: 'a', intervalMs: 25 });
+    const stopB = startTyping({ bot, chatId: 'b', intervalMs: 25 });
+    await new Promise((r) => setTimeout(r, 80));
+    stopA(); stopB();
+    const sa = getChatTypingState('a');
+    const sb = getChatTypingState('b');
+    assert.ok(sa.failures > 0, 'chat a should have failures');
+    assert.equal(sb?.failures ?? 0, 0, 'chat b must stay clean');
+  });
+
+  test('stop() actually stops the interval (no calls after stop)', async () => {
+    let calls = 0;
+    const bot = { api: { sendChatAction: async () => { calls += 1; } } };
+    const stop = startTyping({ bot, chatId: 'x', intervalMs: 30 });
+    await new Promise((r) => setTimeout(r, 70));   // ~3 calls
+    stop();
+    const before = calls;
+    await new Promise((r) => setTimeout(r, 100));  // would be 3 more
+    assert.equal(calls, before, 'no calls after stop');
+  });
+
+  test('stop() is idempotent', () => {
+    const bot = { api: { sendChatAction: async () => {} } };
+    const stop = startTyping({ bot, chatId: 'y', intervalMs: 1000 });
+    assert.doesNotThrow(() => stop());
+    assert.doesNotThrow(() => stop());
+  });
+});
