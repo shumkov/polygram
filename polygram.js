@@ -40,6 +40,7 @@ const {
   formatToolInputForCard,
   approvalCardText,
 } = require('./lib/approval-ui');
+const { makeSessionStartHook } = require('./lib/history-preload');
 const agentLoader = require('./lib/agent-loader');
 const USE_SDK = process.env.POLYGRAM_USE_SDK === '1';
 const { createSender } = require('./lib/telegram');
@@ -929,6 +930,21 @@ function buildSdkOptions(sessionKey, ctx) {
     logger: console,
   });
 
+  // 0.8.0-rc.21: SessionStart hook preloads recent polygram-DB
+  // history into a fresh Query (no resume). Without this, every
+  // /new or daemon-boot starts the agent blank — even though the
+  // chat has been running for weeks. Skips when source is
+  // 'resume' or 'compact' (transcript already populated).
+  const sessionStartHook = ctx?.chatId
+    ? makeSessionStartHook({
+        db,
+        chatId: ctx.chatId,
+        threadId: ctx.threadId ?? null,
+        logEvent,
+        logger: console,
+      })
+    : null;
+
   const baseOpts = {
     model: chatConfig.model || config.defaults.model,
     effort: chatConfig.effort || config.defaults.effort,
@@ -942,6 +958,9 @@ function buildSdkOptions(sessionKey, ctx) {
     ...(useCanUseTool && { canUseTool: makeCanUseTool(sessionKey) }),
     hooks: {
       PostToolBatch: [{ hooks: [postToolBatchHook] }],
+      ...(sessionStartHook && {
+        SessionStart: [{ hooks: [sessionStartHook] }],
+      }),
     },
     executable: 'node',
     ...(existingSessionId && { resume: existingSessionId }),
