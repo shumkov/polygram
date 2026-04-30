@@ -167,6 +167,64 @@ describe('classify — defensive against weird inputs', () => {
   });
 });
 
+describe('classify — autoRecover semantics (G9 wiring)', () => {
+  // The kinds mapped to autoRecover='reset_session' are what
+  // polygram's classifier-driven auto-recovery uses to decide
+  // whether to call pm.resetSession on a failed turn (Phase 2
+  // step 8). Pin the exact set so a future classifier extension
+  // can't silently change which kinds auto-heal.
+
+  test('contextOverflow → autoRecover=reset_session', () => {
+    assert.equal(
+      classify(new Error('prompt is too long')).autoRecover,
+      'reset_session',
+    );
+  });
+
+  test('roleOrdering → autoRecover=reset_session', () => {
+    assert.equal(
+      classify(new Error('role alternation violated')).autoRecover,
+      'reset_session',
+    );
+  });
+
+  test('missingToolInput → autoRecover=reset_session', () => {
+    assert.equal(
+      classify(new Error('tool_use input is missing')).autoRecover,
+      'reset_session',
+    );
+  });
+
+  test('rateLimit / billing / authExpired do NOT auto-recover', () => {
+    // Auto-resetting on rate-limit would burn quota + kill resume.
+    // Auth-expired needs operator action, not a fresh Query.
+    // Billing needs operator action, same.
+    assert.equal(classify(new Error('429 too many requests')).autoRecover, null);
+    assert.equal(classify(new Error('payment required')).autoRecover, null);
+    assert.equal(classify(new Error('401 unauthorized')).autoRecover, null);
+  });
+
+  test('transient5xx does NOT auto-recover (pm retries first)', () => {
+    // pm.send() handles its own one-shot transient retry; resetSession
+    // would clobber the in-flight context.
+    assert.equal(classify(new Error('HTTP 503 service unavailable')).autoRecover, null);
+  });
+
+  test('unknown does NOT auto-recover', () => {
+    assert.equal(classify(new Error('mysterious failure')).autoRecover, null);
+  });
+
+  test('SDK subtype mapping inherits the kind\'s autoRecover', () => {
+    // error_max_turns maps to "format" kind which is null autoRecover.
+    // Documents that subtype-mapped kinds get the same auto-recover
+    // policy as their pattern-matched siblings.
+    assert.equal(
+      classify({ subtype: 'error_max_turns' }).autoRecover,
+      null,
+    );
+  });
+});
+
 describe('classify — SDK error subtypes (post-0.8.0 forward-compat)', () => {
   test('SDKAssistantMessage.error="authentication_failed" → authExpired', () => {
     // Plain string per sdk.d.ts:2343 union.
