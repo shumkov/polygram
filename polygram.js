@@ -33,6 +33,7 @@ const { ProcessManager } = require('./lib/process-manager');
 const { ProcessManagerSdk } = require('./lib/process-manager-sdk');
 const { createAutosteerBuffer, makePostToolBatchHook } = require('./lib/autosteer-buffer');
 const { makeRouterPolicy, createPmRouter } = require('./lib/pm-router');
+const { canonicalizeToolInput } = require('./lib/canonical-json');
 const agentLoader = require('./lib/agent-loader');
 const USE_SDK = process.env.POLYGRAM_USE_SDK === '1';
 const { createSender } = require('./lib/telegram');
@@ -1367,31 +1368,8 @@ function safeParse(s) {
   try { return JSON.parse(s); } catch { return s; }
 }
 
-/**
- * 0.8.0 Phase 2 step 6: canonical-JSON-stringify of a tool input
- * object. Keys sorted alphabetically; no whitespace. Used as the
- * dedup key for chat_tool_decisions match_type='exact' lookups
- * and as the input_pattern stored on "Always allow" clicks.
- *
- * Why canonical: Claude can reorder JSON keys between retries of
- * the same tool call (different SDK versions, different temperature
- * sampling). Without canonicalisation, the dedup digest would
- * differ for semantically-identical calls and the user would see
- * the same approval card twice (ship-breaker M8 mitigation).
- */
-function canonicalizeToolInput(input) {
-  if (input == null || typeof input !== 'object') {
-    return JSON.stringify(input);
-  }
-  const sortRec = (v) => {
-    if (Array.isArray(v)) return v.map(sortRec);
-    if (v == null || typeof v !== 'object') return v;
-    const out = {};
-    for (const k of Object.keys(v).sort()) out[k] = sortRec(v[k]);
-    return out;
-  };
-  return JSON.stringify(sortRec(input));
-}
+// 0.8.0-rc.18+: canonicalizeToolInput moved to lib/canonical-json.js
+// for testability. Same function, no behavior change.
 
 /**
  * 0.8.0 Phase 2 step 6: SDK canUseTool callback. Hands back to the
