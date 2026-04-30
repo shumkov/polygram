@@ -2414,36 +2414,24 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     availableEmojis,
     logError: (m) => console.error(`[${label}] ${m}`),
   });
-  // Start at QUEUED (👀) so user sees their message was received but
-  // not yet being worked on. pm calls context.onActivate when this
-  // pending becomes the queue head (Claude is actually starting it),
-  // at which point we flip to THINKING (🤔).
-  // 0.7.4 (item G): if voice ack (👂) was just emitted by
-  // transcribeVoiceAttachments, skip QUEUED — its 👀 would overwrite the
-  // ack within milliseconds, wasting an API call and flickering. Let 👂
-  // stay until THINKING flips it to 🤔 when Claude actually starts work.
+  // rc.32: skip QUEUED (👀) entirely for first-message-in-chain. Go
+  // straight to THINKING (🤔). The 👀 → 🤔 two-hop didn't add
+  // user-readable signal — Telegram's ✓✓ already conveys "delivered",
+  // and the technical "received-but-not-started vs thinking"
+  // distinction is operator-debugging context, not user UX.
+  //
+  // Follow-up messages during an in-flight turn still go through the
+  // autosteer path (✍ AUTOSTEERED state) — that's the visual that
+  // means "captured while bot is busy, will incorporate." This
+  // change ONLY affects the trigger message of a fresh turn:
+  // previously 👀 → (300ms timer) → 🤔, now just 🤔 immediately.
+  //
+  // 0.7.4 (item G) voice-ack guard preserved: if 👂 is up from
+  // voice transcription, don't overwrite it. Let onFirstStream
+  // promote to 🤔 when Claude actually starts work.
   if (!voiceAck.ackEmitted) {
-    reactor.setState('QUEUED');
+    reactor.setState('THINKING');
   }
-
-  // rc.31: timer-based 👀 → 🤔 transition. After 300ms in QUEUED,
-  // promote to THINKING regardless of whether the SDK has emitted
-  // any stream events yet. Reasoning: THINKING is "the bot is
-  // working on your reply" — a generic processing signal, NOT
-  // specifically about extended-thinking content blocks. Pre-rc.31
-  // we waited for first text/tool_use, which under effort=high
-  // could mean 10+ s sitting at 👀 with no visible progress.
-  //
-  // Guarded on `currentState === 'QUEUED'` so we don't downgrade
-  // a more-specific state (CODING/TOOL/...) if a tool fires
-  // within 300ms of pm.send.
-  //
-  // unref() so a long-pending timer doesn't keep the event loop
-  // alive past shutdown drain.
-  const thinkingPromote = setTimeout(() => {
-    if (reactor.currentState === 'QUEUED') reactor.setState('THINKING');
-  }, 300);
-  thinkingPromote.unref?.();
 
   // Mark the inbound row terminal so boot replay doesn't pick it up
   // again. Must fire down EVERY non-throwing exit path (early returns
