@@ -11,32 +11,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { makeRouterPolicy, createPmRouter } = require('../lib/pm-router');
-
-// Minimal fake pm: tracks every method call so tests can assert
-// routing without a real ProcessManager.
-function makeFakePm(name, opts = {}) {
-  const calls = [];
-  const pm = {
-    name,
-    calls,
-    has(key) { calls.push(['has', key]); return true; },
-    get(key) { calls.push(['get', key]); return { name, key }; },
-    getOrSpawn(key, ctx) { calls.push(['getOrSpawn', key, ctx]); return { name, key }; },
-    send(key, prompt, sendOpts) { calls.push(['send', key, prompt, sendOpts]); return Promise.resolve({ text: name }); },
-    kill(key) { calls.push(['kill', key]); return Promise.resolve(); },
-    async killChat(chatId) { calls.push(['killChat', chatId]); },
-    async shutdown() { calls.push(['shutdown']); },
-  };
-  // Optional methods only present when explicitly opted in
-  if (opts.steer) pm.steer = (key, ...args) => { calls.push(['steer', key, ...args]); return true; };
-  if (opts.setModel) pm.setModel = async (key, m) => { calls.push(['setModel', key, m]); return true; };
-  if (opts.applyFlagSettings) pm.applyFlagSettings = async (key, s) => { calls.push(['applyFlagSettings', key, s]); return true; };
-  if (opts.requestRespawn) pm.requestRespawn = (key, r) => { calls.push(['requestRespawn', key, r]); return { killed: true, queued: 0 }; };
-  if (opts.drainQueue) pm.drainQueue = (key, code) => { calls.push(['drainQueue', key, code]); return 3; };
-  if (opts.interrupt) pm.interrupt = async (key) => { calls.push(['interrupt', key]); };
-  if (opts.resetSession) pm.resetSession = async (key, opts) => { calls.push(['resetSession', key, opts]); return { closed: true, drainedPendings: 0 }; };
-  return pm;
-}
+const { makeFakePm } = require('./_helpers/fake-pm');
 
 const trivialGet = (key) => key.split(':')[0];        // "12345:topic" → "12345"
 
