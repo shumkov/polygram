@@ -44,6 +44,7 @@ const {
 const { makeSessionStartHook } = require('./lib/history-preload');
 const { formatContextReply, maybeContextFullHint } = require('./lib/context-format');
 const { appendDisplayHint, appendDisplayHintCliArgs } = require('./lib/telegram-prompt');
+const { createAbortGrace } = require('./lib/abort-grace');
 const agentLoader = require('./lib/agent-loader');
 const USE_SDK = process.env.POLYGRAM_USE_SDK === '1';
 const { createSender } = require('./lib/telegram');
@@ -1101,30 +1102,16 @@ function errorReplyText(err) {
   return userMessage; // may be null — caller must handle
 }
 
-// Sessions the operator just /stop'd (or natural-language "стоп"). Keyed
-// by sessionKey → timestamp of abort. ANY pending that rejects within
-// ABORT_GRACE_MS of the mark is considered abort-caused — its generic
-// error reply is suppressed and the streamer warning is skipped.
-//
-// Timestamp model (vs the earlier "delete after first read" Set) fixes
-// the case where multiple pendings were in-flight at abort time: all of
-// them reject with "Process killed", all of them should be silent, not
-// just the first one.
-const ABORT_GRACE_MS = 15_000;
-const abortedSessions = new Map();
+// Sessions the operator just /stop'd (or natural-language "стоп").
+// rc.25: extracted to lib/abort-grace.js so the timestamp/window
+// logic has its own unit tests. Behaviour identical: any pending
+// rejected within the grace window is considered abort-caused —
+// its generic error reply is suppressed and the streamer warning
+// is skipped.
+const abortGrace = createAbortGrace();
 
-function markSessionAborted(sessionKey) {
-  abortedSessions.set(sessionKey, Date.now());
-  // Sweep old entries opportunistically.
-  for (const [k, ts] of abortedSessions) {
-    if (Date.now() - ts > ABORT_GRACE_MS * 2) abortedSessions.delete(k);
-  }
-}
-
-function isSessionRecentlyAborted(sessionKey) {
-  const ts = abortedSessions.get(sessionKey);
-  return ts != null && (Date.now() - ts) < ABORT_GRACE_MS;
-}
+function markSessionAborted(sessionKey) { abortGrace.mark(sessionKey); }
+function isSessionRecentlyAborted(sessionKey) { return abortGrace.isRecent(sessionKey); }
 
 // Called by bot.on('message') for every regular (non-admin, non-pair)
 // message. Runs handleMessage in a fire-and-forget manner with centralised
