@@ -205,6 +205,86 @@ describe('createPmRouter — broadcast lifecycle methods', () => {
     // Fast one finishes first → parallel, not serial.
     assert.deepEqual(order, ['sdk', 'cli']);
   });
+
+  test('killChat completes the OTHER pm even when one rejects', async () => {
+    // Pre-fix Promise.all rejected on first failure → second pm's
+    // result was lost AND its rejection became unhandled. The right
+    // contract: every pm must be tried; surface aggregated errors.
+    const sdkLanded = [];
+    const router = createPmRouter({
+      cliPm: {
+        ...makeFakePm('cli'),
+        async killChat() { throw new Error('cli-kill-failed'); },
+      },
+      sdkPm: {
+        ...makeFakePm('sdk'),
+        async killChat(chatId) {
+          // Yield so this scheduling is identifiably async.
+          await new Promise((r) => setImmediate(r));
+          sdkLanded.push(chatId);
+        },
+      },
+      pickPmKindFor: () => 'cli',
+    });
+    // Router's killChat should reject (cli failed) but sdk MUST have run.
+    await assert.rejects(router.killChat(7), /cli-kill-failed/);
+    assert.deepEqual(sdkLanded, [7], 'sdkPm.killChat must run despite cliPm rejection');
+  });
+
+  test('killChat surfaces error from second pm when first succeeds', async () => {
+    const router = createPmRouter({
+      cliPm: { ...makeFakePm('cli'), async killChat() { /* ok */ } },
+      sdkPm: {
+        ...makeFakePm('sdk'),
+        async killChat() { throw new Error('sdk-kill-failed'); },
+      },
+      pickPmKindFor: () => 'cli',
+    });
+    await assert.rejects(router.killChat(7), /sdk-kill-failed/);
+  });
+
+  test('killChat aggregates errors when BOTH pms reject', async () => {
+    const router = createPmRouter({
+      cliPm: { ...makeFakePm('cli'), async killChat() { throw new Error('cli-down'); } },
+      sdkPm: { ...makeFakePm('sdk'), async killChat() { throw new Error('sdk-down'); } },
+      pickPmKindFor: () => 'cli',
+    });
+    await assert.rejects(router.killChat(7), (err) => {
+      // Both errors should be discoverable. Match either AggregateError
+      // (preferred) or any error string mentioning at least one.
+      const msg = String(err.errors ? err.errors.map((e) => e.message).join(',') : err.message);
+      assert.match(msg, /cli-down/);
+      assert.match(msg, /sdk-down/);
+      return true;
+    });
+  });
+
+  test('shutdown completes the OTHER pm even when one rejects', async () => {
+    const sdkShutdown = { fired: false };
+    const router = createPmRouter({
+      cliPm: { ...makeFakePm('cli'), async shutdown() { throw new Error('cli-shutdown-failed'); } },
+      sdkPm: {
+        ...makeFakePm('sdk'),
+        async shutdown() {
+          await new Promise((r) => setImmediate(r));
+          sdkShutdown.fired = true;
+        },
+      },
+      pickPmKindFor: () => 'cli',
+    });
+    await assert.rejects(router.shutdown(), /cli-shutdown-failed/);
+    assert.equal(sdkShutdown.fired, true,
+      'sdkPm.shutdown must run despite cliPm rejection — daemon teardown can\'t leak Query handles');
+  });
+
+  test('shutdown does NOT throw if everyone succeeds', async () => {
+    const router = createPmRouter({
+      cliPm: makeFakePm('cli'),
+      sdkPm: makeFakePm('sdk'),
+      pickPmKindFor: () => 'cli',
+    });
+    await assert.doesNotReject(router.shutdown());
+  });
 });
 
 describe('createPmRouter — optional method routing', () => {
