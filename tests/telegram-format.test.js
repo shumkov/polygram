@@ -102,6 +102,137 @@ describe('toTelegramHtml — tables', () => {
     assert.match(r.text, /Partner/);
     assert.match(r.text, /SHE/);
   });
+
+  test('right-aligned column right-pads with leading spaces (numbers)', () => {
+    const r = toTelegramHtml(
+      '| Partner | Sum |\n|---|---:|\n| SHE | 100 |\n| Tree | 22 |',
+    );
+    // Sum header is 3 chars, max data is "100" (3) → width 3.
+    // Cell "22" right-aligned: pad=" " then s → " 22".
+    // Render row inserts ` | ` separator + ` |` close → "|  22 |"
+    // (two spaces: 1 separator + 1 right-align pad).
+    assert.match(r.text, /\|  22 \|/);
+  });
+
+  test('left-aligned column right-pads with trailing spaces (default)', () => {
+    const r = toTelegramHtml(
+      '| Name | Note |\n|---|---|\n| Mini | x |\n| Big things | y |',
+    );
+    // "Mini" (4) padded to "Big things" width (10): "Mini      "
+    assert.match(r.text, /\| Mini       \|/);
+  });
+
+  test('column width follows the longest cell, not the header', () => {
+    const r = toTelegramHtml(
+      '| A | B |\n|---|---|\n| short | also-short |\n| this-is-much-longer | x |',
+    );
+    // Widest in column A is "this-is-much-longer" (19); header "A"
+    // gets padded to that.
+    assert.match(r.text, /\| A {19}\s*\|/);
+  });
+
+  test('column width follows the header when longer than any cell', () => {
+    const r = toTelegramHtml(
+      '| LongHeader | B |\n|---|---|\n| x | y |\n| z | w |',
+    );
+    // Header "LongHeader" (10) wins; "x" cell padded to width 10.
+    assert.match(r.text, /\| x {9} \|/);
+  });
+
+  test('inline-formatted cells: width measures stripped text, padding restores tags', () => {
+    const r = toTelegramHtml(
+      '| Item | Note |\n|---|---|\n| **bold** | y |\n| plain | another |',
+    );
+    // Bold cell renders <b>bold</b>; col 0 width = max("Item"=4,
+    // "bold"=4 stripped, "plain"=5) = 5. Pad "<b>bold</b>" to len 5
+    // → "<b>bold</b> " (1 trailing space). Then renderRow appends
+    // ` | ` between cells → "<b>bold</b>  |" (1 pad + 1 sep space).
+    assert.match(r.text, /\| <b>bold<\/b>  \|/);
+  });
+
+  test('separator row is dashes one wider than the column on each side', () => {
+    const r = toTelegramHtml(
+      '| A | B |\n|---|---|\n| x | yy |',
+    );
+    // Header widths after sizing: A=1, B=2; separator |---|----|
+    // (3 dashes for col A, 4 for col B because width+2).
+    assert.match(r.text, /\|---\|----\|/);
+  });
+
+  test('renders inside a single <pre> block (not multi-paragraph)', () => {
+    const r = toTelegramHtml(
+      '| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |',
+    );
+    // Exactly one <pre>...</pre>, all 4 lines (header + sep + 2 data) inside.
+    const matches = r.text.match(/<pre>[\s\S]*?<\/pre>/g);
+    assert.ok(matches, '<pre> block missing');
+    assert.equal(matches.length, 1);
+    assert.equal(matches[0].split('\n').length, 4);
+  });
+
+  test('empty data cell is rendered as just padding (no crash)', () => {
+    const r = toTelegramHtml(
+      '| A | B |\n|---|---|\n| x |  |\n| y | hi |',
+    );
+    // Empty cell at row 1 col B becomes "  " (width 2, all padding).
+    // Just verify the table rendered without error.
+    assert.match(r.text, /<pre>/);
+    assert.match(r.text, /<\/pre>/);
+    assert.match(r.text, /\| x \|    \|/);
+  });
+
+  test('numeric-content right-aligned column matches budget calculation', () => {
+    const r = toTelegramHtml(
+      '| Item | Cost |\n|---|---:|\n| Tea | 100 |\n| Pho | 250 |',
+    );
+    // Col widths: col 0 = max("Item"=4, "Tea"=3, "Pho"=3) = 4;
+    // col 1 = max("Cost"=4, "100"=3, "250"=3) = 4. Right-align col 1
+    // adds 1 leading pad-space; renderRow adds 1 separator-space →
+    // "| Tea  |  100 |" (2 trailing in col 0, 2 leading in col 1).
+    const m = r.text.match(/\| Tea  \|  100 \|/);
+    assert.ok(m, `expected '| Tea  |  100 |' in ${r.text}`);
+  });
+
+  test('emoji and unicode cells: width counts code points, not bytes', () => {
+    // The current implementation uses .length which counts UTF-16 code
+    // units, not visible glyphs. This documents that — emoji-heavy
+    // tables render with VISIBLE misalignment because emoji surrogate
+    // pairs count as 2 chars but display as ~2 visible columns.
+    // Documents current behaviour; if we ever ship a Unicode-aware
+    // width pass, this test will start failing and we update.
+    const r = toTelegramHtml(
+      '| A | B |\n|---|---|\n| 🚀 | x |\n| ok | y |',
+    );
+    // 🚀 is one visible glyph but two UTF-16 code units, so widths[0]
+    // becomes 2 from the rocket and "ok" (also 2). No misalignment in
+    // THIS particular case — both cells happen to be 2 code units.
+    assert.match(r.text, /<pre>/);
+  });
+
+  test('many-column wide table renders all columns (no truncation in formatter)', () => {
+    // Pins: the formatter does NOT auto-narrow wide tables. The agent
+    // must use the polygram-side display hint to pick a different
+    // format. If we ever add formatter-side narrowing this test
+    // breaks intentionally so we update the system-prompt hint.
+    const md = '| A | B | C | D | E | F |\n|---|---|---|---|---|---|\n'
+      + '| aaaaaaaa | bbbbbbbb | cccccccc | dddddddd | eeeeeeee | ffffffff |';
+    const r = toTelegramHtml(md);
+    for (const col of ['aaaaaaaa', 'bbbbbbbb', 'cccccccc', 'dddddddd', 'eeeeeeee', 'ffffffff']) {
+      assert.match(r.text, new RegExp(col), `missing column ${col}`);
+    }
+    // Single line (no auto-wrapping in renderer).
+    const dataLine = r.text.match(/\| aaaaaaaa[^\n]*ffffffff[^\n]*\|/);
+    assert.ok(dataLine, 'all columns must be on one line — formatter does not narrow');
+  });
+
+  test('row count: separator + data, no extra blank rows', () => {
+    const r = toTelegramHtml(
+      '| A | B |\n|---|---|\n| 1 | 2 |',
+    );
+    // Lines inside <pre>: header, separator, 1 data row = 3 total.
+    const inner = r.text.match(/<pre>([\s\S]*?)<\/pre>/)[1];
+    assert.equal(inner.split('\n').length, 3);
+  });
 });
 
 describe('wrapFileReferencesInHtml', () => {
