@@ -2537,19 +2537,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // (queue-head transition) flipped to THINKING the moment we wrote
       // stdin, even though Claude could spend hundreds of ms loading.
       // Result: long flat 🤔 with nothing happening; users assumed stall.
-      //
-      // rc.33: also stop typing here. Telegram's "typing…" indicator
-      // shows for ~5s after the LAST sendChatAction tick. If we stop
-      // typing at turn-end (~5-10s post final reply), the indicator
-      // persists 5s past when the user sees the reply — confusing
-      // ("bot replied AND is still typing?"). Stopping at the first
-      // chunk means typing fades naturally as the streamer emits the
-      // bubble. Reactions (THINKING/CODING/etc) take over as the
-      // "still working" signal for long agent turns.
-      onFirstStream: () => {
-        reactor.setState('THINKING');
-        stopTyping();
-      },
+      onFirstStream: () => reactor.setState('THINKING'),
     });
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
