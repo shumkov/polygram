@@ -238,8 +238,13 @@ function checkPendingOutbound(db) {
 function checkApprovals(db) {
   if (!db) return;
   try {
+    // Table is `pending_approvals` (migrations/004-approvals.sql).
+    // Pre-rc.27 this query was `FROM approvals` — a typo that caused
+    // every doctor run to silently land in the catch and emit
+    // "skipped: no such table: approvals" warnings instead of real
+    // pending counts.
     const row = db.prepare(`
-      SELECT COUNT(*) AS n FROM approvals
+      SELECT COUNT(*) AS n FROM pending_approvals
        WHERE status = 'pending' AND bot_name = ?
     `).get(botName);
     if (row.n > 0) {
