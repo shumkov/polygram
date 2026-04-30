@@ -362,6 +362,113 @@ describe('ProcessManagerSdk — interrupt + drainQueue (D8)', () => {
     assert.equal(e2.code, 'INTERRUPTED');
     assert.equal(e3.code, 'INTERRUPTED');
   });
+
+  // Q1 (rc.25-x): "after /stop SDK starts slowly". The /stop path is
+  // interrupt() + drainQueue() — explicitly chosen over kill() to keep
+  // the Query warm. These tests pin the warm-Query contract:
+  //
+  //   pm.has(key) stays true; spawnFn is NOT called again; the next
+  //   pm.send() reuses the same Query and resumes the same session_id.
+  //
+  // If any of these fail, the user's "slow restart" complaint has a
+  // real fix at the lib level (instead of a UX/latency-elsewhere issue).
+
+  test('warm-Query after interrupt: pm.has stays true, no respawn', async () => {
+    let spawnCount = 0;
+    const fq2 = makeFakeQuery();
+    const pm2 = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => { spawnCount += 1; return fq2.query; },
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+    });
+    await pm2.getOrSpawn('c');
+    fq2.emitEvent({ type: 'system', subtype: 'init', session_id: 's-1' });
+    const p1 = pm2.send('c', 'first turn');
+    await new Promise((r) => setImmediate(r));
+    assert.equal(spawnCount, 1);
+
+    // /stop = interrupt + drainQueue (does NOT kill).
+    await pm2.interrupt('c');
+    pm2.drainQueue('c', 'INTERRUPTED');
+    await p1.catch(() => {});
+
+    // Pin the warm-reuse contract:
+    assert.equal(pm2.has('c'), true,
+      'Query must stay alive after interrupt — /stop should not respawn');
+    assert.equal(pm2.get('c').inFlight, false,
+      'inFlight reset to false so a follow-up send can land');
+
+    // Next user message — must NOT respawn.
+    const p2 = pm2.send('c', 'follow-up turn');
+    await new Promise((r) => setImmediate(r));
+    assert.equal(spawnCount, 1,
+      `spawnFn called ${spawnCount} times; must remain 1 for warm reuse`);
+
+    // Drive a clean result for the new turn so afterEach shutdown is fast.
+    fq2.emitEvent({
+      type: 'assistant',
+      message: { id: 'm1', usage: { input_tokens: 1, output_tokens: 1 },
+                 content: [{ type: 'text', text: 'ok' }] },
+    });
+    fq2.emitEvent({
+      type: 'result', subtype: 'success', result: 'ok',
+      session_id: 's-1', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    const r = await p2;
+    assert.equal(r.error, null);
+    assert.equal(r.sessionId, 's-1', 'session_id must persist across interrupt');
+    await pm2.shutdown();
+  });
+
+  test('warm-Query: follow-up message is pushed via streamInput, not via fresh spawn', async () => {
+    // Stronger version of the above: verify the actual SDKUserMessage
+    // arrives on the SAME inputController that served the first turn.
+    const fq2 = makeFakeQuery();
+    const pm2 = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq2.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+    });
+    await pm2.getOrSpawn('c');
+    fq2.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const p1 = pm2.send('c', 'first');
+    await new Promise((r) => setImmediate(r));
+    await pm2.interrupt('c');
+    pm2.drainQueue('c', 'INTERRUPTED');
+    await p1.catch(() => {});
+
+    // Both messages land on the same fake's pushedMessages list —
+    // proves a single underlying Query handled both turns.
+    const p2 = pm2.send('c', 'second');
+    await new Promise((r) => setImmediate(r));
+    fq2.emitEvent({
+      type: 'assistant',
+      message: { id: 'm1', usage: { input_tokens: 1, output_tokens: 1 },
+                 content: [{ type: 'text', text: 'ok' }] },
+    });
+    fq2.emitEvent({
+      type: 'result', subtype: 'success', result: 'ok',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await p2;
+
+    // pushedMessages contains BOTH user messages from the same Query.
+    const texts = fq2.pushedMessages
+      .map((m) => m?.message?.content)
+      .filter(Boolean);
+    const flat = texts.flat().filter((t) => typeof t === 'string').join('|');
+    assert.match(flat, /first/);
+    assert.match(flat, /second/);
+    await pm2.shutdown();
+  });
 });
 
 describe('ProcessManagerSdk — mid-session config (D3, D4)', () => {
