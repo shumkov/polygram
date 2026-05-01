@@ -338,6 +338,149 @@ describe('reactor — rc.32 thinking deepening cascade', () => {
   });
 });
 
+describe('reactor — rc.39 onStateChange telemetry', () => {
+  // Captures the visible-change moments for forensic reconstruction.
+  // One event per setState/cascade/stall/clear that produces a
+  // visible emoji change. Same-emoji no-op transitions DON'T fire.
+
+  test('manual setState fires onStateChange with source=manual', async () => {
+    const events = [];
+    const r = createReactionManager({
+      apply: async () => {},
+      throttleMs: 0,
+      onStateChange: (e) => events.push(e),
+    });
+    await r.setState('THINKING');
+    assert.equal(events.length, 1);
+    assert.equal(events[0].fromState, null);
+    assert.equal(events[0].toState, 'THINKING');
+    assert.equal(events[0].fromEmoji, null);
+    assert.equal(events[0].toEmoji, '🤔');
+    assert.equal(events[0].source, 'manual');
+    assert.ok(typeof events[0].ts === 'number');
+    r.stop();
+  });
+
+  test('cascade-deeper auto-promotion fires with source=cascade-deeper', async () => {
+    const events = [];
+    const r = createReactionManager({
+      apply: async () => {},
+      throttleMs: 0,
+      thinkingDeeperMs: 20,
+      thinkingDeepestMs: 999,
+      onStateChange: (e) => events.push(e),
+    });
+    await r.setState('THINKING');
+    await new Promise((res) => setTimeout(res, 60));
+    const cascade = events.find((e) => e.source === 'cascade-deeper');
+    assert.ok(cascade, 'cascade-deeper event should fire');
+    assert.equal(cascade.fromState, 'THINKING');
+    assert.equal(cascade.toState, 'THINKING_DEEPER');
+    assert.equal(cascade.fromEmoji, '🤔');
+    assert.equal(cascade.toEmoji, '🤨');
+    r.stop();
+  });
+
+  test('cascade-deepest auto-promotion fires with source=cascade-deepest', async () => {
+    const events = [];
+    const r = createReactionManager({
+      apply: async () => {},
+      throttleMs: 0,
+      thinkingDeeperMs: 10,
+      thinkingDeepestMs: 30,
+      onStateChange: (e) => events.push(e),
+    });
+    await r.setState('THINKING');
+    await new Promise((res) => setTimeout(res, 80));
+    const ev = events.find((e) => e.source === 'cascade-deepest');
+    assert.ok(ev, 'cascade-deepest event should fire');
+    assert.equal(ev.toState, 'THINKING_DEEPEST');
+    assert.equal(ev.toEmoji, '🤓');
+    r.stop();
+  });
+
+  test('stall-timer fires with source=stall-timer', async () => {
+    const events = [];
+    const r = createReactionManager({
+      apply: async () => {},
+      throttleMs: 0,
+      stallMs: 30,
+      freezeMs: 999,
+      thinkingDeeperMs: 999,
+      thinkingDeepestMs: 999,
+      onStateChange: (e) => events.push(e),
+    });
+    await r.setState('THINKING');
+    await new Promise((res) => setTimeout(res, 80));
+    const ev = events.find((e) => e.source === 'stall-timer');
+    assert.ok(ev, 'stall-timer event should fire');
+    assert.equal(ev.toState, 'STALL');
+    r.stop();
+  });
+
+  test('clear() fires with source=clear and toState=null', async () => {
+    const events = [];
+    const r = createReactionManager({
+      apply: async () => {},
+      throttleMs: 0,
+      onStateChange: (e) => events.push(e),
+    });
+    await r.setState('THINKING');
+    await r.clear();
+    const clearEv = events.find((e) => e.source === 'clear');
+    assert.ok(clearEv, 'clear event should fire');
+    assert.equal(clearEv.toState, null);
+    assert.equal(clearEv.toEmoji, null);
+    assert.equal(clearEv.fromEmoji, '🤔');
+    r.stop();
+  });
+
+  test('same-emoji no-op transitions do NOT fire (only visible changes)', async () => {
+    const events = [];
+    const r = createReactionManager({
+      apply: async () => {},
+      throttleMs: 0,
+      onStateChange: (e) => events.push(e),
+    });
+    await r.setState('THINKING');  // → 🤔, fires
+    await r.setState('THINKING');  // → 🤔 (no change), should NOT fire
+    assert.equal(events.length, 1);
+    r.stop();
+  });
+
+  test('callback throw is caught — does not break reactor', async () => {
+    const errors = [];
+    const r = createReactionManager({
+      apply: async () => {},
+      throttleMs: 0,
+      onStateChange: () => { throw new Error('boom'); },
+      logError: (m) => errors.push(m),
+    });
+    await assert.doesNotReject(r.setState('THINKING'));
+    assert.ok(errors.some((m) => /onStateChange/.test(m)));
+    r.stop();
+  });
+
+  test('full turn produces an audit-trail of state transitions', async () => {
+    // Verifies the typical lifecycle is captured end-to-end.
+    const events = [];
+    const r = createReactionManager({
+      apply: async () => {},
+      throttleMs: 0,
+      onStateChange: (e) => events.push(e),
+    });
+    await r.setState('THINKING');
+    await r.setState('CODING');
+    await r.setState('WRITING');
+    await r.clear();
+    const sources = events.map((e) => e.source);
+    assert.deepEqual(sources, ['manual', 'manual', 'manual', 'clear']);
+    const states = events.map((e) => e.toState);
+    assert.deepEqual(states, ['THINKING', 'CODING', 'WRITING', null]);
+    r.stop();
+  });
+});
+
 describe('reactor — rc.25 default timing thresholds', () => {
   // Pins the bumped defaults so accidental regression to the
   // pre-rc.25 values (10s STALL / 30s TIMEOUT) is caught.

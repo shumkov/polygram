@@ -2425,6 +2425,26 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     },
     availableEmojis,
     logError: (m) => console.error(`[${label}] ${m}`),
+    // rc.39: emit reactor-state events for forensic post-hoc
+    // reconstruction of any reaction anomaly (stuck reactions, dual
+    // emojis, unexpected ERROR transitions, etc.). Sync callback —
+    // logEvent is best-effort and never throws. One row per visible
+    // change moment; cascade/stall/freeze auto-promotions get
+    // their own `source` value so we can tell apart manual setState
+    // calls from timer-driven transitions.
+    onStateChange: ({ fromState, toState, fromEmoji, toEmoji, source, ts }) => {
+      logEvent('reactor-state', {
+        chat_id: chatId,
+        msg_id: msg.message_id,
+        session_key: sessionKey,
+        from_state: fromState,
+        to_state: toState,
+        from_emoji: fromEmoji,
+        to_emoji: toEmoji,
+        source,
+        ts,
+      });
+    },
   });
   // rc.32: skip QUEUED (👀) entirely for first-message-in-chain. Go
   // straight to THINKING (🤔). The 👀 → 🤔 two-hop didn't add
