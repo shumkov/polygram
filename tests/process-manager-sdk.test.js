@@ -617,6 +617,252 @@ describe('ProcessManagerSdk — rc.45 multi-segment same-bubble streaming', () =
     assert.deepEqual(chunks, ['partial', 'partial response']);
     assert.equal(messageStarts, 0);
   });
+
+  test('multiple steers in one turn → multiple new-bubble splits', async () => {
+    // Each injectUserMessage call sets the flag; on each subsequent
+    // message-id transition the flag is consumed and a new bubble
+    // opens. Verifies the flag is properly re-armed on each steer.
+    //
+    // Each event MUST be flushed through pm's async iteration before
+    // the next one is queued (real SDK timing). Otherwise multiple
+    // events pile in the synchronous fakeQuery yieldQueue and the
+    // flag state at the moment each is processed gets out of sync
+    // with the test's intended interleaving.
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = pm.send('c', 'q');
+    await new Promise((r) => setImmediate(r));
+    const flush = () => new Promise((r) => setImmediate(r));
+
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm1', content: [{ type: 'text', text: 'A' }] },
+    });
+    await flush();
+    pm.injectUserMessage('c', { content: 'first steer', priority: 'next' });
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm2', content: [{ type: 'text', text: 'B' }] },
+    });
+    await flush();
+    pm.injectUserMessage('c', { content: 'second steer', priority: 'next' });
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm3', content: [{ type: 'text', text: 'C' }] },
+    });
+    await flush();
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'C',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+
+    // 3 separate bubbles: A | B | C
+    assert.deepEqual(chunks, ['A', 'B', 'C']);
+    assert.equal(messageStarts, 2,
+      'two steer-driven transitions → onAssistantMessageStart fires twice');
+  });
+
+  test('injectUserMessage before any assistant message → flag waits, applies on first transition', async () => {
+    // Edge case: user steers BEFORE the first assistant message lands.
+    // The flag is set but lastAssistantMessageId is still null, so
+    // no transition has happened yet. Flag should persist until the
+    // FIRST id-transition (which is m1→m2). The first message m1
+    // does NOT start a "new bubble" because there's no prior bubble
+    // to split from.
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = pm.send('c', 'q');
+    await new Promise((r) => setImmediate(r));
+
+    pm.injectUserMessage('c', { content: 'pre-emptive steer', priority: 'next' });
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm1', content: [{ type: 'text', text: 'first' }] },
+    });
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm2', content: [{ type: 'text', text: 'second' }] },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'second',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+
+    // m1 produces 'first' (single bubble open). m2 transitions → flag
+    // set → forceNewMessage → 'second' starts in a new bubble.
+    assert.deepEqual(chunks, ['first', 'second']);
+    assert.equal(messageStarts, 1);
+  });
+
+  test('tool-only assistant message (no text) does not corrupt carry-over', async () => {
+    // SDK can emit an assistant message with ONLY tool_use blocks
+    // (no text). Pre-rc.45 those events were skipped entirely
+    // because `if (added)` short-circuits when extractAssistantText
+    // returns ''. rc.45 must preserve that — the message-id
+    // transition logic only fires on `added` non-empty.
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = pm.send('c', 'q');
+    await new Promise((r) => setImmediate(r));
+
+    // Real text segment.
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm1', content: [{ type: 'text', text: 'thinking' }] },
+    });
+    // Tool-only second segment — different id, no text.
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm2', content: [
+        { type: 'tool_use', name: 'Bash', input: {} },
+      ] },
+    });
+    // Third segment with text — id transitions from m2→m3 with a
+    // non-empty `added`. Should APPEND to 'thinking' (no steer).
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm3', content: [{ type: 'text', text: 'done' }] },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'done',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+
+    // m1: 'thinking'. m2: tool-only, no chunk. m3: append → 'thinking\n\ndone'.
+    assert.deepEqual(chunks, ['thinking', 'thinking\n\ndone']);
+    assert.equal(messageStarts, 0);
+  });
+
+  test('priorMessagesText resets between turns (new pending = clean slate)', async () => {
+    // After a turn completes, the next pm.send() creates a fresh
+    // pending with empty priorMessagesText. Verifies state doesn't
+    // leak across turn boundaries.
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+
+    // Turn 1: two segments concatenated.
+    const t1 = pm.send('c', 'q1');
+    await new Promise((r) => setImmediate(r));
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 't1m1', content: [{ type: 'text', text: 'one' }] },
+    });
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 't1m2', content: [{ type: 'text', text: 'two' }] },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'two',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await t1;
+
+    // Turn 2: should NOT carry 'one\n\ntwo' from turn 1.
+    const t2 = pm.send('c', 'q2');
+    await new Promise((r) => setImmediate(r));
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 't2m1', content: [{ type: 'text', text: 'fresh' }] },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'fresh',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await t2;
+
+    // Turn 1 chunks: ['one', 'one\n\ntwo']. Turn 2 chunks: ['fresh'].
+    assert.deepEqual(chunks, ['one', 'one\n\ntwo', 'fresh']);
+    assert.equal(messageStarts, 0,
+      'no steer in either turn → no new-bubble triggers');
+  });
+
+  test('steer DURING same-id streaming → flag held, fires on next id transition', async () => {
+    // injectUserMessage can fire mid-stream (between two same-id
+    // events). The flag should persist until the next genuine
+    // message-id transition, NOT cause an immediate split.
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = pm.send('c', 'q');
+    await new Promise((r) => setImmediate(r));
+
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm1', content: [{ type: 'text', text: 'A' }] },
+    });
+    // Steer mid-stream while still on m1 — flag set.
+    pm.injectUserMessage('c', { content: 'mid-stream steer', priority: 'next' });
+    // Continued same-id streaming — should NOT fire forceNewMessage.
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm1', content: [{ type: 'text', text: 'A continued' }] },
+    });
+    // First real id transition — flag fires now.
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm2', content: [{ type: 'text', text: 'B' }] },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'B',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+
+    // chunks: ['A', 'A continued', 'B']  (the 3rd is a NEW bubble)
+    assert.deepEqual(chunks, ['A', 'A continued', 'B']);
+    assert.equal(messageStarts, 1, 'forceNewMessage fires exactly once on m1→m2 transition');
+  });
+
+  test('subagent assistant messages do NOT participate in carry-over', async () => {
+    // Subagent messages (parent_tool_use_id != null) are filtered
+    // early in _handleEvent. They should NOT contribute to
+    // priorMessagesText and should NOT trigger transitions.
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = pm.send('c', 'q');
+    await new Promise((r) => setImmediate(r));
+
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'top-1', content: [{ type: 'text', text: 'main first' }] },
+    });
+    // Subagent — filtered.
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: 'tool-xyz',
+      message: { id: 'sub-1', content: [{ type: 'text', text: 'subagent thinking' }] },
+    });
+    // Top-level continuation.
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'top-2', content: [{ type: 'text', text: 'main second' }] },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'main second',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+
+    // Subagent text never lands in chunks. top-1 → top-2 transitions
+    // and concatenates because no steer.
+    assert.deepEqual(chunks, ['main first', 'main first\n\nmain second']);
+    assert.equal(messageStarts, 0);
+  });
 });
 
 describe('ProcessManagerSdk — interrupt + drainQueue (D8)', () => {
