@@ -2324,9 +2324,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // 0.7.2: clean up bubbles superseded by forceNewMessage() — the
   // intermediate text segments that fired across a tool-heavy turn.
   // Pre-0.7.2 (since 0.7.0 multi-bubble landed) those bubbles were
-  // kept; 0.7.2 added cleanup for OpenClaw-parity terseness ("only
-  // final answer visible") motivated by a post-0.7.1 deploy
-  // screenshot of six bubbles per logical turn.
+  // kept; 0.7.2 added cleanup motivated by a post-0.7.1 deploy
+  // screenshot of six bubbles per logical turn — terseness goal,
+  // NOT OpenClaw porting. (Earlier comments mis-cited OpenClaw
+  // parity; the official OpenClaw + pi-telegram model is
+  // single-bubble-per-turn edited in place. Polygram's
+  // multi-bubble shape is its own decision.)
   // rc.44 made preservation the default again — getArchived()
   // returns [] unless the chat opted out via
   // `preserveIntermediateBubbles: false`. This function still runs
