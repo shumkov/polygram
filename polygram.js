@@ -2303,6 +2303,15 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     },
     minChars: botCfg.streamMinChars,
     throttleMs: botCfg.streamThrottleMs,
+    // rc.44: preserve intermediate "thinking out loud" bubbles by
+    // default. Per-chat / per-bot opt-out via
+    // `preserveIntermediateBubbles: false` for chats where the
+    // partner-facing UX wants only the final answer (e.g. UMI Group).
+    preserveIntermediateBubbles: chatConfig.preserveIntermediateBubbles != null
+      ? chatConfig.preserveIntermediateBubbles
+      : (botCfg.preserveIntermediateBubbles != null
+        ? botCfg.preserveIntermediateBubbles
+        : true),
     logger: { error: (m) => console.error(`[${label}] ${m}`) },
   });
   // streamer is registered with this turn via pm.send's context (below)

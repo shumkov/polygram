@@ -11,7 +11,7 @@ const { extractAssistantText } = require('../lib/process-manager');
 
 const silent = { error: () => {} };
 
-function makeHarness({ minChars = 30, throttleMs = 500, deleteMessageImpl = null, editImpl = null } = {}) {
+function makeHarness({ minChars = 30, throttleMs = 500, deleteMessageImpl = null, editImpl = null, preserveIntermediateBubbles } = {}) {
   const sent = [];
   const edits = [];
   const deletes = [];
@@ -32,6 +32,7 @@ function makeHarness({ minChars = 30, throttleMs = 500, deleteMessageImpl = null
     }),
     minChars,
     throttleMs,
+    ...(preserveIntermediateBubbles !== undefined && { preserveIntermediateBubbles }),
     clock: () => now,
     schedule: (fn, delay) => {
       const t = { fn, fireAt: now + delay };
@@ -431,22 +432,71 @@ describe('streamer.archive()', () => {
 });
 
 // 0.7.2: forceNewMessage tracks superseded bubbles for end-of-turn cleanup
-describe('streamer.getArchived() (0.7.2)', () => {
+describe('streamer.getArchived() — rc.44 preserveIntermediateBubbles default true', () => {
+  // rc.44: preserve intermediate "thinking out loud" bubbles by default.
+  // Pre-rc.44 (0.7.2 → rc.43) forceNewMessage pushed the live bubble's
+  // msgId onto archived[] so polygram could delete it at turn-end —
+  // resulting in only the final answer's bubble being visible. Users
+  // wanted the full reasoning trail visible (Ivan DM 2026-05-01).
+  // The DEFAULT now preserves; opt-in to old behaviour with
+  // preserveIntermediateBubbles: false.
+
   test('initial state: archived is empty', () => {
     const h = makeHarness({ minChars: 10 });
     assert.deepEqual(h.s.getArchived(), []);
   });
 
-  test('forceNewMessage pushes the live bubble msgId to archived', async () => {
+  test('forceNewMessage does NOT archive by default (rc.44 preserve)', async () => {
     const h = makeHarness({ minChars: 10 });
+    await h.s.onChunk('first message text streaming');
+    assert.equal(h.s.msgId, 100);
+    h.s.forceNewMessage();
+    assert.deepEqual(h.s.getArchived(), [],
+      'rc.44 default: previous bubble preserved, not archived');
+  });
+
+  test('multiple forceNewMessage calls leave archived empty by default', async () => {
+    const h = makeHarness({ minChars: 10 });
+    await h.s.onChunk('first message text streaming');
+    h.s.forceNewMessage();
+    await h.s.onChunk('second message text streaming');
+    h.s.forceNewMessage();
+    await h.s.onChunk('third message text streaming');
+    assert.deepEqual(h.s.getArchived(), []);
+  });
+
+  test('forceNewMessage from idle is a no-op (no bubble to track)', () => {
+    const h = makeHarness({ minChars: 100 });
+    h.s.forceNewMessage();
+    assert.deepEqual(h.s.getArchived(), []);
+  });
+
+  test('getArchived returns a copy (caller can mutate without affecting internal state)', async () => {
+    const h = makeHarness({ minChars: 10, preserveIntermediateBubbles: false });
+    await h.s.onChunk('first message text streaming');
+    h.s.forceNewMessage();
+    const snap1 = h.s.getArchived();
+    snap1.push(999);
+    const snap2 = h.s.getArchived();
+    assert.deepEqual(snap2, [100]);
+  });
+});
+
+describe('streamer.getArchived() — rc.44 preserveIntermediateBubbles=false (opt-out)', () => {
+  // Verifies the pre-rc.44 / 0.7.2 behaviour is still available
+  // for chats / bots that prefer the "only final answer visible"
+  // partner-facing UX.
+
+  test('forceNewMessage pushes msgId to archived when preserve=false', async () => {
+    const h = makeHarness({ minChars: 10, preserveIntermediateBubbles: false });
     await h.s.onChunk('first message text streaming');
     assert.equal(h.s.msgId, 100);
     h.s.forceNewMessage();
     assert.deepEqual(h.s.getArchived(), [100]);
   });
 
-  test('multiple forceNewMessage calls accumulate', async () => {
-    const h = makeHarness({ minChars: 10 });
+  test('multiple forceNewMessage calls accumulate when preserve=false', async () => {
+    const h = makeHarness({ minChars: 10, preserveIntermediateBubbles: false });
     await h.s.onChunk('first message text streaming');
     h.s.forceNewMessage();
     await h.s.onChunk('second message text streaming');
@@ -455,19 +505,16 @@ describe('streamer.getArchived() (0.7.2)', () => {
     assert.deepEqual(h.s.getArchived(), [100, 101]);
   });
 
-  test('forceNewMessage from idle does NOT push (no bubble to archive)', () => {
-    const h = makeHarness({ minChars: 100 });
+  test('forceNewMessage from idle does NOT push even with preserve=false', () => {
+    const h = makeHarness({ minChars: 100, preserveIntermediateBubbles: false });
     h.s.forceNewMessage();
     assert.deepEqual(h.s.getArchived(), []);
   });
 
-  test('getArchived returns a copy (caller can mutate without affecting internal state)', async () => {
-    const h = makeHarness({ minChars: 10 });
+  test('preserve=true (explicit) matches the default: empty archived', async () => {
+    const h = makeHarness({ minChars: 10, preserveIntermediateBubbles: true });
     await h.s.onChunk('first message text streaming');
     h.s.forceNewMessage();
-    const snap1 = h.s.getArchived();
-    snap1.push(999);
-    const snap2 = h.s.getArchived();
-    assert.deepEqual(snap2, [100]);
+    assert.deepEqual(h.s.getArchived(), []);
   });
 });
