@@ -467,6 +467,64 @@ describe('ProcessManager resume-fail', () => {
     await new Promise(r => setImmediate(r));
     assert.deepEqual(db.cleared, []);
   });
+
+  // rc.38: planned-shutdown signal codes are NOT resume failures.
+  // Pre-rc.38 every deploy logged a resume-fail and cleared the
+  // session_id for every CLI-pm chat — slower next-turn resume +
+  // misleading log noise. The 4 cases below pin the new behaviour.
+  for (const [label, code] of [
+    ['SIGHUP (129) — tmux pty close on deploy kickstart', 129],
+    ['SIGTERM (143) — our own kill()', 143],
+    ['SIGKILL (137) — kill-timeout escalator', 137],
+    ['null code — killed without exit code', null],
+  ]) {
+    test(`signal-driven exit suppresses resume-fail: ${label}`, async () => {
+      const db = mockDb();
+      const pm = new ProcessManager({
+        cap: 2,
+        killTimeoutMs: 50,
+        db,
+        logger: { error: () => {}, log: () => {} },
+        spawnFn: () => makeFakeProc(),
+      });
+      const e = await pm.getOrSpawn('a', { existingSessionId: 'still-valid' });
+      e.proc.emit('close', code);
+      await new Promise((r) => setImmediate(r));
+      assert.deepEqual(db.cleared, [], `should NOT clear session_id (code=${code})`);
+      assert.equal(
+        db.events.filter((ev) => ev.kind === 'resume-fail').length,
+        0,
+        `should NOT emit resume-fail (code=${code})`,
+      );
+    });
+  }
+
+  test('shutdown() suppresses resume-fail even for genuine error codes', async () => {
+    // pm.shutdown sets _shuttingDown=true, then calls kill() which
+    // sends SIGTERM. The fake-proc emits close with the user-supplied
+    // code. If somehow the close arrives with code=1 (genuine error)
+    // *during* shutdown, we still suppress because the operator's
+    // intent was a planned restart — not a "this resume id is dead"
+    // signal.
+    const db = mockDb();
+    const pm = new ProcessManager({
+      cap: 2,
+      killTimeoutMs: 5000,  // long enough that emit('close', 1) wins
+      db,
+      logger: { error: () => {}, log: () => {} },
+      spawnFn: () => makeFakeProc(),
+    });
+    const e = await pm.getOrSpawn('a', { existingSessionId: 'still-valid' });
+    const shutdownDone = pm.shutdown();
+    // simulate the proc exiting with a non-signal exit code DURING shutdown
+    e.proc.emit('close', 1);
+    await shutdownDone;
+    assert.deepEqual(db.cleared, []);
+    assert.equal(
+      db.events.filter((ev) => ev.kind === 'resume-fail').length,
+      0,
+    );
+  });
 });
 
 describe('ProcessManager construction', () => {

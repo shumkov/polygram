@@ -2532,6 +2532,14 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         // applyChain — so it serializes after any in-flight
         // QUEUED apply and lands as the final visible reaction.
         await reactor.setState('AUTOSTEERED');
+        // rc.38: stop the reactor's STALL/TIMEOUT timers. Pre-rc.38
+        // the timers stayed armed, holding setTimeout handles for
+        // up to 30s and pinning the closure (and the bot/chatId
+        // captures) until they fired. AUTOSTEERED is terminal — no
+        // further state changes — so the timers serve no purpose
+        // and just delay GC. One-line patch; small steady-state
+        // heap relief in busy chats.
+        reactor.stop();
         markReplied();
         return;
       }
@@ -2868,6 +2876,17 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   } finally {
     stopTyping();
     reactor.stop();
+    // rc.38: defensive clear-on-exit for ✍ reactions. Pre-rc.38 only
+    // the success path (line ~2622), the abort path (line ~2858), and
+    // the tool-only-completion path (line ~2681) cleared
+    // autosteeredRefs. The plain error path (`if (result.error)` →
+    // throw at ~2612), the empty-response fallback failure (~2714),
+    // and the streamer-overflow path could all leave ✍ reactions
+    // stuck on follow-ups whose buffer entries had never been
+    // drained by PostToolBatch. The clear is idempotent (the second
+    // call returns 0 against an already-emptied map) so adding it
+    // here covers ALL exit paths without double-clearing harm.
+    clearAutosteeredReactions(sessionKey).catch(() => {});
   }
 }
 
