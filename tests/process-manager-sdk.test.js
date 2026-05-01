@@ -426,6 +426,199 @@ describe('ProcessManagerSdk — injectUserMessage (rc.42 native autosteer)', () 
   });
 });
 
+describe('ProcessManagerSdk — rc.45 multi-segment same-bubble streaming', () => {
+  // rc.45: when the SDK emits multiple top-level assistant messages
+  // within ONE turn (typical for tool-using turns: text + tool_use,
+  // tool_result, more text + end_turn), polygram should KEEP all the
+  // text in the SAME bubble — not split into one bubble per
+  // SDKAssistantMessage. The natural mental model:
+  //
+  //   - User sends one message → ONE bubble for the whole reply
+  //   - User pushes a steer (injectUserMessage) → NEW bubble starts
+  //     (acknowledges the user's intervention with visible split)
+  //   - Bubble overflows >4096 chars → existing discard+chunks path
+  //     handles it (separate concern)
+  //
+  // Pre-rc.45 polygram called forceNewMessage on EVERY new
+  // assistant-message-id, regardless of whether the user steered.
+  // That produced 2-6 bubbles per tool-heavy turn even for a single
+  // user input. The OFFICIAL OpenClaw / pi-telegram model is
+  // single-bubble-per-turn edited in place; rc.45 brings polygram
+  // closer to that, with steer-induced splits as the only multi-bubble
+  // case.
+
+  let pm; let fq;
+  let chunks; let messageStarts;
+
+  beforeEach(() => {
+    fq = makeFakeQuery();
+    chunks = [];
+    messageStarts = 0;
+    pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+      onStreamChunk: (_k, t) => chunks.push(t),
+      onAssistantMessageStart: () => { messageStarts += 1; },
+    });
+  });
+
+  afterEach(async () => { await pm.shutdown(); });
+
+  test('two assistant messages WITHOUT steer → APPEND into same bubble', async () => {
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = pm.send('c', 'q');
+    await new Promise((r) => setImmediate(r));
+
+    // First assistant message: text + tool_use
+    fq.emitEvent({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { id: 'msg-1', content: [
+        { type: 'text', text: 'Let me check that.' },
+        { type: 'tool_use', name: 'Bash', input: {} },
+      ] },
+    });
+    // Second assistant message: just text (post tool-result)
+    fq.emitEvent({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { id: 'msg-2', content: [
+        { type: 'text', text: 'Found it. Here is the answer.' },
+      ] },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'Found it. Here is the answer.',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+
+    // Pre-rc.45: chunks=['Let me check that.', 'Found it. Here is the answer.']
+    //   AND onAssistantMessageStart fired ONCE (on msg-2 transition)
+    // Post-rc.45: chunks=['Let me check that.', 'Let me check that.\n\nFound it. Here is the answer.']
+    //   AND onAssistantMessageStart fired ZERO times (no steer)
+    assert.equal(chunks.length, 2);
+    assert.equal(chunks[0], 'Let me check that.');
+    assert.equal(chunks[1], 'Let me check that.\n\nFound it. Here is the answer.');
+    assert.equal(messageStarts, 0,
+      'no steer → no new bubble → onAssistantMessageStart NOT fired');
+  });
+
+  test('steer between two assistant messages → NEW bubble for second segment', async () => {
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = pm.send('c', 'q');
+    await new Promise((r) => setImmediate(r));
+
+    // First message segment.
+    fq.emitEvent({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { id: 'msg-1', content: [
+        { type: 'text', text: 'First reply.' },
+      ] },
+    });
+    // User steers (autosteer push).
+    pm.injectUserMessage('c', { content: 'wait, also look at X', priority: 'next' });
+    // Second message segment after steer.
+    fq.emitEvent({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { id: 'msg-2', content: [
+        { type: 'text', text: 'Looking at X now.' },
+      ] },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'Looking at X now.',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+
+    // Steer flag set between msg-1 and msg-2 → forceNewMessage fires
+    // → new bubble for the second segment, NOT concatenated.
+    assert.equal(chunks.length, 2);
+    assert.equal(chunks[0], 'First reply.');
+    assert.equal(chunks[1], 'Looking at X now.',
+      'steer → new bubble → second chunk does NOT contain first reply text');
+    assert.equal(messageStarts, 1,
+      'steer between segments → onAssistantMessageStart fires once');
+  });
+
+  test('three segments, steer only between #1 and #2 → bubble 1 + bubble 2 (with #2 and #3 merged)', async () => {
+    // Verifies the flag is reset after firing — only ONE new bubble
+    // per steer, subsequent same-bubble segments still merge.
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = pm.send('c', 'q');
+    await new Promise((r) => setImmediate(r));
+
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm1', content: [{ type: 'text', text: 'one' }] },
+    });
+    pm.injectUserMessage('c', { content: 'steer', priority: 'next' });
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm2', content: [{ type: 'text', text: 'two' }] },
+    });
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm3', content: [{ type: 'text', text: 'three' }] },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'three',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+
+    // chunks: ['one', 'two', 'two\n\nthree']
+    // Bubble 1: 'one' (final state)
+    // Bubble 2: 'two\n\nthree' (final state, m2+m3 merged)
+    // onAssistantMessageStart: 1 (between m1 and m2 only — flag cleared)
+    assert.deepEqual(chunks, ['one', 'two', 'two\n\nthree']);
+    assert.equal(messageStarts, 1);
+  });
+
+  test('multiple events for same message-id REPLACE current segment (existing semantics preserved)', async () => {
+    // Same-id cumulative events still REPLACE the current segment's
+    // text (each event is the cumulative content for that message).
+    // The append-across-messages logic only triggers on message-id
+    // TRANSITION, not within a single message's stream.
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const promise = pm.send('c', 'q');
+    await new Promise((r) => setImmediate(r));
+
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm1', content: [{ type: 'text', text: 'partial' }] },
+    });
+    fq.emitEvent({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: 'm1', content: [{ type: 'text', text: 'partial response' }] },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'partial response',
+      session_id: 's', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+
+    assert.deepEqual(chunks, ['partial', 'partial response']);
+    assert.equal(messageStarts, 0);
+  });
+});
+
 describe('ProcessManagerSdk — interrupt + drainQueue (D8)', () => {
   let pm;
   let fq;
