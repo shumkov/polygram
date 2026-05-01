@@ -1,0 +1,74 @@
+
+=== BASELINE: hook returns { continue: true } ===
+  +4821ms  system:init
+  +5959ms  rate_limit_event
+  +7698ms  assistant
+  +8067ms  assistant tool=Bash
+  +8090ms  assistant tool=Bash
+  +8170ms  user
+  +8175ms  user
+  [hook] fired (count=1); returning { continue: true }
+  +10858ms  assistant text=206c
+  +10972ms  result:success term=completed
+  hook fired: 1 time(s)
+  total elapsed: 10972ms
+  result subtype: success
+  result terminal_reason: completed
+  result is_error: false
+  text emitted (chars): 206
+  tool_use count: 2
+  text content: "The `/tmp` directory's first two entries are two image files: `2137-AQADHhVrG8TYmEt--photo-AQADHhVr.jpg` and `863-order.jpg`. The current working directory is `/Users/ivanshumkov/Projects/shumkov/polygram`."
+
+=== HOOK-STOP: hook returns { continue: false } ===
+  +3768ms  system:init
+  +5060ms  rate_limit_event
+  +7596ms  assistant
+  +8082ms  assistant tool=Bash
+  +8372ms  user
+  +8380ms  assistant tool=Bash
+  +8436ms  user
+  [hook] fired (count=1); returning { continue: false }
+  +8445ms  result:success term=hook_stopped
+  hook fired: 1 time(s)
+  total elapsed: 8445ms
+  result subtype: success
+  result terminal_reason: hook_stopped
+  result is_error: false
+  text emitted (chars): 0
+  tool_use count: 2
+
+=== U6 SUMMARY ===
+{
+  "baseline": {
+    "label": "BASELINE",
+    "hookFired": 1,
+    "elapsed": 10972,
+    "gotResult": true,
+    "resultSubtype": "success",
+    "resultTerminalReason": "completed",
+    "resultIsError": false,
+    "resultTextLen": 206,
+    "streamedTextLen": 206,
+    "toolCount": 2,
+    "eventCount": 9
+  },
+  "stopTest": {
+    "label": "HOOK-STOP",
+    "hookFired": 1,
+    "elapsed": 8445,
+    "gotResult": true,
+    "resultSubtype": "success",
+    "resultTerminalReason": "hook_stopped",
+    "resultIsError": false,
+    "resultTextLen": 0,
+    "streamedTextLen": 0,
+    "toolCount": 2,
+    "eventCount": 8
+  }
+}
+
+U6 verdict: PASS — hook-stop produces a result event
+  result subtype: success
+  terminal_reason: hook_stopped
+  is_error: false
+  baseline-vs-stoptest: hook fired 1 vs 1,  text chars 206 vs 0
