@@ -132,6 +132,51 @@ describe('makePostToolBatchHook — telemetry', () => {
   });
 });
 
+describe('makePostToolBatchHook — rc.37 onDrained', () => {
+  test('onDrained fires with sessionKey and count after non-empty drain', async () => {
+    const buffer = createAutosteerBuffer();
+    buffer.append('s1', 'hi');
+    buffer.append('s1', 'there');
+    const calls = [];
+    const hook = makePostToolBatchHook({
+      buffer,
+      sessionKey: 's1',
+      onDrained: (key, count) => calls.push({ key, count }),
+    });
+    await hook();
+    assert.deepEqual(calls, [{ key: 's1', count: 2 }]);
+  });
+
+  test('onDrained does NOT fire on empty drain', async () => {
+    const buffer = createAutosteerBuffer();
+    const calls = [];
+    const hook = makePostToolBatchHook({
+      buffer,
+      sessionKey: 's1',
+      onDrained: (key, count) => calls.push({ key, count }),
+    });
+    await hook();
+    assert.equal(calls.length, 0);
+  });
+
+  test('onDrained throw is swallowed (logged, hook still returns)', async () => {
+    const buffer = createAutosteerBuffer();
+    buffer.append('s1', 'hi');
+    const errors = [];
+    const hook = makePostToolBatchHook({
+      buffer,
+      sessionKey: 's1',
+      onDrained: () => { throw new Error('boom'); },
+      logger: { error: (msg) => errors.push(msg) },
+    });
+    const r = await hook();
+    assert.equal(r.continue, true);
+    assert.match(r.hookSpecificOutput.additionalContext, /hi/);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /onDrained/);
+  });
+});
+
 describe('makePostToolBatchHook — input validation', () => {
   test('throws if buffer is missing', () => {
     assert.throws(() => makePostToolBatchHook({ sessionKey: 's1' }), /buffer/);

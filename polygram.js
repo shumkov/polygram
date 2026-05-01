@@ -931,6 +931,18 @@ function buildSdkOptions(sessionKey, ctx) {
     chatId: ctx?.chatId ?? null,
     logEvent,
     logger: console,
+    // rc.37: clear ✍ reactions when the hook ABSORBS follow-ups, not
+    // at SDK turn-end. Under autosteer one SDK "turn" can stretch
+    // tens of minutes — every drain feeds more user text via
+    // additionalContext, the agent keeps reasoning, no `result` event
+    // fires, inFlight stays true, ✍ stays stuck on every drained
+    // follow-up. Clearing at drain time matches user perception
+    // ("the bot got my message → ✍ goes away").
+    onDrained: (key) => {
+      clearAutosteeredReactions(key).catch((err) => {
+        console.error(`[${BOT_NAME}] autosteer-hook clearReactions: ${err.message}`);
+      });
+    },
   });
 
   // 0.8.0-rc.21: SessionStart hook preloads recent polygram-DB

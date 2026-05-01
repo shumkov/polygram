@@ -190,7 +190,7 @@ describe('reactor — heartbeat (rc.16)', () => {
 
 describe('reactor — rc.32 thinking deepening cascade', () => {
   // Progressive deepening: setState('THINKING') auto-promotes through
-  // THINKING_DEEPER (🤨, 12s) → THINKING_DEEPEST (🧐, 30s). State change
+  // THINKING_DEEPER (🤨, 12s) → THINKING_DEEPEST (🤓, 30s). State change
   // (CODING/TOOL/etc) clears it. Pre-rc.32 behaviour: stay at 🤔 the
   // entire thinking phase, then yawn at 45s.
 
@@ -222,7 +222,7 @@ describe('reactor — rc.32 thinking deepening cascade', () => {
     await r.setState('THINKING');
     await new Promise((res) => setTimeout(res, 100));
     assert.equal(r.currentState, 'THINKING_DEEPEST');
-    assert.ok(calls.includes('🧐'), `🧐 should have fired; got ${JSON.stringify(calls)}`);
+    assert.ok(calls.includes('🤓'), `🧐 should have fired; got ${JSON.stringify(calls)}`);
     r.stop();
   });
 
@@ -241,7 +241,7 @@ describe('reactor — rc.32 thinking deepening cascade', () => {
     await new Promise((res) => setTimeout(res, 100));
     // Should never have promoted to deeper or deepest.
     assert.equal(calls.includes('🤨'), false);
-    assert.equal(calls.includes('🧐'), false);
+    assert.equal(calls.includes('🤓'), false);
     assert.equal(r.currentState, 'CODING');
     r.stop();
   });
@@ -262,7 +262,7 @@ describe('reactor — rc.32 thinking deepening cascade', () => {
     await r.setState('CODING');
     await new Promise((res) => setTimeout(res, 100));
     // Deepest should NOT have fired after CODING took over.
-    assert.equal(calls.includes('🧐'), false);
+    assert.equal(calls.includes('🤓'), false);
     assert.equal(r.currentState, 'CODING');
     r.stop();
   });
@@ -304,7 +304,7 @@ describe('reactor — rc.32 thinking deepening cascade', () => {
     r.stop();
     await new Promise((res) => setTimeout(res, 100));
     assert.equal(calls.includes('🤨'), false);
-    assert.equal(calls.includes('🧐'), false);
+    assert.equal(calls.includes('🤓'), false);
   });
 
   test('STALL still fires from a deepened state', async () => {
