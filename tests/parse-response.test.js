@@ -11,7 +11,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { parseResponse, STICKER_TAG_RE } = require('../lib/parse-response');
+const { parseResponse, STICKER_TAG_RE, STICKER_TAG_INLINE_RE } = require('../lib/parse-response');
 
 const stickerMap = {
   working: 'CAACAgIAAxkBAAEworking',
@@ -107,31 +107,18 @@ describe('parseResponse — [sticker:NAME] regression (0.7.5)', () => {
     assert.equal(r.reaction, null);
   });
 
-  test('tag embedded in surrounding text falls through to text path', () => {
-    // We only swap when the entire response is the tag — partial matches
-    // would risk mis-rendering legitimate code/quotes containing the
-    // pattern.
-    const r = parseResponse('Here you go: [sticker:working]', deps);
-    assert.equal(r.text, 'Here you go: [sticker:working]');
-    assert.equal(r.sticker, null);
-  });
-
-  test('tag with extra characters (e.g. quotes) falls through', () => {
-    const r = parseResponse('"[sticker:working]"', deps);
-    assert.equal(r.text, '"[sticker:working]"');
-    assert.equal(r.sticker, null);
-  });
-
   test('case-sensitive: "Sticker" prefix does not match', () => {
     const r = parseResponse('[Sticker:working]', deps);
     assert.equal(r.text, '[Sticker:working]');
     assert.equal(r.sticker, null);
+    assert.deepEqual(r.stickers, []);
   });
 
   test('NAME charset is restricted (no spaces, slashes, etc)', () => {
     const r = parseResponse('[sticker:hello world]', deps);
     assert.equal(r.text, '[sticker:hello world]');
     assert.equal(r.sticker, null);
+    assert.deepEqual(r.stickers, []);
   });
 
   test('NAME allows hyphens and underscores', () => {
@@ -145,6 +132,151 @@ describe('parseResponse — [sticker:NAME] regression (0.7.5)', () => {
     assert.ok(STICKER_TAG_RE instanceof RegExp);
     assert.ok(STICKER_TAG_RE.test('[sticker:abc]'));
     assert.ok(!STICKER_TAG_RE.test('[sticker:]')); // empty NAME rejected
+  });
+});
+
+describe('parseResponse — inline sticker extraction (rc.39)', () => {
+  // The 0.7.5 fix only handled solo `[sticker:NAME]` (full text = tag).
+  // rc.39 extends this: Claude evolved to use the marker INLINE within
+  // longer replies (e.g. "Done! [sticker:pumped]\n\nStripe Mar 2026
+  // created ✅\n…"). We extract every recognised inline tag, strip
+  // it from the text, and surface them in `stickers[]` so polygram
+  // can send them as separate sendSticker calls after the text.
+  // Production trigger: Stripe-invoices-Mar-2026 turn 2026-05-01 16:21
+  // — bot emitted "Done! [sticker:pumped]" prefix and the tag rendered
+  // verbatim because the parser fell through to the text path.
+
+  test('single inline tag is extracted, text cleaned, sticker pushed', () => {
+    const r = parseResponse('Done! [sticker:thumbsup]\n\nStripe created ✅', deps);
+    assert.equal(r.sticker, null, 'solo-sticker field stays null for inline case');
+    assert.equal(r.reaction, null);
+    assert.equal(r.text, 'Done!\n\nStripe created ✅');
+    assert.deepEqual(r.stickers, [{ fileId: 'CAACAgIAAxkBAAEthumbsup', name: 'thumbsup' }]);
+  });
+
+  test('multiple inline tags extracted in order', () => {
+    const r = parseResponse(
+      'Done! [sticker:thumbsup]\n\nMid-text [sticker:working] continues.\n\nLast [sticker:thumbsup]',
+      deps,
+    );
+    assert.equal(r.text, 'Done!\n\nMid-text  continues.\n\nLast');
+    assert.equal(r.stickers.length, 3);
+    assert.deepEqual(r.stickers.map((s) => s.name), ['thumbsup', 'working', 'thumbsup']);
+  });
+
+  test('unknown inline NAME stays verbatim, known one extracted', () => {
+    // Mixed: one recognised, one not.
+    const r = parseResponse(
+      'Status [sticker:working]: deploy complete [sticker:nonexistent].',
+      deps,
+    );
+    assert.equal(r.text, 'Status : deploy complete [sticker:nonexistent].');
+    assert.deepEqual(r.stickers, [{ fileId: 'CAACAgIAAxkBAAEworking', name: 'working' }]);
+  });
+
+  test('whitespace tidy: trailing spaces on lines stripped, 3+ blank lines collapsed', () => {
+    // Tag at end-of-line + alone-on-its-own-line stress test.
+    const r = parseResponse(
+      'Top line.\n[sticker:working]\n\n\nBottom line.',
+      deps,
+    );
+    assert.equal(r.text, 'Top line.\n\n\nBottom line.'.replace(/\n{3,}/g, '\n\n'));
+    // The expected text is 'Top line.\n\nBottom line.' after tidy.
+    assert.equal(r.text, 'Top line.\n\nBottom line.');
+    assert.deepEqual(r.stickers.map((s) => s.name), ['working']);
+  });
+
+  test('intra-line spacing and code blocks are preserved', () => {
+    const r = parseResponse(
+      'Run:\n```\n  ls /tmp\n  pwd\n```\n[sticker:working]',
+      deps,
+    );
+    // Code-block content (with its leading spaces) untouched.
+    assert.equal(r.text, 'Run:\n```\n  ls /tmp\n  pwd\n```');
+    assert.deepEqual(r.stickers.map((s) => s.name), ['working']);
+  });
+
+  test('inline tag with quotes is still extracted (rc.39 — 0.7.5 said this falls through)', () => {
+    // 0.7.5 documented "tag with extra characters falls through" because
+    // the solo-form regex required `^\s*…\s*$`. rc.39's inline-form
+    // regex is unanchored, so quotes around the tag don't block
+    // extraction. The quotes themselves stay in the text.
+    const r = parseResponse('"[sticker:working]"', deps);
+    assert.equal(r.text, '""');
+    assert.deepEqual(r.stickers, [{ fileId: 'CAACAgIAAxkBAAEworking', name: 'working' }]);
+  });
+
+  test('inline tag in middle of paragraph keeps the surrounding sentence intact', () => {
+    const r = parseResponse('The deploy [sticker:working] succeeded.', deps);
+    // Tag becomes empty string. Surrounding spaces stay.
+    assert.equal(r.text, 'The deploy  succeeded.');
+    assert.deepEqual(r.stickers.map((s) => s.name), ['working']);
+  });
+
+  test('solo-tag path STILL takes the sticker path (not stickers[])', () => {
+    // Backward-compat with 0.7.5: when the entire reply is just a tag,
+    // it goes through `parsed.sticker`, not `parsed.stickers[]`.
+    // polygram has separate code paths for the two — don't break
+    // either.
+    const r = parseResponse('[sticker:working]', deps);
+    assert.equal(r.sticker, 'CAACAgIAAxkBAAEworking');
+    assert.equal(r.stickerLabel, 'working');
+    assert.equal(r.text, '');
+    assert.deepEqual(r.stickers, []);
+  });
+
+  test('repeated same-name inline tags emit one entry per occurrence', () => {
+    // Each `[sticker:working]` produces a sendSticker call. The model
+    // might intentionally repeat a sticker for emphasis.
+    const r = parseResponse(
+      '[sticker:working] [sticker:working] [sticker:working]',
+      deps,
+    );
+    // After stripping all three, only spaces remain → trim → ''
+    // (not the solo-tag path — that requires the entire trimmed text
+    // be a single tag, which 3 isn't).
+    assert.equal(r.text, '');
+    assert.equal(r.stickers.length, 3);
+    assert.equal(r.stickers.every((s) => s.name === 'working'), true);
+  });
+
+  test('pathological: tag at very start with no text strips cleanly', () => {
+    const r = parseResponse('[sticker:thumbsup] Hello!', deps);
+    assert.equal(r.text, 'Hello!');
+    assert.deepEqual(r.stickers.map((s) => s.name), ['thumbsup']);
+  });
+
+  test('tag at very end strips cleanly with trailing-space tidy', () => {
+    const r = parseResponse('Hello! [sticker:thumbsup]', deps);
+    assert.equal(r.text, 'Hello!');
+    assert.deepEqual(r.stickers.map((s) => s.name), ['thumbsup']);
+  });
+
+  test('STICKER_TAG_INLINE_RE is exported and global', () => {
+    assert.ok(STICKER_TAG_INLINE_RE instanceof RegExp);
+    assert.ok(STICKER_TAG_INLINE_RE.global);
+    // Make sure it matches anywhere in the string, not just anchored.
+    const text = 'foo [sticker:abc] bar [sticker:def] baz';
+    const matches = [...text.matchAll(STICKER_TAG_INLINE_RE)].map((m) => m[1]);
+    assert.deepEqual(matches, ['abc', 'def']);
+  });
+
+  test('production regression case: Stripe-Mar-2026 reproduction', () => {
+    // Verbatim shape from the 2026-05-01 16:21:12 UMI Group / Ivan DM
+    // reply that triggered the rc.39 fix. Bot wanted to show
+    // [sticker:pumped] inline as enthusiastic ack before the bullet
+    // list. Pre-rc.39 this rendered the tag as literal text in the
+    // bubble.
+    const r = parseResponse(
+      'Done! [sticker:pumped]\n\n**Stripe Mar 2026 (19ZTNEYU-2026-03) created** ✅\n\n• ฿2,221.39 + VAT ฿155.50',
+      { stickerMap: { pumped: 'CAACAgIAAxkBAAEpumped' }, emojiToSticker: {} },
+    );
+    assert.equal(
+      r.text,
+      'Done!\n\n**Stripe Mar 2026 (19ZTNEYU-2026-03) created** ✅\n\n• ฿2,221.39 + VAT ฿155.50',
+    );
+    assert.equal(r.sticker, null, 'inline path: sticker field stays null');
+    assert.deepEqual(r.stickers, [{ fileId: 'CAACAgIAAxkBAAEpumped', name: 'pumped' }]);
   });
 });
 

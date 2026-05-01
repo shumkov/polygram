@@ -2737,6 +2737,28 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     const parsed = parseResponse(result.text);
     const outMeta = { ...outMetaBase, sessionId: result.sessionId, costUsd: result.cost };
 
+    // 0.8.0-rc.39: send any inline stickers Claude embedded with
+    // `[sticker:NAME]` markers (parseResponse stripped them from
+    // parsed.text and surfaced them in parsed.stickers[]). Send AFTER
+    // the text reply lands so the sticker reads as punctuation on the
+    // message, not as a leading icon. Failures are logged but never
+    // block the rest of the reply — a missing sticker is a soft UX
+    // miss, not a turn failure.
+    const sendInlineStickers = async () => {
+      if (!parsed.stickers || parsed.stickers.length === 0) return;
+      for (const s of parsed.stickers) {
+        try {
+          await tg(bot, 'sendSticker', {
+            chat_id: chatId,
+            sticker: s.fileId,
+            ...(threadId && { message_thread_id: threadId }),
+          }, { ...outMeta, stickerName: s.name, source: 'inline-sticker' });
+        } catch (err) {
+          console.error(`[${label}] inline sendSticker(${s.name}) failed: ${err.message}`);
+        }
+      }
+    };
+
     // OpenClaw's preview-becomes-final flow:
     //
     //   1. flushDraft() — drain any pending throttled edit so the
@@ -2757,6 +2779,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         if (fin.finalEditOk) {
           // Preview was successfully edited to the final text.
           // No follow-up messages needed.
+          await sendInlineStickers();
           await cleanupArchivedBubbles();
           console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
           markReplied();
@@ -2802,6 +2825,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
             console.error(`[${label}] partial-delivery warning failed: ${warnErr.message}`);
           }
         }
+        await sendInlineStickers();
         await cleanupArchivedBubbles();
         console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed-redeliver(${reason}, ${chunks.length} chunks${r.failed.length ? `, ${r.failed.length} failed` : ''}) | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
         markReplied();
@@ -2844,6 +2868,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       });
     }
 
+    await sendInlineStickers();
     console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
     markReplied();
   } catch (err) {
