@@ -65,6 +65,12 @@ function makeFakePm(name = 'fake', opts = {}) {
   if (opts.steer) {
     pm.steer = (key, ...args) => { calls.push(['steer', key, ...args]); return true; };
   }
+  if (opts.injectUserMessage) {
+    pm.injectUserMessage = (key, injectOpts) => {
+      calls.push(['injectUserMessage', key, injectOpts]);
+      return true;
+    };
+  }
   if (opts.setModel) {
     pm.setModel = async (key, m) => { calls.push(['setModel', key, m]); return true; };
   }

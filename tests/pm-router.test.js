@@ -310,6 +310,29 @@ describe('createPmRouter — optional method routing', () => {
     assert.equal(result, false);
   });
 
+  test('injectUserMessage forwards to routed pm when implemented (rc.42)', () => {
+    const cli = makeFakePm('cli');                                // no inject
+    const sdk = makeFakePm('sdk', { injectUserMessage: true });
+    const router = createPmRouter({
+      cliPm: cli, sdkPm: sdk,
+      pickPmKindFor: () => 'sdk',
+    });
+    const result = router.injectUserMessage('chat-1', { content: 'hi', priority: 'next' });
+    assert.equal(result, true);
+    assert.deepEqual(sdk.calls, [['injectUserMessage', 'chat-1', { content: 'hi', priority: 'next' }]]);
+  });
+
+  test('injectUserMessage returns false when routed pm (CLI) lacks the method', () => {
+    const cli = makeFakePm('cli');                                // no inject
+    const router = createPmRouter({
+      cliPm: cli, sdkPm: null,
+      pickPmKindFor: () => 'cli',
+    });
+    const result = router.injectUserMessage('chat-1', { content: 'hi' });
+    assert.equal(result, false);
+    assert.deepEqual(cli.calls, []);  // never called
+  });
+
   test('requestRespawn returns sentinel {killed:false, queued:0} when not supported', () => {
     const cli = makeFakePm('cli');                                // no requestRespawn
     const router = createPmRouter({
