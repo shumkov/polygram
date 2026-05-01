@@ -2303,10 +2303,15 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     },
     minChars: botCfg.streamMinChars,
     throttleMs: botCfg.streamThrottleMs,
-    // rc.44: preserve intermediate "thinking out loud" bubbles by
-    // default. Per-chat / per-bot opt-out via
-    // `preserveIntermediateBubbles: false` for chats where the
-    // partner-facing UX wants only the final answer (e.g. UMI Group).
+    // rc.44: preserve intermediate bubbles by default. These are
+    // regular text segments the model emits across an agentic
+    // multi-step turn ("Let me check..." → tool runs → "Found it.
+    // Here's the answer..."). Pre-0.7.2 polygram preserved them;
+    // 0.7.2 added archive-and-delete-at-turn-end for terseness.
+    // rc.44 reverts to preserve-all (the 0.7.0 default). Per-chat /
+    // per-bot opt-out via `preserveIntermediateBubbles: false` for
+    // chats where the partner-facing UX wants only the final answer
+    // (e.g. UMI Group).
     preserveIntermediateBubbles: chatConfig.preserveIntermediateBubbles != null
       ? chatConfig.preserveIntermediateBubbles
       : (botCfg.preserveIntermediateBubbles != null
@@ -2317,11 +2322,15 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // streamer is registered with this turn via pm.send's context (below)
 
   // 0.7.2: clean up bubbles superseded by forceNewMessage() — the
-  // intermediate "thinking out loud" assistant messages that fired in
-  // a tool-heavy turn. Without this, every tool-result cycle leaves a
-  // permanent bubble in the chat (see the screenshot from the post-
-  // 0.7.1 deploy where six bubbles appeared for one logical turn).
-  // Matches OpenClaw's archivedAnswerPreviews end-of-turn cleanup.
+  // intermediate text segments that fired across a tool-heavy turn.
+  // Pre-0.7.2 (since 0.7.0 multi-bubble landed) those bubbles were
+  // kept; 0.7.2 added cleanup for OpenClaw-parity terseness ("only
+  // final answer visible") motivated by a post-0.7.1 deploy
+  // screenshot of six bubbles per logical turn.
+  // rc.44 made preservation the default again — getArchived()
+  // returns [] unless the chat opted out via
+  // `preserveIntermediateBubbles: false`. This function still runs
+  // unconditionally because the opt-out path needs it to fire.
   // Call AFTER finalize/discard decisions so we never delete the
   // bubble that's the final reply.
   async function cleanupArchivedBubbles() {
