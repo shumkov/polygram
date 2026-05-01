@@ -31,7 +31,8 @@ const { ProcessManager } = require('./lib/process-manager');
 // pick-at-startup. Phase 4 deletes the CLI version after Phase 5
 // soak proves SDK stable. See docs/0.8.0-architecture-decisions.md.
 const { ProcessManagerSdk } = require('./lib/process-manager-sdk');
-const { createAutosteerBuffer, makePostToolBatchHook } = require('./lib/autosteer-buffer');
+// rc.42: autosteer-buffer module deleted. Native SDK priority push
+// (pm.injectUserMessage) replaces the buffer + PostToolBatch detour.
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
 const { makeRouterPolicy, createPmRouter } = require('./lib/pm-router');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
@@ -712,21 +713,24 @@ function formatPrompt(msg, sessionCtx, attachments = []) {
 
 let pm = null; // ProcessManager, created in main()
 
-// 0.8.0-rc.9: per-session autosteer buffer. Holds user follow-ups
-// that arrive mid-turn so the SDK pm's PostToolBatch hook can drain
-// them into `additionalContext` on each tool boundary. Replaces the
-// rc.6/rc.7 approach of pushing priority:'now' SDKUserMessages
-// directly (which violated the SDK's m87 transcript-shape gate when
-// the assistant was mid-tool-use).
-const autosteerBuffer = createAutosteerBuffer();
-
-// 0.8.0-rc.14: track msg_ids that received the AUTOSTEERED ✍ ack, per
-// session, so we can clear those reactions when the in-flight turn
-// finishes. Pre-rc.14 the ✍ persisted forever because each autosteer
-// invocation runs in its OWN handleMessage scope (own reactor), and
-// the TRIGGER message's reactor.clear() at turn-end couldn't reach
-// across to other messages. Without this map, users see ✍ stuck on
-// every follow-up and don't know whether the bot incorporated them.
+// 0.8.0-rc.42: autosteer buffer + stale-drain DELETED. Replaced by
+// pm.injectUserMessage() with native SDK priority hints. The U7 spike
+// (scripts/spikes/native-queue.mjs, 2026-05-01) verified all three
+// SDK priorities ('now' / 'next' / 'later') work cleanly without
+// m87 rejection. The buffer/hook detour was a workaround for a
+// problem the SDK no longer has.
+//
+// What used to live here: createAutosteerBuffer + makePostToolBatchHook
+// + drainStaleAutosteerBuffer. The buffer kept user follow-ups that
+// arrived mid-turn; the PostToolBatch hook drained them into
+// `additionalContext` (with the <channel source="user-followup"> Channels-
+// MCP framing) on each tool boundary; the stale-drain handled the
+// edge case where a turn ended with zero tool calls (no hook fire,
+// followups would otherwise be lost). All three are obsolete with
+// native priority push.
+//
+// Kept: autosteeredRefs — still tracks msg_ids that received the ✍
+// AUTOSTEERED ack so the trigger turn's success path can clear them.
 const autosteeredRefs = createAutosteeredRefs({
   applyClear: async ({ chatId, msgId }) => {
     if (!bot) return;
@@ -739,57 +743,6 @@ const autosteeredRefs = createAutosteeredRefs({
 
 async function clearAutosteeredReactions(sessionKey) {
   return autosteeredRefs.clear(sessionKey);
-}
-
-// 0.8.0-rc.14: tool-less-turn drain. PostToolBatch hook only fires
-// on tool boundaries — when a Query produces a turn that uses ZERO
-// tools (just a text answer), the autosteerBuffer never gets
-// drained and any user follow-ups buffered during that turn
-// disappear silently into the next tool-using turn (or never, if
-// the chat is purely conversational).
-//
-// Workaround: at every success exit in handleMessage, check if
-// the buffer still has items and dispatch them as a synthetic
-// next turn via pm.send. The bot replies to the drained content
-// in a fresh turn — UX-wise the user sees TWO replies (one to
-// the trigger message, one to "B + C") which is the same as if
-// they'd sent the messages without autosteer. Better than losing.
-async function drainStaleAutosteerBuffer(sessionKey, chatId, threadId) {
-  const stale = autosteerBuffer.drain(sessionKey);
-  if (stale.length === 0) return;
-  const followUpPrompt = stale.join('\n\n');
-  logEvent('autosteer-stale-drain', {
-    chat_id: chatId,
-    session_key: sessionKey,
-    message_count: stale.length,
-    text_len: followUpPrompt.length,
-  });
-  // Dispatch as a fresh pm.send via setImmediate so we don't
-  // block the current handleMessage's success-path return. No
-  // streamer / reactor — the synthetic turn gets a plain bubble
-  // reply (no streaming preview, no progress reactions). User
-  // already saw their ✍ ack on the original follow-up; this
-  // turn's existence is the substantive response.
-  setImmediate(async () => {
-    try {
-      const chatConfig = config.chats[chatId];
-      if (!chatConfig) return;
-      const result = await sendToProcess(sessionKey, followUpPrompt, {
-        streamer: null, reactor: null, sourceMsgId: null,
-      });
-      if (result?.text && bot) {
-        await tg(bot, 'sendMessage', {
-          chat_id: chatId,
-          text: result.text,
-          ...(threadId ? { message_thread_id: threadId } : {}),
-        }, { source: 'autosteer-stale-reply', botName: BOT_NAME }).catch((err) => {
-          console.error(`[${BOT_NAME}] autosteer-stale-reply send: ${err.message}`);
-        });
-      }
-    } catch (err) {
-      console.error(`[${BOT_NAME}] autosteer-stale-drain dispatch: ${err.message}`);
-    }
-  });
 }
 
 function spawnClaude(sessionKey, ctx) {
@@ -919,31 +872,11 @@ function buildSdkOptions(sessionKey, ctx) {
   const useCanUseTool = apprCfg && apprCfg.adminChatId
     && Array.isArray(apprCfg.gatedTools) && apprCfg.gatedTools.length > 0;
 
-  // 0.8.0-rc.9 (factored to lib/autosteer-buffer.js in rc.17): the
-  // PostToolBatch hook drains the autosteer buffer for THIS session
-  // and injects queued user follow-ups as `additionalContext` on
-  // each tool boundary, wrapped in `<channel source="user-followup">`
-  // which Claude is trained to trust as legitimate out-of-band user
-  // context.
-  const postToolBatchHook = makePostToolBatchHook({
-    buffer: autosteerBuffer,
-    sessionKey,
-    chatId: ctx?.chatId ?? null,
-    logEvent,
-    logger: console,
-    // rc.37: clear ✍ reactions when the hook ABSORBS follow-ups, not
-    // at SDK turn-end. Under autosteer one SDK "turn" can stretch
-    // tens of minutes — every drain feeds more user text via
-    // additionalContext, the agent keeps reasoning, no `result` event
-    // fires, inFlight stays true, ✍ stays stuck on every drained
-    // follow-up. Clearing at drain time matches user perception
-    // ("the bot got my message → ✍ goes away").
-    onDrained: (key) => {
-      clearAutosteeredReactions(key).catch((err) => {
-        console.error(`[${BOT_NAME}] autosteer-hook clearReactions: ${err.message}`);
-      });
-    },
-  });
+  // rc.42: PostToolBatch hook removed. Native SDK priority push
+  // (pm.injectUserMessage) replaces the absorb-via-additionalContext
+  // detour. The autosteered ✍ reaction now clears via the regular
+  // turn-end path (handleMessage finally + success branches —
+  // existing rc.38 cleanup).
 
   // 0.8.0-rc.21: SessionStart hook preloads recent polygram-DB
   // history into a fresh Query (no resume). Without this, every
@@ -972,7 +905,6 @@ function buildSdkOptions(sessionKey, ctx) {
     allowDangerouslySkipPermissions: !useCanUseTool,
     ...(useCanUseTool && { canUseTool: makeCanUseTool(sessionKey) }),
     hooks: {
-      PostToolBatch: [{ hooks: [postToolBatchHook] }],
       ...(sessionStartHook && {
         SessionStart: [{ hooks: [sessionStartHook] }],
       }),
@@ -2513,52 +2445,57 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const chatAutosteer = chatConfig.autosteer != null
     ? chatConfig.autosteer
     : config.bot?.autosteer;
-  // 0.8.0-rc.9: autosteer now drives through autosteerBuffer +
-  // PostToolBatch hook (in buildSdkOptions), not pm.steer's direct
-  // inputController push. The hook fires on every tool boundary
-  // and injects queued follow-ups as <channel source="user-followup">
-  // additionalContext — the SDK-trusted framing that survives the
-  // m87 transcript-shape gate.
+  // 0.8.0-rc.42: autosteer is now native — push the user message
+  // directly onto the SDK's input controller with a priority hint.
+  // The SDK manages absorption / queueing per the U7 spike findings
+  // (scripts/spikes/native-queue.mjs, 2026-05-01):
   //
-  // We still gate on the SDK pm path: under CLI pm there's no
-  // PostToolBatch hook surface, so autosteer falls through to the
-  // regular FIFO send (same UX as 0.7.x).
+  //   priority='next' (default): absorb into current turn at the next
+  //     natural pause (between tool calls / after subagent return).
+  //     ONE result event for the whole chain — same UX as the
+  //     deleted autosteer-buffer + PostToolBatch flow.
+  //   priority='later': queue for after current turn ends. SEPARATE
+  //     result event per absorbed message. Cleaner per-msg lifecycle
+  //     for chats that prefer accurate cost-row attribution.
+  //
+  // Per-chat opt-in via `chatConfig.autosteerMode: 'merge' | 'queue'`.
+  // 'merge' → priority='next' (default). 'queue' → priority='later'.
+  //
+  // Pre-rc.42 this used a custom autosteerBuffer + PostToolBatch hook
+  // returning <channel source="user-followup"> additionalContext. The
+  // SDK at the time rejected priority='now' mid-tool-use (m87 gate);
+  // 'next'/'later' were never tested. The U7 spike confirmed all
+  // three priorities now work cleanly — so the buffer/hook detour is
+  // gone. ~250 LOC + 2 test files deleted.
+  //
+  // CLI pm has no inputController push primitive, so it falls
+  // through to FIFO pm.send (same UX as 0.7.x — queued behind active).
   const autosteerEnabled = chatAutosteer !== false
     && pm.isSdkFor(sessionKey);
   if (autosteerEnabled && pm.has(sessionKey)) {
     const entry = pm.get(sessionKey);
     if (entry?.inFlight) {
-      const ok = autosteerBuffer.append(sessionKey, prompt);
+      const autosteerMode = chatConfig.autosteerMode != null
+        ? chatConfig.autosteerMode
+        : config.bot?.autosteerMode;
+      const priority = autosteerMode === 'queue' ? 'later' : 'next';
+      const ok = pm.injectUserMessage(sessionKey, {
+        content: prompt,
+        priority,
+      });
       if (ok) {
-        // Track this msg_id so the in-flight turn's success / abort
-        // / error path can clear the ✍ reaction at turn-end.
         autosteeredRefs.add(sessionKey, { chatId, msgId: msg.message_id });
         logEvent('autosteer', {
           chat_id: chatId, msg_id: msg.message_id,
           text_len: prompt?.length ?? 0,
+          priority,
         });
         stopTyping();
-        // 0.8.0-rc.11: route the ✍ ack through the reactor's
-        // serialized apply chain. Pre-rc.11 we used a direct
-        // setMessageReaction(✍) racing with the reactor's
-        // QUEUED→👀 apply AND a follow-up reactor.clear() — three
-        // concurrent network calls, final state was whichever
-        // landed last at Telegram. Symptom: 👀 sometimes stuck,
-        // ✍ sometimes vanished, reactions disappeared "almost
-        // immediately" or got stuck arbitrarily.
-        //
-        // setState('AUTOSTEERED') is terminal so it bypasses the
-        // 800ms throttle and flushes synchronously through
-        // applyChain — so it serializes after any in-flight
-        // QUEUED apply and lands as the final visible reaction.
+        // setState('AUTOSTEERED') is terminal — bypasses the throttle,
+        // serializes after any in-flight QUEUED apply via applyChain.
         await reactor.setState('AUTOSTEERED');
-        // rc.38: stop the reactor's STALL/TIMEOUT timers. Pre-rc.38
-        // the timers stayed armed, holding setTimeout handles for
-        // up to 30s and pinning the closure (and the bot/chatId
-        // captures) until they fired. AUTOSTEERED is terminal — no
-        // further state changes — so the timers serve no purpose
-        // and just delay GC. One-line patch; small steady-state
-        // heap relief in busy chats.
+        // rc.38: AUTOSTEERED is terminal; stop the reactor's STALL /
+        // TIMEOUT timers so they don't pin the closure for up to 30s.
         reactor.stop();
         markReplied();
         return;
@@ -2648,12 +2585,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // message that was autosteered into THIS turn — they live in
       // separate handleMessage scopes whose reactors are already GC'd.
       clearAutosteeredReactions(sessionKey).catch(() => {});
-      // rc.14: tool-less-turn drain. PostToolBatch hook fires only
-      // on tool boundaries; if this turn produced ZERO tools, the
-      // hook never fired and the autosteer buffer still has the
-      // user's follow-ups. Dispatch them as a synthetic next turn
-      // so the bot at least addresses them (better than losing).
-      drainStaleAutosteerBuffer(sessionKey, chatId, threadId).catch(() => {});
+      // rc.42: tool-less-turn stale-drain DELETED. With native priority
+      // push, the SDK's input controller has the followups directly —
+      // there's no buffer for us to drain. Tool-less turns just emit
+      // result, the followup messages (if any) get their own SDK
+      // pause to absorb at, no special handling needed.
 
       // 0.8.0 Phase 2 step 4: 85%-context-full live hint. After a
       // successful turn, peek at SDK's getContextUsage(); if past
@@ -2707,10 +2643,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       if (toolOnlyTurn) {
         await reactor.clear().catch(() => {});
         clearAutosteeredReactions(sessionKey).catch(() => {});
-        // Tool-only turns DID fire PostToolBatch — buffer was drained
-        // — but autosteers received AFTER the last tool-result still
-        // wouldn't be merged. Defensive drain here too.
-        drainStaleAutosteerBuffer(sessionKey, chatId, threadId).catch(() => {});
+        // rc.42: stale-drain removed. SDK manages absorption directly.
         logEvent('tool-only-completion', {
           chat_id: chatId, msg_id: msg.message_id, bot: BOT_NAME,
           num_tool_uses: result.metrics?.numToolUses,
@@ -3129,13 +3062,12 @@ function createBot(token) {
         await stopTarget.kill(sessionKey).catch((err) =>
           console.error(`[${BOT_NAME}] abort kill failed: ${err.message}`));
       }
-      // 0.8.0-rc.13: drop any buffered autosteer follow-ups for this
-      // session — otherwise they'd be injected into the NEXT turn
-      // (stale steer leak across abort boundary, which is what the
-      // user just asked us not to do).
-      autosteerBuffer.clear(sessionKey);
-      // rc.14: also clear ✍ reactions on already-autosteered
-      // messages from this aborted turn — they're now dead context.
+      // rc.42: autosteer buffer is gone (native SDK priority push).
+      // Followups already pushed onto the SDK's input controller will
+      // be drained by drainQueue() / kill() on the entry — no separate
+      // buffer to clear.
+      // Clear ✍ reactions on already-autosteered messages from this
+      // aborted turn — they're now dead context.
       clearAutosteeredReactions(sessionKey).catch(() => {});
       logEvent('abort-requested', {
         chat_id: chatId, user_id: msg.from?.id || null,

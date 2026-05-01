@@ -1,6 +1,24 @@
 # Autosteer Contract Fix — Research & Recommendation
 
-> Status: research only. No code shipped. Implementation gated on review.
+> **STATUS: SUPERSEDED by rc.42 (2026-05-01).** The d-hybrid /
+> userTurnInFlight / MAX_ABSORBED design recommended below is NOT
+> what shipped. The U7 spike (`scripts/spikes/native-queue.mjs`)
+> verified that the SDK's native `priority: 'now' | 'next' | 'later'`
+> on `SDKUserMessage` works without m87 rejection — the rc.9-era
+> rejection that drove the autosteer-buffer + PostToolBatch detour
+> is gone. polygram now uses `pm.injectUserMessage()` with native
+> priority push. The buffer, the hook, the cap, and the hook-stop
+> primitive plan are all deleted.
+>
+> This doc is kept for archaeological context: it documents WHY
+> we built what we built, and the architectural mismatch we
+> thought existed. The mismatch was real circa rc.9; the SDK
+> evolved past it.
+>
+> See `scripts/spikes/native-queue.mjs` and `docs/u7-spike-result.txt`
+> for the spike that obsoleted this plan.
+
+> Status (original): research only. No code shipped. Implementation gated on review.
 > Audience: ivanshumkov + future-me. Scope: polygram 0.8.0, SDK pm only.
 
 ---

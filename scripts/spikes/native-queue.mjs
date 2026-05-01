@@ -109,6 +109,7 @@ async function runScenario({ priority, shouldQueryOnFollowup, label }) {
   let followupPushed = false;
   let firstResultMsg = null;
   let secondResultMsg = null;
+  let gracePeriodTimer = null;
 
   const q = query({
     prompt: input,
@@ -183,15 +184,27 @@ async function runScenario({ priority, shouldQueryOnFollowup, label }) {
       }
 
       if (m.type === 'result') {
-        if (firstResultMsg === null) firstResultMsg = m;
-        else if (secondResultMsg === null) {
+        if (firstResultMsg === null) {
+          firstResultMsg = m;
+          if (!followupPushed) {
+            log(`  !! first result fired before we saw tool_result — closing`);
+            break;
+          }
+          // First result fired AFTER followup push. Three possibilities:
+          //   (a) priority absorbed it into same turn → marker is in the
+          //       result's text, no second result will fire
+          //   (b) priority='now' interrupted → result.terminal_reason
+          //       = 'aborted_streaming', second result will fire shortly
+          //   (c) priority='later'/'next' queued → second result for the
+          //       followup turn coming up to ~20s later
+          // We grace 20s for case (b)/(c) — if no second result, exit.
+          gracePeriodTimer = setTimeout(() => {
+            log(`  >> 20s grace expired after first result; closing`);
+            input.close();
+          }, 20_000);
+        } else if (secondResultMsg === null) {
           secondResultMsg = m;
-          break;  // exit after 2 results (one per turn) OR break after first if no 2nd comes
-        }
-        // If we got first result and didn't push a followup yet, time
-        // to give up — the agent finished without us seeing tool_result.
-        if (!followupPushed) {
-          log(`  !! first result fired before we saw tool_result — closing`);
+          if (gracePeriodTimer) clearTimeout(gracePeriodTimer);
           break;
         }
       }
@@ -200,6 +213,7 @@ async function runScenario({ priority, shouldQueryOnFollowup, label }) {
     log(`!! ${label} iterator threw: ${err?.message || err}`);
   }
   clearTimeout(capTimer);
+  if (gracePeriodTimer) clearTimeout(gracePeriodTimer);
   input.close();
 
   const elapsed = Date.now() - t0;

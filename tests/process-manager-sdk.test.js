@@ -328,6 +328,104 @@ describe('ProcessManagerSdk — basic happy path', () => {
   });
 });
 
+describe('ProcessManagerSdk — injectUserMessage (rc.42 native autosteer)', () => {
+  // U7 spike (scripts/spikes/native-queue.mjs, 2026-05-01) verified
+  // SDK priority hints work cleanly:
+  //   'now'   → aborts current turn, fresh turn for the followup
+  //   'next'  → absorbs into current turn at next pause (default
+  //             autosteer mode)
+  //   'later' → queues separate turn after current ends
+  // pm.injectUserMessage pushes a typed SDKUserMessage onto the
+  // SDK's input controller with the chosen priority. Replaces the
+  // pre-rc.42 autosteerBuffer + PostToolBatch detour.
+
+  let pm; let fq; let db;
+
+  beforeEach(() => {
+    fq = makeFakeQuery();
+    db = mockDb();
+    pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db,
+      logger: { error: () => {}, log: () => {} },
+    });
+  });
+
+  afterEach(async () => { await pm.shutdown(); });
+
+  test('pushes SDKUserMessage with priority="next" by default', async () => {
+    await pm.getOrSpawn('chat-1');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's1' });
+    await new Promise((r) => setImmediate(r));
+
+    const ok = pm.injectUserMessage('chat-1', { content: 'follow-up text' });
+    assert.equal(ok, true);
+    await new Promise((r) => setImmediate(r));
+
+    const last = fq.pushedMessages[fq.pushedMessages.length - 1];
+    assert.equal(last.type, 'user');
+    assert.equal(last.message.role, 'user');
+    assert.equal(last.message.content, 'follow-up text');
+    assert.equal(last.priority, 'next');
+    assert.equal(last.parent_tool_use_id, null);
+    assert.equal(last.shouldQuery, undefined);
+  });
+
+  test('forwards explicit priority + shouldQuery', async () => {
+    await pm.getOrSpawn('chat-2');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's2' });
+    await new Promise((r) => setImmediate(r));
+
+    pm.injectUserMessage('chat-2', { content: 'queue me', priority: 'later' });
+    pm.injectUserMessage('chat-2', { content: 'urgent', priority: 'now', shouldQuery: true });
+    await new Promise((r) => setImmediate(r));
+
+    const recent = fq.pushedMessages.slice(-2);
+    assert.equal(recent[0].priority, 'later');
+    assert.equal(recent[0].shouldQuery, undefined);
+    assert.equal(recent[1].priority, 'now');
+    assert.equal(recent[1].shouldQuery, true);
+  });
+
+  test('emits inject-user-message event for telemetry', async () => {
+    await pm.getOrSpawn('chat-3');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's3' });
+    await new Promise((r) => setImmediate(r));
+
+    pm.injectUserMessage('chat-3', { content: 'hi', priority: 'next' });
+    const ev = db.events.find((e) => e.kind === 'inject-user-message');
+    assert.ok(ev, 'inject-user-message event should fire');
+    assert.equal(ev.detail.session_key, 'chat-3');
+    assert.equal(ev.detail.priority, 'next');
+    assert.equal(ev.detail.text_len, 2);
+  });
+
+  test('returns false when sessionKey not found', () => {
+    const ok = pm.injectUserMessage('nonexistent', { content: 'hi' });
+    assert.equal(ok, false);
+  });
+
+  test('throws TypeError when content is missing or non-string', async () => {
+    await pm.getOrSpawn('chat-4');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's4' });
+    await new Promise((r) => setImmediate(r));
+    assert.throws(() => pm.injectUserMessage('chat-4', {}), /content.*required/);
+    assert.throws(() => pm.injectUserMessage('chat-4', { content: '' }), /content.*required/);
+    assert.throws(() => pm.injectUserMessage('chat-4', { content: 42 }), /content.*required/);
+  });
+
+  test('returns false when entry is closed', async () => {
+    const entry = await pm.getOrSpawn('chat-5');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's5' });
+    await new Promise((r) => setImmediate(r));
+    entry.closed = true;
+    const ok = pm.injectUserMessage('chat-5', { content: 'hi' });
+    assert.equal(ok, false);
+  });
+});
+
 describe('ProcessManagerSdk — interrupt + drainQueue (D8)', () => {
   let pm;
   let fq;

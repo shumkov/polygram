@@ -1,0 +1,169 @@
+
+=== PRIORITY-NOW: followup priority="now" shouldQuery=undefined ===
+  +6151ms  system:init
+  +7258ms  rate_limit_event
+  +10511ms  assistant
+  +11031ms  assistant text=81c
+  +11500ms  assistant tool=Bash
+  +11947ms  user
+  >> pushing followup with priority="now" shouldQuery=undefined
+  >> push succeeded
+  +11949ms  result:success term=aborted_streaming
+  +11951ms  system:init
+  +13852ms  assistant
+  +14325ms  assistant text=44c
+  +14792ms  assistant tool=Bash
+  +15131ms  user
+  +15133ms  assistant tool=Bash
+  +15197ms  user
+  +18138ms  assistant text=379c
+  +18204ms  result:success term=completed
+  total elapsed: 18206ms
+  followup pushed: true
+  first result subtype: success
+  first result is_error: false
+  second result subtype: success
+  second result is_error: false
+  text incorporated marker: true
+
+=== PRIORITY-NEXT: followup priority="next" shouldQuery=undefined ===
+  +4650ms  system:init
+  +5809ms  rate_limit_event
+  +10115ms  assistant
+  +10519ms  assistant tool=Bash
+  +10621ms  user
+  >> pushing followup with priority="next" shouldQuery=undefined
+  >> push succeeded
+  +12916ms  assistant tool=Bash
+  +12979ms  user
+  +17133ms  assistant tool=Bash
+  +17204ms  user
+  +21902ms  assistant text=384c
+  +21973ms  result:success term=completed
+  >> 20s grace expired after first result; closing
+  total elapsed: 42326ms
+  followup pushed: true
+  first result subtype: success
+  first result is_error: false
+  second result subtype: (none — single turn)
+  second result is_error: undefined
+  text incorporated marker: true
+
+=== PRIORITY-LATER: followup priority="later" shouldQuery=undefined ===
+  +4060ms  system:init
+  +5124ms  rate_limit_event
+  +12464ms  assistant
+  +12468ms  assistant text=103c
+  +12699ms  assistant tool=Bash
+  +12777ms  assistant tool=Bash
+  +12799ms  user
+  >> pushing followup with priority="later" shouldQuery=undefined
+  >> push succeeded
+  +12799ms  user
+  +14451ms  assistant tool=Bash
+  +14514ms  user
+  +16962ms  assistant text=308c
+  +17027ms  result:success term=completed
+  +17032ms  system:init
+  +18977ms  assistant
+  +19490ms  assistant tool=Bash
+  +19824ms  user
+  +19829ms  assistant tool=Bash
+  +19885ms  user
+  +21576ms  assistant tool=Bash
+  +21630ms  user
+  +23990ms  assistant text=290c
+  +24070ms  result:success term=completed
+  total elapsed: 24070ms
+  followup pushed: true
+  first result subtype: success
+  first result is_error: false
+  second result subtype: success
+  second result is_error: false
+  text incorporated marker: true
+
+=== NO-PRIORITY (default): followup priority=undefined shouldQuery=undefined ===
+  +4395ms  system:init
+  +5794ms  rate_limit_event
+  +13530ms  assistant
+  +13535ms  assistant tool=Bash
+  +13692ms  user
+  >> pushing followup with priority=undefined shouldQuery=undefined
+  >> push succeeded
+  +13695ms  assistant tool=Bash
+  +13928ms  user
+  +14021ms  assistant tool=Bash
+  +14123ms  user
+  +22566ms  assistant
+  +26081ms  assistant text=845c
+  +26115ms  result:success term=completed
+  >> 20s grace expired after first result; closing
+  total elapsed: 46459ms
+  followup pushed: true
+  first result subtype: success
+  first result is_error: false
+  second result subtype: (none — single turn)
+  second result is_error: undefined
+  text incorporated marker: true
+
+=== U7 SUMMARY ===
+{
+  "nowResult": {
+    "label": "PRIORITY-NOW",
+    "elapsed": 18206,
+    "followupPushed": true,
+    "firstResultSubtype": "success",
+    "firstResultIsError": false,
+    "firstResultTerminalReason": "aborted_streaming",
+    "secondResultSubtype": "success",
+    "secondResultIsError": false,
+    "markerInText": true,
+    "eventCount": 16
+  },
+  "nextResult": {
+    "label": "PRIORITY-NEXT",
+    "elapsed": 42326,
+    "followupPushed": true,
+    "firstResultSubtype": "success",
+    "firstResultIsError": false,
+    "firstResultTerminalReason": "completed",
+    "secondResultSubtype": null,
+    "secondResultIsError": null,
+    "markerInText": true,
+    "eventCount": 11
+  },
+  "laterResult": {
+    "label": "PRIORITY-LATER",
+    "elapsed": 24070,
+    "followupPushed": true,
+    "firstResultSubtype": "success",
+    "firstResultIsError": false,
+    "firstResultTerminalReason": "completed",
+    "secondResultSubtype": "success",
+    "secondResultIsError": false,
+    "markerInText": true,
+    "eventCount": 22
+  },
+  "defaultResult": {
+    "label": "NO-PRIORITY (default)",
+    "elapsed": 46459,
+    "followupPushed": true,
+    "firstResultSubtype": "success",
+    "firstResultIsError": false,
+    "firstResultTerminalReason": "completed",
+    "secondResultSubtype": null,
+    "secondResultIsError": null,
+    "markerInText": true,
+    "eventCount": 12
+  }
+}
+
+Verdict per scenario:
+  nowResult: PASS  — PASS
+  nextResult: PASS  — PASS
+  laterResult: PASS  — PASS
+  defaultResult: PASS  — PASS
+
+If any of next/later/default PASS, polygram should drop the
+autosteer-buffer + PostToolBatch + MAX_ABSORBED machinery and
+use native streamInput pushes instead.
