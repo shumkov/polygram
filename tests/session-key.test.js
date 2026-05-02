@@ -6,7 +6,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { getSessionKey, getChatIdFromKey } = require('../lib/session-key');
+const { getSessionKey, getChatIdFromKey, getThreadIdFromKey } = require('../lib/session-key');
 
 describe('getSessionKey', () => {
   test('no threadId, no chatConfig → just chatId', () => {
@@ -56,5 +56,30 @@ describe('getChatIdFromKey', () => {
 
   test('handles DM chat (positive id)', () => {
     assert.equal(getChatIdFromKey('111111111'), '111111111');
+  });
+});
+
+describe('getThreadIdFromKey (rc.47)', () => {
+  // Inverse of getChatIdFromKey: returns thread_id when sessionKey
+  // includes one (isolateTopics=true), else null. Used by rc.47
+  // autonomous-wakeup routing — when ScheduleWakeup fires, the
+  // generated assistant message has no head pending; polygram needs
+  // to derive chat_id + thread_id from the sessionKey to route the
+  // text to the right Telegram chat/topic.
+
+  test('returns null for non-isolated key (just chatId)', () => {
+    assert.equal(getThreadIdFromKey('-100123'), null);
+    assert.equal(getThreadIdFromKey('111111111'), null);
+  });
+
+  test('returns thread_id for isolated key (chatId:thread)', () => {
+    assert.equal(getThreadIdFromKey('-100123:5379'), '5379');
+    assert.equal(getThreadIdFromKey('-100123:2'), '2');
+  });
+
+  test('handles edge cases gracefully', () => {
+    assert.equal(getThreadIdFromKey(''), null);
+    assert.equal(getThreadIdFromKey(null), null);
+    assert.equal(getThreadIdFromKey(undefined), null);
   });
 });

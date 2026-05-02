@@ -30,7 +30,7 @@ const { ProcessManager } = require('./lib/process-manager');
 // callbacks), so the rest of polygram.js doesn't branch beyond the
 // pick-at-startup. Phase 4 deletes the CLI version after Phase 5
 // soak proves SDK stable. See docs/0.8.0-architecture-decisions.md.
-const { ProcessManagerSdk } = require('./lib/process-manager-sdk');
+const { ProcessManagerSdk, extractAssistantText } = require('./lib/process-manager-sdk');
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
 // (pm.injectUserMessage) replaces the buffer + PostToolBatch detour.
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
@@ -195,7 +195,7 @@ function isWellFormedMessage(msg) {
 }
 
 // ─── Session key — moved to lib/session-key.js so tests can import it. ─
-const { getSessionKey, getChatIdFromKey } = require('./lib/session-key');
+const { getSessionKey, getChatIdFromKey, getThreadIdFromKey } = require('./lib/session-key');
 
 function getTopicName(chatConfig, threadId) {
   if (!threadId) return null;
@@ -3664,6 +3664,50 @@ async function main() {
       // to speak".
       const r = head?.context?.reactor;
       if (r && typeof r.heartbeat === 'function') r.heartbeat();
+    },
+    // rc.47: autonomous wakeup forwarding. Fires when an SDK
+    // assistant message arrives with no head pending — typical
+    // ScheduleWakeup case where the agent self-fires without an
+    // inbound user message. We derive chat_id (always) and thread_id
+    // (when isolateTopics) from the sessionKey, then send the text
+    // to that chat/topic. Subagent messages were already filtered
+    // upstream (parent_tool_use_id != null check in pm-sdk).
+    //
+    // Best-effort send: failures are logged but don't propagate —
+    // an autonomous turn that can't be delivered shouldn't crash
+    // the daemon. Telemetry emitted as `autonomous-wakeup-message`
+    // so we can audit how often these fire and whether any get lost.
+    onAutonomousAssistantMessage: (sessionKey, msg /* , entry */) => {
+      try {
+        const text = extractAssistantText(msg);
+        if (!text) return;
+        const chatId = getChatIdFromKey(sessionKey);
+        const threadIdRaw = getThreadIdFromKey(sessionKey);
+        const threadId = threadIdRaw ? parseInt(threadIdRaw, 10) : null;
+        if (!bot) {
+          console.error(`[${BOT_NAME}] autonomous wakeup: bot not ready, dropping ${text.length} chars`);
+          return;
+        }
+        const params = {
+          chat_id: chatId,
+          text,
+          ...(Number.isInteger(threadId) && { message_thread_id: threadId }),
+        };
+        // Don't `await` — keep the pm-sdk event loop unblocked. The
+        // tg() wrapper handles its own retries / chunking.
+        tg(bot, 'sendMessage', params,
+          { source: 'autonomous-wakeup', botName: BOT_NAME }).catch((err) => {
+            console.error(`[${BOT_NAME}] autonomous wakeup send failed: ${err.message}`);
+          });
+        logEvent('autonomous-wakeup-message', {
+          chat_id: chatId,
+          session_key: sessionKey,
+          thread_id: threadIdRaw,
+          text_len: text.length,
+        });
+      } catch (err) {
+        console.error(`[${BOT_NAME}] autonomous wakeup handler: ${err.message}`);
+      }
     },
     // rc.29 onThinking removed — replaced by simpler timer-based
     // approach in handleMessage (post-QUEUED setState). The

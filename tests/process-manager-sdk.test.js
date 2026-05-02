@@ -1236,6 +1236,189 @@ describe('ProcessManagerSdk — subagent filter (Phase 1 step 7)', () => {
   });
 });
 
+describe('ProcessManagerSdk — rc.47 autonomous assistant messages (no head pending)', () => {
+  // ScheduleWakeup fires inside the SDK Query without a corresponding
+  // pm.send. The assistant event arrives with empty pendingQueue.
+  // Pre-rc.47 the `if (msg.type === 'assistant' && head)` gate at
+  // _handleEvent dropped these silently — autonomous responses went
+  // nowhere. rc.47 detects "no head pending" and routes via a new
+  // onAutonomousAssistantMessage callback so polygram can forward
+  // the text to the right Telegram chat/topic (chat_id + thread_id
+  // derived from sessionKey).
+
+  let pm; let fq;
+  let chunks; let autonomous;
+  let messageStarts;
+
+  beforeEach(() => {
+    fq = makeFakeQuery();
+    chunks = [];
+    autonomous = [];
+    messageStarts = 0;
+    pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+      onStreamChunk: (_k, t) => chunks.push(t),
+      onAssistantMessageStart: () => { messageStarts += 1; },
+      onAutonomousAssistantMessage: (sessionKey, msg) => {
+        autonomous.push({ sessionKey, text: extractAssistantText(msg) });
+      },
+    });
+  });
+
+  afterEach(async () => { await pm.shutdown(); });
+
+  test('assistant msg with NO head fires onAutonomousAssistantMessage', async () => {
+    // Spawn a Query but DO NOT call pm.send. Then emit an assistant
+    // event — simulates ScheduleWakeup firing autonomously.
+    await pm.getOrSpawn('chat-1');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's1' });
+    await new Promise((r) => setImmediate(r));
+
+    fq.emitEvent({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { id: 'wake-1', content: [
+        { type: 'text', text: '🔔 Reminder: deploy gate at 09:00 UTC.' },
+      ] },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    // No regular streaming path because no head pending.
+    assert.deepEqual(chunks, []);
+    assert.equal(messageStarts, 0);
+    // Autonomous callback fired exactly once with the message text.
+    assert.equal(autonomous.length, 1);
+    assert.equal(autonomous[0].sessionKey, 'chat-1');
+    assert.equal(autonomous[0].text, '🔔 Reminder: deploy gate at 09:00 UTC.');
+  });
+
+  test('subagent autonomous msg is filtered (not delivered)', async () => {
+    // Subagent messages have parent_tool_use_id != null. They're
+    // internal to the agent's own tool-orchestration; the user
+    // shouldn't see them surface as autonomous wakeups.
+    await pm.getOrSpawn('chat-2');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's2' });
+    await new Promise((r) => setImmediate(r));
+
+    fq.emitEvent({
+      type: 'assistant',
+      parent_tool_use_id: 'tool-call-xyz',
+      message: { id: 'sub-1', content: [
+        { type: 'text', text: 'subagent thinking aloud' },
+      ] },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(autonomous.length, 0,
+      'subagent autonomous msg must not fire onAutonomousAssistantMessage');
+  });
+
+  test('assistant msg WITH head still uses streaming path (no regression)', async () => {
+    // Verify the rc.45 multi-segment streaming path still works when
+    // there IS a head pending (= regular pm.send-driven turn).
+    await pm.getOrSpawn('chat-3');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's3' });
+    const promise = pm.send('chat-3', 'q');
+    await new Promise((r) => setImmediate(r));
+
+    fq.emitEvent({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { id: 'm1', content: [{ type: 'text', text: 'reply' }] },
+    });
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'reply',
+      session_id: 's3', total_cost_usd: 0, duration_ms: 1,
+      usage: { input_tokens: 1, output_tokens: 1,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await promise;
+
+    // Regular streaming path fires; autonomous does NOT fire.
+    assert.deepEqual(chunks, ['reply']);
+    assert.equal(autonomous.length, 0);
+  });
+
+  test('isolated-topic sessionKey passes through to callback (chat:thread)', async () => {
+    // The user's reasoning: chat_id + thread_id are derivable from
+    // sessionKey via getChatIdFromKey + getThreadIdFromKey (rc.47).
+    // Verify the callback gets the full sessionKey string, so the
+    // wiring layer (polygram.js) can split it.
+    await pm.getOrSpawn('-1003807211164:42');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 'iso-s' });
+    await new Promise((r) => setImmediate(r));
+
+    fq.emitEvent({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { id: 'wake-iso', content: [
+        { type: 'text', text: 'wake-up in topic 42' },
+      ] },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(autonomous.length, 1);
+    assert.equal(autonomous[0].sessionKey, '-1003807211164:42',
+      'callback must receive full sessionKey including thread suffix');
+  });
+
+  test('result with NO head fires no callback (autonomous result is just telemetry)', async () => {
+    // For a wakeup that produces output, the assistant event(s) carry
+    // the user-facing text. The result event afterwards just signals
+    // turn completion — polygram doesn't need to send another message,
+    // just log telemetry. Pin: onAutonomousAssistantMessage does NOT
+    // fire on result-without-head (only on assistant-without-head).
+    await pm.getOrSpawn('chat-4');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's4' });
+    await new Promise((r) => setImmediate(r));
+
+    fq.emitEvent({
+      type: 'result', subtype: 'success', result: 'something',
+      session_id: 's4', total_cost_usd: 0.01, duration_ms: 100,
+      usage: { input_tokens: 5, output_tokens: 3,
+               cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(autonomous.length, 0,
+      'result-only-no-head must not fire onAutonomousAssistantMessage');
+  });
+
+  test('assistant msg with no callback wired = silent no-op (backward compat)', async () => {
+    // If a host doesn't supply onAutonomousAssistantMessage, the
+    // event MUST NOT throw. Important for tests that don't care +
+    // for backward compat with pre-rc.47 callers.
+    const fq2 = makeFakeQuery();
+    const pm2 = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq2.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+      // No onAutonomousAssistantMessage wired.
+    });
+    await pm2.getOrSpawn('c');
+    fq2.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    await new Promise((r) => setImmediate(r));
+
+    await assert.doesNotReject(async () => {
+      fq2.emitEvent({
+        type: 'assistant',
+        parent_tool_use_id: null,
+        message: { id: 'wake', content: [
+          { type: 'text', text: 'wake' },
+        ] },
+      });
+      await new Promise((r) => setImmediate(r));
+    });
+    await pm2.shutdown();
+  });
+});
+
 describe('ProcessManagerSdk — rc.46 kill preserves session_id (/reload primitive)', () => {
   // /reload command UX: keep conversation context, reload skill/agent
   // files from disk. Mechanism: pm.kill(sessionKey) closes the Query
