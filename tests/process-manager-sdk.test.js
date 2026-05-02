@@ -1236,6 +1236,66 @@ describe('ProcessManagerSdk — subagent filter (Phase 1 step 7)', () => {
   });
 });
 
+describe('ProcessManagerSdk — rc.46 kill preserves session_id (/reload primitive)', () => {
+  // /reload command UX: keep conversation context, reload skill/agent
+  // files from disk. Mechanism: pm.kill(sessionKey) closes the Query
+  // but does NOT clear the persisted claude_session_id — the next
+  // user message respawns the Query with `resume: <session_id>` so
+  // the model picks up where the conversation left off, but with
+  // freshly-loaded agent/skill files.
+  //
+  // This test pins the contract /reload depends on: kill MUST NOT
+  // call db.clearSessionId. resetSession (= /new) is the opposite —
+  // it intentionally clears session_id to force a fresh start.
+
+  test('pm.kill does NOT call db.clearSessionId', async () => {
+    const cleared = [];
+    const db = {
+      ...mockDb(),
+      clearSessionId: (key) => cleared.push(key),
+    };
+    const fq = makeFakeQuery();
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db,
+      logger: { error: () => {}, log: () => {} },
+    });
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 'sess-keep-me' });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(pm.has('c'), true);
+
+    await pm.kill('c');
+    assert.equal(pm.has('c'), false);
+    assert.deepEqual(cleared, [],
+      'kill must preserve session_id — only resetSession clears it');
+    await pm.shutdown();
+  });
+
+  test('pm.kill drains pending turns with KILLED code', async () => {
+    const fq = makeFakeQuery();
+    const pm = new ProcessManagerSdk({
+      cap: 2,
+      queryCloseTimeoutMs: 100,
+      spawnFn: () => fq.query,
+      db: mockDb(),
+      logger: { error: () => {}, log: () => {} },
+    });
+    await pm.getOrSpawn('c');
+    fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's' });
+    const p1 = pm.send('c', 'a');
+    await new Promise((r) => setImmediate(r));
+
+    await pm.kill('c');
+    const e1 = await p1.catch((e) => e);
+    assert.equal(e1.code, 'KILLED',
+      'in-flight pending should reject with KILLED on /reload');
+    await pm.shutdown();
+  });
+});
+
 describe('ProcessManagerSdk — resetSession (G9 primitive)', () => {
   // Closes v6 plan §7.1 G9 unit gate (context-overflow auto-recovery).
   // Polygram's classifier wires resetSession on role_ordering /

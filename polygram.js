@@ -1947,6 +1947,38 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     }
     return;
   }
+  // 0.8.0-rc.46: /reload — close + respawn the SDK Query while
+  // PRESERVING the persisted claude_session_id. The next user
+  // message resumes the conversation (model has prior context via
+  // SDK resume) but the spawn re-reads agent / skill / plugin files
+  // from disk, so any local edits to ~/.claude/agents/<name>.md or
+  // skill files take effect.
+  //
+  // Difference vs /new:
+  //   /new    → resetSession clears session_id → fresh conversation
+  //   /reload → kill closes Query, session_id preserved → same
+  //              conversation continues with fresh agent/skill code
+  //
+  // Mechanism: pm.kill drains the pending queue (with code 'KILLED')
+  // and closes the SDK Query. Crucially it does NOT call
+  // db.clearSessionId — the contract test
+  // 'pm.kill does NOT call db.clearSessionId' pins this invariant.
+  // The next user message hits getOrSpawn → no warm Query → spawn
+  // fresh with `resume: <session_id>` from sessions table → SDK
+  // restores conversation history → fresh files loaded.
+  if (botAllowsCommands && text === '/reload') {
+    if (pm.has(sessionKey)) {
+      try { await pm.kill(sessionKey); }
+      catch (err) { console.error(`[${label}] kill on /reload: ${err.message}`); }
+    }
+    logEvent('session-reload-command', {
+      chat_id: chatId, command: text,
+      user: cmdUser, user_id: cmdUserId,
+    });
+    await sendReply('🔄 Reloaded. Next message picks up the conversation with fresh skills/agents.');
+    return;
+  }
+
   if (botAllowsCommands && (text === '/new' || text === '/reset')) {
     let drained = 0;
     const target = pm.pickFor(sessionKey);
