@@ -43,7 +43,7 @@ const {
   formatToolInputForCard,
   approvalCardText,
 } = require('./lib/approval-ui');
-const { makeSessionStartHook } = require('./lib/history-preload');
+const { buildHistoryBlock } = require('./lib/history-preload');
 const { formatContextReply, maybeContextFullHint } = require('./lib/context-format');
 const { appendDisplayHint, appendDisplayHintCliArgs } = require('./lib/telegram-prompt');
 const { createAbortGrace } = require('./lib/abort-grace');
@@ -698,17 +698,53 @@ function resolveReplyTo(msg) {
   return { replyToId };
 }
 
-function formatPrompt(msg, sessionCtx, attachments = []) {
+function formatPrompt(msg, sessionCtx, attachments = [], { sessionKey = null } = {}) {
   const chatId = msg.chat.id.toString();
   const threadId = msg.message_thread_id?.toString() || '';
   const chatConfig = config.chats[chatId];
   const topicName = threadId ? getTopicName(chatConfig, threadId) : '';
+
+  // rc.52: when the upcoming Query has no resume target (fresh
+  // session — daemon boot, /new, /reset, first-ever message in a
+  // chat/topic), prepend a `<polygram-history>` block so the fresh
+  // session has continuity instead of starting blank. Replaces the
+  // dead SessionStart hook (registered into `Options.hooks.SessionStart`
+  // since rc.21 but never fired — the SDK runtime doesn't dispatch
+  // user-defined hooks for that event, only CLI settings.json shell
+  // hooks).
+  let polygramHistory = '';
+  if (sessionKey && db) {
+    const existingSessionId = getClaudeSessionId(db, sessionKey);
+    if (!existingSessionId) {
+      try {
+        polygramHistory = buildHistoryBlock({
+          db,
+          chatId,
+          threadId: threadId || null,
+          excludeMsgId: msg.message_id,
+          logger: console,
+        });
+        if (polygramHistory) {
+          logEvent('history-preloaded', {
+            chat_id: chatId,
+            thread_id: threadId || null,
+            text_len: polygramHistory.length,
+            session_source: 'fresh',
+          });
+        }
+      } catch (err) {
+        console.error(`[history-preload] buildHistoryBlock failed: ${err?.message || err}`);
+      }
+    }
+  }
+
   return buildPrompt({
     msg,
     topicName,
     sessionCtx,
     attachments,
     replyTo: resolveReplyTo(msg),
+    polygramHistory,
   });
 }
 
@@ -903,21 +939,13 @@ function buildSdkOptions(sessionKey, ctx) {
   // turn-end path (handleMessage finally + success branches —
   // existing rc.38 cleanup).
 
-  // 0.8.0-rc.21: SessionStart hook preloads recent polygram-DB
-  // history into a fresh Query (no resume). Without this, every
-  // /new or daemon-boot starts the agent blank — even though the
-  // chat has been running for weeks. Skips when source is
-  // 'resume' or 'compact' (transcript already populated).
-  const sessionStartHook = ctx?.chatId
-    ? makeSessionStartHook({
-        db,
-        chatId: ctx.chatId,
-        threadId: ctx.threadId ?? null,
-        logEvent,
-        logger: console,
-      })
-    : null;
-
+  // rc.52: dropped the SDK SessionStart hook registration. The hook
+  // never fired in production (verified: zero history-preloaded events
+  // across both production DBs since rc.21; SDK runtime grep showed
+  // exactly one occurrence of "SessionStart" — in the type listing,
+  // not in dispatch logic). The history preload is now done inline at
+  // formatPrompt time when the upcoming Query has no resume target,
+  // via lib/history-preload.buildHistoryBlock. See formatPrompt above.
   const baseOpts = {
     model: chatConfig.model || config.defaults.model,
     effort: chatConfig.effort || config.defaults.effort,
@@ -929,11 +957,7 @@ function buildSdkOptions(sessionKey, ctx) {
     permissionMode: useCanUseTool ? 'default' : 'bypassPermissions',
     allowDangerouslySkipPermissions: !useCanUseTool,
     ...(useCanUseTool && { canUseTool: makeCanUseTool(sessionKey) }),
-    hooks: {
-      ...(sessionStartHook && {
-        SessionStart: [{ hooks: [sessionStartHook] }],
-      }),
-    },
+    hooks: {},
     executable: 'node',
     ...(existingSessionId && { resume: existingSessionId }),
     ...(process.env.POLYGRAM_CLAUDE_BIN && {
@@ -2278,7 +2302,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     chatId, msgId: msg.message_id, label, botApi: bot, threadId,
   }) || { ackEmitted: false };
 
-  const prompt = formatPrompt(msg, sessionCtx, downloaded);
+  const prompt = formatPrompt(msg, sessionCtx, downloaded, { sessionKey });
   const stopTyping = startTyping({
     bot, chatId, threadId,
     logger: { error: (m) => console.error(`[${label}] ${m}`) },

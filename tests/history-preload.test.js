@@ -11,7 +11,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { makeSessionStartHook, _formatRow } = require('../lib/history-preload');
+const { makeSessionStartHook, buildHistoryBlock, _formatRow } = require('../lib/history-preload');
 const { open } = require('../lib/db');
 
 let tmpDir;
@@ -297,5 +297,61 @@ describe('formatRow — transcript line shape', () => {
     });
     assert.equal(line.includes('\n'), false);
     assert.match(line, /line1 line2 tabs/);
+  });
+});
+
+describe('buildHistoryBlock — rc.52 inline preload', () => {
+  test('returns formatted polygram-history block when messages exist', () => {
+    seedMessages('12345', [
+      { msg_id: 1, ts: 1_700_000_000_000, user: 'Ivan', text: 'hello' },
+      { msg_id: 2, ts: 1_700_000_001_000, direction: 'out', user: 'shumobot', text: 'hi' },
+    ]);
+    const block = buildHistoryBlock({ db, chatId: '12345', since: null });
+    assert.match(block, /<polygram-history /);
+    assert.match(block, /chat_id="12345"/);
+    assert.match(block, /preloaded="2"/);
+    assert.match(block, /Ivan: hello/);
+    assert.match(block, /shumobot: hi/);
+    assert.match(block, /<\/polygram-history>/);
+  });
+
+  test('returns empty string when no messages exist', () => {
+    const block = buildHistoryBlock({ db, chatId: 'empty-chat' });
+    assert.equal(block, '');
+  });
+
+  test('excludes the message we are about to send (excludeMsgId)', () => {
+    seedMessages('12345', [
+      { msg_id: 1, ts: 1_700_000_000_000, user: 'Ivan', text: 'first message' },
+      { msg_id: 2, ts: 1_700_000_001_000, user: 'Ivan', text: 'about-to-send message' },
+    ]);
+    const block = buildHistoryBlock({ db, chatId: '12345', excludeMsgId: 2, since: null });
+    assert.match(block, /first message/);
+    assert.doesNotMatch(block, /about-to-send/);
+    assert.match(block, /preloaded="1"/);
+  });
+
+  test('thread_id filter scopes per-topic', () => {
+    seedMessages('12345', [
+      { msg_id: 1, ts: 1_700_000_000_000, user: 'Ivan', text: 'thread-A msg', thread_id: 'A' },
+      { msg_id: 2, ts: 1_700_000_001_000, user: 'Ivan', text: 'thread-B msg', thread_id: 'B' },
+    ]);
+    const blockA = buildHistoryBlock({ db, chatId: '12345', threadId: 'A', since: null });
+    assert.match(blockA, /thread-A msg/);
+    assert.doesNotMatch(blockA, /thread-B msg/);
+    assert.match(blockA, /thread_id="A"/);
+  });
+
+  test('returns empty when db is missing or chatId missing (defensive)', () => {
+    assert.equal(buildHistoryBlock({}), '');
+    assert.equal(buildHistoryBlock({ db, chatId: '' }), '');
+  });
+
+  test('row count visible in preloaded= attr (operator forensics)', () => {
+    seedMessages('12345', Array.from({ length: 5 }, (_, i) => ({
+      msg_id: i + 1, ts: 1_700_000_000_000 + i * 1000, user: 'Ivan', text: 'm' + i,
+    })));
+    const block = buildHistoryBlock({ db, chatId: '12345', since: null });
+    assert.match(block, /preloaded="5"/);
   });
 });
