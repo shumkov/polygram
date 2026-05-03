@@ -195,12 +195,13 @@ function isWellFormedMessage(msg) {
 }
 
 // ─── Session key — moved to lib/session-key.js so tests can import it. ─
-const { getSessionKey, getChatIdFromKey, getThreadIdFromKey } = require('./lib/session-key');
-
-function getTopicName(chatConfig, threadId) {
-  if (!threadId) return null;
-  return chatConfig.topics?.[threadId] || threadId;
-}
+const {
+  getSessionKey,
+  getChatIdFromKey,
+  getThreadIdFromKey,
+  getTopicName,
+  getTopicConfig,
+} = require('./lib/session-key');
 
 function getSessionLabel(chatConfig, threadId) {
   const topic = getTopicName(chatConfig, threadId);
@@ -826,30 +827,52 @@ function spawnClaude(sessionKey, ctx) {
  * mcpServers, optional resume sessionId for continuity.
  */
 function buildSdkOptions(sessionKey, ctx) {
-  const { chatConfig, existingSessionId, label, chatId } = ctx;
+  const { chatConfig, existingSessionId, label, chatId, threadId } = ctx;
+
+  // rc.48: per-topic config overrides. When `topics[threadId]` is an
+  // object (not a legacy string label), these fields take precedence
+  // over chat-level config. Principal use case: scope a single topic
+  // to a different agent, cwd, or permissionMode (e.g. flip music
+  // topic from `bypassPermissions` to `default` so settings.json
+  // permissions.allow gates apply).
+  //
+  // Per-topic overrides only apply meaningfully when isolateTopics is
+  // true — each topic has its own SDK Query. With isolateTopics: false
+  // all topics share one Query whose options are fixed at first-spawn.
+  // Startup validation (validateTopicConfigs) emits a one-time warning
+  // when a chat has topic overrides + isolateTopics: false.
+  const topicConfig = getTopicConfig(chatConfig, threadId);
+  const effectiveAgent = topicConfig.agent || chatConfig.agent;
 
   // Per-chat agent (D14): if pinned, load & compose. Failure is
   // non-fatal — chat falls back to defaults; logged for ops.
   let agentBundle = null;
-  if (chatConfig.agent) {
+  if (effectiveAgent) {
     try {
-      agentBundle = agentLoader.loadAgent(chatConfig.agent, {
+      agentBundle = agentLoader.loadAgent(effectiveAgent, {
         homeDir: CHILD_HOME,
         // Pass cwd so the loader checks Claude Code's project-level
         // path (`<cwd>/.claude/agents/<name>.md`) before the
-        // user-level path or polygram's directory convention.
-        cwd: chatConfig.cwd,
+        // user-level path or polygram's directory convention. rc.48:
+        // topic-level cwd takes precedence so topic-scoped agents
+        // load from the topic's project dir.
+        cwd: topicConfig.cwd || chatConfig.cwd,
         logger: console,
       });
     } catch (err) {
       console.error(`[${label}] agent-loader: ${err.message}`);
       logEvent('agent-load-failed', {
-        chat_id: chatId, agent: chatConfig.agent, error: err.message,
+        chat_id: chatId, agent: effectiveAgent, error: err.message,
+        topic: threadId || null,
       });
     }
   }
 
-  console.log(`[${label}] Spawning SDK Query (${chatConfig.model}/${chatConfig.effort})`);
+  const effectiveModel = topicConfig.model || chatConfig.model;
+  const effectiveEffort = topicConfig.effort || chatConfig.effort;
+  const agentSuffix = effectiveAgent && effectiveAgent !== chatConfig.agent
+    ? ` agent=${effectiveAgent}` : '';
+  console.log(`[${label}] Spawning SDK Query (${effectiveModel}/${effectiveEffort}${agentSuffix})`);
 
   // Env: SHADOW semantics (gate 33) — must enumerate every var
   // pollygram needs in the spawned worker.
@@ -916,10 +939,11 @@ function buildSdkOptions(sessionKey, ctx) {
     }),
   };
 
-  // Compose with agent overlay + chat-level config. agent-loader
-  // precedence: chatConfig > agent > defaults. The chatConfig keys
-  // we care about for SDK options are model/effort/cwd/thinking;
-  // others (agent, chrome, isolateTopics) are polygram-only.
+  // Compose with agent overlay + chat-level config + per-topic overrides.
+  // agent-loader precedence: topicConfig > chatConfig > agent > defaults.
+  // The chatConfig keys we care about for SDK options are
+  // model/effort/cwd/thinking; others (agent, chrome, isolateTopics)
+  // are polygram-only and stripped by composeSdkOptions.
   const composed = agentLoader.composeSdkOptions(
     {
       // chat-level overrides — only the keys SDK understands.
@@ -930,7 +954,18 @@ function buildSdkOptions(sessionKey, ctx) {
     },
     agentBundle,
     baseOpts,
+    topicConfig,  // rc.48: highest precedence — overrides chat-level fields.
   );
+
+  // rc.48: keep permissionMode + allowDangerouslySkipPermissions
+  // consistent. baseOpts sets allowDangerouslySkipPermissions=true when
+  // permissionMode='bypassPermissions'. If a topic flipped permissionMode
+  // to anything else (typically 'default' to gate via settings.json),
+  // also disable allowDangerouslySkipPermissions so the SDK actually
+  // honours the permission gates instead of skipping them.
+  if (composed.permissionMode && composed.permissionMode !== 'bypassPermissions') {
+    composed.allowDangerouslySkipPermissions = false;
+  }
 
   // Append polygram's display constraints to the systemPrompt.
   // Infrastructure-layer hint — the agent's own prompt covers
@@ -3794,6 +3829,26 @@ async function main() {
 
   console.log(`polygram (LRU cap=${cap}, SQLite source of truth)`);
   console.log(`Chats: ${Object.entries(config.chats).map(([id, c]) => `${c.name} (${c.model}/${c.effort})`).join(', ')}`);
+
+  // rc.48: validate per-topic config + isolateTopics relationship.
+  // Per-topic SdkOptions overrides only take effect when each topic
+  // gets its own SDK Query (isolateTopics: true). Without isolation
+  // the Query is fixed at first-spawn time; subsequent topic-scoped
+  // messages share that Query regardless of topic-level overrides.
+  for (const [chatId, chatCfg] of Object.entries(config.chats)) {
+    if (!chatCfg.topics || typeof chatCfg.topics !== 'object') continue;
+    const overrideTopics = Object.entries(chatCfg.topics)
+      .filter(([, t]) => t && typeof t === 'object'
+        && Object.keys(t).some((k) => k !== 'name'));
+    if (overrideTopics.length === 0) continue;
+    if (chatCfg.isolateTopics !== true) {
+      const ids = overrideTopics.map(([id]) => id).join(', ');
+      console.warn(`[${BOT_NAME}] WARN: chat ${chatId} (${chatCfg.name}) has topic overrides on topic_ids=${ids} but isolateTopics is not true — overrides will be IGNORED. Set isolateTopics: true to make per-topic config take effect.`);
+      logEvent('topic-override-without-isolation', {
+        chat_id: chatId, name: chatCfg.name, topic_ids: ids,
+      });
+    }
+  }
 
   bot = createBot(config.bot.token);
 

@@ -98,9 +98,17 @@
       "cwd": "/Users/you/admin-agent",
       "requireMention": true,
       "isolateTopics": true,
+      "_comment_topics": "rc.48: each topic entry is EITHER a string (legacy: just a label) OR an object with optional fields {name, agent, cwd, model, effort, permissionMode}. Object form lets a topic override chat-level config. Per-topic permissionMode overrides chat-level — typical use: scope one topic to permissionMode:'default' (so settings.json gates apply) while the rest of the chat stays on bypassPermissions. Object form requires isolateTopics: true (each topic gets its own SDK Query); polygram emits a startup warning otherwise.",
       "topics": {
         "100": "Customer A",
-        "200": "Customer B"
+        "200": {
+          "name": "Customer B",
+          "agent": "customer-b-helper",
+          "cwd": "/Users/you/customer-b-projects",
+          "model": "opus",
+          "effort": "high",
+          "permissionMode": "default"
+        }
       }
     },
 

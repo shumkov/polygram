@@ -181,3 +181,79 @@ describe('composeSdkOptions', () => {
     assert.equal(opts.systemPrompt, 'p');
   });
 });
+
+describe('composeSdkOptions — rc.48 topic overrides (highest precedence)', () => {
+  // rc.48: per-topic overrides via the 4th `topicConfig` argument.
+  // Precedence (highest to lowest): topicConfig > chatConfig > agent
+  // frontmatter (raw) > defaults. Per-topic permissionMode MUST
+  // override the chat-level one — the principal use case is loosening
+  // an agent's `bypassPermissions` default to `default` for a
+  // sensitive topic that should hit the canUseTool prompts.
+
+  test('topic overrides chat-level model + effort + cwd', () => {
+    const chatConfig = { model: 'sonnet', effort: 'medium', cwd: '/x/chat' };
+    const topic = { model: 'opus', effort: 'high', cwd: '/x/topic' };
+    const opts = composeSdkOptions(chatConfig, null, {}, topic);
+    assert.equal(opts.model, 'opus');
+    assert.equal(opts.effort, 'high');
+    assert.equal(opts.cwd, '/x/topic');
+  });
+
+  test('topic permissionMode overrides chat permissionMode (the principal rc.48 use case)', () => {
+    const chatConfig = { permissionMode: 'bypassPermissions' };
+    const topic = { permissionMode: 'default' };
+    const opts = composeSdkOptions(chatConfig, null, {}, topic);
+    assert.equal(opts.permissionMode, 'default');
+  });
+
+  test('topic permissionMode overrides agent frontmatter too', () => {
+    const chatConfig = {};
+    const agent = {
+      agentName: 'a', skills: [], systemPrompt: null, mcpServers: {},
+      raw: { permissionMode: 'bypassPermissions' },
+    };
+    const topic = { permissionMode: 'default' };
+    const opts = composeSdkOptions(chatConfig, agent, {}, topic);
+    assert.equal(opts.permissionMode, 'default');
+  });
+
+  test('topic with no overrides → composeSdkOptions behaves identically to pre-rc.48', () => {
+    const chatConfig = { model: 'sonnet', cwd: '/x' };
+    const opts = composeSdkOptions(chatConfig, null, {});
+    const optsWithEmptyTopic = composeSdkOptions(chatConfig, null, {}, {});
+    assert.deepEqual(opts, optsWithEmptyTopic);
+  });
+
+  test('topic does NOT inject `agent` key into SdkOptions (polygram-only)', () => {
+    const opts = composeSdkOptions(
+      { model: 'sonnet' },
+      null,
+      {},
+      { agent: 'music-curation', cwd: '/x' },
+    );
+    assert.equal(opts.agent, undefined);
+    assert.equal(opts.cwd, '/x');
+  });
+
+  test('null/undefined topicConfig values do not overwrite chat values', () => {
+    const chatConfig = { model: 'sonnet', cwd: '/keep' };
+    const topic = { model: null, cwd: undefined, effort: 'high' };
+    const opts = composeSdkOptions(chatConfig, null, {}, topic);
+    assert.equal(opts.model, 'sonnet', 'null topic.model must not override chat.model');
+    assert.equal(opts.cwd, '/keep');
+    assert.equal(opts.effort, 'high');
+  });
+
+  test('full layered precedence: topic > chat > agent > defaults', () => {
+    const chatConfig = { model: 'opus' };           // chat wins
+    const agent = {
+      agentName: 'a', skills: [], systemPrompt: null, mcpServers: {},
+      raw: { model: 'haiku', effort: 'low' },        // agent wins for effort (no chat override)
+    };
+    const defaults = { model: 'haiku', effort: 'medium' };
+    const topic = { effort: 'high' };               // topic wins for effort
+    const opts = composeSdkOptions(chatConfig, agent, defaults, topic);
+    assert.equal(opts.model, 'opus', 'chat overrides agent + defaults');
+    assert.equal(opts.effort, 'high', 'topic overrides agent + chat');
+  });
+});
