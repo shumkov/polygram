@@ -3977,8 +3977,19 @@ async function main() {
       let replayed = 0;
       let skipped = 0;
       for (const row of candidates) {
-        if (db.hasOutboundReplyTo({ chat_id: row.chat_id, msg_id: row.msg_id })) {
-          // Already replied — just mark so we don't look at it again.
+        // rc.51: dedupe on turn_metrics (definitive turn completion),
+        // NOT just on hasOutboundReplyTo. The latter trips on
+        // intermediate ack-bubbles (e.g. "Catching up on history…",
+        // "I'll write a quick inline script…") and silently skips the
+        // replay even when the actual answer never arrived. The rc.50
+        // EIO-orphan incident lost Ivan DM msg 12158 this way: an ack
+        // bubble was sent at 13:20:36, the turn was killed mid-flight,
+        // boot-replay saw the ack and assumed "answered."
+        //
+        // turn_metrics is only inserted by the SDK pm's onResult
+        // callback, which fires only when the turn definitively
+        // completes. No row → no completion → re-dispatch.
+        if (db.hasCompletedTurnFor({ chat_id: row.chat_id, msg_id: row.msg_id })) {
           db.setInboundHandlerStatus({
             chat_id: row.chat_id, msg_id: row.msg_id, status: 'replied',
           });

@@ -478,6 +478,44 @@ describe('boot replay dedupe wiring', () => {
     assert.equal(db.hasOutboundReplyTo({ chat_id: '1', msg_id: 9 }), false);
   });
 
+  // rc.51: when an EIO orphan-loop kills a turn after sending only an
+  // intermediate ack-bubble (the rc.50 incident exposed this), boot
+  // replay's hasOutboundReplyTo dedupe sees the ack and skips the replay
+  // — losing the user's actual answer. The fix: gate dedupe on
+  // `turn_metrics`, which is only inserted when a turn definitively
+  // completes. No turn_metrics row → turn never finished → replay.
+  test('hasCompletedTurnFor true when turn_metrics row exists for that msg_id', () => {
+    db.insertTurnMetric({
+      chat_id: '1', msg_id: 158, bot_name: 'b',
+      result_subtype: 'success', duration_ms: 1000,
+    });
+    assert.equal(db.hasCompletedTurnFor({ chat_id: '1', msg_id: 158 }), true);
+    assert.equal(db.hasCompletedTurnFor({ chat_id: '1', msg_id: 159 }), false);
+  });
+
+  test('hasCompletedTurnFor false when turn errored mid-flight', () => {
+    db.insertTurnMetric({
+      chat_id: '1', msg_id: 158, bot_name: 'b',
+      result_subtype: 'error_max_turns', duration_ms: 500, error: 'aborted',
+    });
+    // Turn that errored should NOT count as complete — replay if still in window.
+    assert.equal(db.hasCompletedTurnFor({ chat_id: '1', msg_id: 158 }), false);
+  });
+
+  test('hasCompletedTurnFor distinguishes msg_id within same chat', () => {
+    db.insertTurnMetric({ chat_id: '1', msg_id: 100, bot_name: 'b', result_subtype: 'success', duration_ms: 100 });
+    db.insertTurnMetric({ chat_id: '1', msg_id: 200, bot_name: 'b', result_subtype: 'success', duration_ms: 100 });
+    assert.equal(db.hasCompletedTurnFor({ chat_id: '1', msg_id: 100 }), true);
+    assert.equal(db.hasCompletedTurnFor({ chat_id: '1', msg_id: 200 }), true);
+    assert.equal(db.hasCompletedTurnFor({ chat_id: '1', msg_id: 300 }), false);
+  });
+
+  test('hasCompletedTurnFor scoped per-chat (same msg_id in different chats)', () => {
+    db.insertTurnMetric({ chat_id: '1', msg_id: 5, bot_name: 'b', result_subtype: 'success', duration_ms: 100 });
+    assert.equal(db.hasCompletedTurnFor({ chat_id: '1', msg_id: 5 }), true);
+    assert.equal(db.hasCompletedTurnFor({ chat_id: '2', msg_id: 5 }), false);
+  });
+
   test('hasOutboundReplyTo counts crashed-mid-send rows as replied (avoid double-reply on boot replay)', () => {
     // Polygram crashed after API call but before markOutboundSent.
     // markStalePending swept the row to status='failed' with the
