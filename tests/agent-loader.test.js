@@ -118,6 +118,173 @@ describe('loadAgent', () => {
   });
 });
 
+describe('loadAgent — rc.49 plugin-qualified names', () => {
+  // Background: plugin-bundled agents live at
+  //   ~/.claude/plugins/cache/<plugin>@<marketplace>/<version>/agents/<name>.md
+  // (managed plugins, enrolled in ~/.claude/plugins/installed_plugins.json)
+  //   ~/.claude-plugins-local/<plugin>/agents/<name>.md
+  // (local-only plugins, no marketplace).
+  //
+  // Pre-rc.49 polygram only searched ~/.claude/agents/ and
+  // <cwd>/.claude/agents/, so plugin agents were invisible — the
+  // music-curator agent shipped by the music-curation plugin failed
+  // to load until a manual symlink was created. rc.49 lets polygram
+  // resolve `<plugin>:<agent>` names natively (mirrors Claude Code's
+  // own plugin-qualified syntax, e.g. settings.json's
+  // `"agent": "music-curation:music-curator"`).
+  //
+  // Resolution order for `<plugin>:<agent>`:
+  //   1. Look up <plugin>@<any-marketplace> in
+  //      ~/.claude/plugins/installed_plugins.json → installPath +
+  //      /agents/<agent>.md
+  //   2. Fall back to ~/.claude-plugins-local/<plugin>/agents/<agent>.md
+  // Plain (unqualified) names: keep existing behaviour — no plugin
+  // search, to avoid silent collisions when two plugins ship same-named
+  // agents.
+
+  let tmp;
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-loader-plugin-'));
+    clearCache();
+  });
+
+  function writeInstalledPlugins(homeDir, plugins) {
+    const dir = path.join(homeDir, '.claude', 'plugins');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'installed_plugins.json'),
+      JSON.stringify({ version: 2, plugins }, null, 2),
+    );
+  }
+
+  function writePluginAgent(installPath, agentName, body) {
+    const agentsDir = path.join(installPath, 'agents');
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.writeFileSync(path.join(agentsDir, agentName + '.md'), body);
+  }
+
+  test('resolves <plugin>:<agent> via installed_plugins.json', () => {
+    const installPath = path.join(tmp, 'plugins-cache', 'music-curation', '0.1.0');
+    writeInstalledPlugins(tmp, {
+      'music-curation@local': [{ scope: 'user', installPath, version: '0.1.0' }],
+    });
+    writePluginAgent(installPath, 'music-curator',
+      '---\nname: music-curator\nmodel: sonnet\n---\n\nYou are music-curator.');
+    const b = loadAgent('music-curation:music-curator', { homeDir: tmp });
+    assert.equal(b.systemPrompt.trim(), 'You are music-curator.');
+    assert.equal(b.raw.model, 'sonnet');
+    assert.equal(b.agentName, 'music-curation:music-curator');
+  });
+
+  test('falls back to ~/.claude-plugins-local/<plugin>/agents/ when not in installed_plugins.json', () => {
+    // No installed_plugins.json at all.
+    const localPluginPath = path.join(tmp, '.claude-plugins-local', 'my-local', 'agents');
+    fs.mkdirSync(localPluginPath, { recursive: true });
+    fs.writeFileSync(
+      path.join(localPluginPath, 'helper.md'),
+      '---\nname: helper\nmodel: haiku\n---\n\nLocal plugin helper.',
+    );
+    const b = loadAgent('my-local:helper', { homeDir: tmp });
+    assert.equal(b.systemPrompt.trim(), 'Local plugin helper.');
+    assert.equal(b.raw.model, 'haiku');
+  });
+
+  test('installed_plugins.json takes precedence over .claude-plugins-local/', () => {
+    const installPath = path.join(tmp, 'plugins-cache', 'overlap', '1.0');
+    writeInstalledPlugins(tmp, {
+      'overlap@market': [{ scope: 'user', installPath, version: '1.0' }],
+    });
+    writePluginAgent(installPath, 'helper', 'from cache');
+
+    const localPath = path.join(tmp, '.claude-plugins-local', 'overlap', 'agents');
+    fs.mkdirSync(localPath, { recursive: true });
+    fs.writeFileSync(path.join(localPath, 'helper.md'), 'from local');
+
+    const b = loadAgent('overlap:helper', { homeDir: tmp });
+    assert.equal(b.systemPrompt, 'from cache');
+  });
+
+  test('matches plugin name regardless of @marketplace suffix', () => {
+    // installed_plugins.json keys plugins as "<name>@<marketplace>" but
+    // polygram config writes just "<name>" — the lookup must match by
+    // the bare plugin name.
+    const installPath = path.join(tmp, 'plugins-cache', 'thing', 'unknown');
+    writeInstalledPlugins(tmp, {
+      'thing@some-marketplace': [{ scope: 'user', installPath, version: 'unknown' }],
+    });
+    writePluginAgent(installPath, 'helper', 'plugin agent');
+    const b = loadAgent('thing:helper', { homeDir: tmp });
+    assert.equal(b.systemPrompt, 'plugin agent');
+  });
+
+  test('throws AGENT_NOT_FOUND for unknown plugin', () => {
+    writeInstalledPlugins(tmp, {});
+    assert.throws(
+      () => loadAgent('nonexistent:agent', { homeDir: tmp }),
+      { code: 'AGENT_NOT_FOUND' },
+    );
+  });
+
+  test('throws AGENT_NOT_FOUND when plugin exists but agent file does not', () => {
+    const installPath = path.join(tmp, 'plugins-cache', 'real', '1.0');
+    fs.mkdirSync(installPath, { recursive: true });
+    writeInstalledPlugins(tmp, {
+      'real@local': [{ scope: 'user', installPath, version: '1.0' }],
+    });
+    assert.throws(
+      () => loadAgent('real:missing-agent', { homeDir: tmp }),
+      { code: 'AGENT_NOT_FOUND' },
+    );
+  });
+
+  test('plain unqualified names still resolve via ~/.claude/agents/ (no plugin search)', () => {
+    // Unqualified should NOT silently fall through to a plugin —
+    // collision risk if multiple plugins ship same-named agents.
+    const installPath = path.join(tmp, 'plugins-cache', 'p', '1.0');
+    writeInstalledPlugins(tmp, {
+      'p@local': [{ scope: 'user', installPath, version: '1.0' }],
+    });
+    writePluginAgent(installPath, 'orphan', 'plugin orphan');
+    // No ~/.claude/agents/orphan.md → unqualified lookup must fail.
+    assert.throws(
+      () => loadAgent('orphan', { homeDir: tmp }),
+      { code: 'AGENT_NOT_FOUND' },
+    );
+  });
+
+  test('cache distinguishes qualified vs unqualified names', () => {
+    fs.mkdirSync(path.join(tmp, '.claude', 'agents'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, '.claude', 'agents', 'shared.md'),
+      'user-level shared',
+    );
+    const installPath = path.join(tmp, 'plugins-cache', 'pkg', '1.0');
+    writeInstalledPlugins(tmp, {
+      'pkg@local': [{ scope: 'user', installPath, version: '1.0' }],
+    });
+    writePluginAgent(installPath, 'shared', 'plugin-level shared');
+
+    const a = loadAgent('shared', { homeDir: tmp });
+    const b = loadAgent('pkg:shared', { homeDir: tmp });
+    assert.equal(a.systemPrompt, 'user-level shared');
+    assert.equal(b.systemPrompt, 'plugin-level shared');
+    assert.notEqual(a, b);
+  });
+
+  test('rejects malformed qualified names (path-traversal protection)', () => {
+    writeInstalledPlugins(tmp, {});
+    // Plugin-qualified names should still apply the strict charset
+    // rule on each side of the colon.
+    for (const bad of ['../etc:passwd', 'plugin:../escape', 'a:b:c', ':agent', 'plugin:', '..:..']) {
+      assert.throws(
+        () => loadAgent(bad, { homeDir: tmp }),
+        { code: 'AGENT_NOT_FOUND' },
+        'should reject ' + bad,
+      );
+    }
+  });
+});
+
 describe('composeSdkOptions', () => {
   test('precedence: chatConfig > agent > defaults', () => {
     const chatConfig = { model: 'claude-opus-4-7' };
