@@ -20,6 +20,7 @@ const { Bot } = require('grammy');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const processGuard = require('./lib/process-guard');
 const dbClient = require('./lib/db');
 const { migrateJsonToDb, getClaudeSessionId } = require('./lib/sessions');
 const { buildPrompt } = require('./lib/prompt');
@@ -85,6 +86,7 @@ const SESSIONS_JSON_PATH = path.join(DATA_DIR, 'sessions.json'); // legacy, impo
 const DB_DIR = DATA_DIR;
 // DB_PATH is resolved in main() from --db or <bot>.db default.
 let DB_PATH = null;
+let PID_PATH = null;          // rc.50: orphan-detection PID file
 const STICKERS_PATH = process.env.POLYGRAM_STICKERS
   || path.join(DATA_DIR, 'stickers.json');
 const INBOX_DIR = process.env.POLYGRAM_INBOX || path.join(DATA_DIR, 'inbox');
@@ -3535,6 +3537,17 @@ async function main() {
   DB_PATH = dbOverride || path.join(DB_DIR, `${BOT_NAME}.db`);
   console.log(`[polygram] bot: ${BOT_NAME} (${Object.keys(config.chats).length} chats) db: ${DB_PATH}`);
 
+  // rc.50: claim our PID file BEFORE binding the bot token. If a
+  // prior daemon (orphan from a botched restart) is still running,
+  // SIGTERM/SIGKILL it first. Two daemons sharing one Telegram bot
+  // token + SQLite DB caused the rc.50 incident's user-visible
+  // damage; this stops the cascade at boot.
+  PID_PATH = path.join(DB_DIR, `${BOT_NAME}.pid`);
+  const pidClaim = processGuard.claimPidFile(PID_PATH, { logger: console });
+  if (pidClaim.priorAction !== 'no-prior') {
+    console.log(`[orphan-guard] prior=${pidClaim.priorPid ?? '?'} action=${pidClaim.priorAction}`);
+  }
+
   try {
     db = dbClient.open(DB_PATH);
     console.log(`[db] opened ${DB_PATH}`);
@@ -3560,38 +3573,28 @@ async function main() {
     process.exit(1);
   }
 
-  // 0.8.0 Phase 1 step 11: belt-and-suspenders unhandledRejection
-  // logger. The new pm wraps every Query iteration in try/catch so
-  // SDK throws never leak — but if a callback ever does throw async
-  // (canUseTool body, onResult handler, etc.) the rejection could
-  // escape to the global handler. Without this, Node's default is to
-  // exit the process. With this, we log + persist and keep running
-  // so other chats are unaffected.
-  process.on('unhandledRejection', (reason, promise) => {
-    const reasonStr = reason instanceof Error
-      ? `${reason.message}\n${(reason.stack || '').split('\n').slice(0, 3).join('\n')}`
-      : String(reason);
-    console.error(`[polygram] unhandledRejection: ${reasonStr.slice(0, 1000)}`);
-    try {
-      db.logEvent('unhandled-rejection', {
-        reason: String(reason instanceof Error ? reason.message : reason).slice(0, 500),
-        bot_name: BOT_NAME,
-      });
-    } catch { /* swallow — db might be closing */ }
-  });
-  // Same defensive posture for uncaughtException — Node's default is
-  // exit on these. We want to log + persist + survive (the affected
-  // chat's iteration loop will have rejected its pendings via the
-  // catch in pm's _runIteration, so user-visible UX is "their turn
-  // failed", not "bot died").
-  process.on('uncaughtException', (err) => {
-    console.error(`[polygram] uncaughtException: ${err?.message}\n${err?.stack?.split('\n').slice(0, 5).join('\n')}`);
-    try {
-      db.logEvent('uncaught-exception', {
-        message: String(err?.message || err).slice(0, 500),
-        bot_name: BOT_NAME,
-      });
-    } catch { /* swallow */ }
+  // 0.8.0 Phase 1 step 11 + rc.50: defensive uncaughtException +
+  // unhandledRejection handlers. The new pm wraps every Query
+  // iteration in try/catch so SDK throws never leak — but if a
+  // callback ever does throw async (canUseTool body, onResult
+  // handler, etc.) the rejection could escape. Node's default is
+  // process exit; we log + persist + survive so other chats keep
+  // running.
+  //
+  // rc.50 hardening (after the PID-6335 orphan-storm incident):
+  //   1. Both handlers wrap their loggers in try/catch — pre-rc.50,
+  //      a bare console.error inside the uncaughtException handler
+  //      threw EIO when stdout was wired to a destroyed pty. That
+  //      re-fired the same handler infinitely, hijacking the event
+  //      loop and preventing the SIGHUP shutdown drain from running.
+  //   2. Storm circuit breaker: same message firing >100× in 5s →
+  //      panic exit(2). Lets launchd restart cleanly instead of
+  //      letting the process zombie at ~12k EIO/sec writing to DB.
+  // Lives in lib/process-guard.js.
+  processGuard.installSafetyHandlers({
+    logger: console,
+    logEvent: (kind, detail) => { try { db.logEvent(kind, detail); } catch {} },
+    botName: BOT_NAME,
   });
 
   const cap = config.maxWarmProcesses || DEFAULT_MAX_WARM_PROCS;
@@ -3913,6 +3916,11 @@ async function main() {
     if (db) {
       try { db.logEvent('polygram-stop'); db.raw.close(); } catch {}
     }
+    // rc.50: release our PID file claim so the next boot doesn't try
+    // to kill us. releasePidFile is idempotent and only deletes the
+    // file when its content matches our PID — a new daemon that
+    // already claimed the slot is left alone.
+    if (PID_PATH) processGuard.releasePidFile(PID_PATH);
     setTimeout(() => process.exit(0), 100);
   };
   process.on('SIGINT', shutdown);
