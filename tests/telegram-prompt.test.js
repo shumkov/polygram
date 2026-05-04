@@ -32,13 +32,24 @@ describe('POLYGRAM_DISPLAY_HINT — content', () => {
     assert.match(POLYGRAM_DISPLAY_HINT, /Telegram/);
   });
 
-  test('tells the agent to drop the table when too wide', () => {
-    assert.match(POLYGRAM_DISPLAY_HINT, /drop the table/i);
+  test('uses imperative MUST NOT for the table rule (rc.53)', () => {
+    // rc.53: previous wording ("drop the table", "switch to row blocks")
+    // was descriptive guidance. Sonnet ignored it on long agent prompts
+    // (umi-assistant 7.7k tokens — display hint at the tail). The new
+    // rule is imperative so the model treats it as binding, not advice.
+    assert.match(POLYGRAM_DISPLAY_HINT, /MUST NOT/);
   });
 
-  test('describes the vertical row-block fallback', () => {
-    assert.match(POLYGRAM_DISPLAY_HINT, /vertical/i);
+  test('describes the row-block fallback with bold headline', () => {
+    assert.match(POLYGRAM_DISPLAY_HINT, /row blocks/i);
     assert.match(POLYGRAM_DISPLAY_HINT, /\*\*[^*]+\*\*/);   // bold headline example
+  });
+
+  test('addresses the "user is on desktop" loophole', () => {
+    // rc.53: explicitly close the rationalization vector — model can't
+    // think "this user is on desktop today, table is fine" because
+    // tables fail on phone regardless and surface affinity flips.
+    assert.match(POLYGRAM_DISPLAY_HINT, /desktop/i);
   });
 
   test('TELEGRAM_TABLE_WIDTH_BUDGET is a positive integer', () => {
