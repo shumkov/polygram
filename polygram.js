@@ -65,6 +65,7 @@ const { redactBotToken } = require('./lib/net-errors');
 const { createReactionManager, classifyToolName } = require('./lib/status-reactions');
 const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
 const { classify: classifyError, isTransientHttpError } = require('./lib/error-classify');
+const { createAutoResumeTracker, isAutoResumable } = require('./lib/auto-resume');
 const {
   createStore: createApprovalsStore,
   matchesAnyPattern: matchesApprovalPattern,
@@ -1118,6 +1119,94 @@ const abortGrace = createAbortGrace();
 function markSessionAborted(sessionKey) { abortGrace.mark(sessionKey); }
 function isSessionRecentlyAborted(sessionKey) { return abortGrace.isRecent(sessionKey); }
 
+// rc.54: per-session cooldown for auto-resume on 300s no-activity
+// timeout. Without the cooldown, a permanently-wedged tool would
+// trigger an infinite resume → timeout → resume loop.
+const autoResumeTracker = createAutoResumeTracker();
+
+// rc.54: spawn a fresh Query resuming the same session_id and ask
+// Claude to continue the timed-out work. The killed pm Query has
+// already torn down the wedged subprocess (via pm.kill on timeout);
+// getOrSpawnForChat creates a new entry that picks up the saved
+// session_id from `sessions` table and sets `--resume <id>` on the
+// SDK Options. The continuation message tells Claude what happened
+// and that it has full prior context to keep going.
+//
+// Returns the result.text on success (already-sent to chat); throws
+// on any failure (caller writes auto-resume-failed event + falls
+// back to the standard timeout reply).
+async function attemptAutoResume(sessionKey, chatId, originalMsg, bot) {
+  const threadId = originalMsg.message_thread_id || null;
+  // 1. Tell the user we're auto-resuming so they don't think nothing
+  //    happened. Threaded under the original user message.
+  await tg(bot, 'sendMessage', {
+    chat_id: chatId,
+    text: '🔁 Auto-resuming after timeout — continuing where the previous turn left off.',
+    reply_parameters: { message_id: originalMsg.message_id },
+    ...(threadId && { message_thread_id: threadId }),
+  }, { source: 'auto-resume-indicator', botName: BOT_NAME }).catch((sendErr) => {
+    // Indicator is informational; don't fail the whole resume on it.
+    console.error(`[${sessionKey}] auto-resume indicator send failed: ${sendErr.message}`);
+  });
+
+  // 2. Continuation prompt. Plain text — no XML wrapper. The SDK
+  //    Query resumes the saved session_id, so Claude has full prior
+  //    transcript context including its own partially-streamed text
+  //    and tool calls. We just need to tell it WHAT happened and
+  //    that it should pick up where it left off.
+  const continuation = '[polygram] Your previous turn timed out at 300s with no Claude activity (likely a wedged tool call — long Bash, hanging MCP, or stuck subagent). Continue from where you left off; do not restart from scratch. If the same operation would just hang again, abort it and tell me.';
+
+  // 3. No-op streamer + reactor. We don't need to stream the resume
+  //    turn's response (we'll send it as one message at the end). pm
+  //    invokes streamer/reactor methods only when present; passing
+  //    minimal stubs keeps pm happy.
+  const noopStreamer = {
+    onChunk: async () => {},
+    forceNewMessage: () => {},
+    finalize: async () => ({ streamed: false }),
+    flushDraft: async () => {},
+    discard: async () => {},
+  };
+  const noopReactor = {
+    setState: () => {},
+    heartbeat: () => {},
+    clear: async () => {},
+    stop: () => {},
+  };
+
+  const result = await sendToProcess(sessionKey, continuation, {
+    streamer: noopStreamer,
+    reactor: noopReactor,
+    sourceMsgId: originalMsg.message_id,
+    threadId,
+    onFirstStream: () => {},
+  });
+
+  if (result?.error) {
+    throw new Error(`auto-resume turn errored: ${String(result.error).slice(0, 200)}`);
+  }
+  if (!result?.text) {
+    throw new Error('auto-resume turn produced no text');
+  }
+
+  // 4. Send the continuation reply as regular Telegram message(s),
+  //    threaded under the original user message. Reuse the existing
+  //    chunked-delivery + markdown-formatting primitives.
+  const chunks = chunkMarkdownText(result.text, TG_MAX_LEN);
+  await deliverReplies({
+    bot,
+    send: (b, method, params, m) => tg(b, method, params, m),
+    chatId,
+    threadId,
+    chunks,
+    replyToMessageId: originalMsg.message_id,
+    meta: { source: 'auto-resume-reply', botName: BOT_NAME },
+    logger: { error: (m) => console.error(`[${sessionKey}] auto-resume deliver: ${m}`) },
+  });
+
+  return result.text;
+}
+
 // Called by bot.on('message') for every regular (non-admin, non-pair)
 // message. Runs handleMessage in a fire-and-forget manner with centralised
 // error handling. Replaces the old processQueue loop.
@@ -1170,6 +1259,49 @@ function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
     //    re-dispatch it on next start)
     //  - user just /stop'd (already saw their abort acknowledgement)
     if (!wasAborted && !isReplay && !isShuttingDown) {
+      // rc.54: auto-resume on 300s no-activity timeout. Spawn a fresh
+      // Query resuming the same session_id and inject a continuation
+      // nudge. This recovers from wedged tool calls (long Bash, hung
+      // MCP, stuck subagent) that polygram's watchdog catches but
+      // currently leaves the user stranded with "try resending".
+      // Skipped when the failed turn was ITSELF an auto-resume
+      // (msg._isAutoResume) to prevent recursion; per-session
+      // cooldown blocks tight loops on permanent wedges.
+      const isResumeTurn = msg._isAutoResume === true;
+      const resumable = !isResumeTurn && isAutoResumable({
+        error: err, aborted: wasAborted, replay: isReplay, shuttingDown: isShuttingDown,
+      });
+      if (resumable && !autoResumeTracker.isInCooldown(sessionKey)) {
+        autoResumeTracker.markAttempt(sessionKey);
+        logEvent('auto-resume-attempted', {
+          chat_id: chatId, session_key: sessionKey, msg_id: msg.message_id,
+          original_error: err.message?.slice(0, 200),
+        });
+        attemptAutoResume(sessionKey, chatId, msg, bot)
+          .then(() => {
+            logEvent('auto-resume-success', {
+              chat_id: chatId, session_key: sessionKey, msg_id: msg.message_id,
+            });
+            autoResumeTracker.clear(sessionKey);
+          })
+          .catch((resumeErr) => {
+            console.error(`[${sessionKey}] auto-resume failed: ${resumeErr?.message}`);
+            logEvent('auto-resume-failed', {
+              chat_id: chatId, session_key: sessionKey, msg_id: msg.message_id,
+              error: resumeErr?.message?.slice(0, 200),
+            });
+            // Fall back to the original error reply so the user isn't
+            // left with just the 🔁 indicator and no answer.
+            const fallbackText = errorReplyText(err);
+            if (fallbackText) {
+              tg(bot, 'sendMessage', {
+                chat_id: chatId, text: fallbackText,
+                reply_parameters: { message_id: msg.message_id },
+              }, { source: 'error-reply', botName: BOT_NAME }).catch(() => {});
+            }
+          });
+        return;
+      }
       // 0.7.7: errorReplyText may return null when the classifier
       // says "suppress reply" (e.g. INTERRUPTED inside abort grace —
       // user already saw their /stop ack). Skip the send call in
