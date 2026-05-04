@@ -213,8 +213,8 @@ describe('formatContextReply — categories', () => {
 });
 
 describe('maybeContextFullHint — threshold behaviour', () => {
-  test('returns null below threshold', () => {
-    assert.equal(maybeContextFullHint({ percentage: 84 }), null);
+  test('returns null below default threshold (rc.56: 70)', () => {
+    assert.equal(maybeContextFullHint({ percentage: 69 }), null);
     assert.equal(maybeContextFullHint({ percentage: 50 }), null);
     assert.equal(maybeContextFullHint({ percentage: 0 }), null);
   });
@@ -222,10 +222,10 @@ describe('maybeContextFullHint — threshold behaviour', () => {
   test('returns hint exactly at threshold', () => {
     const hint = maybeContextFullHint({ percentage: HINT_THRESHOLD_PCT });
     assert.ok(hint);
-    assert.match(hint, /85% full/);
+    assert.match(hint, new RegExp(`${HINT_THRESHOLD_PCT}% full`));
   });
 
-  test('returns hint above threshold', () => {
+  test('returns hint above default threshold', () => {
     const hint = maybeContextFullHint({ percentage: 92 });
     assert.ok(hint);
     assert.match(hint, /92% full/);
@@ -259,16 +259,48 @@ describe('maybeContextFullHint — threshold behaviour', () => {
   });
 
   test('rc.4 anti-regression: percentage is 0-100 scale, not 0-1', () => {
-    // If somebody re-introduces the bug where 0.85 is treated as 85%,
-    // this test fails: 0.85 < 85 means below threshold.
-    assert.equal(maybeContextFullHint({ percentage: 0.85 }), null);
-    // And a value of 85 (the actual scale) does fire.
-    assert.ok(maybeContextFullHint({ percentage: 85 }));
+    // If somebody re-introduces the bug where 0.7 is treated as 70%,
+    // this test fails: 0.7 < 70 means below threshold.
+    assert.equal(maybeContextFullHint({ percentage: 0.7 }), null);
+    // And a value of 70 (the actual scale) does fire.
+    assert.ok(maybeContextFullHint({ percentage: 70 }));
+  });
+});
+
+describe('maybeContextFullHint — rc.56 configurable threshold', () => {
+  // rc.56: caller can override the default 70% via { threshold }.
+  // Use case: per-bot or per-chat tuning — operators can set 60% for
+  // chats with chunky tool turns or 80% if they're OK with the warning
+  // being late. polygram resolves the value from
+  // chatConfig.contextHintThreshold > config.bot.contextHintThreshold
+  // > undefined → default 70%.
+
+  test('custom threshold higher than default — fires at custom only', () => {
+    assert.equal(maybeContextFullHint({ percentage: 75 }, { threshold: 80 }), null);
+    assert.ok(maybeContextFullHint({ percentage: 80 }, { threshold: 80 }));
+  });
+
+  test('custom threshold lower than default — fires at custom', () => {
+    assert.equal(maybeContextFullHint({ percentage: 49 }, { threshold: 50 }), null);
+    assert.ok(maybeContextFullHint({ percentage: 50 }, { threshold: 50 }));
+    // At 60, default-70 would NOT fire, but custom-50 does.
+    assert.ok(maybeContextFullHint({ percentage: 60 }, { threshold: 50 }));
+    assert.equal(maybeContextFullHint({ percentage: 60 }), null);
+  });
+
+  test('opts undefined falls back to default threshold', () => {
+    assert.equal(maybeContextFullHint({ percentage: 69 }), null);
+    assert.equal(maybeContextFullHint({ percentage: 69 }, undefined), null);
+    assert.ok(maybeContextFullHint({ percentage: 70 }));
+  });
+
+  test('threshold:0 fires at any non-zero usage (degenerate but valid)', () => {
+    assert.ok(maybeContextFullHint({ percentage: 1 }, { threshold: 0 }));
   });
 });
 
 describe('HINT_THRESHOLD_PCT', () => {
-  test('exported constant is 85', () => {
-    assert.equal(HINT_THRESHOLD_PCT, 85);
+  test('exported default is 70 (rc.56 lowered from 85)', () => {
+    assert.equal(HINT_THRESHOLD_PCT, 70);
   });
 });

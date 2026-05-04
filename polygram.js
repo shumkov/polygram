@@ -2859,14 +2859,22 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // result, the followup messages (if any) get their own SDK
       // pause to absorb at, no special handling needed.
 
-      // 0.8.0 Phase 2 step 4: 85%-context-full live hint. After a
+      // 0.8.0 Phase 2 step 4: context-full live hint. After a
       // successful turn, peek at SDK's getContextUsage(); if past
-      // 85%, post a quiet hint so the user knows /new will help.
-      // SDK pm only — CLI pm has no equivalent (no Query object,
-      // no getContextUsage). OPT-IN per-chat or per-bot
-      // (rc.12+) — most chats don't want the noise. Per-chat takes
+      // the threshold, post a quiet hint so the user knows /new
+      // will help. SDK pm only — CLI pm has no equivalent (no
+      // Query object, no getContextUsage). OPT-IN per-chat or
+      // per-bot — most chats don't want the noise. Per-chat takes
       // precedence over per-bot so admins (Ivan DM) can opt in
       // without forcing it on every other chat.
+      //
+      // rc.56: threshold default lowered to 70% (was 85%) because
+      // the SDK auto-compacts mid-turn at ~85% — by the time
+      // polygram queries getContextUsage post-turn, the percentage
+      // has already dropped and the hint never fires. 70% gives
+      // the user 1-3 turns of headroom before SDK compaction.
+      // Configurable via `contextHintThreshold` (number, 0-100)
+      // per-chat or per-bot. Same precedence rule as contextHint.
       const chatCtxHint = chatConfig.contextHint != null
         ? chatConfig.contextHint
         : config.bot?.contextHint;
@@ -2874,8 +2882,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         const entry = pm.get(sessionKey);
         const q = entry?.query;
         if (q && typeof q.getContextUsage === 'function') {
+          const threshold = chatConfig.contextHintThreshold != null
+            ? chatConfig.contextHintThreshold
+            : (config.bot?.contextHintThreshold != null
+              ? config.bot.contextHintThreshold
+              : undefined);
           q.getContextUsage().then((usage) => {
-            const text = maybeContextFullHint(usage);
+            const text = maybeContextFullHint(usage, threshold != null ? { threshold } : undefined);
             if (!text) return;
             return tg(bot, 'sendMessage', {
               chat_id: chatId,
