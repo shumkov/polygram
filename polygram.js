@@ -1252,6 +1252,28 @@ function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
       aborted: wasAborted || undefined,
       replay: isReplay || undefined,
     });
+    // rc.55: surface replay failures with a meaningful message. Pre-rc.55
+    // any boot-replay turn that failed for ANY reason was silently dropped
+    // (the original logic assumed "user typed this minutes ago and moved
+    // on"). But the rc.51-onward boot-replay path is a recovery primitive,
+    // not stale-message handling — when it fails, the user IS still waiting
+    // for their answer. The Shumabit@UMI thread :24 wall-clock incident on
+    // 2026-05-04 hit exactly this: original turn SIGHUP'd by deploy → boot-
+    // replay redispatched → replay hit 1800s wall-clock → user saw nothing
+    // and didn't know their work had been lost.
+    //
+    // Now: send a tailored message on replay failures. Still suppress when
+    // the replay itself was killed by ANOTHER shutdown (the next boot will
+    // redispatch — same logic as before, just narrower).
+    if (isReplay && !wasAborted && !isShuttingDown) {
+      tg(bot, 'sendMessage', {
+        chat_id: chatId,
+        text: '⚠️ This turn was interrupted and didn\'t complete on retry — please rephrase or simplify, or split into smaller steps.',
+        reply_parameters: { message_id: msg.message_id },
+      }, { source: 'error-reply', botName: BOT_NAME }).catch((replyErr) => {
+        console.error(`[${sessionKey}] failed to send replay-failure reply: ${replyErr.message}`);
+      });
+    }
     // Suppress the user-facing error reply when:
     //  - boot replay (user typed this minutes ago and moved on)
     //  - polygram is shutting down (the failure is "Process killed" /
@@ -3075,19 +3097,33 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // without the scary "⚠ stream interrupted" banner. The user has already
     // seen their "Остановлено." ack; adding a warning to the partial bubble
     // just reads as "something crashed".
+    //
+    // rc.55: SAME quiet-finalize path during shutdown. Pre-rc.55 a deploy
+    // that landed mid-turn appended "⚠ stream interrupted" to whatever
+    // had streamed so far — the user saw a scary symbol every time we
+    // kickstart-k'd. polygram's boot-replay (rc.51) redispatches the
+    // turn from the same session_id, so the recovery is automatic; the
+    // user shouldn't be told "we crashed". Skip the suffix; let the
+    // partial bubble stand silently. The redispatched turn streams a
+    // fresh bubble with the full answer below.
     const abortedByUser = isSessionRecentlyAborted(sessionKey);
-    if (abortedByUser) {
+    const quietFinalize = abortedByUser || isShuttingDown;
+    if (quietFinalize) {
       await streamer.finalize('').catch(() => {});
-      // 0.8.0-rc.13: clear the in-flight emoji on abort so the user
-      // sees a clean message after their /stop ack — pre-rc.13 the
-      // last 👀 / 🤔 / ✍ stayed stuck on the message indefinitely
-      // because reactor.stop() (in finally) only kills timers, not
-      // the visible reaction. We DON'T set 🤯/😨 (those are for
-      // unexpected errors); the user just wants their stop honored.
-      await reactor.clear().catch(() => {});
-      // rc.14: clear ✍ on autosteered followups too (per-msg
-      // reactors are already GC'd in their own handleMessage scopes).
-      await clearAutosteeredReactions(sessionKey).catch(() => {});
+      if (abortedByUser) {
+        // 0.8.0-rc.13: clear the in-flight emoji on abort so the user
+        // sees a clean message after their /stop ack — pre-rc.13 the
+        // last 👀 / 🤔 / ✍ stayed stuck on the message indefinitely
+        // because reactor.stop() (in finally) only kills timers, not
+        // the visible reaction. We DON'T set 🤯/😨 (those are for
+        // unexpected errors); the user just wants their stop honored.
+        await reactor.clear().catch(() => {});
+        // rc.14: clear ✍ on autosteered followups too (per-msg
+        // reactors are already GC'd in their own handleMessage scopes).
+        await clearAutosteeredReactions(sessionKey).catch(() => {});
+      }
+      // On shutdown, leave the reactor state as-is — boot-replay's
+      // fresh dispatch will set its own reactor.
     } else {
       await streamer.finalize('', { errorSuffix: 'stream interrupted' }).catch(() => {});
       if (/wall-clock ceiling|idle with no Claude activity/i.test(err?.message || '')) {
