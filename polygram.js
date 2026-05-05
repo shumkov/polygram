@@ -4043,10 +4043,48 @@ async function main() {
         : config.bot?.announceCompact === false;
       if (optOut) return;
       const threadId = entry.threadId || undefined;
+
+      // rc.62: word the message based on what actually happened.
+      // Pre-rc.62 we said "💭 Catching up on history, one moment…"
+      // for every compact_boundary — but the event fires AFTER
+      // compaction completed, not during. The "one moment…" wording
+      // implied more work was coming, leaving the user confused
+      // when nothing followed. Now: distinguish manual vs auto and
+      // surface the actual compression ratio.
+      const meta = msg?.compact_metadata || {};
+      const trigger = meta.trigger;        // 'manual' | 'auto'
+      const preTokens = meta.pre_tokens;
+      const postTokens = meta.post_tokens;
+      const durationMs = meta.duration_ms;
+      const fmtTok = (n) => {
+        if (n == null) return null;
+        if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+        return String(n);
+      };
+      const ratio = (preTokens && postTokens) ? `${fmtTok(preTokens)} → ${fmtTok(postTokens)}` : null;
+      const duration = durationMs ? `${(durationMs / 1000).toFixed(1)}s` : null;
+      const stats = [ratio, duration].filter(Boolean).join(', ');
+
+      let text;
+      if (trigger === 'manual') {
+        // /compact — the user explicitly asked. Compaction is DONE,
+        // session is idle, ready for next message.
+        text = stats
+          ? `✅ Compacted (${stats}). Ready for your next message.`
+          : `✅ Compacted. Ready for your next message.`;
+      } else {
+        // Auto-compaction (mid-turn). The agent is continuing, this
+        // is just informational — show that something happened
+        // without implying "wait, more is coming."
+        text = stats
+          ? `💭 Auto-compacted (${stats}). Continuing…`
+          : `💭 Auto-compacted. Continuing…`;
+      }
+
       try {
         await tg(bot, 'sendMessage', {
           chat_id: entry.chatId,
-          text: '💭 Catching up on history, one moment…',
+          text,
           ...(threadId ? { message_thread_id: threadId } : {}),
         }, { source: 'compact-boundary', botName: BOT_NAME });
       } catch (err) {
