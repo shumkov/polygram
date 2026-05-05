@@ -1126,6 +1126,13 @@ function isSessionRecentlyAborted(sessionKey) { return abortGrace.isRecent(sessi
 // trigger an infinite resume → timeout → resume loop.
 const autoResumeTracker = createAutoResumeTracker();
 
+// rc.59: once-per-cycle gate for the contextHint. A session is added
+// to this Set when the hint fires, removed when the SDK emits
+// compact_boundary (so the next cycle can fire its own hint). Without
+// this gate, a chat over-threshold would see the hint on every turn
+// until auto-compact — noisy enough that Ivan called it out.
+const contextHintShown = new Set();
+
 // rc.54: spawn a fresh Query resuming the same session_id and ask
 // Claude to continue the timed-out work. The killed pm Query has
 // already torn down the wedged subprocess (via pm.kill on timeout);
@@ -2223,6 +2230,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       catch (err) { console.error(`[${label}] kill on ${text}: ${err.message}`); }
       try { db.clearSessionId(sessionKey); } catch { /* swallow */ }
     }
+    // rc.59: clear contextHint once-per-cycle gate so a freshly-reset
+    // session can fire its own hint when context fills up again.
+    contextHintShown.delete(sessionKey);
     logEvent('session-reset-command', {
       chat_id: chatId, command: text, drained_pendings: drained,
       user: cmdUser, user_id: cmdUserId,
@@ -2887,7 +2897,14 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       const chatCtxHint = chatConfig.contextHint != null
         ? chatConfig.contextHint
         : config.bot?.contextHint;
-      if (pm.isSdkFor(sessionKey) && chatCtxHint === true) {
+      // rc.59: gate the hint to once-per-cycle. Pre-rc.59 the hint
+      // fired on EVERY turn that landed over threshold — so a user
+      // saw "📚 70% full…" then "71% full…" then "72% full…"
+      // turn after turn until compaction. Now: fire once when the
+      // session first crosses the threshold, mark the flag, suppress
+      // subsequent fires. Cleared on compact-boundary so the next
+      // cycle (if it crosses again) will fire fresh.
+      if (pm.isSdkFor(sessionKey) && chatCtxHint === true && !contextHintShown.has(sessionKey)) {
         const entry = pm.get(sessionKey);
         const q = entry?.query;
         if (q && typeof q.getContextUsage === 'function') {
@@ -2899,6 +2916,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           q.getContextUsage().then((usage) => {
             const text = maybeContextFullHint(usage, threshold != null ? { threshold } : undefined);
             if (!text) return;
+            // Mark BEFORE the send so concurrent turns don't all
+            // fire the hint while the first one's still in flight.
+            contextHintShown.add(sessionKey);
             return tg(bot, 'sendMessage', {
               chat_id: chatId,
               text,
@@ -3987,6 +4007,13 @@ async function main() {
     // care about "compaction" or "tokens"; they just want to know
     // the bot didn't hang.
     onCompactBoundary: async (sessionKey, msg, entry) => {
+      // rc.59: clear the contextHint once-per-cycle gate. After
+      // compaction, context drops below threshold; if it climbs back
+      // up the next cycle should fire a fresh hint. Without this
+      // clear, a session that fired its hint pre-compact would never
+      // fire again for the rest of the daemon's life.
+      contextHintShown.delete(sessionKey);
+
       const chatCfg = config.chats[entry.chatId] || {};
       const optOut = chatCfg.announceCompact != null
         ? chatCfg.announceCompact === false
