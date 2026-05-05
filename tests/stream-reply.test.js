@@ -518,3 +518,180 @@ describe('streamer.getArchived() — rc.44 preserveIntermediateBubbles=false (op
     assert.deepEqual(h.s.getArchived(), []);
   });
 });
+
+// rc.67: transformText option pre-processes every chunk BEFORE the
+// streamer commits it via send/edit. polygram passes
+// stripInlineTags(...) so [sticker:NAME] / [react:EMOJI] never reach the
+// bubble or the messages.text DB row, removing the leak path observed at
+// msg 205 (Shumabit@UMI :24, 2026-05-05 11:30) where finalize's no-op
+// branch left a streamed bubble with the literal tag visible.
+describe('createStreamer — transformText option (rc.67)', () => {
+  function makeHarnessWithTransform({ transformText, minChars = 10 } = {}) {
+    const sent = [];
+    const edits = [];
+    let now = 0;
+    const timers = [];
+
+    const s = createStreamer({
+      send: async (text) => {
+        const id = 100 + sent.length;
+        sent.push({ id, text });
+        return { message_id: id };
+      },
+      edit: async (msgId, text) => { edits.push({ msgId, text }); },
+      minChars,
+      throttleMs: 500,
+      transformText,
+      clock: () => now,
+      schedule: (fn, delay) => {
+        const t = { fn, fireAt: now + delay };
+        timers.push(t);
+        return t;
+      },
+      cancel: (t) => {
+        const i = timers.indexOf(t);
+        if (i !== -1) timers.splice(i, 1);
+      },
+      logger: silent,
+    });
+
+    async function advance(ms) {
+      now += ms;
+      const due = timers.filter((t) => t.fireAt <= now);
+      for (const t of due) {
+        const i = timers.indexOf(t);
+        if (i !== -1) timers.splice(i, 1);
+        await t.fn();
+      }
+    }
+
+    return { s, sent, edits, advance };
+  }
+
+  test('initial send receives transformed text — bubble never sees raw tag', async () => {
+    const h = makeHarnessWithTransform({
+      transformText: (t) => t.replace(/\[sticker:working\]/g, '').trim(),
+    });
+    await h.s.onChunk('On it — adding ฿ prefix, rebuilding, uploading. [sticker:working]');
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.sent[0].text, 'On it — adding ฿ prefix, rebuilding, uploading.');
+    assert.doesNotMatch(h.sent[0].text, /\[sticker:/);
+  });
+
+  test('subsequent edits receive transformed text', async () => {
+    const h = makeHarnessWithTransform({
+      transformText: (t) => t.replace(/\[react:[^\]]+\]/g, '').trim(),
+    });
+    await h.s.onChunk('Working on it');
+    await h.s.onChunk('Working on it — almost done [react:👍]');
+    await h.advance(1000);
+    assert.equal(h.edits.length, 1);
+    assert.equal(h.edits[0].text, 'Working on it — almost done');
+    assert.doesNotMatch(h.edits[0].text, /\[react:/);
+  });
+
+  test('finalize body is transformed too — currentText match becomes a no-op', async () => {
+    // The leak scenario: agent emits the WHOLE reply in one chunk with a
+    // tag at the end. Without transformText the streamer sends raw text,
+    // and finalize's body-vs-currentText comparison is the wrong axis (it
+    // compares cleaned-vs-raw which differs even though the user already
+    // sees raw). With transformText, both sides are clean, finalize takes
+    // the no-op branch CORRECTLY because the bubble truly is final.
+    const stripTags = (t) => t.replace(/\[sticker:working\]/g, '').trim();
+    const h = makeHarnessWithTransform({ transformText: stripTags, minChars: 1 });
+    await h.s.onChunk('Done [sticker:working]');
+    const fin = await h.s.finalize('Done');
+    assert.equal(fin.streamed, true);
+    assert.equal(fin.finalEditOk, true);
+    assert.equal(h.edits.length, 0);
+    assert.equal(h.sent[0].text, 'Done');
+  });
+
+  test('finalize transforms its finalText argument too (defense in depth)', async () => {
+    // If a caller accidentally passes raw text to finalize (regression in
+    // polygram.js), transformText still scrubs it before the edit. This
+    // is the belt-and-suspenders guarantee: even with one site forgetting
+    // to strip, the bubble stays clean.
+    const stripTags = (t) => t.replace(/\[sticker:working\]/g, '').trim();
+    const h = makeHarnessWithTransform({ transformText: stripTags });
+    await h.s.onChunk('Done [sticker:working] streaming text long enough');
+    const fin = await h.s.finalize('Done [sticker:working] final body');
+    assert.equal(fin.streamed, true);
+    assert.doesNotMatch(fin.finalText, /\[sticker:/);
+    if (h.edits.length > 0) {
+      assert.doesNotMatch(h.edits[h.edits.length - 1].text, /\[sticker:/);
+    }
+  });
+
+  test('omitting transformText defaults to identity — back-compat', async () => {
+    const h = makeHarnessWithTransform({});
+    await h.s.onChunk('Plain text without any tags');
+    assert.equal(h.sent[0].text, 'Plain text without any tags');
+  });
+
+  test('transformText returning empty under minChars keeps streamer idle', async () => {
+    // If the entire chunk was just a tag, transformed text is empty.
+    // Streamer should NOT send a blank bubble — it stays idle. Caller
+    // (polygram.js) handles the empty-text-only-sticker case via the
+    // non-streamed path with parsed.stickers.
+    const h = makeHarnessWithTransform({
+      minChars: 10,
+      transformText: (t) => t.replace(/\[sticker:working\]/g, '').trim(),
+    });
+    await h.s.onChunk('[sticker:working]');
+    assert.equal(h.sent.length, 0, 'streamer sent a bubble for empty transformed text');
+    assert.equal(h.s.state, 'idle');
+  });
+
+  test('transformText is applied on each onChunk — no double-strip drift', async () => {
+    let calls = 0;
+    const stripTags = (t) => {
+      calls += 1;
+      return t.replace(/\[sticker:working\]/g, '').trim();
+    };
+    const h = makeHarnessWithTransform({ transformText: stripTags });
+    await h.s.onChunk('First chunk text long enough');
+    await h.s.onChunk('First chunk text long enough plus [sticker:working] more');
+    await h.advance(1000);
+    assert.ok(calls >= 2, 'transformText should run on each onChunk');
+    if (h.edits.length > 0) {
+      assert.doesNotMatch(h.edits[h.edits.length - 1].text, /\[sticker:/);
+    }
+  });
+
+  test('msg 205 reproduction — full flow', async () => {
+    const stickerMap = { working: 'CAACAgIAAxkBAAEworking' };
+    const { stripInlineTags } = require('../lib/parse-response');
+    const h = makeHarnessWithTransform({
+      transformText: (t) => stripInlineTags(t, { stickerMap }),
+    });
+    const raw = 'On it — adding ฿ prefix, rebuilding, uploading, and sending. [sticker:working]';
+    await h.s.onChunk(raw);
+    assert.equal(h.sent.length, 1);
+    assert.doesNotMatch(h.sent[0].text, /\[sticker:/);
+    assert.equal(
+      h.sent[0].text,
+      'On it — adding ฿ prefix, rebuilding, uploading, and sending.',
+    );
+    const fin = await h.s.finalize(
+      'On it — adding ฿ prefix, rebuilding, uploading, and sending.',
+    );
+    assert.equal(fin.finalEditOk, true);
+    assert.equal(h.edits.length, 0);
+  });
+
+  test('[react:👍] gdocs reply — full flow, no edit needed at finalize', async () => {
+    const { stripInlineTags } = require('../lib/parse-response');
+    const h = makeHarnessWithTransform({
+      transformText: (t) => stripInlineTags(t, { stickerMap: {} }),
+    });
+    const raw = 'Done. The main addition is a Safe Rewrite Workflow section.\n\n[react:👍]';
+    await h.s.onChunk(raw);
+    assert.doesNotMatch(h.sent[0].text, /\[react:/);
+    const fin = await h.s.finalize(
+      'Done. The main addition is a Safe Rewrite Workflow section.',
+    );
+    assert.equal(fin.finalEditOk, true);
+    assert.equal(h.edits.length, 0);
+  });
+});

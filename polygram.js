@@ -1377,9 +1377,23 @@ const stdinLock = createAsyncLock();
 // mimicking the format as plain text. Without the new branch the
 // placeholder was rendered verbatim in the chat instead of swapped for
 // the actual sticker.
-const { parseResponse: parseResponseImpl } = require('./lib/parse-response');
+const {
+  parseResponse: parseResponseImpl,
+  stripInlineTags: stripInlineTagsImpl,
+} = require('./lib/parse-response');
 function parseResponse(text) {
   return parseResponseImpl(text, { stickerMap, emojiToSticker });
+}
+// rc.67: pre-processor for the streamer. Strips recognised inline
+// `[sticker:NAME]` and any `[react:EMOJI]` tags BEFORE the chunk is
+// committed to the bubble + DB row, so the user never sees a literal
+// tag even when the turn-end finalize path doesn't manage to clean it
+// (interrupt, error, hung query, edit failure, or the stickerMap-miss
+// no-op branch). parseResponse continues to surface the same tags in
+// `parsed.stickers[]` / `parsed.reactions[]` for outbound dispatch via
+// sendInlineStickers / sendInlineReactions.
+function stripInlineTagsForStreamer(text) {
+  return stripInlineTagsImpl(text, { stickerMap });
 }
 
 // ─── Cron/IPC send ─────────────────────────────────────────────────
@@ -2572,6 +2586,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // code path. For short responses the streamer stays idle and we fall
   // through to the normal send path via finalize() returning streamed=false.
   const streamer = createStreamer({
+    // rc.67: pre-process every chunk to strip recognised
+    // [sticker:NAME] / [react:EMOJI] tags BEFORE the bubble or DB row
+    // captures them. See stripInlineTagsForStreamer above.
+    transformText: stripInlineTagsForStreamer,
     send: async (text) => {
       const params = {
         chat_id: chatId, text,

@@ -11,7 +11,10 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { parseResponse, STICKER_TAG_RE, STICKER_TAG_INLINE_RE } = require('../lib/parse-response');
+const {
+  parseResponse, STICKER_TAG_RE, STICKER_TAG_INLINE_RE,
+  stripInlineTags,
+} = require('../lib/parse-response');
 
 const stickerMap = {
   working: 'CAACAgIAAxkBAAEworking',
@@ -365,5 +368,118 @@ describe('parseResponse — rc.63 [react:EMOJI] inline reaction tags', () => {
     assert.deepEqual(parseResponse('🔥', {}).reactions, []);
     assert.deepEqual(parseResponse('[sticker:foo]', { stickerMap: { foo: 'X' } }).reactions, []);
     assert.deepEqual(parseResponse('🔥', { emojiToSticker: { '🔥': 'X' } }).reactions, []);
+  });
+});
+
+// rc.67: stripInlineTags is the streamer-side pre-processor that removes
+// recognised `[sticker:NAME]` and any `[react:EMOJI]` tags BEFORE the text
+// is sent to Telegram. parseResponse remains the turn-end extractor that
+// surfaces the same tags in `stickers[]` / `reactions[]` for outbound
+// dispatch. Decoupling these two roles fixes the leak observed at msg 205
+// (Shumabit@UMI :24, 2026-05-05 11:30): if parseResponse failed to strip
+// (stickerMap missing the name, turn never reaching `result`, or the final
+// edit silently swallowed) the streamed bubble retained the literal tag.
+// stripInlineTags applied at chunk-time means the bubble ALWAYS goes out
+// clean, so any later cleanup failure is a soft miss (no sticker/reaction
+// sent), not a visible leak.
+describe('stripInlineTags — streamer-side pre-processor', () => {
+  test('strips [sticker:NAME] when name is in stickerMap', () => {
+    const out = stripInlineTags('Done [sticker:working]', { stickerMap });
+    assert.equal(out, 'Done');
+  });
+
+  test('strips ALL inline [sticker:NAME] occurrences in one call', () => {
+    const out = stripInlineTags('A [sticker:working] B [sticker:thumbsup] C', { stickerMap });
+    assert.equal(out, 'A  B  C');
+  });
+
+  test('preserves [sticker:NAME] when name is NOT in stickerMap', () => {
+    const out = stripInlineTags('see [sticker:unknown_thing] here', { stickerMap });
+    assert.equal(out, 'see [sticker:unknown_thing] here');
+  });
+
+  test('strips [react:EMOJI] unconditionally (no map dependency)', () => {
+    const out = stripInlineTags('Got it [react:👍]', {});
+    assert.equal(out, 'Got it');
+  });
+
+  test('strips multiple [react:EMOJI] tags in one call', () => {
+    const out = stripInlineTags('Yes [react:👍] also [react:🔥]', {});
+    assert.equal(out, 'Yes  also');
+  });
+
+  test('strips both kinds in same text', () => {
+    const out = stripInlineTags('Working [react:👍] [sticker:working]', { stickerMap });
+    assert.equal(out, 'Working');
+  });
+
+  test('msg 205 reproduction — known failing case before rc.67', () => {
+    // The exact text saved in shumabit.db msg_id=205 today (2026-05-05 11:30).
+    // Pre-rc.67: streamer sent this verbatim; user saw the literal tag if
+    // the result-event finalize path didn't manage to clean it.
+    const raw = 'On it — adding ฿ prefix, rebuilding, uploading, and sending. [sticker:working]';
+    const out = stripInlineTags(raw, { stickerMap });
+    assert.equal(out, 'On it — adding ฿ prefix, rebuilding, uploading, and sending.');
+  });
+
+  test('keeps text unchanged when no tags present', () => {
+    const out = stripInlineTags('Plain text reply, no tags.', { stickerMap });
+    assert.equal(out, 'Plain text reply, no tags.');
+  });
+
+  test('handles empty/null/undefined input gracefully', () => {
+    assert.equal(stripInlineTags('', { stickerMap }), '');
+    assert.equal(stripInlineTags(null, { stickerMap }), '');
+    assert.equal(stripInlineTags(undefined, { stickerMap }), '');
+  });
+
+  test('omitted stickerMap dependency uses empty default (no strip)', () => {
+    const out = stripInlineTags('see [sticker:working]');
+    assert.equal(out, 'see [sticker:working]');
+  });
+
+  test('whitespace cleanup matches parseResponse — trailing-space-on-line strip', () => {
+    // Tag stripped from end of a line should not leave dangling whitespace
+    // (otherwise streamed-currentText ≠ parsed.text and finalize re-edits
+    // unnecessarily, producing a flicker).
+    const out = stripInlineTags('Line one [sticker:working]\nLine two', { stickerMap });
+    assert.equal(out, 'Line one\nLine two');
+  });
+
+  test('whitespace cleanup — collapses 3+ blank lines to 2', () => {
+    const out = stripInlineTags('Para one\n\n\n[react:👍]\n\nPara two', {});
+    assert.equal(out, 'Para one\n\nPara two');
+  });
+
+  test('idempotent: running twice equals running once', () => {
+    const raw = 'Working [react:👍] [sticker:working]';
+    const once = stripInlineTags(raw, { stickerMap });
+    const twice = stripInlineTags(once, { stickerMap });
+    assert.equal(once, twice);
+  });
+
+  test('output identical to parseResponse(...).text for the same input', () => {
+    // The whole point of stripInlineTags is to pre-compute what
+    // parseResponse will eventually produce, so the streamer reaches a
+    // resting state where streamer.currentText === parsed.text and the
+    // final edit becomes a documented no-op.
+    const raw = 'Got it [react:👍] and [sticker:working]';
+    const stripped = stripInlineTags(raw, { stickerMap });
+    const parsed = parseResponse(raw, { stickerMap, emojiToSticker: {} });
+    assert.equal(stripped, parsed.text);
+  });
+
+  test('output identical to parseResponse for msg 205 raw text', () => {
+    const raw = 'On it — adding ฿ prefix, rebuilding, uploading, and sending. [sticker:working]';
+    const stripped = stripInlineTags(raw, { stickerMap });
+    const parsed = parseResponse(raw, { stickerMap, emojiToSticker: {} });
+    assert.equal(stripped, parsed.text);
+  });
+
+  test('output identical to parseResponse for the [react:👍] gdocs reply', () => {
+    const raw = 'Done. The main addition is a Safe Rewrite Workflow section.\n\n[react:👍]';
+    const stripped = stripInlineTags(raw, { stickerMap });
+    const parsed = parseResponse(raw, { stickerMap, emojiToSticker: {} });
+    assert.equal(stripped, parsed.text);
   });
 });
