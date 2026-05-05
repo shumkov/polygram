@@ -297,3 +297,73 @@ describe('parseResponse — defensive defaults', () => {
     assert.equal(r.sticker, null);
   });
 });
+
+describe('parseResponse — rc.63 [react:EMOJI] inline reaction tags', () => {
+  // Discovery: 2026-05-05 — agent in Ivan DM responded with
+  // "Да, вижу\! [react:👍]" intending to add a thumbs-up reaction
+  // on Ivan's message + send the text reply. polygram leaked the
+  // literal "[react:👍]" as text. Same pattern as [sticker:NAME];
+  // mirror the inline-extraction logic.
+
+  test('inline [react:EMOJI] extracted, stripped from text, surfaced in reactions[]', () => {
+    const r = parseResponse('Да, вижу\! [react:👍]', {});
+    assert.equal(r.text, 'Да, вижу\!');
+    assert.deepEqual(r.reactions, ['👍']);
+  });
+
+  test('multiple inline reactions all collected (caller picks one)', () => {
+    const r = parseResponse('Done\! [react:👍] [react:🎉]', {});
+    assert.equal(r.text, 'Done\!');
+    assert.deepEqual(r.reactions, ['👍', '🎉']);
+  });
+
+  test('solo [react:EMOJI] (whole reply = tag) → reaction set, text empty', () => {
+    const r = parseResponse('[react:🔥]', {});
+    assert.equal(r.text, '');
+    assert.equal(r.reaction, '🔥');
+    assert.deepEqual(r.reactions, []);
+  });
+
+  test('[react:EMOJI] mid-text leaves clean spacing on the line', () => {
+    const r = parseResponse('Status: green ✓ [react:👍] all good', {});
+    assert.match(r.text, /Status: green ✓\s+all good/);
+    assert.deepEqual(r.reactions, ['👍']);
+  });
+
+  test('[react:EMOJI] alone on its own line collapses blank lines', () => {
+    const r = parseResponse('First line\n\n[react:👍]\n\nThird line', {});
+    assert.match(r.text, /First line\n\nThird line/);
+    assert.doesNotMatch(r.text, /\n{3,}/);
+    assert.deepEqual(r.reactions, ['👍']);
+  });
+
+  test('[react:] with multi-codepoint emoji (skin tone)', () => {
+    const r = parseResponse('Done [react:👍🏽]', {});
+    assert.equal(r.text, 'Done');
+    assert.deepEqual(r.reactions, ['👍🏽']);
+  });
+
+  test('[react:] does NOT match non-bracket usage like [react ok]', () => {
+    const r = parseResponse('see [react ok] for details', {});
+    assert.equal(r.text, 'see [react ok] for details');
+    assert.deepEqual(r.reactions, []);
+  });
+
+  test('[react:] AND [sticker:] in same reply both extracted', () => {
+    const r = parseResponse('Working on it [react:👍] [sticker:pumped]', {
+      stickerMap: { pumped: 'STICKER_FILE_ID_X' },
+    });
+    assert.equal(r.text, 'Working on it');
+    assert.deepEqual(r.reactions, ['👍']);
+    assert.equal(r.stickers.length, 1);
+    assert.equal(r.stickers[0].fileId, 'STICKER_FILE_ID_X');
+  });
+
+  test('reactions[] field always present (consistent shape)', () => {
+    // Pre-rc.63 some return paths didn't have reactions[]; check all paths.
+    assert.deepEqual(parseResponse('plain text', {}).reactions, []);
+    assert.deepEqual(parseResponse('🔥', {}).reactions, []);
+    assert.deepEqual(parseResponse('[sticker:foo]', { stickerMap: { foo: 'X' } }).reactions, []);
+    assert.deepEqual(parseResponse('🔥', { emojiToSticker: { '🔥': 'X' } }).reactions, []);
+  });
+});

@@ -3045,6 +3045,33 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       }
     };
 
+    // rc.63: agents send inline `[react:EMOJI]` tags within text replies
+    // (e.g. "Да, вижу! [react:👍]"). parse-response strips the tag from
+    // the visible text and surfaces the emoji in `parsed.reactions[]`.
+    // Apply the FIRST one as a Telegram reaction on the user's message.
+    // Most Telegram bots can place only one emoji reaction per message;
+    // additional [react:] tags in the same reply are dropped silently
+    // (logged for forensics but not user-visible).
+    const sendInlineReactions = async () => {
+      if (!parsed.reactions || parsed.reactions.length === 0) return;
+      const emoji = parsed.reactions[0];
+      try {
+        await tg(bot, 'setMessageReaction', {
+          chat_id: chatId,
+          message_id: msg.message_id,
+          reaction: [{ type: 'emoji', emoji }],
+        }, { ...outMeta, source: 'inline-reaction', reaction: emoji });
+      } catch (err) {
+        console.error(`[${label}] inline setMessageReaction(${emoji}) failed: ${err.message}`);
+      }
+      if (parsed.reactions.length > 1) {
+        logEvent('inline-reactions-dropped', {
+          chat_id: chatId, msg_id: msg.message_id,
+          applied: emoji, dropped_count: parsed.reactions.length - 1,
+        });
+      }
+    };
+
     // OpenClaw's preview-becomes-final flow:
     //
     //   1. flushDraft() — drain any pending throttled edit so the
@@ -3066,6 +3093,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           // Preview was successfully edited to the final text.
           // No follow-up messages needed.
           await sendInlineStickers();
+          await sendInlineReactions();
           await cleanupArchivedBubbles();
           console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
           markReplied();
@@ -3112,6 +3140,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           }
         }
         await sendInlineStickers();
+          await sendInlineReactions();
         await cleanupArchivedBubbles();
         console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed-redeliver(${reason}, ${chunks.length} chunks${r.failed.length ? `, ${r.failed.length} failed` : ''}) | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
         markReplied();
@@ -3155,6 +3184,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     }
 
     await sendInlineStickers();
+          await sendInlineReactions();
     console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
     markReplied();
   } catch (err) {
