@@ -2192,7 +2192,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         parent_tool_use_id: null,
       });
       logEvent('compact-command', {
-        chat_id: chatId, text_len: text.length,
+        chat_id: chatId, thread_id: threadIdStr, session_key: sessionKey,
+        text_len: text.length,
         user: cmdUser, user_id: cmdUserId,
       });
       const hasHint = text.length > '/compact'.length + 1;
@@ -4323,6 +4324,53 @@ async function main() {
     }
   } catch (err) {
     console.error(`[replay] boot replay failed: ${err.message}`);
+  }
+
+  // rc.61: surface compact-command events that were never paired with
+  // a compact-boundary (i.e. interrupted by deploy / crash). The SDK
+  // accepts /compact via stream input but compaction itself runs at a
+  // turn boundary; if polygram restarts before the SDK gets a chance
+  // to actually compact, the work is lost silently. Pre-rc.61 the
+  // user only saw "🗜️ Compacting with your hint…" then nothing —
+  // and on the next over-threshold turn, the contextHint reminded
+  // them context was still full. Now: detect orphaned compact-command
+  // events on boot, post a "compaction was interrupted" message to
+  // the chat so the user knows to re-run.
+  //
+  // Scan window matches replayWindowMs — same logic: anything older
+  // than the bot's expected long-turn ceiling is stale and not worth
+  // surfacing.
+  try {
+    const orphans = db.findOrphanedCompactCommands({
+      olderThanMs: resolveReplayWindowMs(config) ?? 30 * 60 * 1000,
+    });
+    for (const o of orphans) {
+      const chatCfg = config.chats[o.chat_id];
+      if (!chatCfg) continue; // chat not owned by this bot
+      const threadId = o.thread_id ? Number(o.thread_id) : null;
+      try {
+        await tg(bot, 'sendMessage', {
+          chat_id: o.chat_id,
+          text: '🗜️ Last `/compact` was interrupted by a polygram restart before it could finish. Run `/compact` again (with the same hint if you had one) to retry.',
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        }, { source: 'compact-failed-restart', botName: BOT_NAME });
+        logEvent('compact-failed-restart', {
+          chat_id: o.chat_id,
+          thread_id: o.thread_id,
+          session_key: o.session_key,
+          original_ts: o.ts,
+          user: o.user,
+          user_id: o.user_id,
+        });
+      } catch (err) {
+        console.error(`[compact-orphan-surface] ${o.session_key}: ${err.message}`);
+      }
+    }
+    if (orphans.length > 0) {
+      console.log(`[compact-orphan] surfaced ${orphans.length} interrupted /compact events`);
+    }
+  } catch (err) {
+    console.error(`[compact-orphan-surface] failed: ${err.message}`);
   }
 
   console.log(`[${BOT_NAME}] Starting...`);

@@ -718,3 +718,113 @@ describe('setMessageText', () => {
     assert.equal(row.text.length, 10_000);
   });
 });
+
+describe('findOrphanedCompactCommands — rc.61', () => {
+  // Discovery: 2026-05-05 — Ivan ran /compact, polygram pushed it to
+  // SDK input controller, then rc.59 deploy fired before SDK could
+  // process. The compact-command event landed but no compact-boundary
+  // followed. User saw "🗜️ Compacting..." then context stayed full.
+  // Now: boot-time scan surfaces these as compact-failed-restart
+  // events + posts to chat so user knows to re-run.
+
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  test('returns empty when there are no compact-command events', () => {
+    assert.deepEqual(db.findOrphanedCompactCommands(), []);
+  });
+
+  test('compact-command WITHOUT matching boundary → orphan returned', () => {
+    db.logEvent('compact-command', {
+      chat_id: '-100', thread_id: '24', session_key: '-100:24',
+      text_len: 50, user: 'Ivan', user_id: 1,
+    });
+    const orphans = db.findOrphanedCompactCommands();
+    assert.equal(orphans.length, 1);
+    assert.equal(orphans[0].session_key, '-100:24');
+    assert.equal(orphans[0].chat_id, '-100');
+    assert.equal(orphans[0].thread_id, '24');
+    assert.equal(orphans[0].user, 'Ivan');
+  });
+
+  test('compact-command followed by matching boundary → NOT orphaned', () => {
+    db.logEvent('compact-command', {
+      chat_id: '-100', thread_id: '24', session_key: '-100:24',
+      text_len: 50, user: 'Ivan', user_id: 1,
+    });
+    db.logEvent('compact-boundary', {
+      session_key: '-100:24', trigger: 'manual', pre_tokens: 170000, post_tokens: 8000,
+    });
+    assert.deepEqual(db.findOrphanedCompactCommands(), []);
+  });
+
+  test('boundary BEFORE compact-command does NOT count as a match', () => {
+    // Earlier compact (already handled) followed by a NEW /compact that's orphaned.
+    db.logEvent('compact-boundary', {
+      session_key: '-100:24', trigger: 'manual', pre_tokens: 170000, post_tokens: 8000,
+    });
+    db.logEvent('compact-command', {
+      chat_id: '-100', thread_id: '24', session_key: '-100:24',
+      text_len: 50, user: 'Ivan', user_id: 1,
+    });
+    const orphans = db.findOrphanedCompactCommands();
+    assert.equal(orphans.length, 1, 'NEW /compact after earlier boundary is still orphaned');
+  });
+
+  test('boundary with DIFFERENT session_key does NOT count as a match', () => {
+    db.logEvent('compact-command', {
+      chat_id: '-100', thread_id: '24', session_key: '-100:24',
+      text_len: 50, user: 'Ivan', user_id: 1,
+    });
+    db.logEvent('compact-boundary', {
+      session_key: '-200:5', // different session
+      trigger: 'manual', pre_tokens: 170000, post_tokens: 8000,
+    });
+    assert.equal(db.findOrphanedCompactCommands().length, 1);
+  });
+
+  test('multiple orphans returned in chronological order', () => {
+    db.logEvent('compact-command', { session_key: 'a', chat_id: '1', thread_id: null });
+    db.logEvent('compact-command', { session_key: 'b', chat_id: '2', thread_id: null });
+    db.logEvent('compact-command', { session_key: 'c', chat_id: '3', thread_id: null });
+    const orphans = db.findOrphanedCompactCommands();
+    assert.equal(orphans.length, 3);
+    assert.equal(orphans[0].session_key, 'a');
+    assert.equal(orphans[1].session_key, 'b');
+    assert.equal(orphans[2].session_key, 'c');
+  });
+
+  test('mixed: one resolved, one orphan — only the orphan returned', () => {
+    db.logEvent('compact-command', { session_key: 'resolved', chat_id: '1', thread_id: null });
+    db.logEvent('compact-boundary', { session_key: 'resolved', trigger: 'manual' });
+    db.logEvent('compact-command', { session_key: 'orphan', chat_id: '2', thread_id: null });
+    const orphans = db.findOrphanedCompactCommands();
+    assert.equal(orphans.length, 1);
+    assert.equal(orphans[0].session_key, 'orphan');
+  });
+
+  test('respects olderThanMs cutoff', () => {
+    // Force an old event by manipulating ts directly via raw insert.
+    const oldTs = Date.now() - 60 * 60 * 1000; // 60 min ago
+    db.raw.prepare(`
+      INSERT INTO events (ts, chat_id, kind, detail_json) VALUES (?, ?, ?, ?)
+    `).run(oldTs, '-100', 'compact-command', JSON.stringify({
+      chat_id: '-100', session_key: '-100:24', user: 'Ivan',
+    }));
+    const recent = db.findOrphanedCompactCommands({ olderThanMs: 30 * 60 * 1000 });
+    assert.deepEqual(recent, [], '60-min-old event filtered by 30-min window');
+    const wide = db.findOrphanedCompactCommands({ olderThanMs: 90 * 60 * 1000 });
+    assert.equal(wide.length, 1, '90-min window includes it');
+  });
+
+  test('compact-command without session_key in detail (legacy pre-rc.61) is skipped', () => {
+    // Pre-rc.61 compact-command events had no session_key. Don't try
+    // to surface those — we can't match them.
+    db.raw.prepare(`
+      INSERT INTO events (ts, chat_id, kind, detail_json) VALUES (?, ?, ?, ?)
+    `).run(Date.now(), '-100', 'compact-command', JSON.stringify({
+      chat_id: '-100', text_len: 50, user: 'Ivan', /* no session_key */
+    }));
+    assert.deepEqual(db.findOrphanedCompactCommands(), []);
+  });
+});
