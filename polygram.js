@@ -67,6 +67,7 @@ const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
 const { classify: classifyError, isTransientHttpError } = require('./lib/error-classify');
 const { createAutoResumeTracker, isAutoResumable } = require('./lib/auto-resume');
 const { resolveReplayWindowMs } = require('./lib/replay-window');
+const { validateIpcFileParam } = require('./lib/ipc-file-validator');
 const {
   createStore: createApprovalsStore,
   matchesAnyPattern: matchesApprovalPattern,
@@ -1404,6 +1405,13 @@ async function handleSendOverIpc(req) {
   if (chatId && !config.chats[chatId]) {
     throw new Error(`chat not owned by ${BOT_NAME}: ${chatId}`);
   }
+
+  // rc.58: catch the most common file-upload mistakes before Telegram
+  // rejects with a confusing error. validateIpcFileParam returns a
+  // human-readable error string when the file param is malformed,
+  // null otherwise.
+  const fileParamErr = validateIpcFileParam(method, params);
+  if (fileParamErr) throw new Error(fileParamErr);
 
   const sendRes = await tg(bot, method, params, {
     source: source || 'ipc',
