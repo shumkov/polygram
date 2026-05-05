@@ -2220,6 +2220,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       logEvent('compact-command', {
         chat_id: chatId, thread_id: threadIdStr, session_key: sessionKey,
         text_len: text.length,
+        // rc.65: store the full /compact text so boot-time orphan
+        // recovery can silently re-push it after a deploy
+        // interrupted compaction. Agent-supplied hints (e.g.
+        // "/compact keep the Q3 commission decisions") need to be
+        // preserved verbatim for the retry to summarize correctly.
+        text,
         user: cmdUser, user_id: cmdUserId,
       });
       const hasHint = text.length > '/compact'.length + 1;
@@ -4420,28 +4426,77 @@ async function main() {
     console.error(`[replay] boot replay failed: ${err.message}`);
   }
 
-  // rc.61: surface compact-command events that were never paired with
-  // a compact-boundary (i.e. interrupted by deploy / crash). The SDK
-  // accepts /compact via stream input but compaction itself runs at a
-  // turn boundary; if polygram restarts before the SDK gets a chance
-  // to actually compact, the work is lost silently. Pre-rc.61 the
-  // user only saw "🗜️ Compacting with your hint…" then nothing —
-  // and on the next over-threshold turn, the contextHint reminded
-  // them context was still full. Now: detect orphaned compact-command
-  // events on boot, post a "compaction was interrupted" message to
-  // the chat so the user knows to re-run.
+  // rc.61 + rc.65: handle compact-command events that were never
+  // paired with a compact-boundary (deploy / crash interrupted them
+  // before the SDK processed). rc.65 changes behaviour from
+  // "post a 'please retry' message and ask the user" to
+  // "silently retry by re-pushing the same /compact text to a
+  // freshly-spawned (resumed) Query." Same pattern as boot-replay
+  // for inbound messages — recovery should be invisible.
   //
-  // Scan window matches replayWindowMs — same logic: anything older
-  // than the bot's expected long-turn ceiling is stale and not worth
-  // surfacing.
+  // Requirements for a silent retry:
+  //   1. The compact-command event was logged with full `text`
+  //      (rc.65+ does this; pre-rc.65 events have only text_len —
+  //      we fall back to the old "please retry" message for those).
+  //   2. The chat is still configured (config.chats[chat_id] exists).
+  //   3. The session has a saved claude_session_id we can resume.
+  //
+  // Dedupe: if multiple orphans for the same session_key (e.g. user
+  // ran /compact twice in quick succession before a deploy), retry
+  // only the MOST RECENT — older ones are obsolete.
+  //
+  // Scan window matches replayWindowMs — anything older than the
+  // bot's expected long-turn ceiling is stale.
   try {
-    const orphans = db.findOrphanedCompactCommands({
+    const orphansAll = db.findOrphanedCompactCommands({
       olderThanMs: resolveReplayWindowMs(config) ?? 30 * 60 * 1000,
     });
-    for (const o of orphans) {
+    // Dedupe per-session_key, keep the most recent (highest ts).
+    const orphansLatest = new Map();
+    for (const o of orphansAll) {
+      orphansLatest.set(o.session_key, o);
+    }
+    let replayed = 0;
+    let surfacedFallback = 0;
+    for (const o of orphansLatest.values()) {
       const chatCfg = config.chats[o.chat_id];
-      if (!chatCfg) continue; // chat not owned by this bot
+      if (!chatCfg) continue;
       const threadId = o.thread_id ? Number(o.thread_id) : null;
+      const savedSessionId = getClaudeSessionId(db, o.session_key);
+
+      // Silent retry path: only when we have BOTH the original text
+      // (rc.65+) AND a session_id to resume into.
+      if (o.text && savedSessionId) {
+        try {
+          const entry = await pm.getOrSpawn(o.session_key, buildSpawnContext(o.session_key));
+          if (!entry?.inputController?.push) {
+            throw new Error('input controller not ready post-spawn');
+          }
+          entry.inputController.push({
+            type: 'user',
+            message: { role: 'user', content: o.text },
+            parent_tool_use_id: null,
+          });
+          logEvent('compact-replay', {
+            chat_id: o.chat_id,
+            thread_id: o.thread_id,
+            session_key: o.session_key,
+            original_ts: o.ts,
+            text_len: o.text.length,
+            user: o.user,
+            user_id: o.user_id,
+          });
+          replayed += 1;
+          continue;
+        } catch (err) {
+          console.error(`[compact-replay] ${o.session_key}: ${err.message} — falling back to surface`);
+          // fall through to surface fallback below
+        }
+      }
+
+      // Fallback: surface the legacy "please retry" message. Only
+      // happens for pre-rc.65 events (no `text` field) or when
+      // the silent-retry spawn failed.
       try {
         await tg(bot, 'sendMessage', {
           chat_id: o.chat_id,
@@ -4455,16 +4510,18 @@ async function main() {
           original_ts: o.ts,
           user: o.user,
           user_id: o.user_id,
+          reason: o.text ? 'spawn-failed' : 'pre-rc65-event-no-text',
         });
+        surfacedFallback += 1;
       } catch (err) {
         console.error(`[compact-orphan-surface] ${o.session_key}: ${err.message}`);
       }
     }
-    if (orphans.length > 0) {
-      console.log(`[compact-orphan] surfaced ${orphans.length} interrupted /compact events`);
+    if (replayed + surfacedFallback > 0) {
+      console.log(`[compact-orphan] silent-replayed=${replayed}, surfaced-fallback=${surfacedFallback}`);
     }
   } catch (err) {
-    console.error(`[compact-orphan-surface] failed: ${err.message}`);
+    console.error(`[compact-orphan-handler] failed: ${err.message}`);
   }
 
   console.log(`[${BOT_NAME}] Starting...`);

@@ -828,3 +828,32 @@ describe('findOrphanedCompactCommands — rc.61', () => {
     assert.deepEqual(db.findOrphanedCompactCommands(), []);
   });
 });
+
+describe('findOrphanedCompactCommands — rc.65 returns full text', () => {
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  test('rc.65 events include the full /compact text in the result', () => {
+    db.logEvent('compact-command', {
+      chat_id: '-100', thread_id: '24', session_key: '-100:24',
+      text_len: 50, text: '/compact keep the Q3 commission decisions',
+      user: 'Ivan', user_id: 1,
+    });
+    const [orphan] = db.findOrphanedCompactCommands();
+    assert.equal(orphan.text, '/compact keep the Q3 commission decisions');
+  });
+
+  test('pre-rc.65 events (no text field) return text=null gracefully', () => {
+    // Simulate a legacy event written before rc.65.
+    db.raw.prepare(`
+      INSERT INTO events (ts, chat_id, kind, detail_json) VALUES (?, ?, ?, ?)
+    `).run(Date.now(), '-100', 'compact-command', JSON.stringify({
+      chat_id: '-100', thread_id: '24', session_key: '-100:24',
+      text_len: 50, /* no text field */
+      user: 'Ivan', user_id: 1,
+    }));
+    const [orphan] = db.findOrphanedCompactCommands();
+    assert.equal(orphan.text, null,
+      'caller can fall back to "please retry" when text is null');
+  });
+});
