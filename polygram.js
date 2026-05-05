@@ -2172,11 +2172,37 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       await sendReply('🗜️ /compact requires the SDK pm. This chat is on the CLI pm path.');
       return;
     }
-    if (!pm.has(sessionKey)) {
-      await sendReply('🗜️ No active session — /compact only works once a turn has started.');
-      return;
+    // rc.64: if the in-memory session was evicted (LRU cap pressure)
+    // but there's a saved Claude session_id in DB, auto-spawn the
+    // Query with --resume so /compact has something to work with.
+    // Pre-rc.64 we returned "🗜️ No active session" — confusing
+    // because the user just had a conversation 5 minutes ago, the
+    // session went idle, LRU evicted it, and "No active session"
+    // reads as "I never knew you" instead of "I unloaded your
+    // session, hold on."
+    let entry = pm.get(sessionKey);
+    if (!entry) {
+      const savedSessionId = getClaudeSessionId(db, sessionKey);
+      if (!savedSessionId) {
+        await sendReply('🗜️ No conversation to compact yet. Send a message first, then /compact.');
+        return;
+      }
+      try {
+        entry = await getOrSpawnForChat(sessionKey);
+      } catch (err) {
+        console.error(`[${label}] /compact spawn-resume: ${err.message}`);
+        await sendReply(`🗜️ Couldn't load session for compaction: ${err.message}`);
+        return;
+      }
+      if (!entry) {
+        await sendReply('🗜️ Session not loadable (config missing).');
+        return;
+      }
+      logEvent('compact-spawn-resumed', {
+        chat_id: chatId, thread_id: threadIdStr, session_key: sessionKey,
+        resumed_session_id: savedSessionId,
+      });
     }
-    const entry = pm.get(sessionKey);
     if (!entry?.inputController?.push) {
       await sendReply('🗜️ Session not ready for /compact (no input controller).');
       return;
