@@ -857,3 +857,57 @@ describe('findOrphanedCompactCommands — rc.65 returns full text', () => {
       'caller can fall back to "please retry" when text is null');
   });
 });
+
+describe('findOrphanedCompactCommands — rc.66 dedupe handled orphans', () => {
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  test('orphan with prior compact-replay event is NOT re-returned', () => {
+    db.logEvent('compact-command', {
+      chat_id: '-100', thread_id: '24', session_key: '-100:24',
+      text: '/compact xyz', user: 'Ivan',
+    });
+    const cmd = db.raw.prepare("SELECT id, ts FROM events WHERE kind='compact-command'").get();
+    db.logEvent('compact-replay', {
+      chat_id: '-100', session_key: '-100:24',
+      original_ts: cmd.ts, text_len: 12, user: 'Ivan',
+    });
+    assert.deepEqual(db.findOrphanedCompactCommands(), []);
+  });
+
+  test('orphan with prior compact-failed-restart event is NOT re-returned', () => {
+    db.logEvent('compact-command', {
+      chat_id: '-100', thread_id: '24', session_key: '-100:24',
+      user: 'Ivan',
+    });
+    const cmd = db.raw.prepare("SELECT id, ts FROM events WHERE kind='compact-command'").get();
+    db.logEvent('compact-failed-restart', {
+      chat_id: '-100', session_key: '-100:24',
+      original_ts: cmd.ts, user: 'Ivan',
+    });
+    assert.deepEqual(db.findOrphanedCompactCommands(), []);
+  });
+
+  test('handled-marker for ONE orphan does NOT mask another fresh orphan', () => {
+    // Use explicit non-colliding timestamps via raw insert. logEvent
+    // uses Date.now() — events fired in the same millisecond would
+    // share `ts` and the original_ts dedupe match would be ambiguous.
+    const tsHandled = 1_777_000_000_000;
+    const tsFresh = 1_777_000_001_000;
+    db.raw.prepare(`INSERT INTO events (ts, chat_id, kind, detail_json) VALUES (?, ?, ?, ?)`).run(
+      tsHandled, '-100', 'compact-command',
+      JSON.stringify({ chat_id: '-100', session_key: '-100:24', user: 'Ivan' }),
+    );
+    db.raw.prepare(`INSERT INTO events (ts, chat_id, kind, detail_json) VALUES (?, ?, ?, ?)`).run(
+      tsHandled + 1, '-100', 'compact-replay',
+      JSON.stringify({ session_key: '-100:24', original_ts: tsHandled, text_len: 5 }),
+    );
+    db.raw.prepare(`INSERT INTO events (ts, chat_id, kind, detail_json) VALUES (?, ?, ?, ?)`).run(
+      tsFresh, '-100', 'compact-command',
+      JSON.stringify({ chat_id: '-100', session_key: '-100:24', user: 'Ivan' }),
+    );
+    const orphans = db.findOrphanedCompactCommands({ olderThanMs: 9_999_999_999_999 });
+    assert.equal(orphans.length, 1, 'fresh orphan returns even when older was handled');
+    assert.equal(orphans[0].ts, tsFresh);
+  });
+});
