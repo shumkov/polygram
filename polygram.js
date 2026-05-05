@@ -2085,10 +2085,37 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const cmdUser = msg.from?.first_name || msg.from?.username || null;
   const cmdUserId = msg.from?.id || null;
 
+  // Mark the inbound row terminal so boot replay doesn't pick it up
+  // again. Must fire down EVERY non-throwing exit path (early returns
+  // for error / NO_REPLY, streamed-reply preview-becomes-final, the
+  // discard+redeliver branch, regular reply at end). Earlier versions
+  // only marked at the bottom of try, so streamed-reply early returns
+  // left handler_status stuck at 'dispatched' forever and the next
+  // boot replayed every long turn.
+  //
+  // rc.59: hoisted ABOVE sendReply (was originally below all slash
+  // commands) so sendReply can call it. Slash commands like /compact
+  // /new /reset /model /effort all reply via sendReply but never
+  // dispatched a turn, so they were leaving handler_status='dispatched'
+  // forever. Boot-replay (now with rc.57's auto-derived 72-min window
+  // for chats with maxTurn=3600) would then re-fire the same /compact
+  // command — which post-compaction lands in a stale-session state and
+  // emits "🗜️ No active session — /compact only works once a turn has
+  // started." Visible duplicate-reply UX bug.
+  const markReplied = () => dbWrite(() => db.setInboundHandlerStatus({
+    chat_id: chatId, msg_id: msg.message_id, status: 'replied',
+  }), 'set handler_status=replied');
+
   // sendReply accepts (text, meta?) with optional extra Telegram params
   // pulled out via meta.params (kept separate so meta stays for DB tags).
+  // rc.59: also calls markReplied() so slash-command paths don't leave
+  // handler_status='dispatched' for boot-replay to re-fire later. All
+  // 29 sendReply call sites in handleMessage are slash-command exit
+  // paths — the contract "we sent a response, the inbound is handled"
+  // holds for every one of them.
   const sendReply = (replyText, meta = {}) => {
     const { params: extraParams = {}, ...metaTags } = meta;
+    markReplied();
     return tg(bot, 'sendMessage', {
       chat_id: chatId, text: replyText, ...replyOpts(threadId), ...extraParams,
     }, { source: 'command-reply', botName: BOT_NAME, model: chatConfig.model, effort: chatConfig.effort, ...metaTags });
@@ -2697,16 +2724,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     reactor.setState('THINKING');
   }
 
-  // Mark the inbound row terminal so boot replay doesn't pick it up
-  // again. Must fire down EVERY non-throwing exit path (early returns
-  // for error / NO_REPLY, streamed-reply preview-becomes-final, the
-  // discard+redeliver branch, regular reply at end). Earlier versions
-  // only marked at the bottom of try, so streamed-reply early returns
-  // left handler_status stuck at 'dispatched' forever and the next
-  // boot replayed every long turn.
-  const markReplied = () => dbWrite(() => db.setInboundHandlerStatus({
-    chat_id: chatId, msg_id: msg.message_id, status: 'replied',
-  }), 'set handler_status=replied');
+  // markReplied hoisted to top of handleMessage in rc.59 (see
+  // definition near sendReply for context). Slash commands path
+  // through sendReply which now calls it; all the OTHER non-throwing
+  // exit paths below (NO_REPLY, streamed-reply preview-becomes-final,
+  // discard+redeliver, regular reply at end) call it directly.
 
   // 0.8.0 Phase 2 step 1 — AUTOSTEER. If SDK pm is active AND there's
   // already an in-flight turn for this session AND autosteer isn't
