@@ -66,6 +66,7 @@ const { createReactionManager, classifyToolName } = require('./lib/status-reacti
 const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
 const { classify: classifyError, isTransientHttpError } = require('./lib/error-classify');
 const { createAutoResumeTracker, isAutoResumable } = require('./lib/auto-resume');
+const { resolveReplayWindowMs } = require('./lib/replay-window');
 const {
   createStore: createApprovalsStore,
   matchesAnyPattern: matchesApprovalPattern,
@@ -3654,7 +3655,13 @@ async function pollBot(bot) {
           const chatId = m.chat.id.toString();
           const chatConfig = config.chats[chatId];
           const threadId = m.message_thread_id?.toString();
-          const topicName = threadId && chatConfig?.topics?.[threadId] ? chatConfig.topics[threadId] : threadId;
+          // rc.57: use getTopicName() helper which handles BOTH legacy string
+          // form and rc.48 object form. Pre-rc.57 the direct lookup
+          // `chatConfig.topics[threadId]` template-literal'd into "[object Object]"
+          // because rc.48 topics are objects like {name:"Music",agent:"...",...}.
+          const topicName = threadId
+            ? (chatConfig ? getTopicName(chatConfig, threadId) : threadId)
+            : null;
           const chatLabel = chatConfig?.name || chatId;
           const label = topicName ? `${chatLabel}/${topicName}` : chatLabel;
           console.log(`[${BOT_NAME}] ← ${label}: ${(m.text || m.caption || '(media)').slice(0, 60)}`);
@@ -4166,18 +4173,25 @@ async function main() {
   // Boot replay: re-dispatch any inbound turns that were interrupted by
   // the previous polygram's shutdown or crash. These are rows marked
   // 'dispatched', 'processing', or 'replay-pending' (set by the SIGTERM
-  // handler) — all within the last `replayWindowMs` (default 3 min) so
-  // we don't resurrect ancient work. Override via
-  // `config.bot.replayWindowMs` for ops tuning. Dedupe against
-  // already-sent outbound replies in case the previous instance DID
-  // answer before dying.
+  // handler) — all within the last `replayWindowMs` so we don't
+  // resurrect ancient work. Dedupe against already-sent outbound
+  // replies in case the previous instance DID answer before dying.
+  //
+  // rc.57: auto-derive replayWindowMs from max(maxTurn) * 1.2 when not
+  // explicitly set. Pre-rc.57 the default was 3 min — but chats with
+  // long agent tasks (Shumabit@UMI maxTurn=3600 = 60 min) would have
+  // their interrupted turns silently dropped because the turn was
+  // typically older than 3 min when polygram restarted. Discovery
+  // context: msg 151 in Shumabit@UMI thread :24 on 2026-05-05 was
+  // sent at 01:55:14, polygram restarted for rc.56 at 02:17 (22 min
+  // later). msg 151 was 'replay-pending' but boot-replay's 3-min
+  // window discarded it; the agent's 7-hour Xero task was abandoned.
+  // Auto-derive: 1.2 × max(chatConfig.maxTurn) across all chats,
+  // floored at 3 min (legacy default), capped at 2 hours (sanity).
   try {
     const chatIds = Object.keys(config.chats);
     if (chatIds.length > 0) {
-      const replayWindowMs = (() => {
-        const v = Number(config.bot?.replayWindowMs);
-        return (Number.isInteger(v) && v > 0) ? v : undefined; // undefined → use db.js default
-      })();
+      const replayWindowMs = resolveReplayWindowMs(config);
       const candidates = db.getReplayCandidates({ chatIds, ...(replayWindowMs && { olderThanMs: replayWindowMs }) });
       let replayed = 0;
       let skipped = 0;
