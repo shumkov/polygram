@@ -6,9 +6,9 @@
  * loudly).
  *
  * This test is the canonical answer to "what does a Pm look like?"
- * Real pm classes (process-manager.js / process-manager-sdk.js)
- * declare @implements {Pm} JSDoc — drift between this test and
- * real impls is a signal to update the JSDoc typedef.
+ * lib/process-manager-sdk.js declares @implements {Pm} JSDoc — drift
+ * between this test and the real impl is a signal to update the
+ * typedef in lib/pm-interface.js.
  */
 
 'use strict';
@@ -23,7 +23,7 @@ describe('Pm interface — required methods on every fake', () => {
 
   for (const m of REQUIRED_METHODS) {
     test(`fake exposes ${m}() by default`, () => {
-      const pm = makeFakePm('cli');
+      const pm = makeFakePm('test');
       assert.equal(typeof pm[m], 'function', `${m} must be on every Pm`);
     });
   }
@@ -31,8 +31,8 @@ describe('Pm interface — required methods on every fake', () => {
 
 describe('Pm interface — optional methods are off by default', () => {
   const OPTIONAL_METHODS = [
-    'steer', 'setModel', 'applyFlagSettings', 'setPermissionMode',
-    'drainQueue', 'interrupt', 'resetSession',
+    'steer', 'injectUserMessage', 'setModel', 'applyFlagSettings',
+    'setPermissionMode', 'drainQueue', 'interrupt', 'resetSession',
   ];
 
   for (const m of OPTIONAL_METHODS) {
@@ -93,7 +93,7 @@ describe('Pm interface — opted-in optional methods record', () => {
   });
 
   test('resetSession returns Promise of {closed, drainedPendings}', async () => {
-    const pm = makeFakePm('sdk', { resetSession: true });
+    const pm = makeFakePm('test', { resetSession: true });
     const r = await pm.resetSession('a', { reason: 'user' });
     assert.equal(r.closed, true);
     assert.equal(r.drainedPendings, 0);

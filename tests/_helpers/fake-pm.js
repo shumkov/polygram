@@ -10,12 +10,11 @@
  *
  * Usage:
  *
- *   const cli = makeFakePm('cli');
- *   const sdk = makeFakePm('sdk', { steer: true, drainQueue: true });
- *   const router = createPmRouter({ cliPm: cli, sdkPm: sdk, pickPmKindFor });
+ *   const pm = makeFakePm('test', { steer: true, drainQueue: true });
+ *   const router = createPmRouter({ pm });
  *
  *   router.send('chat-1', 'hi');
- *   assert.deepEqual(sdk.calls, [['send', 'chat-1', 'hi', undefined]]);
+ *   assert.deepEqual(pm.calls, [['send', 'chat-1', 'hi', undefined]]);
  *
  * Bigger fakes (entry mocks, queued-pending sims) are out of scope —
  * tests that need them should use the SDK pm's `fake-query.js`
@@ -32,12 +31,13 @@
  *   Toggle each optional method into the returned fake. When false
  *   (default), the method is NOT defined on the returned object —
  *   so `typeof fake.X === 'function'` returns false, matching the
- *   real cli/sdk pms' feature-presence semantics.
+ *   pm interface's feature-presence semantics for future alternate
+ *   pm impls.
  * @param {boolean} [opts.steer]
+ * @param {boolean} [opts.injectUserMessage]
  * @param {boolean} [opts.setModel]
  * @param {boolean} [opts.applyFlagSettings]
  * @param {boolean} [opts.setPermissionMode]
- * @param {boolean} [opts.requestRespawn]
  * @param {boolean} [opts.drainQueue]
  * @param {boolean} [opts.interrupt]
  * @param {boolean} [opts.resetSession]
@@ -79,12 +79,6 @@ function makeFakePm(name = 'fake', opts = {}) {
   }
   if (opts.setPermissionMode) {
     pm.setPermissionMode = async (key, mode) => { calls.push(['setPermissionMode', key, mode]); return true; };
-  }
-  if (opts.requestRespawn) {
-    pm.requestRespawn = (key, r) => {
-      calls.push(['requestRespawn', key, r]);
-      return { killed: true, queued: 0 };
-    };
   }
   if (opts.drainQueue) {
     pm.drainQueue = (key, code) => { calls.push(['drainQueue', key, code]); return 3; };

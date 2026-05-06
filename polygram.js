@@ -2,22 +2,22 @@
 /**
  * Telegram Bridge for Claude Code — Persistent Sessions
  *
- * Each chat gets a persistent claude process (stream-json multi-turn).
- * Process stays warm: no cold start, full prompt caching.
+ * Each chat gets a long-lived `@anthropic-ai/claude-agent-sdk` Query
+ * held warm in lib/process-manager-sdk.js. No cold start; full prompt
+ * caching across turns.
  *
  * Architecture:
  *   Telegram (grammy long-poll) → polygram receives message
  *   → looks up per-chat config (model, effort, agent, cwd)
- *   → sends to persistent claude process via stdin (stream-json)
- *   → reads response from stdout (stream-json)
- *   → sends reply to Telegram
+ *   → routes to the per-chat Query via pm.send / pm.injectUserMessage
+ *   → streams the assistant reply back to the chat live
  *   → writes every in/out message to per-bot SQLite (source of truth)
  *
- * Chat commands: /model <model>, /effort <level>, /config
+ * Chat commands: /model, /effort, /config, /context, /compact,
+ *                /new, /reset, /reload, /agent, /stop.
  */
 
 const { Bot } = require('grammy');
-const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const processGuard = require('./lib/process-guard');
@@ -1481,7 +1481,7 @@ function formatConfigInfoText(chatConfig, show, sessionKey) {
  *
  * Reuses the existing approvals store + approvalWaiters Map (same
  * shape as today's IPC flow). Both paths can coexist on the same
- * daemon — IPC for CLI pm chats, canUseTool for SDK pm chats.
+ * daemon — SDK in-process canUseTool flow.
  */
 function makeCanUseTool(sessionKey) {
   const chatId = getChatIdFromKey(sessionKey);
@@ -1612,9 +1612,9 @@ function dropWaiter(id, fn) {
 
 function resolveApprovalWaiter(id, decision, reason, extra) {
   // `extra` carries SDK-shape updatedPermissions for always-* clicks.
-  // IPC waiters (CLI pm) ignore it; SDK canUseTool waiters use it
-  // to populate PermissionResult.updatedPermissions so the in-flight
-  // Query picks up the new rule for the rest of the turn.
+  // canUseTool waiters use it to populate
+  // PermissionResult.updatedPermissions so the in-flight Query
+  // picks up the new rule for the rest of the turn.
   const list = approvalWaiters.get(id);
   if (!list) return;
   approvalWaiters.delete(id);
@@ -2621,8 +2621,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // saves tokens, feels more conversational.
   //
   // Opt-out: config.bot.autosteer === false (or per-chat
-  // chatConfig.autosteer === false). CLI pm always falls through
-  // to the queue-FIFO path (no steer primitive on stream-json).
+  // chatConfig.autosteer === false) → falls through to FIFO queue.
   //
   // The steered message gets a ✍ reaction so the user knows it
   // landed; no separate reply is generated (the in-flight turn's
@@ -2776,14 +2775,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // result, the followup messages (if any) get their own SDK
       // pause to absorb at, no special handling needed.
 
-      // 0.8.0 Phase 2 step 4: context-full live hint. After a
-      // successful turn, peek at SDK's getContextUsage(); if past
-      // the threshold, post a quiet hint so the user knows /new
-      // will help. SDK pm only — CLI pm has no equivalent (no
-      // Query object, no getContextUsage). OPT-IN per-chat or
-      // per-bot — most chats don't want the noise. Per-chat takes
-      // precedence over per-bot so admins (Ivan DM) can opt in
-      // without forcing it on every other chat.
+      // Context-full live hint. After a successful turn, peek at
+      // SDK's getContextUsage(); if past the threshold, post a
+      // quiet hint so the user knows /new will help. OPT-IN
+      // per-chat or per-bot — most chats don't want the noise.
+      // Per-chat takes precedence over per-bot so admins (Ivan DM)
+      // can opt in without forcing it on every other chat.
       //
       // rc.56: threshold default lowered to 70% (was 85%) because
       // the SDK auto-compacts mid-turn at ~85% — by the time
@@ -3283,15 +3280,12 @@ function createBot(token) {
       // skip the generic error-reply. If we marked after, there'd be a
       // race where the error-reply slips through.
       if (hadActive) markSessionAborted(sessionKey);
-      // 0.8.0 Phase 2 step 2: under SDK pm, prefer interrupt() +
-      // drainQueue() — keeps the Query alive (cheap to reuse for
-      // the user's next message), no respawn cost. Falls back to
-      // pm.kill() under CLI pm, which is the original behaviour.
-      //
-      // Why both: interrupt() cancels the in-flight turn at SDK
-      // level WITHOUT tearing down the subprocess; drainQueue()
-      // rejects every queued pending with err.code='INTERRUPTED'
-      // so the abort-grace classifier suppresses error replies.
+      // SDK abort: interrupt() + drainQueue(). interrupt() cancels
+      // the in-flight turn at SDK level WITHOUT tearing down the
+      // Query (cheap to reuse for the user's next message);
+      // drainQueue() rejects every queued pending with
+      // err.code='INTERRUPTED' so the abort-grace classifier
+      // suppresses error replies.
       //
       // Kill ONLY the user's own session, not every topic in the
       // chat. Pre-0.6.5 this was pm.killChat(chatId) which fanned
@@ -3901,7 +3895,6 @@ async function main() {
     // reorganising context (compaction can take seconds, during
     // which the bot looks unresponsive). ON by default (rc.12+) —
     // set per-chat or per-bot `announceCompact: false` to silence.
-    // Only fires under SDK pm — the CLI pm has no equivalent event.
     //
     // Wording is intentionally non-technical — the user doesn't
     // care about "compaction" or "tokens"; they just want to know
