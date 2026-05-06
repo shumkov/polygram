@@ -43,6 +43,7 @@ const { createHandleConfigCallback } = require('./lib/handlers/config-callback')
 const { createHandleAbort } = require('./lib/handlers/abort');
 const { createAutosteerHandlers } = require('./lib/handlers/autosteer');
 const { createSlashCommands } = require('./lib/handlers/slash-commands');
+const { createApprovals } = require('./lib/handlers/approvals');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
   buildApprovalKeyboardWithAlways,
@@ -114,7 +115,7 @@ let db;
 let tg; // unified sender, created after db opens
 let pairings; // pairings store, created after db opens
 let approvals; // approvals store, created after db opens
-let approvalWaiters = new Map(); // approval_id -> { resolve, reject, timer }
+// approvalWaiters Map moved to lib/handlers/approvals.js (commit 29).
 let approvalSweepTimer = null;
 let ipcCloser = null;
 // BOT_NAME and bot are set once in main() after filterConfigToBot. Because
@@ -1067,362 +1068,15 @@ function formatConfigInfoText(chatConfig, show, sessionKey) {
   return body;
 }
 
-// rc.20: approvalCardText + safeParse moved to lib/approval-ui.js.
-
-// 0.8.0-rc.18+: canonicalizeToolInput moved to lib/canonical-json.js
-// for testability. Same function, no behavior change.
-
-/**
- * 0.8.0 Phase 2 step 6: SDK canUseTool callback. Hands back to the
- * SDK an async PermissionResult per `@anthropic-ai/claude-agent-sdk`
- * sdk.d.ts:146-188.
- *
- * Flow (per v4 plan §4.2):
- *   1. If no approval config → allow.
- *   2. Look up chat_tool_decisions for short-circuit (always-allow/
- *      always-deny by exact / prefix / regex match). If found,
- *      return that decision.
- *   3. Match against config.bot.approvals.gatedTools; if not gated,
- *      allow.
- *   4. Issue pending_approvals row (with tool_use_id dedup); post
- *      4-button card to admin chat; park resolver in
- *      approvalWaiters Map; race against opts.signal + timeout.
- *   5. Return PermissionResult; the SDK lets the tool run or denies.
- *
- * Reuses the existing approvals store + approvalWaiters Map (same
- * shape as today's IPC flow). Both paths can coexist on the same
- * daemon — SDK in-process canUseTool flow.
- */
-function makeCanUseTool(sessionKey) {
-  const chatId = getChatIdFromKey(sessionKey);
-  const threadId = sessionKey.includes(':') ? sessionKey.split(':')[1] : null;
-  return async function canUseTool(toolName, input, opts) {
-    const apprCfg = config.bot?.approvals;
-    if (!apprCfg || !apprCfg.adminChatId) {
-      // Not configured for this bot → allow everything (matches CLI
-      // pm's bypassPermissions today when approvals not set).
-      return { behavior: 'allow' };
-    }
-
-    const canonicalInput = canonicalizeToolInput(input);
-
-    // Step 2: chat_tool_decisions short-circuit.
-    try {
-      const persisted = db.lookupChatToolDecision({
-        bot_name: BOT_NAME, chat_id: chatId, tool_name: toolName,
-        canonical_input: canonicalInput, now: Date.now(),
-      });
-      if (persisted) {
-        logEvent('canusetool-shortcircuit', {
-          chat_id: chatId, tool_name: toolName,
-          decision: persisted.decision, match_type: persisted.match_type,
-          tool_use_id: opts?.toolUseID || null,
-        });
-        if (persisted.decision === 'allow') return { behavior: 'allow' };
-        return { behavior: 'deny', message: 'matched persisted always-deny rule' };
-      }
-    } catch (err) {
-      console.error(`[${sessionKey}] chat_tool_decisions lookup: ${err.message}`);
-      // Non-fatal — fall through to gating + card.
-    }
-
-    // Step 3: gating check.
-    const gated = matchesApprovalPattern(toolName, input, apprCfg.gatedTools || []);
-    if (!gated.matched) return { behavior: 'allow' };
-
-    // Step 4: issue + post + park. tool_use_id (the SDK's stable
-    // per-call identifier) is the dedup key when the SDK supplies
-    // it — falls back to the legacy (turn_id, tool_input_digest)
-    // tuple otherwise (cron / IPC / pre-SDK callers).
-    const row = approvals.issue({
-      bot_name: BOT_NAME,
-      turn_id: opts?.toolUseID || null,
-      tool_use_id: opts?.toolUseID || null,
-      requester_chat_id: chatId,
-      approver_chat_id: String(apprCfg.adminChatId),
-      tool_name: toolName, tool_input: input,
-      timeoutMs: apprCfg.timeoutMs || APPROVAL_DEFAULT_TIMEOUT_MS,
-    });
-    if (!bot) {
-      approvals.resolve({ id: row.id, status: 'cancelled', reason: 'bot not ready' });
-      return { behavior: 'deny', message: 'bot not ready' };
-    }
-    if (!row.reused || !row.approver_msg_id) {
-      try {
-        const sent = await tg(bot, 'sendMessage', {
-          chat_id: apprCfg.adminChatId,
-          text: approvalCardText(row),
-          reply_markup: buildApprovalKeyboardWithAlways(row.id, row.callback_token),
-        }, { source: 'canusetool-card', botName: BOT_NAME, plainText: true });
-        if (sent?.message_id) approvals.setApproverMsgId(row.id, sent.message_id);
-      } catch (err) {
-        console.error(`[${sessionKey}] failed to post canUseTool card: ${err.message}`);
-        approvals.resolve({ id: row.id, status: 'cancelled', reason: `post failed: ${err.message}` });
-        return { behavior: 'deny', message: `post failed: ${err.message}` };
-      }
-    }
-
-    // Step 5: race signal + timeout + click.
-    return await new Promise((resolve) => {
-      let settled = false;
-      const settle = (decision) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (opts?.signal && sigCleanup) {
-          try { opts.signal.removeEventListener('abort', sigCleanup); }
-          catch { /* swallow */ }
-        }
-        dropWaiter(row.id, wrappedResolve);
-        resolve(decision);
-      };
-      const timer = setTimeout(() => {
-        approvals.resolve({ id: row.id, status: 'timeout' }).catch?.(() => {});
-        settle({ behavior: 'deny', message: 'approval timed out' });
-      }, Math.max(1000, row.timeout_ts - Date.now()));
-      const sigCleanup = opts?.signal
-        ? () => settle({ behavior: 'deny', message: 'aborted' })
-        : null;
-      if (opts?.signal && sigCleanup) {
-        opts.signal.addEventListener('abort', sigCleanup, { once: true });
-      }
-      const wrappedResolve = (decision, reason, extra) => {
-        // decision here is from resolveApprovalWaiter:
-        //   'approved' | 'denied' | 'approved-always' | 'denied-always'
-        // Map to SDK PermissionResult shape. extra carries
-        // updatedPermissions for the always-* variants.
-        if (decision === 'approved' || decision === 'approved-always') {
-          settle({
-            behavior: 'allow',
-            ...(decision === 'approved-always' && extra?.updatedPermissions
-              ? { updatedPermissions: extra.updatedPermissions }
-              : {}),
-          });
-        } else {
-          settle({
-            behavior: 'deny',
-            message: reason || decision || 'denied',
-          });
-        }
-      };
-      const list = approvalWaiters.get(row.id) || [];
-      list.push(wrappedResolve);
-      approvalWaiters.set(row.id, list);
-    });
-  };
-}
-
-function dropWaiter(id, fn) {
-  const list = approvalWaiters.get(id);
-  if (!list) return;
-  const i = list.indexOf(fn);
-  if (i !== -1) list.splice(i, 1);
-  if (list.length === 0) approvalWaiters.delete(id);
-}
-
-function resolveApprovalWaiter(id, decision, reason, extra) {
-  // `extra` carries SDK-shape updatedPermissions for always-* clicks.
-  // canUseTool waiters use it to populate
-  // PermissionResult.updatedPermissions so the in-flight Query
-  // picks up the new rule for the rest of the turn.
-  const list = approvalWaiters.get(id);
-  if (!list) return;
-  approvalWaiters.delete(id);
-  for (const fn of list) {
-    try { fn(decision, reason, extra); } catch {}
-  }
-}
-
-async function handleApprovalCallback(ctx) {
-  const data = ctx.callbackQuery?.data || '';
-  // 0.8.0 Phase 2 step 6: extended pattern accepts the 4-button
-  // SDK canUseTool format. `approve-always` / `deny-always`
-  // additionally write a row to chat_tool_decisions so subsequent
-  // calls to the same tool with the same input short-circuit.
-  const m = String(data).match(/^(approve|deny|approve-always|deny-always):(\d+):(\S+)$/);
-  if (!m) return;
-  const decision = m[1];
-  const id = parseInt(m[2], 10);
-  const token = m[3];
-
-  const row = approvals.getById(id);
-  if (!row) {
-    await ctx.answerCallbackQuery({ text: 'Unknown approval.', show_alert: true }).catch(() => {});
-    return;
-  }
-  if (!approvalTokensEqual(row.callback_token, token)) {
-    logEvent('approval-token-mismatch', {
-      id, from_user: ctx.from?.id,
-      // Don't log the sent_token — attackers guessing it don't need to know
-      // which prefix they got close on.
-    });
-    await ctx.answerCallbackQuery({ text: 'Bad token.', show_alert: true }).catch(() => {});
-    return;
-  }
-  if (row.status !== 'pending') {
-    await ctx.answerCallbackQuery({ text: `Already ${row.status}.`, show_alert: true }).catch(() => {});
-    return;
-  }
-
-  // Only the configured approver chat is authoritative. Our process only
-  // serves one bot, so config.bot.approvals is the authoritative source.
-  const apprCfg = config.bot?.approvals;
-  const expectedChat = String(apprCfg?.adminChatId || '');
-  if (String(ctx.chat?.id) !== expectedChat) {
-    logEvent('approval-foreign-chat', {
-      id, from_chat: ctx.chat?.id, expected: expectedChat,
-    });
-    await ctx.answerCallbackQuery({ text: 'Not authorised here.', show_alert: true }).catch(() => {});
-    return;
-  }
-
-  // 0.8.0 Phase 2 step 6: parse always-variants. The base status
-  // ('approved' / 'denied') drives existing logic + card edit;
-  // `isAlways` triggers the chat_tool_decisions persistence
-  // below (after the atomic SQL resolve succeeds, so we don't
-  // write a "always" rule for a stale double-click).
-  const isApprove = decision === 'approve' || decision === 'approve-always';
-  const isAlways = decision === 'approve-always' || decision === 'deny-always';
-  const status = isApprove ? 'approved' : 'denied';
-  const user = ctx.from?.first_name || ctx.from?.username || null;
-  const userId = ctx.from?.id || null;
-  // SQL-level atomic resolve: UPDATE ... WHERE status='pending' — so in a
-  // double-click race only one of the two callers writes. If ours was
-  // second, changes=0 → stale decision; tell the clicker and don't edit
-  // the card a second time (the winner already did).
-  const changes = approvals.resolve({
-    id, status,
-    decided_by_user_id: userId, decided_by_user: user,
-  });
-  if (changes === 0) {
-    const fresh = approvals.getById(id);
-    await ctx.answerCallbackQuery({
-      text: `Already ${fresh?.status || 'resolved'}.`,
-      show_alert: true,
-    }).catch(() => {});
-    return;
-  }
-  logEvent('approval-resolved', {
-    id, status, by: userId, user, bot: BOT_NAME,
-  });
-
-  // Edit the card to show the decision. 0.6.14: routed through tg() so
-  // the edit gets the same write-before-send DB row, plain-text policy
-  // (no parse_mode injection from tool input), and logged failure
-  // surface as every other outbound. Pre-0.6.14 this called
-  // ctx.api.editMessageText directly — same bypass class as the two
-  // already-routed in 0.6.8 (approval-timeout and pair-onboarding).
-  try {
-    const fresh = approvals.getById(id);
-    await tg(bot, 'editMessageText', {
-      chat_id: row.approver_chat_id,
-      message_id: row.approver_msg_id,
-      text: approvalCardText(fresh, {
-        resolvedBy: `${status === 'approved' ? '✅ Approved' : '❌ Denied'} by ${user || userId}`,
-      }),
-    }, { source: 'approval-card-decision', botName: BOT_NAME, plainText: true });
-  } catch (err) {
-    console.error(`[${BOT_NAME}] edit approval card failed: ${err.message}`);
-  }
-  // 0.8.0 Phase 2 step 6: persist always-* clicks to chat_tool_decisions
-  // so subsequent SDK canUseTool calls for the same (bot, chat, tool,
-  // input) short-circuit without prompting. Use prefix match by default
-  // (allows minor argument variations) — the user can hand-edit to
-  // exact / regex via SQL if they want narrower rules.
-  let updatedPermissions = null;
-  if (isAlways) {
-    try {
-      const canonical = canonicalizeToolInput(row.tool_input);
-      db.insertChatToolDecision({
-        bot_name: BOT_NAME,
-        chat_id: row.requester_chat_id,
-        tool_name: row.tool_name,
-        match_type: 'prefix',  // most useful default; exact would be too narrow
-        input_pattern: canonical,
-        decision: status === 'approved' ? 'allow' : 'deny',
-        issued_by_user_id: userId ? String(userId) : null,
-        expires_ts: null,
-      });
-      logEvent('chat-tool-decision-persisted', {
-        chat_id: row.requester_chat_id,
-        tool_name: row.tool_name,
-        decision: status === 'approved' ? 'allow' : 'deny',
-        match_type: 'prefix',
-      });
-      // Build SDK-shape updatedPermissions so the in-flight Query
-      // also picks up the rule for the rest of THIS turn (avoids
-      // re-prompting on the next sibling tool call).
-      updatedPermissions = [{
-        type: 'addRules',
-        rules: [{
-          toolName: row.tool_name,
-          decision: status === 'approved' ? 'allow' : 'deny',
-        }],
-      }];
-    } catch (err) {
-      console.error(`[${BOT_NAME}] chat_tool_decisions persist failed: ${err.message}`);
-      // Non-fatal — the one-time decision still propagates below.
-    }
-  }
-
-  await ctx.answerCallbackQuery({ text: status }).catch(() => {});
-
-  // Pass the original decision token back to the waiter so it can
-  // distinguish 'approved-always' (SDK gets updatedPermissions)
-  // from plain 'approved'. CLI IPC waiters strip back to plain
-  // approve/deny in their wrappedResolve.
-  resolveApprovalWaiter(id, decision === 'approve-always' ? 'approved-always'
-    : decision === 'deny-always' ? 'denied-always'
-    : status, undefined, { updatedPermissions });
-}
-
-// handleConfigCallback extracted to lib/handlers/config-callback.js.
-// Wired in main() once pm + db + getSessionKey + formatConfigInfoText +
-// buildConfigKeyboard are available.
-let handleConfigCallback = null;
-// handleAbortIfRequested extracted to lib/handlers/abort.js.
-let handleAbortIfRequested = null;
-// autosteer (willAutosteer + tryAutosteer) extracted to lib/handlers/autosteer.js.
-let autosteer = null;
-// dispatchSlashCommand extracted to lib/handlers/slash-commands.js.
-let dispatchSlashCommand = null;
-
-function startApprovalSweeper(intervalMs = 30_000) {
-  return setInterval(() => {
-    let rows;
-    try {
-      rows = approvals.sweepTimedOut();
-    } catch (err) {
-      // Silent failure here is invisible death — pending approvals time out
-      // with no operator signal. Log loudly.
-      console.error(`[approvals] sweeper DB error: ${err.message}`);
-      logEvent('approval-sweep-failed', {
-        error: err.message?.slice(0, 300),
-      });
-      return;
-    }
-    for (const row of rows) {
-      approvals.resolve({ id: row.id, status: 'timeout' });
-      logEvent('approval-timeout', {
-        id: row.id, bot: BOT_NAME, tool: row.tool_name,
-      });
-      resolveApprovalWaiter(row.id, 'timeout', 'swept');
-      // Best-effort: edit the card to show the timeout. Routed through
-      // tg() so the edit gets the same plain-text formatting policy as
-      // the original card post (no parse_mode injection from tool input)
-      // AND lands in the transcript like every other outbound. Pre-0.6.8
-      // this called bot.api.editMessageText directly and bypassed both.
-      if (bot && row.approver_msg_id) {
-        tg(bot, 'editMessageText', {
-          chat_id: row.approver_chat_id,
-          message_id: row.approver_msg_id,
-          text: approvalCardText(approvals.getById(row.id), { resolvedBy: '⏰ Timed out' }),
-        }, { source: 'approval-card-timeout', botName: BOT_NAME, plainText: true })
-          .catch((err) => console.error(`[${BOT_NAME}] approval-card-timeout edit: ${err.message}`));
-      }
-    }
-  }, intervalMs);
-}
+// rc.20: approvalCardText + safeParse moved to lib/approvals/ui.js.
+// 0.9.0 commit 29: makeCanUseTool / handleApprovalCallback /
+// resolveApprovalWaiter / dropWaiter / startApprovalSweeper extracted
+// to lib/handlers/approvals.js. Wired in main() once db + bot + tg +
+// approvals store are available.
+let makeCanUseTool = null;
+let handleApprovalCallback = null;
+let resolveApprovalWaiter = null;
+let startApprovalSweeper = null;
 
 // Parse /pair-code args: /pair-code [--chat <id>] [--scope user|chat] [--ttl 10m] [--note "..."]
 function parsePairCodeArgs(text) {
@@ -2871,6 +2525,18 @@ async function main() {
   // buildSdkOptions is the per-call spawn factory; we wire it now
   // that the runtime context (config, BOT_NAME, makeCanUseTool,
   // logEvent) exists.
+  // Wire approval flow FIRST — buildSdkOptions takes makeCanUseTool
+  // as a runtime dep, so we need it bound before we instantiate
+  // ProcessManagerSdk.
+  ({
+    makeCanUseTool,
+    handleApprovalCallback,
+    resolveApprovalWaiter,
+    startApprovalSweeper,
+  } = createApprovals({
+    config, db, bot, botName: BOT_NAME, tg, logEvent,
+    approvals, getChatIdFromKey, logger: console,
+  }));
   buildSdkOptions = createBuildSdkOptions({
     config,
     botName: BOT_NAME,
