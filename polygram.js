@@ -254,6 +254,7 @@ const { extractAttachments } = require('./lib/handlers/extract-attachments');
 const { createRecordInbound } = require('./lib/handlers/record-inbound');
 const { createHandleSendOverIpc } = require('./lib/handlers/ipc-send');
 const { createDispatcher } = require('./lib/handlers/dispatcher');
+const { createPollLoop } = require('./lib/handlers/poll');
 
 // transcribeVoiceAttachments extracted to lib/handlers/voice.js.
 // Wired in main() once db + tg + config are available.
@@ -1745,117 +1746,9 @@ function createBot(token) {
   return bot;
 }
 
-// ─── Manual polling ─────────────────────────────────────────────────
-
-async function pollBot(bot) {
-  await bot.init();
-  bot._setBotUsername(bot.botInfo.username);
-  console.log(`[${BOT_NAME}] Bot @${bot.botInfo.username} ready`);
-
-  await bot.api.deleteWebhook();
-
-  // Restore polling offset from DB so a restart doesn't re-process the
-  // backlog Telegram has accumulated while we were down. Grammy's in-memory
-  // offset resets to 0 each boot, which makes getUpdates return every
-  // un-confirmed update since the last ack — for an overnight outage that
-  // can mean replaying dozens of stale messages.
-  let offset = 0;
-  try {
-    const saved = db?.getPollingOffset?.(BOT_NAME);
-    if (saved && saved > 0) {
-      offset = saved + 1;
-      console.log(`[${BOT_NAME}] resuming polling from update_id ${saved}`);
-    }
-  } catch (err) {
-    console.error(`[${BOT_NAME}] getPollingOffset failed: ${err.message}`);
-  }
-  let running = true;
-  bot._lastPollTs = Date.now();
-
-  bot._stop = () => { running = false; };
-
-  while (running) {
-    try {
-      const updates = await bot.api.getUpdates({
-        offset,
-        // Long-poll: Telegram holds the connection up to 25s waiting for
-        // updates. When something arrives it returns immediately; empty
-        // windows cost ~0 local CPU. Drops median inbound latency vs the
-        // old short-poll-every-1s.
-        timeout: 25,
-        allowed_updates: ['message', 'edited_message', 'callback_query'],
-      });
-      bot._lastPollTs = Date.now();
-
-      for (const update of updates) {
-        offset = update.update_id + 1;
-        if (update.message && isWellFormedMessage(update.message)) {
-          const m = update.message;
-          const chatId = m.chat.id.toString();
-          const chatConfig = config.chats[chatId];
-          const threadId = m.message_thread_id?.toString();
-          // rc.57: use getTopicName() helper which handles BOTH legacy string
-          // form and rc.48 object form. Pre-rc.57 the direct lookup
-          // `chatConfig.topics[threadId]` template-literal'd into "[object Object]"
-          // because rc.48 topics are objects like {name:"Music",agent:"...",...}.
-          const topicName = threadId
-            ? (chatConfig ? getTopicName(chatConfig, threadId) : threadId)
-            : null;
-          const chatLabel = chatConfig?.name || chatId;
-          const label = topicName ? `${chatLabel}/${topicName}` : chatLabel;
-          console.log(`[${BOT_NAME}] ← ${label}: ${(m.text || m.caption || '(media)').slice(0, 60)}`);
-        }
-        try {
-          await bot.handleUpdate(update);
-        } catch (err) {
-          console.error(`[${BOT_NAME}] Handler error:`, err.message);
-        }
-      }
-      // Persist offset after batch dispatch so a crash mid-batch only risks
-      // re-processing the unacked updates. We write only on non-empty batches
-      // to avoid churning the row on every 25s idle poll.
-      if (updates.length > 0) {
-        dbWrite(() => db.savePollingOffset(BOT_NAME, updates[updates.length - 1].update_id),
-          'save polling offset');
-      }
-      // No sleep on the success path: long-poll already blocks up to 25s
-      // when idle. Sleeping here would add latency with no gain.
-    } catch (err) {
-      if (!running) break;
-      if (err.error_code === 409) {
-        console.log(`[${BOT_NAME}] 409, waiting 3s...`);
-        await new Promise(r => setTimeout(r, 3000));
-      } else {
-        console.error(`[${BOT_NAME}] Poll error:`, err.message);
-        await new Promise(r => setTimeout(r, 3000));
-      }
-    }
-  }
-}
-
-// Watchdog: if the poll loop hasn't ticked in POLL_STALL_MS, log an event
-// so external monitoring (or a human reading `events`) can see it. Launchd
-// restarts the whole process on death, so we don't exit here — a stalled
-// grammy poll is usually transient (network flap, Telegram 5xx).
-const POLL_STALL_MS = 120_000;
-function startPollWatchdog(bot) {
-  let stalled = false;
-  return setInterval(() => {
-    const now = Date.now();
-    const age = now - (bot._lastPollTs || 0);
-    if (age > POLL_STALL_MS) {
-      if (!stalled) {
-        console.error(`[${BOT_NAME}] poll-stalled: no tick in ${Math.round(age / 1000)}s`);
-        logEvent('poll-stalled', { bot: BOT_NAME, stall_ms: age });
-        stalled = true;
-      }
-    } else if (stalled) {
-      console.log(`[${BOT_NAME}] poll-recovered after stall`);
-      logEvent('poll-recovered', { bot: BOT_NAME });
-      stalled = false;
-    }
-  }, 30_000);
-}
+// ─── Manual polling — extracted to lib/handlers/poll.js ────────────
+let pollBot = null;
+let startPollWatchdog = null;
 
 // ─── Main ───────────────────────────────────────────────────────────
 
@@ -2050,6 +1943,11 @@ async function main() {
     chunkMarkdownText, deliverReplies,
     TG_MAX_LEN,
     getIsShuttingDown: () => isShuttingDown,
+    logger: console,
+  }));
+  ({ pollBot, startPollWatchdog } = createPollLoop({
+    db, dbWrite, config, botName: BOT_NAME,
+    isWellFormedMessage, getTopicName,
     logger: console,
   }));
   dispatchSlashCommand = createSlashCommands({
@@ -2390,7 +2288,7 @@ async function main() {
     console.error(`[${BOT_NAME}] Fatal:`, err.message);
   });
 
-  const watchdogTimer = startPollWatchdog(bot);
+  const watchdogTimer = startPollWatchdog(bot, { logEvent });
   process.once('exit', () => clearInterval(watchdogTimer));
 
   await pollPromise;
