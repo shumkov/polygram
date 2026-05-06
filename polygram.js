@@ -2270,23 +2270,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
 
   if (botAllowsCommands && (text === '/new' || text === '/reset')) {
     let drained = 0;
-    const target = pm.pickFor(sessionKey);
-    if (typeof target.resetSession === 'function') {
-      try {
-        const r = await target.resetSession(sessionKey, { reason: text.slice(1) });
-        drained = r?.drainedPendings ?? 0;
-      } catch (err) {
-        console.error(`[${label}] resetSession ${text}: ${err.message}`);
-      }
-    } else {
-      // CLI pm fallback: kill the session; sessions table cleared
-      // via clearSessionId in pm's proc.on('close') resume-fail
-      // path (lib/process-manager.js:457). We force the path by
-      // setting the kill rationale so the close handler treats it
-      // as a successful reset.
-      try { await pm.kill(sessionKey); }
-      catch (err) { console.error(`[${label}] kill on ${text}: ${err.message}`); }
-      try { db.clearSessionId(sessionKey); } catch { /* swallow */ }
+    try {
+      const r = await pm.resetSession(sessionKey, { reason: text.slice(1) });
+      drained = r?.drainedPendings ?? 0;
+    } catch (err) {
+      console.error(`[${label}] resetSession ${text}: ${err.message}`);
     }
     // rc.59: clear contextHint once-per-cycle gate so a freshly-reset
     // session can fire its own hint when context fills up again.
@@ -2890,12 +2878,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // role_ordering / context_overflow / missing_tool_input),
       // tell pm to reset the session NOW so the user's NEXT
       // message starts fresh — without them having to type /new.
-      // Only fires when pm.resetSession is available (SDK pm
-      // path); CLI pm doesn't have the method.
       const cls = classifyError(result.error);
-      const recoverTarget = pm.pickFor(sessionKey);
-      if (cls.autoRecover === 'reset_session' && typeof recoverTarget.resetSession === 'function') {
-        recoverTarget.resetSession(sessionKey, { reason: cls.kind })
+      if (cls.autoRecover === 'reset_session') {
+        pm.resetSession(sessionKey, { reason: cls.kind })
           .catch((err) => console.error(`[${label}] auto-reset failed: ${err.message}`));
         logEvent('auto-recover', {
           chat_id: chatId, kind: cls.kind, action: 'reset_session',
@@ -3454,17 +3439,9 @@ function createBot(token) {
       // sessionKey is the chat itself, so killing one session is
       // the same as killing the chat — behavior unchanged for the
       // common case.
-      const stopTarget = pm.pickFor(sessionKey);
-      if (typeof stopTarget.interrupt === 'function') {
-        await stopTarget.interrupt(sessionKey).catch((err) =>
-          console.error(`[${BOT_NAME}] interrupt failed: ${err.message}`));
-        if (typeof stopTarget.drainQueue === 'function') {
-          stopTarget.drainQueue(sessionKey, 'INTERRUPTED');
-        }
-      } else {
-        await stopTarget.kill(sessionKey).catch((err) =>
-          console.error(`[${BOT_NAME}] abort kill failed: ${err.message}`));
-      }
+      await pm.interrupt(sessionKey).catch((err) =>
+        console.error(`[${BOT_NAME}] interrupt failed: ${err.message}`));
+      pm.drainQueue(sessionKey, 'INTERRUPTED');
       // rc.42: autosteer buffer is gone (native SDK priority push).
       // Followups already pushed onto the SDK's input controller will
       // be drained by drainQueue() / kill() on the entry — no separate
