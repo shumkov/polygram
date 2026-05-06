@@ -13,7 +13,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { createPmRouter } = require('../lib/pm-router');
+const { createPmRouter } = require('../lib/sdk/pm-router');
 
 describe('createPmRouter — single-pm wrapper', () => {
   test('returns the wrapped pm instance', () => {

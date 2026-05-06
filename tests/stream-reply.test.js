@@ -7,7 +7,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { createStreamer } = require('../lib/stream-reply');
-const { extractAssistantText } = require('../lib/process-manager-sdk');
+const { extractAssistantText } = require('../lib/sdk/process-manager-sdk');
 
 const silent = { error: () => {} };
 

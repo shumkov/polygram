@@ -31,11 +31,11 @@ const { filterAttachments, MAX_FILE_BYTES } = require('./lib/attachments');
 // callbacks), so the rest of polygram.js doesn't branch beyond the
 // pick-at-startup. Phase 4 deletes the CLI version after Phase 5
 // soak proves SDK stable. See docs/0.8.0-architecture-decisions.md.
-const { ProcessManagerSdk, extractAssistantText } = require('./lib/process-manager-sdk');
+const { ProcessManagerSdk, extractAssistantText } = require('./lib/sdk/process-manager-sdk');
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
 // (pm.injectUserMessage) replaces the buffer + PostToolBatch detour.
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
-const { createPmRouter } = require('./lib/pm-router');
+const { createPmRouter } = require('./lib/sdk/pm-router');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
   buildApprovalKeyboardWithAlways,
