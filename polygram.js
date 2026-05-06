@@ -40,6 +40,7 @@ const { createBuildSdkOptions } = require('./lib/sdk/build-options');
 const { createSdkCallbacks } = require('./lib/sdk/callbacks');
 const { createTranscribeVoiceAttachments } = require('./lib/handlers/voice');
 const { createDownloadAttachments } = require('./lib/handlers/download');
+const { createHandleConfigCallback } = require('./lib/handlers/config-callback');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
   buildApprovalKeyboardWithAlways,
@@ -1371,106 +1372,10 @@ async function handleApprovalCallback(ctx) {
     : status, undefined, { updatedPermissions });
 }
 
-// Handles taps on the /model and /effort inline keyboard buttons. Same
-// outcome as the text-typed `/model sonnet` flow: mutate chatConfig,
-// trigger graceful respawn, log config change, edit the message to show
-// the new ✓ marker.
-async function handleConfigCallback(ctx) {
-  const data = ctx.callbackQuery?.data || '';
-  const m = String(data).match(/^cfg:(model|effort):(\S+)$/);
-  if (!m) return;
-  const setting = m[1];
-  const value = m[2];
-
-  const chatId = String(ctx.callbackQuery.message?.chat?.id || '');
-  const chatConfig = config.chats[chatId];
-  if (!chatConfig) {
-    await ctx.answerCallbackQuery({ text: 'Chat not configured', show_alert: true }).catch(() => {});
-    return;
-  }
-  if (!config.bot?.allowConfigCommands) {
-    await ctx.answerCallbackQuery({ text: 'Config commands disabled', show_alert: true }).catch(() => {});
-    return;
-  }
-
-  const validValues = setting === 'model' ? MODEL_OPTIONS : EFFORT_OPTIONS;
-  if (!validValues.includes(value)) {
-    await ctx.answerCallbackQuery({ text: `Invalid ${setting}` }).catch(() => {});
-    return;
-  }
-
-  const oldValue = chatConfig[setting];
-  if (oldValue === value) {
-    await ctx.answerCallbackQuery({ text: `Already ${value}` }).catch(() => {});
-    return;
-  }
-
-  chatConfig[setting] = value;
-  const cmdUserId = ctx.callbackQuery.from?.id || null;
-  const cmdUser = ctx.callbackQuery.from?.first_name || ctx.callbackQuery.from?.username || null;
-  dbWrite(() => db.logConfigChange({
-    chat_id: chatId, thread_id: null, field: setting,
-    old_value: oldValue, new_value: value,
-    user: cmdUser, user_id: cmdUserId, source: 'inline-button',
-  }), `log ${setting} change`);
-
-  // Graceful application of the change to the topic's session. With
-  // isolateTopics=false sessionKey is the chat (one shared session). With
-  // isolateTopics=true sessionKey carries the topic, so other topics'
-  // in-flight turns are not disturbed and the card update + button toast
-  // only affect the user's own context.
-  //
-  // SDK pm applies the change live to the running Query via setModel /
-  // applyFlagSettings — no respawn, no kill, the change takes effect
-  // for the rest of the in-flight turn AND all future ones. Falls back
-  // to {killed: false} if the pm doesn't expose the targeted method
-  // (would only happen if a future alternate pm impl ships incomplete);
-  // chatConfig still updated on disk above, so the next cold spawn
-  // picks up the new value either way.
-  const callbackThreadId = ctx.callbackQuery.message?.message_thread_id?.toString() || null;
-  const callbackSessionKey = getSessionKey(chatId, callbackThreadId, chatConfig);
-  // SDK pm guarantees applyFlagSettings + setModel; chatConfig is
-  // already updated on disk above so a missing live session still
-  // gets the new value on its next cold spawn.
-  let applied = false;
-  if (setting === 'effort') {
-    applied = await pm.applyFlagSettings(callbackSessionKey, { effortLevel: value });
-  } else if (setting === 'model') {
-    applied = await pm.setModel(callbackSessionKey, value);
-  }
-  const anyActive = !applied;
-
-  // Re-render the card with updated ✓ + the same help text shown initially.
-  // Detect original card type (model-only / effort-only / both) by counting
-  // rows in the existing reply_markup so the user sees the same layout
-  // they tapped into.
-  const existingRows = ctx.callbackQuery.message?.reply_markup?.inline_keyboard?.length || 0;
-  const showRow = existingRows >= 2 ? 'all' : setting;
-  // chatId works as a session-key proxy here for the warm-process check
-  // (isolateTopics chats might have multiple keys but for this card we
-  // just want a representative state).
-  const newInfo = formatConfigInfoText(chatConfig, showRow, chatId);
-  const newKeyboard = buildConfigKeyboard(chatConfig, showRow);
-  try {
-    // Pre-format the markdown→HTML ourselves so editMessageText can be
-    // called with the right parse_mode (the bot.api.editMessageText path
-    // bypasses tg() / applyFormatting in the chat-action approval card,
-    // but here we DO want HTML).
-    const { toTelegramHtml } = require('./lib/telegram/format');
-    const { text: html, parseMode } = toTelegramHtml(newInfo);
-    await ctx.editMessageText(html, {
-      reply_markup: newKeyboard,
-      ...(parseMode && { parse_mode: parseMode }),
-    });
-  } catch (err) {
-    console.error(`[${BOT_NAME}] config-card edit failed: ${err.message}`);
-  }
-
-  const ackText = anyActive
-    ? `${setting} → ${value} — switching when finished`
-    : `${setting} → ${value}`;
-  await ctx.answerCallbackQuery({ text: ackText }).catch(() => {});
-}
+// handleConfigCallback extracted to lib/handlers/config-callback.js.
+// Wired in main() once pm + db + getSessionKey + formatConfigInfoText +
+// buildConfigKeyboard are available.
+let handleConfigCallback = null;
 
 function startApprovalSweeper(intervalMs = 30_000) {
   return setInterval(() => {
@@ -3398,6 +3303,11 @@ async function main() {
   });
   downloadAttachments = createDownloadAttachments({
     config, db, dbWrite, inboxDir: INBOX_DIR, logger: console,
+  });
+  handleConfigCallback = createHandleConfigCallback({
+    config, db, dbWrite, pm, getSessionKey,
+    formatConfigInfoText, buildConfigKeyboard,
+    botName: BOT_NAME, logger: console,
   });
   const sdkPm = new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions });
   pm = createPmRouter({ pm: sdkPm });
