@@ -42,6 +42,7 @@ const { createDownloadAttachments } = require('./lib/handlers/download');
 const { createHandleConfigCallback } = require('./lib/handlers/config-callback');
 const { createHandleAbort } = require('./lib/handlers/abort');
 const { createAutosteerHandlers } = require('./lib/handlers/autosteer');
+const { createSlashCommands } = require('./lib/handlers/slash-commands');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
   buildApprovalKeyboardWithAlways,
@@ -1383,6 +1384,8 @@ let handleConfigCallback = null;
 let handleAbortIfRequested = null;
 // autosteer (willAutosteer + tryAutosteer) extracted to lib/handlers/autosteer.js.
 let autosteer = null;
+// dispatchSlashCommand extracted to lib/handlers/slash-commands.js.
+let dispatchSlashCommand = null;
 
 function startApprovalSweeper(intervalMs = 30_000) {
   return setInterval(() => {
@@ -1518,315 +1521,14 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     await sendReply(info, { params: { reply_markup } });
     return;
   }
-  // 0.8.0 Phase 2 step 7: /new and /reset slash commands. Both close
-  // the current Query (if any), clear the claude_session_id from the
-  // sessions table, and post "✨ Started a fresh session." Next user
-  // message starts a fresh subprocess with no resume.
-  //
-  // Equivalent UX to OpenClaw's /new and /reset handlers
-  // (pi-embedded:40594 BARE_SESSION_RESET_PROMPT). Required by the
-  // 85%-context-full hint (Phase 2 step 4) and by classifier-driven
-  // auto-recovery (step 8) — both reference these commands.
-  // 0.8.0 Phase 2 step 9: /context slash command. On-demand context-
-  // usage report via Query.getContextUsage().
-  if (botAllowsCommands && text === '/context') {
-    const entry = pm.get(sessionKey);
-    const q = entry?.query;
-    if (!q || typeof q.getContextUsage !== 'function') {
-      await sendReply('📚 No active session yet — send a message first, then /context.');
-      return;
-    }
-    try {
-      const u = await q.getContextUsage();
-      await sendReply(formatContextReply(u));
-    } catch (err) {
-      console.error(`[${label}] /context failed: ${err.message}`);
-      await sendReply(`📚 Couldn't fetch context info: ${err.message}`);
-    }
-    return;
-  }
-  // 0.8.0-rc.22: /compact <preserve text> — manual SDK compaction with
-  // user-supplied preservation instructions. The SDK's CLI binary
-  // recognises "/compact" as a slash command via streamInput.push
-  // (verified by scripts/spikes/compact-via-streaminput.mjs: PreCompact
-  // hook fires with trigger:'manual', compact_boundary event lands).
-  // We push the raw text "/compact <instructions>" through the SDK's
-  // input controller; the SDK handles parsing + compaction internally.
-  if (botAllowsCommands && text.startsWith('/compact')) {
-    // rc.64: if the in-memory session was evicted (LRU cap pressure)
-    // but there's a saved Claude session_id in DB, auto-spawn the
-    // Query with --resume so /compact has something to work with.
-    // Pre-rc.64 we returned "🗜️ No active session" — confusing
-    // because the user just had a conversation 5 minutes ago, the
-    // session went idle, LRU evicted it, and "No active session"
-    // reads as "I never knew you" instead of "I unloaded your
-    // session, hold on."
-    let entry = pm.get(sessionKey);
-    if (!entry) {
-      const savedSessionId = getClaudeSessionId(db, sessionKey);
-      if (!savedSessionId) {
-        await sendReply('🗜️ No conversation to compact yet. Send a message first, then /compact.');
-        return;
-      }
-      try {
-        entry = await getOrSpawnForChat(sessionKey);
-      } catch (err) {
-        console.error(`[${label}] /compact spawn-resume: ${err.message}`);
-        await sendReply(`🗜️ Couldn't load session for compaction: ${err.message}`);
-        return;
-      }
-      if (!entry) {
-        await sendReply('🗜️ Session not loadable (config missing).');
-        return;
-      }
-      logEvent('compact-spawn-resumed', {
-        chat_id: chatId, thread_id: threadIdStr, session_key: sessionKey,
-        resumed_session_id: savedSessionId,
-      });
-    }
-    if (!entry?.inputController?.push) {
-      await sendReply('🗜️ Session not ready for /compact (no input controller).');
-      return;
-    }
-    // Push the literal "/compact ..." text into the input stream.
-    // The SDK parses leading "/" as a slash command and triggers
-    // manual compaction; user's preserve instructions land in
-    // PreCompactHookInput.custom_instructions.
-    try {
-      entry.inputController.push({
-        type: 'user',
-        message: { role: 'user', content: text },
-        parent_tool_use_id: null,
-      });
-      logEvent('compact-command', {
-        chat_id: chatId, thread_id: threadIdStr, session_key: sessionKey,
-        text_len: text.length,
-        // rc.65: store the full /compact text so boot-time orphan
-        // recovery can silently re-push it after a deploy
-        // interrupted compaction. Agent-supplied hints (e.g.
-        // "/compact keep the Q3 commission decisions") need to be
-        // preserved verbatim for the retry to summarize correctly.
-        text,
-        user: cmdUser, user_id: cmdUserId,
-      });
-      const hasHint = text.length > '/compact'.length + 1;
-      await sendReply(hasHint
-        ? '🗜️ Compacting with your hint…'
-        : '🗜️ Compacting…');
-    } catch (err) {
-      console.error(`[${label}] /compact push: ${err.message}`);
-      await sendReply(`🗜️ Couldn't trigger compact: ${err.message}`);
-    }
-    return;
-  }
-  // 0.8.0-rc.46: /reload — close + respawn the SDK Query while
-  // PRESERVING the persisted claude_session_id. The next user
-  // message resumes the conversation (model has prior context via
-  // SDK resume) but the spawn re-reads agent / skill / plugin files
-  // from disk, so any local edits to ~/.claude/agents/<name>.md or
-  // skill files take effect.
-  //
-  // Difference vs /new:
-  //   /new    → resetSession clears session_id → fresh conversation
-  //   /reload → kill closes Query, session_id preserved → same
-  //              conversation continues with fresh agent/skill code
-  //
-  // Mechanism: pm.kill drains the pending queue (with code 'KILLED')
-  // and closes the SDK Query. Crucially it does NOT call
-  // db.clearSessionId — the contract test
-  // 'pm.kill does NOT call db.clearSessionId' pins this invariant.
-  // The next user message hits getOrSpawn → no warm Query → spawn
-  // fresh with `resume: <session_id>` from sessions table → SDK
-  // restores conversation history → fresh files loaded.
-  if (botAllowsCommands && text === '/reload') {
-    if (pm.has(sessionKey)) {
-      try { await pm.kill(sessionKey); }
-      catch (err) { console.error(`[${label}] kill on /reload: ${err.message}`); }
-    }
-    logEvent('session-reload-command', {
-      chat_id: chatId, command: text,
-      user: cmdUser, user_id: cmdUserId,
-    });
-    await sendReply('🔄 Reloaded. Next message picks up the conversation with fresh skills/agents.');
-    return;
-  }
-
-  if (botAllowsCommands && (text === '/new' || text === '/reset')) {
-    let drained = 0;
-    try {
-      const r = await pm.resetSession(sessionKey, { reason: text.slice(1) });
-      drained = r?.drainedPendings ?? 0;
-    } catch (err) {
-      console.error(`[${label}] resetSession ${text}: ${err.message}`);
-    }
-    // rc.59: clear contextHint once-per-cycle gate so a freshly-reset
-    // session can fire its own hint when context fills up again.
-    contextHintShown.delete(sessionKey);
-    logEvent('session-reset-command', {
-      chat_id: chatId, command: text, drained_pendings: drained,
-      user: cmdUser, user_id: cmdUserId,
-    });
-    await sendReply('✨ Started a fresh session.');
-    return;
-  }
-  // 0.8.0-rc.9: /steer command removed. Mid-turn user input is
-  // handled implicitly by autosteer — any follow-up message during
-  // an in-flight SDK turn flows through autosteerBuffer +
-  // PostToolBatch hook. No explicit command needed; matches Claude
-  // Code interactive UX where you just keep typing.
-  // Graceful application of a model/effort change to the user's CURRENT
-  // session only. With isolateTopics=false the sessionKey is just the
-  // chat (one shared session for the whole chat — every topic
-  // respawns implicitly). With isolateTopics=true each topic is a
-  // separate session, and a /model in topic A should NOT disturb
-  // topic B's in-flight turn or post a phantom "✓ Using sonnet now"
-  // in a topic that didn't ask.
-  //
-  // SDK pm applies the model/effort change live to the running Query
-  // via setModel / applyFlagSettings — no respawn, change takes
-  // effect for the rest of the in-flight turn AND all future ones.
-  // Returns whether there was a live session to push the change into;
-  // false means chatConfig was updated on disk but no in-memory Query
-  // received it (next cold spawn picks it up).
-  const applyConfigChange = async (setting, value) => {
-    let applied = false;
-    if (setting === 'effort') {
-      applied = await pm.applyFlagSettings(sessionKey, { effortLevel: value });
-    } else if (setting === 'model') {
-      applied = await pm.setModel(sessionKey, value);
-    }
-    return { anyActive: !applied };
-  };
-
-  if (botAllowsCommands && text.startsWith('/model ')) {
-    const newModel = text.slice(7).trim();
-    if (['opus', 'sonnet', 'haiku'].includes(newModel)) {
-      const oldModel = chatConfig.model;
-      // Ephemeral: in-memory only, reverts to config.json on restart.
-      chatConfig.model = newModel;
-      dbWrite(() => db.logConfigChange({
-        chat_id: chatId, thread_id: threadIdStr, field: 'model',
-        old_value: oldModel, new_value: newModel,
-        user: cmdUser, user_id: cmdUserId, source: 'command',
-      }), 'log model change');
-      const { anyActive } = await applyConfigChange('model', newModel);
-      const ver = MODEL_VERSIONS[newModel] || newModel;
-      const suffix = anyActive ? ` — I'll switch when I finish` : '';
-      await sendReply(`Model → ${newModel} (${ver})${suffix}`);
-    } else {
-      await sendReply(`Unknown model. Use: opus, sonnet, haiku`);
-    }
-    return;
-  }
-  if (botAllowsCommands && text.startsWith('/effort ')) {
-    const newEffort = text.slice(8).trim();
-    if (['low', 'medium', 'high', 'xhigh', 'max'].includes(newEffort)) {
-      const oldEffort = chatConfig.effort;
-      // Ephemeral: in-memory only, reverts to config.json on restart.
-      chatConfig.effort = newEffort;
-      dbWrite(() => db.logConfigChange({
-        chat_id: chatId, thread_id: threadIdStr, field: 'effort',
-        old_value: oldEffort, new_value: newEffort,
-        user: cmdUser, user_id: cmdUserId, source: 'command',
-      }), 'log effort change');
-      const { anyActive } = await applyConfigChange('effort', newEffort);
-      const suffix = anyActive ? ` — I'll switch when I finish` : '';
-      await sendReply(`Effort → ${newEffort}${suffix}`);
-    } else {
-      await sendReply(`Unknown effort. Use: low, medium, high, xhigh, max`);
-    }
-    return;
-  }
-  // Admin-only pairing commands — chat must match config.bot.adminChatId.
-  // allowConfigCommands alone is NOT sufficient: that flag gates /model and
-  // /effort which only affect the current chat. Pairing issues cross-chat
-  // trust and must be narrowed further.
-  const adminChatId = config.bot?.adminChatId ? String(config.bot.adminChatId) : null;
-  const isAdminChat = adminChatId && String(chatId) === adminChatId;
-
-  if (botAllowsCommands && text.startsWith('/pair-code')) {
-    if (!isAdminChat) { await sendReply('Pairing commands are admin-only; run from the admin chat.'); return; }
-    const issuerId = cmdUserId;
-    if (!issuerId) { await sendReply('No user id on request'); return; }
-    const args = parsePairCodeArgs(text);
-    try {
-      const out = pairings.issueCode({
-        bot_name: BOT_NAME,
-        chat_id: args.chat || null,
-        scope: args.scope || 'user',
-        issued_by_user_id: issuerId,
-        ttlMs: args.ttl ? parsePairingTtl(args.ttl) : undefined,
-        note: args.note || null,
-      });
-      logEvent('pair-code-issued', {
-        bot: BOT_NAME, by: issuerId, scope: out.scope,
-        chat_id: out.chat_id, note: out.note,
-      });
-      const ttlLabel = args.ttl || '10m';
-      const chatLabel = out.chat_id ? `chat ${out.chat_id}` : 'any chat';
-      await sendReply(
-        `Code: ${out.code}\nexpires: ${ttlLabel}\nscope: ${out.scope} (${chatLabel})${out.note ? `\nnote: ${out.note}` : ''}\n\nShare with user:\n/pair ${out.code}`,
-      );
-    } catch (err) {
-      await sendReply(`Could not issue code: ${err.message}`);
-    }
-    return;
-  }
-  if (botAllowsCommands && text.startsWith('/pairings')) {
-    if (!isAdminChat) { await sendReply('Pairing commands are admin-only; run from the admin chat.'); return; }
-    const rows = pairings.listActive(BOT_NAME);
-    if (!rows.length) { await sendReply('No active pairings.'); return; }
-    const lines = rows.map(r => {
-      const chat = r.chat_id ? `chat ${r.chat_id}` : 'any chat';
-      const granted = new Date(r.granted_ts).toISOString().slice(0, 16).replace('T', ' ');
-      const note = r.note ? ` — ${r.note}` : '';
-      return `• user ${r.user_id} — ${chat} — ${granted}${note}`;
-    });
-    await sendReply(`Active pairings (${rows.length}):\n${lines.join('\n')}`);
-    return;
-  }
-  if (botAllowsCommands && text.startsWith('/unpair ')) {
-    if (!isAdminChat) { await sendReply('Pairing commands are admin-only; run from the admin chat.'); return; }
-    const arg = text.slice(8).trim();
-    const targetId = parseInt(arg, 10);
-    if (!Number.isFinite(targetId)) {
-      await sendReply('Usage: /unpair <user_id>'); return;
-    }
-    const n = pairings.revokeByUser({ bot_name: BOT_NAME, user_id: targetId });
-    logEvent('pair-revoked', {
-      bot: BOT_NAME, user_id: targetId, by: cmdUserId, count: n,
-    });
-    await sendReply(n ? `Revoked ${n} pairing(s) for user ${targetId}.` : `No active pairings for user ${targetId}.`);
-    return;
-  }
-  // /pair <CODE> — open to anyone, no admin gate (the code IS the auth)
-  if (text.startsWith('/pair ') && !text.startsWith('/pair-code') && !text.startsWith('/pairings')) {
-    if (!cmdUserId) { await sendReply('No user id on request'); return; }
-    const code = text.slice(6).trim();
-    const res = pairings.claimCode({
-      code, claimer_user_id: cmdUserId,
-      chat_id: chatId, bot_name: BOT_NAME,
-    });
-    logEvent('pair-claim-attempt', {
-      bot: BOT_NAME, user_id: cmdUserId, chat_id: chatId,
-      ok: res.ok, reason: res.reason,
-    });
-    if (res.ok) {
-      const chatLabel = res.chat_id ? `chat ${res.chat_id}` : `every chat ${BOT_NAME} is in`;
-      await sendReply(`Paired. You can use me in ${chatLabel}.${res.note ? `\n(${res.note})` : ''}`);
-    } else {
-      // Collapse specific failure reasons into a single "invalid or expired"
-      // response to prevent enumeration: distinguishing "wrong-chat" from
-      // "not-found" would tell an attacker a valid code prefix. The
-      // pair-claim-attempt event above still logs the precise reason for
-      // operator audit.
-      const userMsg = res.reason === 'rate-limited'
-        ? 'Too many attempts. Try again later.'
-        : 'Invalid or expired code.';
-      await sendReply(userMsg);
-    }
-    return;
-  }
+  // Slash command dispatch — extracted to lib/handlers/slash-commands.js.
+  // Covers /context /compact /reload /new /reset /model /effort
+  // /pair-code /pairings /unpair /pair. Returns true when handled;
+  // caller short-circuits.
+  if (await dispatchSlashCommand({
+    text, sessionKey, chatId, threadIdStr, chatConfig,
+    cmdUser, cmdUserId, label, sendReply,
+  })) return;
 
   const t0 = Date.now();
 
@@ -3197,6 +2899,13 @@ async function main() {
   });
   autosteer = createAutosteerHandlers({
     config, pm, autosteeredRefs, logEvent,
+  });
+  dispatchSlashCommand = createSlashCommands({
+    config, db, dbWrite, pm, pairings, parsePairingTtl,
+    contextHintShown, formatContextReply, getClaudeSessionId,
+    getOrSpawnForChat, parsePairCodeArgs,
+    modelVersionsDesc: MODEL_VERSIONS_DESC,
+    botName: BOT_NAME, logEvent, logger: console,
   });
   pm = new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions });
   console.log('[polygram] using SDK ProcessManager');
