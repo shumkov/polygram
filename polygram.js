@@ -38,7 +38,6 @@ const { createAutosteeredRefs } = require('./lib/autosteered-refs');
 const { createPmRouter } = require('./lib/pm-router');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
-  buildApprovalKeyboard,
   buildApprovalKeyboardWithAlways,
   formatToolInputForCard,
   approvalCardText,

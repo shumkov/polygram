@@ -11,37 +11,11 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
-  buildApprovalKeyboard,
   buildApprovalKeyboardWithAlways,
   formatToolInputForCard,
   approvalCardText,
   _safeParse,
 } = require('../lib/approval-ui');
-
-describe('buildApprovalKeyboard — 2-button (CLI pm IPC flow)', () => {
-  test('produces single-row keyboard with approve + deny', () => {
-    const kb = buildApprovalKeyboard(42, 'tok123');
-    assert.equal(kb.inline_keyboard.length, 1);
-    assert.equal(kb.inline_keyboard[0].length, 2);
-  });
-
-  test('callback_data carries id + token in expected format', () => {
-    const kb = buildApprovalKeyboard(42, 'tok123');
-    assert.equal(kb.inline_keyboard[0][0].callback_data, 'approve:42:tok123');
-    assert.equal(kb.inline_keyboard[0][1].callback_data, 'deny:42:tok123');
-  });
-
-  test('button text uses standard emoji', () => {
-    const kb = buildApprovalKeyboard(1, 't');
-    assert.match(kb.inline_keyboard[0][0].text, /Approve/);
-    assert.match(kb.inline_keyboard[0][1].text, /Deny/);
-  });
-
-  test('handles string approvalId', () => {
-    const kb = buildApprovalKeyboard('xyz', 'tok');
-    assert.equal(kb.inline_keyboard[0][0].callback_data, 'approve:xyz:tok');
-  });
-});
 
 describe('buildApprovalKeyboardWithAlways — 4-button (SDK canUseTool)', () => {
   test('produces TWO rows of buttons', () => {
@@ -51,7 +25,7 @@ describe('buildApprovalKeyboardWithAlways — 4-button (SDK canUseTool)', () => 
     assert.equal(kb.inline_keyboard[1].length, 2);
   });
 
-  test('row 1 is one-time approve/deny (same as 2-button)', () => {
+  test('row 1 is one-time approve/deny', () => {
     const kb = buildApprovalKeyboardWithAlways(7, 't');
     assert.equal(kb.inline_keyboard[0][0].callback_data, 'approve:7:t');
     assert.equal(kb.inline_keyboard[0][1].callback_data, 'deny:7:t');
