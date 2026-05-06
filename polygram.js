@@ -44,7 +44,7 @@ const {
 } = require('./lib/approval-ui');
 const { buildHistoryBlock } = require('./lib/history-preload');
 const { formatContextReply, maybeContextFullHint } = require('./lib/context-format');
-const { appendDisplayHint, appendDisplayHintCliArgs } = require('./lib/telegram-prompt');
+const { appendDisplayHint } = require('./lib/telegram-prompt');
 const { createAbortGrace } = require('./lib/abort-grace');
 const agentLoader = require('./lib/agent-loader');
 const { createSender } = require('./lib/telegram');
@@ -1374,9 +1374,9 @@ async function handleSendOverIpc(req) {
 }
 
 // ─── Approvals ─────────────────────────────────────────────────────
-// rc.20: pure UI builders moved to lib/approval-ui.js for testability.
-// Imported above (buildApprovalKeyboard, buildApprovalKeyboardWithAlways,
-// approvalCardText, formatToolInputForCard).
+// Pure UI builders live in lib/approval-ui.js for testability.
+// Imported above (buildApprovalKeyboardWithAlways, approvalCardText,
+// formatToolInputForCard).
 
 // /model and /effort inline keyboard. `show` controls which row(s) appear:
 // 'model', 'effort', or 'all'. The current value gets a ✓ marker so the
@@ -1814,17 +1814,16 @@ async function handleConfigCallback(ctx) {
   // picks up the new value either way.
   const callbackThreadId = ctx.callbackQuery.message?.message_thread_id?.toString() || null;
   const callbackSessionKey = getSessionKey(chatId, callbackThreadId, chatConfig);
-  let respawn;
-  if (setting === 'effort' && typeof pm.applyFlagSettings === 'function') {
-    const ok = await pm.applyFlagSettings(callbackSessionKey, { effortLevel: value });
-    respawn = { killed: ok };
-  } else if (setting === 'model' && typeof pm.setModel === 'function') {
-    const ok = await pm.setModel(callbackSessionKey, value);
-    respawn = { killed: ok };
-  } else {
-    respawn = { killed: false };
+  // SDK pm guarantees applyFlagSettings + setModel; chatConfig is
+  // already updated on disk above so a missing live session still
+  // gets the new value on its next cold spawn.
+  let applied = false;
+  if (setting === 'effort') {
+    applied = await pm.applyFlagSettings(callbackSessionKey, { effortLevel: value });
+  } else if (setting === 'model') {
+    applied = await pm.setModel(callbackSessionKey, value);
   }
-  const anyActive = !respawn.killed;
+  const anyActive = !applied;
 
   // Re-render the card with updated ✓ + the same help text shown initially.
   // Detect original card type (model-only / effort-only / both) by counting
@@ -2157,21 +2156,19 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // in a topic that didn't ask.
   //
   // SDK pm applies the model/effort change live to the running Query
-  // via setModel / applyFlagSettings — no respawn, no kill, change
-  // takes effect for the rest of the in-flight turn AND all future
-  // ones. Falls back to anyActive:false if neither method is available
-  // (chatConfig still updated on disk above; next cold spawn will pick
-  // it up either way).
+  // via setModel / applyFlagSettings — no respawn, change takes
+  // effect for the rest of the in-flight turn AND all future ones.
+  // Returns whether there was a live session to push the change into;
+  // false means chatConfig was updated on disk but no in-memory Query
+  // received it (next cold spawn picks it up).
   const applyConfigChange = async (setting, value) => {
-    if (setting === 'effort' && typeof pm.applyFlagSettings === 'function') {
-      const ok = await pm.applyFlagSettings(sessionKey, { effortLevel: value });
-      return { queued: 0, anyActive: !ok };
+    let applied = false;
+    if (setting === 'effort') {
+      applied = await pm.applyFlagSettings(sessionKey, { effortLevel: value });
+    } else if (setting === 'model') {
+      applied = await pm.setModel(sessionKey, value);
     }
-    if (setting === 'model' && typeof pm.setModel === 'function') {
-      const ok = await pm.setModel(sessionKey, value);
-      return { queued: 0, anyActive: !ok };
-    }
-    return { queued: 0, anyActive: false };
+    return { anyActive: !applied };
   };
 
   if (botAllowsCommands && text.startsWith('/model ')) {
@@ -3961,30 +3958,12 @@ async function main() {
         console.error(`[${entry.label}] compact-boundary post: ${err.message}`);
       }
     },
-    // Fires after a graceful /model or /effort drain has actually
-    // swapped to the new settings. Post a confirmation back to the
-    // chat ONLY when wasDrained=true — the user actively waited for an
-    // in-flight turn to finish before the switch took effect, so the
-    // explicit "switched" message is meaningful. When the kill was
-    // immediate (queue empty), the inline-card update + button toast
-    // already convey "done", and a separate message is just noise.
-    onRespawn: (sessionKey, reason, entry, wasDrained) => {
-      if (!wasDrained) return;
-      const chatId = entry.chatId;
-      if (!chatId) return;
-      const chatConfig = config.chats[chatId];
-      if (!chatConfig) return;
-      const text = reason === 'model-change'
-        ? `✓ Using ${chatConfig.model} now.`
-        : reason === 'effort-change'
-        ? `✓ Effort is ${chatConfig.effort} now.`
-        : `✓ Ready.`;
-      const threadId = entry.threadId || undefined;
-      tg(bot, 'sendMessage', {
-        chat_id: chatId, text,
-        ...(threadId && { message_thread_id: threadId }),
-      }, { source: 'respawn-confirm', botName: BOT_NAME }).catch(() => {});
-    },
+    // 0.9.0: dropped onRespawn callback. It fired only on the deleted
+    // CLI pm's drain-then-respawn path; SDK pm applies /model + /effort
+    // live via setModel / applyFlagSettings with no drain event to
+    // hook. The inline-card update + button toast already convey "done"
+    // — a separate "✓ Using sonnet now" message would be noise on top
+    // of the change taking effect within the next streamed chunk.
   };
 
   // 0.9.0: single SDK pm wrapped by the (now thin) router for

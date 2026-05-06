@@ -11,7 +11,6 @@
   },
   "files": [
     "polygram.js",
-    "bin/",
     "lib/",
     "migrations/",
     "scripts/split-db.js",

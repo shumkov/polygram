@@ -20,7 +20,6 @@ const {
   POLYGRAM_DISPLAY_HINT,
   TELEGRAM_TABLE_WIDTH_BUDGET,
   appendDisplayHint,
-  appendDisplayHintCliArgs,
 } = require('../lib/telegram-prompt');
 
 describe('POLYGRAM_DISPLAY_HINT — content', () => {
@@ -193,27 +192,6 @@ describe('appendDisplayHint — custom hint override', () => {
   });
 });
 
-describe('appendDisplayHintCliArgs', () => {
-  test('returns --append-system-prompt + hint', () => {
-    const r = appendDisplayHintCliArgs();
-    assert.equal(r.length, 2);
-    assert.equal(r[0], '--append-system-prompt');
-    assert.equal(r[1], POLYGRAM_DISPLAY_HINT);
-  });
-
-  test('uses the override hint', () => {
-    const r = appendDisplayHintCliArgs('CUSTOM');
-    assert.deepEqual(r, ['--append-system-prompt', 'CUSTOM']);
-  });
-
-  test('empty hint returns empty argv', () => {
-    assert.deepEqual(appendDisplayHintCliArgs(''), []);
-  });
-
-  test('null hint returns empty argv', () => {
-    assert.deepEqual(appendDisplayHintCliArgs(null), []);
-  });
-});
 
 describe('integration with agent-loader composeSdkOptions', () => {
   // Smoke test: the hint format must survive through the actual
