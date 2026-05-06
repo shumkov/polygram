@@ -2145,13 +2145,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // 85%-context-full hint (Phase 2 step 4) and by classifier-driven
   // auto-recovery (step 8) — both reference these commands.
   // 0.8.0 Phase 2 step 9: /context slash command. On-demand context-
-  // usage report. Only meaningful under SDK pm (CLI pm has no
-  // getContextUsage equivalent); CLI path replies with a hint.
+  // usage report via Query.getContextUsage().
   if (botAllowsCommands && text === '/context') {
-    if (!pm.isSdkFor(sessionKey)) {
-      await sendReply('📚 /context requires the SDK pm. This chat is on the CLI pm path.');
-      return;
-    }
     const entry = pm.get(sessionKey);
     const q = entry?.query;
     if (!q || typeof q.getContextUsage !== 'function') {
@@ -2175,10 +2170,6 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // We push the raw text "/compact <instructions>" through the SDK's
   // input controller; the SDK handles parsing + compaction internally.
   if (botAllowsCommands && text.startsWith('/compact')) {
-    if (!pm.isSdkFor(sessionKey)) {
-      await sendReply('🗜️ /compact requires the SDK pm. This chat is on the CLI pm path.');
-      return;
-    }
     // rc.64: if the in-memory session was evicted (LRU cap pressure)
     // but there's a saved Claude session_id in DB, auto-spawn the
     // Query with --resume so /compact has something to work with.
@@ -2752,11 +2743,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // this message. Pre-fix, autosteer messages briefly showed
   // 🤔 → ✍ (THINKING set here, then AUTOSTEERED set inside the
   // autosteer block ~50 lines below). The flash was visible to
-  // users. Detect the autosteer pre-condition (SDK pm active AND
-  // session in-flight AND chat hasn't opted out) and skip.
+  // users. Detect the autosteer pre-condition (session in-flight AND
+  // chat hasn't opted out) and skip.
   const willAutosteer = pm.has(sessionKey)
     && pm.get(sessionKey)?.inFlight
-    && pm.isSdkFor(sessionKey)
     && (chatConfig.autosteer != null
       ? chatConfig.autosteer !== false
       : config.bot?.autosteer !== false);
@@ -2817,10 +2807,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // three priorities now work cleanly — so the buffer/hook detour is
   // gone. ~250 LOC + 2 test files deleted.
   //
-  // CLI pm has no inputController push primitive, so it falls
-  // through to FIFO pm.send (same UX as 0.7.x — queued behind active).
-  const autosteerEnabled = chatAutosteer !== false
-    && pm.isSdkFor(sessionKey);
+  const autosteerEnabled = chatAutosteer !== false;
   if (autosteerEnabled && pm.has(sessionKey)) {
     const entry = pm.get(sessionKey);
     if (entry?.inFlight) {
@@ -2966,7 +2953,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // session first crosses the threshold, mark the flag, suppress
       // subsequent fires. Cleared on compact-boundary so the next
       // cycle (if it crosses again) will fire fresh.
-      if (pm.isSdkFor(sessionKey) && chatCtxHint === true && !contextHintShown.has(sessionKey)) {
+      if (chatCtxHint === true && !contextHintShown.has(sessionKey)) {
         const entry = pm.get(sessionKey);
         const q = entry?.query;
         if (q && typeof q.getContextUsage === 'function') {
