@@ -41,6 +41,7 @@ const { createSdkCallbacks } = require('./lib/sdk/callbacks');
 const { createTranscribeVoiceAttachments } = require('./lib/handlers/voice');
 const { createDownloadAttachments } = require('./lib/handlers/download');
 const { createHandleConfigCallback } = require('./lib/handlers/config-callback');
+const { createHandleAbort } = require('./lib/handlers/abort');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
   buildApprovalKeyboardWithAlways,
@@ -1376,6 +1377,8 @@ async function handleApprovalCallback(ctx) {
 // Wired in main() once pm + db + getSessionKey + formatConfigInfoText +
 // buildConfigKeyboard are available.
 let handleConfigCallback = null;
+// handleAbortIfRequested extracted to lib/handlers/abort.js.
+let handleAbortIfRequested = null;
 
 function startApprovalSweeper(intervalMs = 30_000) {
   return setInterval(() => {
@@ -2775,80 +2778,11 @@ function createBot(token) {
     const rawText = msg.text || '';
     const cleanText = mentionRe ? rawText.replace(mentionRe, '').trim() : rawText.trim();
 
-    // Abort: skip the queue entirely. Matches bilingual natural-language
-    // cues ("stop" / "стоп" / "cancel" / "отмена" / …) and explicit
-    // slash commands (/stop, /abort, /cancel). Kills the active Claude
-    // subprocess and drains queued messages for this chat. Replies so
-    // the user sees the bot heard them — silent abort is worse than
-    // acknowledged abort.
-    if (isAbortRequest(cleanText)) {
-      const threadId = msg.message_thread_id?.toString();
-      const sessionKey = getSessionKey(chatId, threadId, chatConfig);
-      const hadActive = pm.has(sessionKey) && !!pm.get(sessionKey)?.inFlight;
-      // Mark BEFORE killing: the 'close' event fires almost immediately
-      // after SIGTERM, and processQueue's catch needs to see the flag to
-      // skip the generic error-reply. If we marked after, there'd be a
-      // race where the error-reply slips through.
-      if (hadActive) markSessionAborted(sessionKey);
-      // SDK abort: interrupt() + drainQueue(). interrupt() cancels
-      // the in-flight turn at SDK level WITHOUT tearing down the
-      // Query (cheap to reuse for the user's next message);
-      // drainQueue() rejects every queued pending with
-      // err.code='INTERRUPTED' so the abort-grace classifier
-      // suppresses error replies.
-      //
-      // Kill ONLY the user's own session, not every topic in the
-      // chat. Pre-0.6.5 this was pm.killChat(chatId) which fanned
-      // out across all topics under isolateTopics=true: the user
-      // typed "stop" in topic A and the bot tore down topic B's
-      // in-flight turn, surfacing a 💥 reply to topic B's user
-      // (whose key was never marked aborted, so the abort grace
-      // window didn't apply). With isolateTopics=false the
-      // sessionKey is the chat itself, so killing one session is
-      // the same as killing the chat — behavior unchanged for the
-      // common case.
-      await pm.interrupt(sessionKey).catch((err) =>
-        console.error(`[${BOT_NAME}] interrupt failed: ${err.message}`));
-      pm.drainQueue(sessionKey, 'INTERRUPTED');
-      // rc.42: autosteer buffer is gone (native SDK priority push).
-      // Followups already pushed onto the SDK's input controller will
-      // be drained by drainQueue() / kill() on the entry — no separate
-      // buffer to clear.
-      // Clear ✍ reactions on already-autosteered messages from this
-      // aborted turn — they're now dead context.
-      clearAutosteeredReactions(sessionKey).catch(() => {});
-      logEvent('abort-requested', {
-        chat_id: chatId, user_id: msg.from?.id || null,
-        had_active: hadActive,
-        trigger: cleanText.slice(0, 40),
-      });
-      // Reply in the same language the user aborted in. Cyrillic-detection
-      // is crude but reliable for ru/en (the only two cue sets we ship).
-      // 0.6.12 fix: pre-0.6.5 the message included a "queue cleared (N)"
-      // suffix when N > 0; that came from drainQueuesForChat which always
-      // returned 0 in the concurrent model and was deleted in 0.6.5.
-      // The reference to `dropped` here was missed, so EVERY abort hit
-      // a ReferenceError that the surrounding `catch {}` swallowed —
-      // leaving the user with no ack at all. Reduced to "stopped vs
-      // nothing-to-stop" since the queue-cleared variant was already
-      // dead.
-      const lang = /[а-яё]/i.test(cleanText) ? 'ru' : 'en';
-      const strs = {
-        en: { stopped: 'Stopped.',     nothing: 'Nothing to stop.' },
-        ru: { stopped: 'Остановлено.', nothing: 'Нечего останавливать.' },
-      }[lang];
-      const reply = hadActive ? strs.stopped : strs.nothing;
-      try {
-        await tg(bot, 'sendMessage', {
-          chat_id: chatId, text: reply,
-          reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
-          ...(threadId && { message_thread_id: threadId }),
-        }, { source: 'abort-ack', botName: BOT_NAME });
-      } catch (err) {
-        // Don't swallow silently — if the ack itself fails, the operator
-        // needs to know (the user typed stop and saw nothing).
-        console.error(`[${BOT_NAME}] abort-ack send failed: ${err.message}`);
-      }
+    // Abort: skip the queue entirely. Matches bilingual natural-
+    // language cues + slash variants. handleAbortIfRequested
+    // (lib/handlers/abort.js) returns true when handled — short-
+    // circuit out of dispatch.
+    if (await handleAbortIfRequested(msg, chatId, chatConfig, cleanText)) {
       return;
     }
 
@@ -3307,6 +3241,11 @@ async function main() {
   handleConfigCallback = createHandleConfigCallback({
     config, db, dbWrite, pm, getSessionKey,
     formatConfigInfoText, buildConfigKeyboard,
+    botName: BOT_NAME, logger: console,
+  });
+  handleAbortIfRequested = createHandleAbort({
+    pm, bot, tg, logEvent, isAbortRequest,
+    markSessionAborted, clearAutosteeredReactions, getSessionKey,
     botName: BOT_NAME, logger: console,
   });
   const sdkPm = new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions });
