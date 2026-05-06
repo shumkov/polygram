@@ -6,7 +6,7 @@ const {
   isTransientNetworkError,
   extractCode,
   redactBotToken,
-} = require('../lib/net-errors');
+} = require('../lib/error/net');
 
 function codeErr(code) {
   return Object.assign(new Error(`fake ${code}`), { code });

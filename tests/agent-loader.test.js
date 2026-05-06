@@ -14,7 +14,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { loadAgent, composeSdkOptions, clearCache } = require('../lib/agent-loader');
+const { loadAgent, composeSdkOptions, clearCache } = require('../lib/agents/loader');
 
 function makeAgentDir(homeDir, name, files = {}) {
   const agentDir = path.join(homeDir, '.claude', 'agents', name);

@@ -14,7 +14,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { validateIpcFileParam } = require('../lib/ipc-file-validator');
+const { validateIpcFileParam } = require('../lib/ipc/file-validator');
 
 describe('validateIpcFileParam — accepts good shapes', () => {
   test('null when method has no file param (sendMessage)', () => {

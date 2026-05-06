@@ -15,7 +15,7 @@ const {
   formatToolInputForCard,
   approvalCardText,
   _safeParse,
-} = require('../lib/approval-ui');
+} = require('../lib/approvals/ui');
 
 describe('buildApprovalKeyboardWithAlways — 4-button (SDK canUseTool)', () => {
   test('produces TWO rows of buttons', () => {

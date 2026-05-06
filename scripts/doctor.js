@@ -28,7 +28,7 @@ const Database = require('better-sqlite3');
 
 const {
   call, tell, socketPathFor, readSecret,
-} = require('../lib/ipc-client');
+} = require('../lib/ipc/client');
 
 // ─── Arg parsing ─────────────────────────────────────────────────────
 

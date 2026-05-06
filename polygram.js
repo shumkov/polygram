@@ -41,12 +41,12 @@ const {
   buildApprovalKeyboardWithAlways,
   formatToolInputForCard,
   approvalCardText,
-} = require('./lib/approval-ui');
+} = require('./lib/approvals/ui');
 const { buildHistoryBlock } = require('./lib/history-preload');
 const { formatContextReply, maybeContextFullHint } = require('./lib/context-format');
 const { appendDisplayHint } = require('./lib/telegram/display-hint');
 const { createAbortGrace } = require('./lib/abort-grace');
-const agentLoader = require('./lib/agent-loader');
+const agentLoader = require('./lib/agents/loader');
 const { createSender } = require('./lib/telegram/api');
 const { createAsyncLock } = require('./lib/async-lock');
 const { sweepInbox } = require('./lib/db/inbox');
@@ -59,20 +59,20 @@ const { deliverReplies } = require('./lib/telegram/deliver');
 const { announce, shouldAnnounce } = require('./lib/announces');
 const { isAbortRequest } = require('./lib/abort-detector');
 const { startTyping } = require('./lib/telegram/typing');
-const { redactBotToken } = require('./lib/net-errors');
+const { redactBotToken } = require('./lib/error/net');
 const { createReactionManager, classifyToolName } = require('./lib/telegram/reactions');
 const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
-const { classify: classifyError, isTransientHttpError } = require('./lib/error-classify');
+const { classify: classifyError, isTransientHttpError } = require('./lib/error/classify');
 const { createAutoResumeTracker, isAutoResumable } = require('./lib/db/auto-resume');
 const { resolveReplayWindowMs } = require('./lib/db/replay-window');
-const { validateIpcFileParam } = require('./lib/ipc-file-validator');
+const { validateIpcFileParam } = require('./lib/ipc/file-validator');
 const {
   createStore: createApprovalsStore,
   matchesAnyPattern: matchesApprovalPattern,
   tokensEqual: approvalTokensEqual,
   DEFAULT_TIMEOUT_MS: APPROVAL_DEFAULT_TIMEOUT_MS,
-} = require('./lib/approvals');
-const ipcServer = require('./lib/ipc-server');
+} = require('./lib/approvals/store');
+const ipcServer = require('./lib/ipc/server');
 
 // ─── Config ──────────────────────────────────────────────────────────
 //

@@ -18,7 +18,7 @@ const {
   USER_MESSAGES,
   AUTO_RECOVER,
   CODES,
-} = require('../lib/error-classify');
+} = require('../lib/error/classify');
 
 describe('classify — typed-code short-circuit', () => {
   test('QUEUE_OVERFLOW returns the queue-overflow shape exactly', () => {

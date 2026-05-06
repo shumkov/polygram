@@ -4,7 +4,7 @@
  * Usage: node scripts/ipc-smoke.js <bot-name>
  */
 
-const { call, socketPathFor } = require('../lib/ipc-client');
+const { call, socketPathFor } = require('../lib/ipc/client');
 
 (async () => {
   const bot = process.argv[2] || 'shumabit';

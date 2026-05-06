@@ -197,7 +197,7 @@ describe('integration with agent-loader composeSdkOptions', () => {
   // Smoke test: the hint format must survive through the actual
   // option-composer path. If composeSdkOptions starts re-shaping
   // systemPrompt, this catches it before deploy.
-  const { composeSdkOptions } = require('../lib/agent-loader');
+  const { composeSdkOptions } = require('../lib/agents/loader');
 
   test('appending after composeSdkOptions returns valid SdkOptions.systemPrompt', () => {
     const composed = composeSdkOptions(

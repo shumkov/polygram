@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 const {
   createStore, matchesAnyPattern, patternToRegex, digestInput, newToken,
-} = require('../lib/approvals');
+} = require('../lib/approvals/store');
 
 let db, dbPath, store;
 let fakeNow;
@@ -171,7 +171,7 @@ describe('digestInput + newToken', () => {
 });
 
 describe('tokensEqual', () => {
-  const { tokensEqual } = require('../lib/approvals');
+  const { tokensEqual } = require('../lib/approvals/store');
   test('equal strings → true', () => {
     assert.equal(tokensEqual('abc', 'abc'), true);
   });

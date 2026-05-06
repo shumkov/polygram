@@ -7,7 +7,7 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { createApprovalWaiters } = require('../lib/approval-waiters');
+const { createApprovalWaiters } = require('../lib/approvals/waiters');
 
 describe('approval-waiters — happy path', () => {
   test('park then resolveByClick resolves the promise with decision', async () => {

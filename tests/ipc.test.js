@@ -8,8 +8,8 @@ const assert = require('node:assert/strict');
 const path = require('path');
 const os = require('os');
 
-const ipcServer = require('../lib/ipc-server');
-const ipcClient = require('../lib/ipc-client');
+const ipcServer = require('../lib/ipc/server');
+const ipcClient = require('../lib/ipc/client');
 
 const silentLogger = { log: () => {}, error: () => {} };
 

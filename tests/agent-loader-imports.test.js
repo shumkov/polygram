@@ -21,7 +21,7 @@ const {
   _parseFrontmatter,
   _expandImports,
   _resolveAgentLocation,
-} = require('../lib/agent-loader');
+} = require('../lib/agents/loader');
 
 let tmpHome, tmpCwd;
 
