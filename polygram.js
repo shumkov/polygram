@@ -253,6 +253,7 @@ let recordInbound = null;
 const { extractAttachments } = require('./lib/handlers/extract-attachments');
 const { createRecordInbound } = require('./lib/handlers/record-inbound');
 const { createHandleSendOverIpc } = require('./lib/handlers/ipc-send');
+const { createDispatcher } = require('./lib/handlers/dispatcher');
 
 // transcribeVoiceAttachments extracted to lib/handlers/voice.js.
 // Wired in main() once db + tg + config are available.
@@ -434,293 +435,28 @@ async function sendToProcess(sessionKey, prompt, context = {}) {
 //   - emit a `queue-depth-warning` event if the count ever exceeds a
 //     threshold (abnormal inbound rate, slow pre-work, stuck bot)
 //   - (future) drain on shutdown if we want clean exit
-// Threshold for the queue-depth-warning event (operator-tuned signal
-// for "this session is getting hammered"). Override via
-// `config.bot.queueWarnThreshold`. Below the threshold no event fires.
-const CONCURRENT_WARN_THRESHOLD_DEFAULT = 20;
-function queueWarnThreshold() {
-  const v = Number(config.bot?.queueWarnThreshold);
-  return (Number.isInteger(v) && v > 0) ? v : CONCURRENT_WARN_THRESHOLD_DEFAULT;
-}
-const inFlightHandlers = new Map(); // sessionKey → count
-
-// Set true by the SIGTERM/SIGINT handler. Module-scoped so the
-// fire-and-forget catch in dispatchHandleMessage can check it: when
-// polygram is going down, in-flight handlers reject with "Process
-// killed" / "Process exited" but those failures aren't "real" — the
-// next boot's replay will re-dispatch them. Suppressing the user-facing
-// error reply during shutdown removes a misleading post-mortem apology
-// the user shouldn't see. (The boot replay's own _isReplay flag handles
-// the OTHER half: suppressing if the replay itself fails.)
+// dispatcher state. The dispatcher itself (errorReplyText,
+// queueWarnThreshold, dispatchHandleMessage, attemptAutoResume,
+// inFlightHandlers Map) lives in lib/handlers/dispatcher.js;
+// polygram owns the abortGrace + autoResumeTracker instances
+// + the isShuttingDown flag and threads them in.
 let isShuttingDown = false;
-
-// Map a handler-error to a user-facing reply that says what happened
-// and what to do next. The technical strings come from process-manager
-// (idle / wall-clock timeouts) and node child_process (Process exited /
-// killed). Anything we don't recognise falls back to a generic line
-// with a single-line snippet of the error so the user can at least
-// distinguish unique failures from the obvious "try again" cases.
-// 0.7.7: errorReplyText delegates to lib/error-classify.js so the
-// regex tables live in one place and stay in sync with future SDK
-// error subtypes (the 0.8.0 migration extends the classifier rather
-// than adding more if-branches here).
-//
-// classify() returns { kind, userMessage, isTransient, autoRecover }.
-// `userMessage: null` is a deliberate "suppress reply" signal —
-// today only used by INTERRUPTED in the abort-grace window. Callers
-// that already gate on isSessionRecentlyAborted will short-circuit
-// before reaching here, but we honour `null` defensively.
-function errorReplyText(err) {
-  const { userMessage } = classifyError(err);
-  return userMessage; // may be null — caller must handle
-}
-
-// Sessions the operator just /stop'd (or natural-language "стоп").
-// rc.25: extracted to lib/abort-grace.js so the timestamp/window
-// logic has its own unit tests. Behaviour identical: any pending
-// rejected within the grace window is considered abort-caused —
-// its generic error reply is suppressed and the streamer warning
-// is skipped.
 const abortGrace = createAbortGrace();
-
 function markSessionAborted(sessionKey) { abortGrace.mark(sessionKey); }
 function isSessionRecentlyAborted(sessionKey) { return abortGrace.isRecent(sessionKey); }
-
-// rc.54: per-session cooldown for auto-resume on 300s no-activity
-// timeout. Without the cooldown, a permanently-wedged tool would
-// trigger an infinite resume → timeout → resume loop.
 const autoResumeTracker = createAutoResumeTracker();
+const contextHintShown = new Set();
+let dispatchHandleMessage = null;
+let attemptAutoResume = null;
+let errorReplyText = null;
+let queueWarnThreshold = null;
+let inFlightHandlers = null;
 
 // rc.59: once-per-cycle gate for the contextHint. A session is added
 // to this Set when the hint fires, removed when the SDK emits
 // compact_boundary (so the next cycle can fire its own hint). Without
 // this gate, a chat over-threshold would see the hint on every turn
 // until auto-compact — noisy enough that Ivan called it out.
-const contextHintShown = new Set();
-
-// rc.54: spawn a fresh Query resuming the same session_id and ask
-// Claude to continue the timed-out work. The killed pm Query has
-// already torn down the wedged subprocess (via pm.kill on timeout);
-// getOrSpawnForChat creates a new entry that picks up the saved
-// session_id from `sessions` table and sets `--resume <id>` on the
-// SDK Options. The continuation message tells Claude what happened
-// and that it has full prior context to keep going.
-//
-// Returns the result.text on success (already-sent to chat); throws
-// on any failure (caller writes auto-resume-failed event + falls
-// back to the standard timeout reply).
-async function attemptAutoResume(sessionKey, chatId, originalMsg, bot) {
-  const threadId = originalMsg.message_thread_id || null;
-  // 1. Tell the user we're auto-resuming so they don't think nothing
-  //    happened. Threaded under the original user message.
-  await tg(bot, 'sendMessage', {
-    chat_id: chatId,
-    text: '🔁 Auto-resuming after timeout — continuing where the previous turn left off.',
-    reply_parameters: { message_id: originalMsg.message_id },
-    ...(threadId && { message_thread_id: threadId }),
-  }, { source: 'auto-resume-indicator', botName: BOT_NAME }).catch((sendErr) => {
-    // Indicator is informational; don't fail the whole resume on it.
-    console.error(`[${sessionKey}] auto-resume indicator send failed: ${sendErr.message}`);
-  });
-
-  // 2. Continuation prompt. Plain text — no XML wrapper. The SDK
-  //    Query resumes the saved session_id, so Claude has full prior
-  //    transcript context including its own partially-streamed text
-  //    and tool calls. We just need to tell it WHAT happened and
-  //    that it should pick up where it left off.
-  const continuation = '[polygram] Your previous turn timed out at 300s with no Claude activity (likely a wedged tool call — long Bash, hanging MCP, or stuck subagent). Continue from where you left off; do not restart from scratch. If the same operation would just hang again, abort it and tell me.';
-
-  // 3. No-op streamer + reactor. We don't need to stream the resume
-  //    turn's response (we'll send it as one message at the end). pm
-  //    invokes streamer/reactor methods only when present; passing
-  //    minimal stubs keeps pm happy.
-  const noopStreamer = {
-    onChunk: async () => {},
-    forceNewMessage: () => {},
-    finalize: async () => ({ streamed: false }),
-    flushDraft: async () => {},
-    discard: async () => {},
-  };
-  const noopReactor = {
-    setState: () => {},
-    heartbeat: () => {},
-    clear: async () => {},
-    stop: () => {},
-  };
-
-  const result = await sendToProcess(sessionKey, continuation, {
-    streamer: noopStreamer,
-    reactor: noopReactor,
-    sourceMsgId: originalMsg.message_id,
-    threadId,
-    onFirstStream: () => {},
-  });
-
-  if (result?.error) {
-    throw new Error(`auto-resume turn errored: ${String(result.error).slice(0, 200)}`);
-  }
-  if (!result?.text) {
-    throw new Error('auto-resume turn produced no text');
-  }
-
-  // 4. Send the continuation reply as regular Telegram message(s),
-  //    threaded under the original user message. Reuse the existing
-  //    chunked-delivery + markdown-formatting primitives.
-  const chunks = chunkMarkdownText(result.text, TG_MAX_LEN);
-  await deliverReplies({
-    bot,
-    send: (b, method, params, m) => tg(b, method, params, m),
-    chatId,
-    threadId,
-    chunks,
-    replyToMessageId: originalMsg.message_id,
-    meta: { source: 'auto-resume-reply', botName: BOT_NAME },
-    logger: { error: (m) => console.error(`[${sessionKey}] auto-resume deliver: ${m}`) },
-  });
-
-  return result.text;
-}
-
-// Called by bot.on('message') for every regular (non-admin, non-pair)
-// message. Runs handleMessage in a fire-and-forget manner with centralised
-// error handling. Replaces the old processQueue loop.
-function dispatchHandleMessage(sessionKey, chatId, msg, bot) {
-  const count = (inFlightHandlers.get(sessionKey) || 0) + 1;
-  inFlightHandlers.set(sessionKey, count);
-  const warnAt = queueWarnThreshold();
-  if (count === warnAt) {
-    logEvent('queue-depth-warning', {
-      chat_id: chatId, session_key: sessionKey,
-      in_flight: count, threshold: warnAt,
-    });
-  }
-  handleMessage(sessionKey, chatId, msg, bot).catch((err) => {
-    const wasAborted = isSessionRecentlyAborted(sessionKey);
-    const isReplay = msg._isReplay === true;
-    console.error(`[${sessionKey}] Error:`, err.message);
-    // Mark the row terminal so the right thing happens on next boot:
-    // - aborted: user explicitly stopped → 'aborted' (not replayable)
-    // - shutting down on a NEW turn: 'replay-pending' so the next
-    //   boot picks it up via getReplayCandidates. Pre-0.6.12 we marked
-    //   'failed' here, which excluded the row from replay — a clean
-    //   restart between user send and reply silently dropped the turn.
-    // - shutting down on a REPLAY turn (msg._isReplay=true): keep
-    //   'replay-attempted' so the one-shot guard from 0.6.4 still
-    //   holds. Without this, a replay interrupted by another shutdown
-    //   would be promoted to 'replay-pending' and the next boot would
-    //   replay it AGAIN — infinite loop on chained shutdowns.
-    // - everything else: 'failed' (genuine claude crash / timeout etc).
-    const status = wasAborted
-      ? 'aborted'
-      : isShuttingDown
-        ? (isReplay ? 'replay-attempted' : 'replay-pending')
-        : 'failed';
-    dbWrite(() => db.setInboundHandlerStatus({
-      chat_id: chatId, msg_id: msg.message_id, status,
-    }), `set handler_status=${status}`);
-    logEvent('handler-error', {
-      chat_id: chatId, session_key: sessionKey,
-      msg_id: msg?.message_id,
-      error: err.message?.slice(0, 500),
-      stack: err.stack?.split('\n').slice(0, 5).join('\n'),
-      aborted: wasAborted || undefined,
-      replay: isReplay || undefined,
-    });
-    // rc.55: surface replay failures with a meaningful message. Pre-rc.55
-    // any boot-replay turn that failed for ANY reason was silently dropped
-    // (the original logic assumed "user typed this minutes ago and moved
-    // on"). But the rc.51-onward boot-replay path is a recovery primitive,
-    // not stale-message handling — when it fails, the user IS still waiting
-    // for their answer. The Shumabit@UMI thread :24 wall-clock incident on
-    // 2026-05-04 hit exactly this: original turn SIGHUP'd by deploy → boot-
-    // replay redispatched → replay hit 1800s wall-clock → user saw nothing
-    // and didn't know their work had been lost.
-    //
-    // Now: send a tailored message on replay failures. Still suppress when
-    // the replay itself was killed by ANOTHER shutdown (the next boot will
-    // redispatch — same logic as before, just narrower).
-    if (isReplay && !wasAborted && !isShuttingDown) {
-      tg(bot, 'sendMessage', {
-        chat_id: chatId,
-        text: '⚠️ This turn was interrupted and didn\'t complete on retry — please rephrase or simplify, or split into smaller steps.',
-        reply_parameters: { message_id: msg.message_id },
-      }, { source: 'error-reply', botName: BOT_NAME }).catch((replyErr) => {
-        console.error(`[${sessionKey}] failed to send replay-failure reply: ${replyErr.message}`);
-      });
-    }
-    // Suppress the user-facing error reply when:
-    //  - boot replay (user typed this minutes ago and moved on)
-    //  - polygram is shutting down (the failure is "Process killed" /
-    //    "Process exited" which isn't a real error — boot replay will
-    //    re-dispatch it on next start)
-    //  - user just /stop'd (already saw their abort acknowledgement)
-    if (!wasAborted && !isReplay && !isShuttingDown) {
-      // rc.54: auto-resume on 300s no-activity timeout. Spawn a fresh
-      // Query resuming the same session_id and inject a continuation
-      // nudge. This recovers from wedged tool calls (long Bash, hung
-      // MCP, stuck subagent) that polygram's watchdog catches but
-      // currently leaves the user stranded with "try resending".
-      // Skipped when the failed turn was ITSELF an auto-resume
-      // (msg._isAutoResume) to prevent recursion; per-session
-      // cooldown blocks tight loops on permanent wedges.
-      const isResumeTurn = msg._isAutoResume === true;
-      const resumable = !isResumeTurn && isAutoResumable({
-        error: err, aborted: wasAborted, replay: isReplay, shuttingDown: isShuttingDown,
-      });
-      if (resumable && !autoResumeTracker.isInCooldown(sessionKey)) {
-        autoResumeTracker.markAttempt(sessionKey);
-        logEvent('auto-resume-attempted', {
-          chat_id: chatId, session_key: sessionKey, msg_id: msg.message_id,
-          original_error: err.message?.slice(0, 200),
-        });
-        attemptAutoResume(sessionKey, chatId, msg, bot)
-          .then(() => {
-            logEvent('auto-resume-success', {
-              chat_id: chatId, session_key: sessionKey, msg_id: msg.message_id,
-            });
-            autoResumeTracker.clear(sessionKey);
-          })
-          .catch((resumeErr) => {
-            console.error(`[${sessionKey}] auto-resume failed: ${resumeErr?.message}`);
-            logEvent('auto-resume-failed', {
-              chat_id: chatId, session_key: sessionKey, msg_id: msg.message_id,
-              error: resumeErr?.message?.slice(0, 200),
-            });
-            // Fall back to the original error reply so the user isn't
-            // left with just the 🔁 indicator and no answer.
-            const fallbackText = errorReplyText(err);
-            if (fallbackText) {
-              tg(bot, 'sendMessage', {
-                chat_id: chatId, text: fallbackText,
-                reply_parameters: { message_id: msg.message_id },
-              }, { source: 'error-reply', botName: BOT_NAME }).catch(() => {});
-            }
-          });
-        return;
-      }
-      // 0.7.7: errorReplyText may return null when the classifier
-      // says "suppress reply" (e.g. INTERRUPTED inside abort grace —
-      // user already saw their /stop ack). Skip the send call in
-      // that case rather than dispatching empty text (which would
-      // 400 at the lib/telegram.js empty-text guard added in 0.7.4).
-      const replyText = errorReplyText(err);
-      if (replyText) {
-        tg(bot, 'sendMessage', {
-          chat_id: chatId,
-          text: replyText,
-          reply_parameters: { message_id: msg.message_id },
-        }, { source: 'error-reply', botName: BOT_NAME }).catch((replyErr) => {
-          console.error(`[${sessionKey}] failed to send error reply: ${replyErr.message}`);
-        });
-      }
-    }
-  }).finally(() => {
-    const n = (inFlightHandlers.get(sessionKey) || 1) - 1;
-    if (n <= 0) inFlightHandlers.delete(sessionKey);
-    else inFlightHandlers.set(sessionKey, n);
-  });
-}
-
 // Per-session lock ordering stdin writes. Module is I/O-pure.
 const stdinLock = createAsyncLock();
 
@@ -2300,6 +2036,22 @@ async function main() {
   handleSendOverIpc = createHandleSendOverIpc({
     config, bot, tg, botName: BOT_NAME,
   });
+  ({
+    dispatchHandleMessage,
+    attemptAutoResume,
+    errorReplyText,
+    queueWarnThreshold,
+    inFlightHandlers,
+  } = createDispatcher({
+    config, db, dbWrite, tg, botName: BOT_NAME, logEvent,
+    handleMessage, sendToProcess,
+    classifyError, isAutoResumable,
+    abortGrace, autoResumeTracker,
+    chunkMarkdownText, deliverReplies,
+    TG_MAX_LEN,
+    getIsShuttingDown: () => isShuttingDown,
+    logger: console,
+  }));
   dispatchSlashCommand = createSlashCommands({
     config, db, dbWrite, pm, pairings, parsePairingTtl,
     contextHintShown, formatContextReply, getClaudeSessionId,
