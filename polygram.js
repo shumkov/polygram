@@ -77,7 +77,8 @@ const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
 const { classify: classifyError, isTransientHttpError } = require('./lib/error/classify');
 const { createAutoResumeTracker, isAutoResumable } = require('./lib/db/auto-resume');
 const { resolveReplayWindowMs } = require('./lib/db/replay-window');
-const { validateIpcFileParam } = require('./lib/ipc/file-validator');
+// validateIpcFileParam moved with handleSendOverIpc to
+// lib/handlers/ipc-send.js (commit 36).
 const {
   createStore: createApprovalsStore,
   matchesAnyPattern: matchesApprovalPattern,
@@ -251,6 +252,7 @@ let recordInbound = null;
 // sanitizeFilename moved with downloadAttachments to lib/handlers/download.js.
 const { extractAttachments } = require('./lib/handlers/extract-attachments');
 const { createRecordInbound } = require('./lib/handlers/record-inbound');
+const { createHandleSendOverIpc } = require('./lib/handlers/ipc-send');
 
 // transcribeVoiceAttachments extracted to lib/handlers/voice.js.
 // Wired in main() once db + tg + config are available.
@@ -759,50 +761,8 @@ function stripInlineTagsForStreamer(text) {
   return stripInlineTagsImpl(text, { stickerMap });
 }
 
-// ─── Cron/IPC send ─────────────────────────────────────────────────
-
-// Allowlist of Telegram Bot API methods external callers (cron) may invoke.
-// Broader than sendMessage to cover receipts, error reports, quick replies.
-// Deliberately excludes destructive ops (deleteMessage, banChatMember, etc.);
-// cron has no business calling those.
-const IPC_SEND_ALLOWED_METHODS = new Set([
-  'sendMessage',
-  'sendPhoto',
-  'sendDocument',
-  'sendSticker',
-  'sendChatAction',
-  'editMessageText',
-  'setMessageReaction',
-]);
-
-async function handleSendOverIpc(req) {
-  const { method, params = {}, source } = req || {};
-  if (!method) throw new Error('method required');
-  if (!IPC_SEND_ALLOWED_METHODS.has(method)) {
-    throw new Error(`method not allowed: ${method}`);
-  }
-  if (!bot) throw new Error(`bot process not ready`);
-
-  // Enforce: chat_id must belong to this bot (no cross-bot sends).
-  // After filterConfigToBot, config.chats only contains our chats.
-  const chatId = params.chat_id != null ? String(params.chat_id) : null;
-  if (chatId && !config.chats[chatId]) {
-    throw new Error(`chat not owned by ${BOT_NAME}: ${chatId}`);
-  }
-
-  // rc.58: catch the most common file-upload mistakes before Telegram
-  // rejects with a confusing error. validateIpcFileParam returns a
-  // human-readable error string when the file param is malformed,
-  // null otherwise.
-  const fileParamErr = validateIpcFileParam(method, params);
-  if (fileParamErr) throw new Error(fileParamErr);
-
-  const sendRes = await tg(bot, method, params, {
-    source: source || 'ipc',
-    botName: BOT_NAME,
-  });
-  return { result: sendRes };
-}
+// ─── Cron/IPC send — extracted to lib/handlers/ipc-send.js ──────────
+let handleSendOverIpc = null;
 
 // ─── Approvals ─────────────────────────────────────────────────────
 // Pure UI builders live in lib/approval-ui.js for testability.
@@ -2336,6 +2296,9 @@ async function main() {
   });
   recordInbound = createRecordInbound({
     db, dbWrite, config, botName: BOT_NAME, extractAttachments,
+  });
+  handleSendOverIpc = createHandleSendOverIpc({
+    config, bot, tg, botName: BOT_NAME,
   });
   dispatchSlashCommand = createSlashCommands({
     config, db, dbWrite, pm, pairings, parsePairingTtl,
