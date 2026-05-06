@@ -241,86 +241,16 @@ function logEvent(kind, detail) {
   dbWrite(() => db.logEvent(kind, detail), `log ${kind}`);
 }
 
-function recordInbound(msg) {
-  // 0.6.4 wrapped the body in db.raw.transaction(...) for atomicity, but
-  // the wrap itself runs at call time — before dbWrite's null-db guard
-  // kicks in. A late-arriving inbound during shutdown (after db.raw.close())
-  // would TypeError and unhandled-reject grammy's update handler. Restore
-  // best-effort semantics with an explicit early-out.
-  if (!db) return;
-  const chatId = msg.chat.id.toString();
-  const threadId = msg.message_thread_id?.toString() || null;
-  const user = msg.from?.first_name || msg.from?.username || null;
-  const attachments = extractAttachments(msg);
-  const chatConfig = config.chats[chatId];
-  const ts = (msg.date || Math.floor(Date.now() / 1000)) * 1000;
-
-  // Atomic message + attachments write: all-or-nothing so a half-applied
-  // record can never leave a message row with zero (or partial) attachment
-  // rows that boot replay would silently treat as "no media." Wrapping in
-  // db.raw.transaction also collapses the message + N-attachment fsyncs
-  // into one commit (perf win for media groups: 7-attachment albums go
-  // from 8 sync writes to 1).
-  const writeInbound = db.raw.transaction(() => {
-    db.insertMessage({
-      chat_id: chatId,
-      thread_id: threadId,
-      msg_id: msg.message_id,
-      user,
-      user_id: msg.from?.id || null,
-      text: msg.text || msg.caption || '',
-      reply_to_id: msg.reply_to_message?.message_id || null,
-      direction: 'in',
-      source: 'polygram',
-      bot_name: BOT_NAME,
-      model: chatConfig?.model || null,
-      effort: chatConfig?.effort || null,
-      ts,
-    });
-
-    if (!attachments.length) return;
-    // Look up the just-inserted (or ON-CONFLICT-updated) message row id
-    // so attachments can FK to it. lastInsertRowid is unreliable across
-    // the upsert path; an explicit lookup is cheap and always correct.
-    const messageId = db.getInboundMessageId({ chat_id: chatId, msg_id: msg.message_id });
-    if (!messageId) return;
-    // Edit-safe insert: Telegram edited_message events re-fire
-    // recordInbound with the same (chat_id, msg_id). polygram doesn't
-    // currently handle media-edit cases (Bot API does support
-    // editMessageMedia, but we don't process it specially — the typical
-    // edit is text/caption). If rows already exist for this message_id
-    // they're correct as-is — re-inserting would (a) duplicate them,
-    // (b) reset download_status back to 'pending' and lose the
-    // local_path we already fetched. If we add media-edit support
-    // later, this guard needs to compare file_unique_id and replace
-    // selectively rather than skipping wholesale.
-    if (db.getAttachmentsByMessage(messageId).length > 0) return;
-    for (const att of attachments) {
-      db.insertAttachment({
-        message_id: messageId,
-        chat_id: chatId,
-        msg_id: msg.message_id,
-        thread_id: threadId,
-        bot_name: BOT_NAME,
-        file_id: att.file_id,
-        file_unique_id: att.file_unique_id,
-        kind: att.kind,
-        name: att.name,
-        mime_type: att.mime_type,
-        size_bytes: att.size,
-        ts,
-      });
-    }
-  });
-
-  dbWrite(() => writeInbound(), `insert inbound ${chatId}/${msg.message_id}`);
-}
+// recordInbound extracted to lib/handlers/record-inbound.js. Wired
+// in main() once db + config + extractAttachments are available.
+let recordInbound = null;
 
 
 // ─── Attachment extraction ──────────────────────────────────────────
 // extractAttachments + shortFileTag live in lib/handlers/extract-attachments.js.
 // sanitizeFilename moved with downloadAttachments to lib/handlers/download.js.
 const { extractAttachments } = require('./lib/handlers/extract-attachments');
+const { createRecordInbound } = require('./lib/handlers/record-inbound');
 
 // transcribeVoiceAttachments extracted to lib/handlers/voice.js.
 // Wired in main() once db + tg + config are available.
@@ -2403,6 +2333,9 @@ async function main() {
   });
   formatConfigInfoText = createFormatConfigInfoText({
     pm, db, getClaudeSessionId,
+  });
+  recordInbound = createRecordInbound({
+    db, dbWrite, config, botName: BOT_NAME, extractAttachments,
   });
   dispatchSlashCommand = createSlashCommands({
     config, db, dbWrite, pm, pairings, parsePairingTtl,
