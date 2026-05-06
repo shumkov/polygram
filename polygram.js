@@ -2520,14 +2520,24 @@ async function main() {
     ...sdkCallbacks,
   };
 
-  // 0.9.0: single SDK pm wrapped by the (now thin) router for
-  // forward compatibility with future alternate impls.
-  // buildSdkOptions is the per-call spawn factory; we wire it now
-  // that the runtime context (config, BOT_NAME, makeCanUseTool,
-  // logEvent) exists.
-  // Wire approval flow FIRST — buildSdkOptions takes makeCanUseTool
-  // as a runtime dep, so we need it bound before we instantiate
-  // ProcessManagerSdk.
+  // 0.9.0 wiring order matters here. The factories destructure
+  // their `pm` / `bot` deps by value at call time; the closures
+  // they return then reference those CAPTURED references at every
+  // future call. So `pm` and `bot` must be assigned BEFORE the
+  // factory that consumes them runs — late-rebinding the
+  // module-level `let pm` doesn't propagate into the factory's
+  // captured local. v3 architecture review caught this as a
+  // production-blocking bug after commit 29.
+  //
+  // Order encoded below:
+  //   1. bot = createBot(token)              — needed by approvals + abort
+  //   2. createApprovals(...)                — provides makeCanUseTool
+  //   3. createBuildSdkOptions(...)          — uses makeCanUseTool
+  //   4. pm = new ProcessManagerSdk(...)     — uses buildSdkOptions
+  //   5. handler factories that need pm/bot  — see them as live refs
+
+  bot = createBot(config.bot.token);
+
   ({
     makeCanUseTool,
     handleApprovalCallback,
@@ -2553,6 +2563,7 @@ async function main() {
   downloadAttachments = createDownloadAttachments({
     config, db, dbWrite, inboxDir: INBOX_DIR, logger: console,
   });
+  pm = new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions });
   handleConfigCallback = createHandleConfigCallback({
     config, db, dbWrite, pm, getSessionKey,
     formatConfigInfoText, buildConfigKeyboard,
@@ -2573,7 +2584,6 @@ async function main() {
     modelVersionsDesc: MODEL_VERSIONS_DESC,
     botName: BOT_NAME, logEvent, logger: console,
   });
-  pm = new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions });
   console.log('[polygram] using SDK ProcessManager');
 
   console.log(`polygram (LRU cap=${cap}, SQLite source of truth)`);
@@ -2599,7 +2609,8 @@ async function main() {
     }
   }
 
-  bot = createBot(config.bot.token);
+  // bot was created earlier in main() — see the wiring-order block
+  // around the factory creations.
 
   // Graceful shutdown: stop accepting new inbound, drain in-flight pendings
   // up to SHUTDOWN_DRAIN_MS, then mark anything still unfinished so boot
