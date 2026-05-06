@@ -37,6 +37,7 @@ const { ProcessManagerSdk, extractAssistantText } = require('./lib/sdk/process-m
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
 const { createPmRouter } = require('./lib/sdk/router');
 const { createBuildSdkOptions } = require('./lib/sdk/build-options');
+const { createSdkCallbacks } = require('./lib/sdk/callbacks');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
   buildApprovalKeyboardWithAlways,
@@ -3586,217 +3587,21 @@ async function main() {
   // 0.9.0: single pm. SDK ProcessManager is the only impl after the
   // CLI pm + dual-pm router were deleted (see lib/pm-router.js
   // header comment for the migration history).
+  // 0.9.0 commit 19: SDK lifecycle callbacks live in lib/sdk/callbacks.js;
+  // factory threads the runtime context in via DI. onRespawn dropped
+  // earlier — SDK pm applies /model + /effort live so there's no
+  // drain event to hook.
+  const sdkCallbacks = createSdkCallbacks({
+    db, dbWrite, config, bot, botName: BOT_NAME, tg, logEvent,
+    classifyToolName, announce, shouldAnnounce, contextHintShown,
+    extractAssistantText, getChatIdFromKey, getThreadIdFromKey,
+    logger: console,
+  });
   const pmOpts = {
     cap,
     db,
     logger: console,
-    onInit: (sessionKey, event, entry) => {
-      dbWrite(() => db.upsertSession({
-        session_key: sessionKey,
-        chat_id: entry.chatId,
-        thread_id: entry.threadId,
-        claude_session_id: event.session_id,
-        agent: config.chats[entry.chatId]?.agent || null,
-        cwd: config.chats[entry.chatId]?.cwd || null,
-        model: config.chats[entry.chatId]?.model || null,
-        effort: config.chats[entry.chatId]?.effort || null,
-      }), `upsert session ${sessionKey}`);
-    },
-    onClose: (sessionKey, code, entry) => {
-      console.log(`[${entry.label}] Process exited (code ${code})`);
-      logEvent('process-close', { chat_id: entry.chatId, session_key: sessionKey, code });
-    },
-    onStreamChunk: (sessionKey, partial, entry) => {
-      // Route to the head pending's per-turn streamer. In the 0.4.8
-      // concurrent-pending model, there can be N pendings queued — only
-      // the HEAD is the turn Claude is actively emitting events for.
-      const head = entry.pendingQueue?.[0];
-      const s = head?.context?.streamer;
-      if (s) s.onChunk(partial).catch(() => {});
-      // 0.8.0-rc.16: heartbeat the reactor so long text generation
-      // doesn't trip the 10s STALL → 🥱 / 30s TIMEOUT → 😨 promotion.
-      // Pre-rc.16 the reactor only got setState calls at turn start
-      // (THINKING) and per-tool (CODING/TOOL/...); pure text turns
-      // hit STALL within 10s of streaming. heartbeat() re-arms the
-      // stall timers without changing the visible emoji.
-      const r = head?.context?.reactor;
-      if (r && typeof r.heartbeat === 'function') r.heartbeat();
-    },
-    onToolUse: (sessionKey, toolName, entry) => {
-      const head = entry.pendingQueue?.[0];
-      const r = head?.context?.reactor;
-      if (r) r.setState(classifyToolName(toolName));
-      // 0.7.0 (Phase J): opt-in subagent announce. When Claude uses
-      // the Task tool to spawn a subagent, post a brief informational
-      // message to the chat so the user knows a heavier turn is in
-      // progress. ON by default (rc.9+) — set per-chat
-      // `announceSubagents: false` (or per-bot) to silence.
-      // Per-chat debounce 30s prevents announce-storms in tool-heavy
-      // turns.
-      const chatCfg = config.chats[entry.chatId] || {};
-      const optOut = chatCfg.announceSubagents != null
-        ? chatCfg.announceSubagents === false
-        : config.bot?.announceSubagents === false;
-      if (toolName === 'Task' && !optOut) {
-        if (shouldAnnounce(entry.chatId)) {
-          announce({
-            send: (b, method, params, m) => tg(b, method, params, m),
-            bot, chatId: entry.chatId,
-            threadId: head?.context?.threadId ?? null,
-            text: '🤖 Spawning subagent…',
-            meta: { botName: BOT_NAME, source: 'subagent-announce' },
-            logger: { error: (m) => console.error(`[${entry.label}] ${m}`) },
-          });
-        }
-      }
-    },
-    // 0.7.0 (Phase F): each new top-level assistant message gets its
-    // own bubble. When Claude emits text, then tool_use, then more
-    // text in a NEW assistant message (typical of tool-heavy turns),
-    // the previous bubble's content stays visible as a "thinking out
-    // loud" intermediate; the new message starts fresh below.
-    onAssistantMessageStart: (sessionKey, entry) => {
-      const head = entry.pendingQueue?.[0];
-      const s = head?.context?.streamer;
-      if (s) s.forceNewMessage();
-      // rc.25: heartbeat at every assistant-message boundary too. A
-      // long thinking phase (effort=high, 30+ s before first chunk)
-      // doesn't fire onStreamChunk. Without this, the freeze timer
-      // could expire while the model is "still thinking but about
-      // to speak".
-      const r = head?.context?.reactor;
-      if (r && typeof r.heartbeat === 'function') r.heartbeat();
-    },
-    // rc.47: autonomous wakeup forwarding. Fires when an SDK
-    // assistant message arrives with no head pending — typical
-    // ScheduleWakeup case where the agent self-fires without an
-    // inbound user message. We derive chat_id (always) and thread_id
-    // (when isolateTopics) from the sessionKey, then send the text
-    // to that chat/topic. Subagent messages were already filtered
-    // upstream (parent_tool_use_id != null check in pm-sdk).
-    //
-    // Best-effort send: failures are logged but don't propagate —
-    // an autonomous turn that can't be delivered shouldn't crash
-    // the daemon. Telemetry emitted as `autonomous-wakeup-message`
-    // so we can audit how often these fire and whether any get lost.
-    onAutonomousAssistantMessage: (sessionKey, msg /* , entry */) => {
-      try {
-        const text = extractAssistantText(msg);
-        if (!text) return;
-        const chatId = getChatIdFromKey(sessionKey);
-        const threadIdRaw = getThreadIdFromKey(sessionKey);
-        const threadId = threadIdRaw ? parseInt(threadIdRaw, 10) : null;
-        if (!bot) {
-          console.error(`[${BOT_NAME}] autonomous wakeup: bot not ready, dropping ${text.length} chars`);
-          return;
-        }
-        const params = {
-          chat_id: chatId,
-          text,
-          ...(Number.isInteger(threadId) && { message_thread_id: threadId }),
-        };
-        // Don't `await` — keep the pm-sdk event loop unblocked. The
-        // tg() wrapper handles its own retries / chunking.
-        tg(bot, 'sendMessage', params,
-          { source: 'autonomous-wakeup', botName: BOT_NAME }).catch((err) => {
-            console.error(`[${BOT_NAME}] autonomous wakeup send failed: ${err.message}`);
-          });
-        logEvent('autonomous-wakeup-message', {
-          chat_id: chatId,
-          session_key: sessionKey,
-          thread_id: threadIdRaw,
-          text_len: text.length,
-        });
-      } catch (err) {
-        console.error(`[${BOT_NAME}] autonomous wakeup handler: ${err.message}`);
-      }
-    },
-    // rc.29 onThinking removed — replaced by simpler timer-based
-    // approach in handleMessage (post-QUEUED setState). The
-    // SDK-thinking-block detection added complexity (partial-message
-    // bandwidth, thinking config mapping) without solving the actual
-    // user-visible problem ("show me the bot is working"). The lib-
-    // side handler in pm-sdk stays for any future caller; polygram
-    // doesn't wire it.
-    // 0.8.0 Phase 2 step 5: SDK auto-compaction observability. Fires
-    // when SDK emits SDKCompactBoundaryMessage (between turns or
-    // mid-turn — see Phase 0 gate 8.5). Surfaces a quiet system
-    // status note to the chat so the user knows the bot is busy
-    // reorganising context (compaction can take seconds, during
-    // which the bot looks unresponsive). ON by default (rc.12+) —
-    // set per-chat or per-bot `announceCompact: false` to silence.
-    //
-    // Wording is intentionally non-technical — the user doesn't
-    // care about "compaction" or "tokens"; they just want to know
-    // the bot didn't hang.
-    onCompactBoundary: async (sessionKey, msg, entry) => {
-      // rc.59: clear the contextHint once-per-cycle gate. After
-      // compaction, context drops below threshold; if it climbs back
-      // up the next cycle should fire a fresh hint. Without this
-      // clear, a session that fired its hint pre-compact would never
-      // fire again for the rest of the daemon's life.
-      contextHintShown.delete(sessionKey);
-
-      const chatCfg = config.chats[entry.chatId] || {};
-      const optOut = chatCfg.announceCompact != null
-        ? chatCfg.announceCompact === false
-        : config.bot?.announceCompact === false;
-      if (optOut) return;
-      const threadId = entry.threadId || undefined;
-
-      // rc.62: word the message based on what actually happened.
-      // Pre-rc.62 we said "💭 Catching up on history, one moment…"
-      // for every compact_boundary — but the event fires AFTER
-      // compaction completed, not during. The "one moment…" wording
-      // implied more work was coming, leaving the user confused
-      // when nothing followed. Now: distinguish manual vs auto and
-      // surface the actual compression ratio.
-      const meta = msg?.compact_metadata || {};
-      const trigger = meta.trigger;        // 'manual' | 'auto'
-      const preTokens = meta.pre_tokens;
-      const postTokens = meta.post_tokens;
-      const durationMs = meta.duration_ms;
-      const fmtTok = (n) => {
-        if (n == null) return null;
-        if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
-        return String(n);
-      };
-      const ratio = (preTokens && postTokens) ? `${fmtTok(preTokens)} → ${fmtTok(postTokens)}` : null;
-      const duration = durationMs ? `${(durationMs / 1000).toFixed(1)}s` : null;
-      const stats = [ratio, duration].filter(Boolean).join(', ');
-
-      let text;
-      if (trigger === 'manual') {
-        // /compact — the user explicitly asked. Compaction is DONE,
-        // session is idle, ready for next message.
-        text = stats
-          ? `✅ Compacted (${stats}). Ready for your next message.`
-          : `✅ Compacted. Ready for your next message.`;
-      } else {
-        // Auto-compaction (mid-turn). The agent is continuing, this
-        // is just informational — show that something happened
-        // without implying "wait, more is coming."
-        text = stats
-          ? `💭 Auto-compacted (${stats}). Continuing…`
-          : `💭 Auto-compacted. Continuing…`;
-      }
-
-      try {
-        await tg(bot, 'sendMessage', {
-          chat_id: entry.chatId,
-          text,
-          ...(threadId ? { message_thread_id: threadId } : {}),
-        }, { source: 'compact-boundary', botName: BOT_NAME });
-      } catch (err) {
-        console.error(`[${entry.label}] compact-boundary post: ${err.message}`);
-      }
-    },
-    // 0.9.0: dropped onRespawn callback. It fired only on the deleted
-    // CLI pm's drain-then-respawn path; SDK pm applies /model + /effort
-    // live via setModel / applyFlagSettings with no drain event to
-    // hook. The inline-card update + button toast already convey "done"
-    // — a separate "✓ Using sonnet now" message would be noise on top
-    // of the change taking effect within the next streamed chunk.
+    ...sdkCallbacks,
   };
 
   // 0.9.0: single SDK pm wrapped by the (now thin) router for
