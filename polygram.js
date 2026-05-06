@@ -518,6 +518,13 @@ const {
   MODEL_VERSIONS_DESC,
 } = require('./lib/handlers/config-ui');
 let formatConfigInfoText = null;
+// CRITICAL: these placeholders MUST exist or 'use strict' boot fails
+// with ReferenceError. v4 review (commit 39) found 4 missing — restored.
+// Each handler is wired in main() once its deps exist.
+let handleConfigCallback = null;
+let handleAbortIfRequested = null;
+let autosteer = null;
+let dispatchSlashCommand = null;
 
 // rc.20: approvalCardText + safeParse moved to lib/approvals/ui.js.
 // 0.9.0 commit 29: makeCanUseTool / handleApprovalCallback /
@@ -528,6 +535,7 @@ let makeCanUseTool = null;
 let handleApprovalCallback = null;
 let resolveApprovalWaiter = null;
 let startApprovalSweeper = null;
+let cancelAllWaiters = null;
 
 // Parse /pair-code args: /pair-code [--chat <id>] [--scope user|chat] [--ttl 10m] [--note "..."]
 function parsePairCodeArgs(text) {
@@ -1886,6 +1894,7 @@ async function main() {
     handleApprovalCallback,
     resolveApprovalWaiter,
     startApprovalSweeper,
+    cancelAllWaiters,
   } = createApprovals({
     config, db, bot, botName: BOT_NAME, tg, logEvent,
     approvals, getChatIdFromKey, logger: console,
@@ -1907,6 +1916,13 @@ async function main() {
     config, db, dbWrite, inboxDir: INBOX_DIR, logger: console,
   });
   pm = new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions });
+  // formatConfigInfoText MUST be wired BEFORE createHandleConfigCallback
+  // — the latter destructures formatConfigInfoText from its deps at
+  // call time and captures the value (closure-by-value). v4 reviewer
+  // caught this as the same class as the v3 BLOCKER.
+  formatConfigInfoText = createFormatConfigInfoText({
+    pm, db, getClaudeSessionId,
+  });
   handleConfigCallback = createHandleConfigCallback({
     config, db, dbWrite, pm, getSessionKey,
     formatConfigInfoText, buildConfigKeyboard,
@@ -1919,9 +1935,6 @@ async function main() {
   });
   autosteer = createAutosteerHandlers({
     config, pm, autosteeredRefs, logEvent,
-  });
-  formatConfigInfoText = createFormatConfigInfoText({
-    pm, db, getClaudeSessionId,
   });
   recordInbound = createRecordInbound({
     db, dbWrite, config, botName: BOT_NAME, extractAttachments,
@@ -2038,10 +2051,12 @@ async function main() {
     if (approvalSweepTimer) clearInterval(approvalSweepTimer);
     if (ipcCloser) ipcCloser.close().catch(() => {});
     try { fs.unlinkSync(ipcServer.secretPathFor(BOT_NAME)); } catch {}
-    for (const list of approvalWaiters.values()) {
-      for (const fn of list) { try { fn('cancelled', 'polygram shutting down'); } catch {} }
-    }
-    approvalWaiters.clear();
+    // Reject every parked canUseTool waiter so the SDK doesn't
+    // hang on a dangling approval Promise. v4 review caught this:
+    // commit 29 moved the Map into lib/handlers/approvals.js; the
+    // old `approvalWaiters` reference here would ReferenceError
+    // mid-shutdown and prevent pm/DB cleanup.
+    if (cancelAllWaiters) cancelAllWaiters('cancelled', 'polygram shutting down');
     if (pm) await pm.shutdown().catch(() => {});
     if (db) {
       try { db.logEvent('polygram-stop'); db.raw.close(); } catch {}
