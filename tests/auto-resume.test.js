@@ -19,7 +19,7 @@ const {
   createAutoResumeTracker,
   isAutoResumable,
   DEFAULT_COOLDOWN_MS,
-} = require('../lib/auto-resume');
+} = require('../lib/db/auto-resume');
 
 describe('createAutoResumeTracker — cooldown', () => {
   let now;

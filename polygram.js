@@ -21,8 +21,8 @@ const { Bot } = require('grammy');
 const fs = require('fs');
 const path = require('path');
 const processGuard = require('./lib/process-guard');
-const dbClient = require('./lib/db');
-const { migrateJsonToDb, getClaudeSessionId } = require('./lib/sessions');
+const dbClient = require('./lib/db/index');
+const { migrateJsonToDb, getClaudeSessionId } = require('./lib/db/sessions');
 const { buildPrompt } = require('./lib/prompt');
 const { filterAttachments, MAX_FILE_BYTES } = require('./lib/attachments');
 // 0.9.0: SDK ProcessManager is the only pm. CLI pm
@@ -49,9 +49,9 @@ const { createAbortGrace } = require('./lib/abort-grace');
 const agentLoader = require('./lib/agent-loader');
 const { createSender } = require('./lib/telegram/api');
 const { createAsyncLock } = require('./lib/async-lock');
-const { sweepInbox } = require('./lib/inbox');
+const { sweepInbox } = require('./lib/db/inbox');
 const { parseBotArg, parseDbArg, filterConfigToBot } = require('./lib/config-scope');
-const { createStore: createPairingsStore, parseTtl: parsePairingTtl } = require('./lib/pairings');
+const { createStore: createPairingsStore, parseTtl: parsePairingTtl } = require('./lib/db/pairings');
 const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/telegram/voice');
 const { createStreamer } = require('./lib/telegram/streamer');
 const { chunkMarkdownText } = require('./lib/telegram/chunk');
@@ -63,8 +63,8 @@ const { redactBotToken } = require('./lib/net-errors');
 const { createReactionManager, classifyToolName } = require('./lib/telegram/reactions');
 const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
 const { classify: classifyError, isTransientHttpError } = require('./lib/error-classify');
-const { createAutoResumeTracker, isAutoResumable } = require('./lib/auto-resume');
-const { resolveReplayWindowMs } = require('./lib/replay-window');
+const { createAutoResumeTracker, isAutoResumable } = require('./lib/db/auto-resume');
+const { resolveReplayWindowMs } = require('./lib/db/replay-window');
 const { validateIpcFileParam } = require('./lib/ipc-file-validator');
 const {
   createStore: createApprovalsStore,

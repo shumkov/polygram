@@ -11,7 +11,7 @@ const {
   createStore, generateCode, normalizeCode, parseTtl,
   DEFAULT_TTL_MS, MAX_TTL_MS, MIN_TTL_MS,
   ISSUE_RATE_PER_OPERATOR_PER_HOUR, CLAIM_RATE_PER_USER_PER_HOUR,
-} = require('../lib/pairings');
+} = require('../lib/db/pairings');
 
 let db, dbPath, store;
 let fakeNow;

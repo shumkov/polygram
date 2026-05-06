@@ -7,7 +7,7 @@ const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { freshDb, cleanupDb } = require('./helpers/db-fixture');
-const { open } = require('../lib/db'); // a couple of tests open a 2nd connection to the same file
+const { open } = require('../lib/db/index'); // a couple of tests open a 2nd connection to the same file
 
 let db;
 let dbPath;

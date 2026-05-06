@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { sweepInbox } = require('../lib/inbox');
+const { sweepInbox } = require('../lib/db/inbox');
 
 let root;
 

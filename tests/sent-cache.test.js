@@ -1,7 +1,7 @@
 const { test, describe, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { createSentCache } = require('../lib/sent-cache');
+const { createSentCache } = require('../lib/db/sent-cache');
 
 describe('createSentCache', () => {
   let cache;

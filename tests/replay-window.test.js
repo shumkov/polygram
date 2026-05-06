@@ -19,7 +19,7 @@ const {
   resolveReplayWindowMs,
   FLOOR_MS,
   CAP_MS,
-} = require('../lib/replay-window');
+} = require('../lib/db/replay-window');
 
 describe('resolveReplayWindowMs — explicit override', () => {
   test('config.bot.replayWindowMs takes precedence', () => {

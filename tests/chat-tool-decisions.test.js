@@ -14,7 +14,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { open } = require('../lib/db');
+const { open } = require('../lib/db/index');
 
 let tmp;
 let db;

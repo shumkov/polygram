@@ -19,7 +19,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const { open } = require('../lib/db');
+const { open } = require('../lib/db/index');
 
 function parseArg(argv, flag, required = false) {
   const i = argv.indexOf(flag);

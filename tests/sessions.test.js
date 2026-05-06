@@ -9,8 +9,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { open } = require('../lib/db');
-const { migrateJsonToDb, getClaudeSessionId } = require('../lib/sessions');
+const { open } = require('../lib/db/index');
+const { migrateJsonToDb, getClaudeSessionId } = require('../lib/db/sessions');
 
 let db;
 let dbPath;

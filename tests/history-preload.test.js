@@ -12,7 +12,7 @@ const os = require('os');
 const path = require('path');
 
 const { makeSessionStartHook, buildHistoryBlock, _formatRow } = require('../lib/history-preload');
-const { open } = require('../lib/db');
+const { open } = require('../lib/db/index');
 
 let tmpDir;
 let db;
