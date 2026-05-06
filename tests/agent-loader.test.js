@@ -1,5 +1,5 @@
 /**
- * Tests for lib/agent-loader.js (Phase 1 step 14).
+ * Tests for lib/agents/loader.js (Phase 1 step 14).
  *
  * Builds synthetic agent dirs in tmpdir with various combinations of
  * CLAUDE.md / settings.json / skills / mcpServers and verifies

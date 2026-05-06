@@ -17,7 +17,7 @@
  * shapes; userMessage is the friendly variant; no enum leak.
  */
 
-import { classify } from '../../lib/error-classify.js';
+import { classify } from '../../lib/error/classify.js';
 
 const cases = [
   { name: 'HTTP 401 string', input: 'HTTP 401 Unauthorized' },

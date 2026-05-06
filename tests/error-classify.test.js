@@ -1,5 +1,5 @@
 /**
- * Tests for lib/error-classify.js.
+ * Tests for lib/error/classify.js.
  *
  * Covers every PATTERNS entry, every CODES short-circuit, every
  * SDK_MESSAGE_ERROR / SDK_RESULT_SUBTYPE map entry, plus defensive

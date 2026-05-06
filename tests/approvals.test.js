@@ -1,5 +1,5 @@
 /**
- * Tests for lib/approvals.js
+ * Tests for lib/approvals/store.js
  * Run: node --test tests/approvals.test.js
  */
 

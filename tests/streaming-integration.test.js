@@ -3,7 +3,7 @@
  *
  * These wire together:
  *   - createStreamer (lib/stream-reply.js) with finalize/discard
- *   - chunkMarkdownText (lib/telegram-chunk.js)
+ *   - chunkMarkdownText (lib/telegram/chunk.js)
  *   - deliverReplies (lib/deliver.js)
  *
  * Without spinning up polygram.js (which requires DB + grammy + config).

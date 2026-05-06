@@ -24,7 +24,7 @@ const processGuard = require('./lib/process-guard');
 const dbClient = require('./lib/db/index');
 const { migrateJsonToDb, getClaudeSessionId } = require('./lib/db/sessions');
 const { buildPrompt } = require('./lib/prompt');
-const { filterAttachments, MAX_FILE_BYTES } = require('./lib/attachments');
+const { filterAttachments } = require('./lib/attachments');
 // 0.9.0: SDK ProcessManager is the only pm. CLI pm
 // (lib/process-manager.js) deleted in commit 6.
 // Both implementations expose the same public API (constructor +
@@ -50,7 +50,8 @@ const {
 } = require('./lib/approvals/ui');
 const { buildHistoryBlock } = require('./lib/history-preload');
 const { formatContextReply, maybeContextFullHint } = require('./lib/context-format');
-const { appendDisplayHint } = require('./lib/telegram/display-hint');
+// appendDisplayHint moved with buildSdkOptions extraction (commit 18) —
+// only consumer of that import is now lib/sdk/build-options.js itself.
 const { createAbortGrace } = require('./lib/abort-grace');
 const agentLoader = require('./lib/agents/loader');
 const { createSender } = require('./lib/telegram/api');
@@ -65,7 +66,8 @@ const { deliverReplies } = require('./lib/telegram/deliver');
 const { announce, shouldAnnounce } = require('./lib/announces');
 const { isAbortRequest } = require('./lib/abort-detector');
 const { startTyping } = require('./lib/telegram/typing');
-const { redactBotToken } = require('./lib/error/net');
+// redactBotToken moved with download extraction (commit 21) — only
+// consumer is lib/handlers/download.js.
 const { createReactionManager, classifyToolName } = require('./lib/telegram/reactions');
 const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
 const { classify: classifyError, isTransientHttpError } = require('./lib/error/classify');

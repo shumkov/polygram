@@ -1,5 +1,5 @@
 /**
- * Tests for lib/approval-ui.js — pure UI builders for the approval
+ * Tests for lib/approvals/ui.js — pure UI builders for the approval
  * flow's Telegram surface. These functions feed `tg.sendMessage`
  * and `tg.editMessageText`; bugs here = users can't see/use
  * the approval card.

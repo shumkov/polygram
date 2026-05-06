@@ -1,5 +1,5 @@
 /**
- * Tests for lib/telegram-chunk.js — port of OpenClaw's chunkMarkdownText.
+ * Tests for lib/telegram/chunk.js — port of OpenClaw's chunkMarkdownText.
  *
  * Coverage:
  *   - Trivial inputs: empty / shorter than limit / exactly at limit

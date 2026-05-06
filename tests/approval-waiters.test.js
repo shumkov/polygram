@@ -1,5 +1,5 @@
 /**
- * Tests for lib/approval-waiters.js — covers all 5 cleanup paths +
+ * Tests for lib/approvals/waiters.js — covers all 5 cleanup paths +
  * the WAITER_CAP and SUPERSEDED edge cases.
  */
 

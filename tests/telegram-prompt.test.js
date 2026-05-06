@@ -1,5 +1,5 @@
 /**
- * Tests for lib/telegram-prompt.js — the polygram-side display hint
+ * Tests for lib/telegram/display-hint.js — the polygram-side display hint
  * appended to every chat's system prompt so agents know Telegram's
  * <pre> render width.
  *
