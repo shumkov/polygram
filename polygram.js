@@ -879,72 +879,18 @@ async function handleSendOverIpc(req) {
 // Imported above (buildApprovalKeyboardWithAlways, approvalCardText,
 // formatToolInputForCard).
 
-// /model and /effort inline keyboard. `show` controls which row(s) appear:
-// 'model', 'effort', or 'all'. The current value gets a ✓ marker so the
-// user can see at a glance what's selected.
-const MODEL_OPTIONS = ['opus', 'sonnet', 'haiku'];
-const EFFORT_OPTIONS = ['low', 'medium', 'high', 'xhigh', 'max'];
-
-function buildConfigKeyboard(chatConfig, show = 'all') {
-  const rows = [];
-  if (show === 'model' || show === 'all') {
-    rows.push(MODEL_OPTIONS.map((m) => ({
-      text: m === chatConfig.model ? `✓ ${m}` : m,
-      callback_data: `cfg:model:${m}`,
-    })));
-  }
-  if (show === 'effort' || show === 'all') {
-    rows.push(EFFORT_OPTIONS.map((e) => ({
-      text: e === chatConfig.effort ? `✓ ${e}` : e,
-      callback_data: `cfg:effort:${e}`,
-    })));
-  }
-  return { inline_keyboard: rows };
-}
-
-// Card text shown above the inline keyboard. Includes plain-language
-// guidance on when to pick which model / effort, since most users
-// (especially in shared groups) don't know which option to tap.
-//
-// Model versions: polygram passes the alias ("opus", "sonnet", "haiku")
-// to claude, which resolves it to the latest snapshot. We mirror those
-// snapshots here for display only, and verify them on each release with
-// `claude --model <alias>` (probing the system:init event's `model`
-// field). Bumping is a manual step — when claude releases a new
-// snapshot the alias maps to, update this map and ship.
-const MODEL_VERSIONS_DESC = {
-  opus: 'claude-opus-4-7',
-  sonnet: 'claude-sonnet-4-6',
-  haiku: 'claude-haiku-4-5',
-};
-
-function formatConfigInfoText(chatConfig, show, sessionKey) {
-  const alive = pm.has(sessionKey) && !pm.get(sessionKey).closed;
-  const ver = MODEL_VERSIONS_DESC[chatConfig.model] || chatConfig.model;
-  const head = `Model: ${chatConfig.model} (${ver})\nEffort: ${chatConfig.effort}\nAgent: ${chatConfig.agent}\nProcess: ${alive ? 'warm' : 'cold'}\nSession: ${getClaudeSessionId(db, sessionKey)?.slice(0, 8) || 'new'}`;
-
-  const modelHelp = [
-    '',
-    '**Models**',
-    '🧠 **opus** — deep analysis, code refactor, multi-source reconciliation. ~5× sonnet cost.',
-    '🤖 **sonnet** — default. Most ops, code review, document summary.',
-    '⚡ **haiku** — quick simple tasks, classification, lookup.',
-  ].join('\n');
-
-  const effortHelp = [
-    '',
-    '**Effort** — ceiling on how much Claude can think. Simple questions get fast replies; hard ones spend more tokens. Safe to set higher — Claude scales down automatically when it doesn\'t need to think.',
-    '• **low** — fast replies, minimum reasoning. Casual chat, simple lookups.',
-    '• **medium** — balanced default. Fits most use cases.',
-    '• **high** — multi-step tasks. Audit, debug, multi-source analysis.',
-    '• **xhigh** / **max** — heaviest. Hard reasoning, edge cases.',
-  ].join('\n');
-
-  let body = head;
-  if (show === 'model' || show === 'all') body += '\n' + modelHelp;
-  if (show === 'effort' || show === 'all') body += '\n' + effortHelp;
-  return body;
-}
+// Config card UI moved to lib/handlers/config-ui.js. polygram.js
+// keeps a thin formatConfigInfoText wrapper since it needs the
+// runtime pm + db + getClaudeSessionId; buildConfigKeyboard is
+// pure and re-exported.
+const {
+  buildConfigKeyboard,
+  createFormatConfigInfoText,
+  MODEL_OPTIONS,
+  EFFORT_OPTIONS,
+  MODEL_VERSIONS_DESC,
+} = require('./lib/handlers/config-ui');
+let formatConfigInfoText = null;
 
 // rc.20: approvalCardText + safeParse moved to lib/approvals/ui.js.
 // 0.9.0 commit 29: makeCanUseTool / handleApprovalCallback /
@@ -2454,6 +2400,9 @@ async function main() {
   });
   autosteer = createAutosteerHandlers({
     config, pm, autosteeredRefs, logEvent,
+  });
+  formatConfigInfoText = createFormatConfigInfoText({
+    pm, db, getClaudeSessionId,
   });
   dispatchSlashCommand = createSlashCommands({
     config, db, dbWrite, pm, pairings, parsePairingTtl,
