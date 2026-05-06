@@ -12,15 +12,6 @@ const { call, socketPathFor } = require('../lib/ipc-client');
 
   console.log('path:', path);
   console.log('ping:', JSON.stringify(await call({ path, op: 'ping' })));
-
-  console.log('ungated:', JSON.stringify(await call({
-    path, op: 'approval_request',
-    payload: {
-      bot_name: bot, chat_id: '111111111',
-      tool_name: 'Read', tool_input: { path: '/etc/hosts' },
-    },
-  })));
-
   console.log('DONE');
 })().catch((err) => {
   console.error('ERR:', err.message);

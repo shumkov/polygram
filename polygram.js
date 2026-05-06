@@ -1593,81 +1593,6 @@ function makeCanUseTool(sessionKey) {
   };
 }
 
-async function handleApprovalRequest(req) {
-  const { bot_name, chat_id, turn_id, tool_name, tool_input } = req;
-  if (!chat_id || !tool_name) {
-    throw new Error('chat_id, tool_name required');
-  }
-  // Per-bot process: the caller's bot_name must match ours if provided.
-  if (bot_name && bot_name !== BOT_NAME) {
-    throw new Error(`wrong bot: socket is ${BOT_NAME}, request is for ${bot_name}`);
-  }
-
-  const apprCfg = config.bot?.approvals;
-  if (!apprCfg || !apprCfg.adminChatId) {
-    return { decision: 'not-gated', reason: 'approvals not configured for this bot' };
-  }
-
-  const gated = matchesApprovalPattern(tool_name, tool_input, apprCfg.gatedTools || []);
-  if (!gated.matched) {
-    return { decision: 'not-gated' };
-  }
-
-  // Issue pending row (with dedup). Row persists the bot_name for archive/
-  // audit queries across per-bot DBs.
-  const row = approvals.issue({
-    bot_name: BOT_NAME, turn_id, requester_chat_id: chat_id,
-    approver_chat_id: String(apprCfg.adminChatId),
-    tool_name, tool_input,
-    timeoutMs: apprCfg.timeoutMs || APPROVAL_DEFAULT_TIMEOUT_MS,
-  });
-
-  if (!bot) {
-    approvals.resolve({ id: row.id, status: 'cancelled', reason: 'bot process not ready' });
-    return { decision: 'denied', reason: 'bot process not ready' };
-  }
-
-  if (!row.reused || !row.approver_msg_id) {
-    try {
-      const sent = await tg(bot, 'sendMessage', {
-        chat_id: apprCfg.adminChatId,
-        text: approvalCardText(row),
-        reply_markup: buildApprovalKeyboard(row.id, row.callback_token),
-      }, { source: 'approval-request', botName: BOT_NAME, plainText: true });
-      if (sent?.message_id) {
-        approvals.setApproverMsgId(row.id, sent.message_id);
-      }
-    } catch (err) {
-      console.error(`[${BOT_NAME}] failed to post approval card: ${err.message}`);
-      approvals.resolve({ id: row.id, status: 'cancelled', reason: `post failed: ${err.message}` });
-      return { decision: 'denied', reason: `post failed: ${err.message}` };
-    }
-  }
-
-  // Block until callback resolves us, or timeout fires. Multiple dedup'd
-  // callers can queue on the same id — they all get the same decision.
-  return await new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      dropWaiter(row.id, wrappedResolve);
-      resolve({ decision: 'timeout', reason: 'operator did not respond in time' });
-    }, Math.max(1000, row.timeout_ts - Date.now()));
-
-    const wrappedResolve = (decision, reason) => {
-      clearTimeout(timer);
-      // Translate 'approved-always' / 'denied-always' to plain
-      // approve/deny for the IPC caller — the IPC hook protocol
-      // doesn't carry persistence state, only the bool decision.
-      if (decision === 'approved-always') decision = 'approved';
-      else if (decision === 'denied-always') decision = 'denied';
-      resolve({ decision, reason });
-    };
-
-    const list = approvalWaiters.get(row.id) || [];
-    list.push(wrappedResolve);
-    approvalWaiters.set(row.id, list);
-  });
-}
-
 function dropWaiter(id, fn) {
   const list = approvalWaiters.get(id);
   if (!list) return;
@@ -4186,7 +4111,6 @@ async function main() {
       path: ipcServer.socketPathFor(BOT_NAME),
       secret: ipcSecret,
       handlers: {
-        approval_request: handleApprovalRequest,
         ping: async () => ({ pong: true, bot: BOT_NAME }),
         send: (req) => handleSendOverIpc(req),
       },
