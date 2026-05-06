@@ -137,62 +137,21 @@ let bot = null;       // grammy Bot for BOT_NAME
 // name starts with that string. (filterEnv + lists moved to
 // lib/sdk/build-options.js with the buildSdkOptions extraction.)
 
-function loadConfig() {
-  config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-}
+// Config helpers extracted to lib/config.js. Thin wrappers below
+// keep the existing call shape — polygram.js owns the module-level
+// `config` / `stickerMap` / `emojiToSticker` and assigns from the
+// pure I/O functions.
+const configIO = require('./lib/config');
+const { isWellFormedMessage } = configIO;
 
+function loadConfig() { config = configIO.loadConfig(CONFIG_PATH); }
 function saveConfig() {
-  // Atomic read-merge-write. In-memory `config` is FILTERED (only one bot +
-  // its chats) because filterConfigToBot narrowed it at boot. Writing it
-  // back directly would clobber every OTHER bot's section on disk. Instead:
-  // read the current on-disk config fresh, apply our bot-scoped changes,
-  // write the merged result. This is safe against parallel writers because
-  // each bot only mutates entries inside its own scope (its bot entry + its
-  // own chats), and we use rename for atomicity.
-  const onDisk = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-
-  // Apply our bot's changes.
-  if (BOT_NAME && config.bots?.[BOT_NAME]) {
-    onDisk.bots = onDisk.bots || {};
-    onDisk.bots[BOT_NAME] = config.bots[BOT_NAME];
-  }
-  // Apply chat changes — only chats the filter left in our memory belong
-  // to this bot; overwrite those keys, leave the rest of onDisk.chats alone.
-  if (config.chats) {
-    onDisk.chats = onDisk.chats || {};
-    for (const [chatId, chat] of Object.entries(config.chats)) {
-      onDisk.chats[chatId] = chat;
-    }
-  }
-  // Top-level non-bot-scoped fields (defaults, maxWarmProcesses, etc.)
-  // reflect ops-wide policy. Only copy if our in-memory value is newer —
-  // but detecting that is hard; simplest safe rule is: don't touch them
-  // from a bot-scoped process. Leave onDisk's values as-is.
-
-  const tmp = `${CONFIG_PATH}.tmp.${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(onDisk, null, 2));
-  fs.renameSync(tmp, CONFIG_PATH);
+  configIO.saveConfig({ configPath: CONFIG_PATH, botName: BOT_NAME, config });
 }
-
 function loadStickers() {
-  try {
-    const data = JSON.parse(fs.readFileSync(STICKERS_PATH, 'utf8'));
-    for (const [name, s] of Object.entries(data.stickers || {})) {
-      stickerMap[name] = s.file_id;
-      if (s.emoji) emojiToSticker[s.emoji] = s.file_id;
-    }
-    console.log(`Stickers: ${Object.keys(stickerMap).join(', ')}`);
-  } catch { console.log('No sticker map found'); }
-}
-
-// Quick shape check before we start hashing/DB-writing on an update.
-// Telegram updates are user-controlled; a hostile or malformed payload
-// without chat.id / message_id would throw deep in recordInbound.
-function isWellFormedMessage(msg) {
-  return !!(msg
-    && msg.chat
-    && (typeof msg.chat.id === 'number' || typeof msg.chat.id === 'bigint')
-    && typeof msg.message_id === 'number');
+  const { stickerMap: m, emojiToSticker: e } = configIO.loadStickers(STICKERS_PATH);
+  Object.assign(stickerMap, m);
+  Object.assign(emojiToSticker, e);
 }
 
 // ─── Session key — moved to lib/session-key.js so tests can import it. ─

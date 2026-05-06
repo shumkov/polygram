@@ -1,0 +1,205 @@
+/**
+ * Tests for lib/config.js — the pure-I/O config / sticker / message
+ * loaders extracted from polygram.js.
+ */
+
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const { test, describe, beforeEach, afterEach } = require('node:test');
+const assert = require('node:assert/strict');
+
+const {
+  loadConfig,
+  saveConfig,
+  loadStickers,
+  isWellFormedMessage,
+} = require('../lib/config');
+
+const silentLogger = { log: () => {}, error: () => {} };
+
+let tmpDir;
+beforeEach(() => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-config-test-'));
+});
+afterEach(() => {
+  try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+});
+
+describe('loadConfig', () => {
+  test('reads + parses JSON', () => {
+    const p = path.join(tmpDir, 'config.json');
+    fs.writeFileSync(p, JSON.stringify({ defaults: { model: 'sonnet' }, bots: {} }));
+    const cfg = loadConfig(p);
+    assert.equal(cfg.defaults.model, 'sonnet');
+  });
+
+  test('throws on parse error (caller fails fast)', () => {
+    const p = path.join(tmpDir, 'bad.json');
+    fs.writeFileSync(p, '{not-json');
+    assert.throws(() => loadConfig(p));
+  });
+
+  test('throws on missing file', () => {
+    assert.throws(() => loadConfig(path.join(tmpDir, 'nonexistent.json')));
+  });
+});
+
+describe('saveConfig — atomic write + bot-scoped merge', () => {
+  test('overwrites OUR bot section, preserves OTHER bots on disk', () => {
+    const p = path.join(tmpDir, 'config.json');
+    // On-disk has TWO bots; in-memory is filtered to just bot-A.
+    fs.writeFileSync(p, JSON.stringify({
+      defaults: { model: 'sonnet' },
+      bots: {
+        'bot-A': { token: 'old-A' },
+        'bot-B': { token: 'untouched-B' },
+      },
+      chats: {},
+    }, null, 2));
+    saveConfig({
+      configPath: p,
+      botName: 'bot-A',
+      config: { bots: { 'bot-A': { token: 'new-A' } }, chats: {} },
+    });
+    const after = JSON.parse(fs.readFileSync(p, 'utf8'));
+    assert.equal(after.bots['bot-A'].token, 'new-A');
+    assert.equal(after.bots['bot-B'].token, 'untouched-B',
+      'other bot must NOT be clobbered');
+  });
+
+  test('merges chat updates without clobbering other chats', () => {
+    const p = path.join(tmpDir, 'config.json');
+    fs.writeFileSync(p, JSON.stringify({
+      bots: {},
+      chats: {
+        '111': { name: 'A', model: 'sonnet' },
+        '222': { name: 'B', model: 'opus' },
+      },
+    }, null, 2));
+    saveConfig({
+      configPath: p,
+      botName: 'bot',
+      config: { bots: {}, chats: { '111': { name: 'A', model: 'haiku' } } },
+    });
+    const after = JSON.parse(fs.readFileSync(p, 'utf8'));
+    assert.equal(after.chats['111'].model, 'haiku', 'updated chat written');
+    assert.equal(after.chats['222'].model, 'opus', 'untouched chat preserved');
+  });
+
+  test('does NOT touch top-level ops-wide fields (defaults, maxWarmProcesses)', () => {
+    const p = path.join(tmpDir, 'config.json');
+    fs.writeFileSync(p, JSON.stringify({
+      defaults: { model: 'sonnet', effort: 'high' },
+      maxWarmProcesses: 10,
+      bots: {},
+      chats: {},
+    }, null, 2));
+    saveConfig({
+      configPath: p,
+      botName: null,
+      // In-memory has stale ops-wide values; saveConfig must not write them.
+      config: { defaults: { model: 'opus' }, maxWarmProcesses: 99, bots: {}, chats: {} },
+    });
+    const after = JSON.parse(fs.readFileSync(p, 'utf8'));
+    assert.equal(after.defaults.model, 'sonnet');
+    assert.equal(after.maxWarmProcesses, 10);
+  });
+
+  test('atomic write — temp file is gone after success', () => {
+    const p = path.join(tmpDir, 'config.json');
+    fs.writeFileSync(p, JSON.stringify({ bots: {}, chats: {} }));
+    saveConfig({ configPath: p, botName: 'bot', config: { bots: {}, chats: {} } });
+    const tmp = `${p}.tmp.${process.pid}`;
+    assert.equal(fs.existsSync(tmp), false, 'temp file removed after rename');
+    assert.equal(fs.existsSync(p), true);
+  });
+});
+
+describe('loadStickers', () => {
+  test('reads stickers.json + populates both maps', () => {
+    const p = path.join(tmpDir, 'stickers.json');
+    fs.writeFileSync(p, JSON.stringify({
+      stickers: {
+        working:  { emoji: '💻', file_id: 'CAACWORK' },
+        pumped:   { emoji: '⚡', file_id: 'CAACPUMP' },
+        nameless: { file_id: 'CAACNAME' },  // no emoji
+      },
+    }));
+    const { stickerMap, emojiToSticker } = loadStickers(p, { logger: silentLogger });
+    assert.equal(stickerMap.working, 'CAACWORK');
+    assert.equal(stickerMap.pumped, 'CAACPUMP');
+    assert.equal(stickerMap.nameless, 'CAACNAME');
+    assert.equal(emojiToSticker['💻'], 'CAACWORK');
+    assert.equal(emojiToSticker['⚡'], 'CAACPUMP');
+    assert.equal('nameless' in emojiToSticker, false,
+      'sticker without emoji does not pollute emojiToSticker');
+  });
+
+  test('missing file → empty maps + log', () => {
+    const logs = [];
+    const { stickerMap, emojiToSticker } = loadStickers(
+      path.join(tmpDir, 'absent.json'),
+      { logger: { log: (m) => logs.push(m), error: () => {} } },
+    );
+    assert.deepEqual(stickerMap, {});
+    assert.deepEqual(emojiToSticker, {});
+    assert.match(logs[0], /No sticker map/);
+  });
+
+  test('malformed JSON → empty maps (does not throw)', () => {
+    const p = path.join(tmpDir, 'broken.json');
+    fs.writeFileSync(p, '{not-json');
+    const { stickerMap } = loadStickers(p, { logger: silentLogger });
+    assert.deepEqual(stickerMap, {});
+  });
+
+  test('empty stickers map produces empty maps without throwing', () => {
+    const p = path.join(tmpDir, 'empty.json');
+    fs.writeFileSync(p, JSON.stringify({ stickers: {} }));
+    const { stickerMap } = loadStickers(p, { logger: silentLogger });
+    assert.deepEqual(stickerMap, {});
+  });
+});
+
+describe('isWellFormedMessage', () => {
+  test('valid Telegram message → true', () => {
+    assert.equal(isWellFormedMessage({
+      chat: { id: 12345 }, message_id: 1, text: 'hi',
+    }), true);
+  });
+
+  test('bigint chat.id (large group) accepted', () => {
+    assert.equal(isWellFormedMessage({
+      chat: { id: 999999999999n }, message_id: 1,
+    }), true);
+  });
+
+  test('null / undefined → false', () => {
+    assert.equal(isWellFormedMessage(null), false);
+    assert.equal(isWellFormedMessage(undefined), false);
+  });
+
+  test('missing chat → false', () => {
+    assert.equal(isWellFormedMessage({ message_id: 1 }), false);
+  });
+
+  test('missing chat.id → false', () => {
+    assert.equal(isWellFormedMessage({ chat: {}, message_id: 1 }), false);
+  });
+
+  test('missing message_id → false', () => {
+    assert.equal(isWellFormedMessage({ chat: { id: 1 } }), false);
+  });
+
+  test('chat.id as string → false (defends against type drift)', () => {
+    assert.equal(isWellFormedMessage({ chat: { id: '123' }, message_id: 1 }), false);
+  });
+
+  test('message_id as string → false', () => {
+    assert.equal(isWellFormedMessage({ chat: { id: 1 }, message_id: '1' }), false);
+  });
+});
