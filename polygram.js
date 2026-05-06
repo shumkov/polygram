@@ -17,11 +17,13 @@
  *                /new, /reset, /reload, /agent, /stop.
  */
 
+'use strict';
+
 const { Bot } = require('grammy');
 const fs = require('fs');
 const path = require('path');
 const processGuard = require('./lib/process-guard');
-const dbClient = require('./lib/db/index');
+const dbClient = require('./lib/db');
 const { migrateJsonToDb, getClaudeSessionId } = require('./lib/db/sessions');
 const { buildPrompt } = require('./lib/prompt');
 const { filterAttachments } = require('./lib/attachments');

@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { open } = require('../lib/db/index');
+const { open } = require('../lib/db');
 const { copy, count, chatIdsForBot } = require('../scripts/split-db');
 
 let tmpDir;
