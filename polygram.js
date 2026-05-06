@@ -38,6 +38,7 @@ const { createAutosteeredRefs } = require('./lib/autosteered-refs');
 const { createPmRouter } = require('./lib/sdk/router');
 const { createBuildSdkOptions } = require('./lib/sdk/build-options');
 const { createSdkCallbacks } = require('./lib/sdk/callbacks');
+const { createTranscribeVoiceAttachments } = require('./lib/handlers/voice');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
   buildApprovalKeyboardWithAlways,
@@ -436,81 +437,9 @@ function extractAttachments(msg) {
   return items;
 }
 
-async function transcribeVoiceAttachments(downloaded, { chatId, msgId, label, botApi, threadId }) {
-  const voiceCfg = config.bot?.voice || config.voice;
-  if (!voiceCfg?.enabled) return { ackEmitted: false };
-  const provider = voiceCfg.provider || 'openai';
-  const providerCfg = voiceCfg[provider] || {};
-  const targets = downloaded.filter((a) => isVoiceAttachment(a) && a.path);
-  if (!targets.length) return { ackEmitted: false };
-
-  // Acknowledge receipt with a reaction so the user knows we heard them.
-  // Cheap, robust (no state), and survives transcription failure.
-  // 0.7.4 (item G): we report `ackEmitted: true` so the caller can skip
-  // the reactor's QUEUED → 👀 transition. Pre-fix, 👂 was visible for
-  // ~milliseconds before 👀 overwrote it on the same message — wasted
-  // API call and confusing flicker. Now 👂 stays until Claude actually
-  // starts work and the reactor flips to THINKING (🤔).
-  const ack = voiceCfg.ackReaction || '👂';
-  let ackEmitted = false;
-  if (ack && botApi) {
-    ackEmitted = true;
-    tg(botApi, 'setMessageReaction', {
-      chat_id: chatId, message_id: msgId,
-      reaction: [{ type: 'emoji', emoji: ack }],
-    }, { source: 'voice-ack', botName: BOT_NAME }).catch((err) => {
-      console.error(`[${label}] voice ack reaction failed: ${err.message}`);
-    });
-  }
-
-  await Promise.all(targets.map(async (a) => {
-    try {
-      const opts = {
-        provider,
-        ...providerCfg,
-        language: voiceCfg.language || 'auto',
-        maxDurationSec: voiceCfg.maxDurationSec,
-        maxDurationBytesPerSec: voiceCfg.maxDurationBytesPerSec,
-      };
-      const r = await transcribeVoice(a.path, opts);
-      a.transcription = r;
-      console.log(`[${label}] transcribed ${a.kind} (${r.duration_sec?.toFixed?.(1) || '?'}s, ${r.text.length} chars)`);
-      logEvent('voice-transcribed', {
-        chat_id: chatId, msg_id: msgId,
-        provider: r.provider, language: r.language,
-        duration_sec: r.duration_sec, chars: r.text.length,
-        cost_usd: r.cost_usd,
-      });
-    } catch (err) {
-      console.error(`[${label}] transcribe failed for ${a.name}: ${err.message}`);
-      logEvent('voice-transcribe-failed', {
-        chat_id: chatId, msg_id: msgId, name: a.name, error: err.message,
-      });
-    }
-  }));
-
-  // Persist transcription:
-  //   - Per-attachment: setAttachmentTranscription stores the full
-  //     transcription object (text + language + duration + provider) as
-  //     JSON in the attachments.transcription column. buildVoiceTags
-  //     parses it back when building the prompt.
-  //   - Message-level: setMessageText updates messages.text with the
-  //     combined transcript so FTS finds "what Maria said" via the
-  //     normal chat search path.
-  const successful = targets.filter((a) => a.transcription?.text);
-  if (!successful.length) return { ackEmitted };
-  for (const a of successful) {
-    if (a.id != null) {
-      dbWrite(() => db.setAttachmentTranscription(a.id, JSON.stringify(a.transcription)),
-        `setAttachmentTranscription ${a.id}`);
-    }
-  }
-  const combinedText = successful.map((a) => a.transcription.text).join(' ').trim();
-  dbWrite(() => db.setMessageText({
-    chat_id: chatId, msg_id: msgId, text: combinedText,
-  }), 'persist voice transcription');
-  return { ackEmitted };
-}
+// transcribeVoiceAttachments extracted to lib/handlers/voice.js.
+// Wired in main() once db + tg + config are available.
+let transcribeVoiceAttachments = null;
 
 // Bounded concurrency for parallel fetches. A 10-photo album used to be
 // 10× per-photo latency (each `await fetch` was serial); now in-flight
@@ -3616,6 +3545,11 @@ async function main() {
     makeCanUseTool,
     logEvent,
     logger: console,
+  });
+  transcribeVoiceAttachments = createTranscribeVoiceAttachments({
+    config, db, dbWrite, tg, logEvent,
+    transcribeVoice, isVoiceAttachment,
+    botName: BOT_NAME, logger: console,
   });
   const sdkPm = new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions });
   pm = createPmRouter({ pm: sdkPm });
