@@ -317,93 +317,10 @@ function recordInbound(msg) {
 }
 
 
-// ─── Attachment download ────────────────────────────────────────────
-
-function sanitizeFilename(name) {
-  if (!name) return 'file';
-  return name.replace(/[\/\\:\0]/g, '_').slice(0, 120);
-}
-
-// Short, filesystem-safe handle from the file_unique_id for auto-gen names.
-// Telegram guarantees file_unique_id is stable per file across sessions; 8
-// chars is collision-safe within a chat (~48 bits) and short enough to read.
-// Falls back to msg.message_id for the rare case where file_unique_id is
-// unset (very old Bot API rows). The pre-0.6.15 pattern embedded message_id
-// directly, which then went stale after media-group reassignment rewrote
-// the row's msg_id → name and msg_id disagreed about which Telegram message
-// the file came from. Using file_unique_id makes the name stable across
-// reassignment.
-function shortFileTag(fileUniqueId, fallback) {
-  if (fileUniqueId) {
-    return String(fileUniqueId).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 8) || String(fallback);
-  }
-  return String(fallback);
-}
-
-function extractAttachments(msg) {
-  // Media-group bundling path: when we synthesised a single message from
-  // several siblings sharing a media_group_id, the merged attachment list
-  // was pre-computed in `_mergedAttachments`. Return it directly instead
-  // of running the per-field extraction against the primary message.
-  if (Array.isArray(msg._mergedAttachments)) return msg._mergedAttachments;
-
-  const items = [];
-  if (msg.document) {
-    const d = msg.document;
-    items.push({
-      file_id: d.file_id,
-      file_unique_id: d.file_unique_id,
-      name: d.file_name || `document-${shortFileTag(d.file_unique_id, msg.message_id)}`,
-      mime_type: d.mime_type || 'application/octet-stream',
-      size: d.file_size || 0,
-      kind: 'document',
-    });
-  }
-  if (msg.photo && msg.photo.length > 0) {
-    const largest = msg.photo[msg.photo.length - 1];
-    items.push({
-      file_id: largest.file_id,
-      file_unique_id: largest.file_unique_id,
-      name: `photo-${shortFileTag(largest.file_unique_id, msg.message_id)}.jpg`,
-      mime_type: 'image/jpeg',
-      size: largest.file_size || 0,
-      kind: 'photo',
-    });
-  }
-  if (msg.voice) {
-    items.push({
-      file_id: msg.voice.file_id,
-      file_unique_id: msg.voice.file_unique_id,
-      name: `voice-${shortFileTag(msg.voice.file_unique_id, msg.message_id)}.ogg`,
-      mime_type: msg.voice.mime_type || 'audio/ogg',
-      size: msg.voice.file_size || 0,
-      kind: 'voice',
-    });
-  }
-  if (msg.audio) {
-    const a = msg.audio;
-    items.push({
-      file_id: a.file_id,
-      file_unique_id: a.file_unique_id,
-      name: a.file_name || `audio-${shortFileTag(a.file_unique_id, msg.message_id)}.mp3`,
-      mime_type: a.mime_type || 'audio/mpeg',
-      size: a.file_size || 0,
-      kind: 'audio',
-    });
-  }
-  if (msg.video) {
-    const v = msg.video;
-    items.push({
-      file_id: v.file_id,
-      file_unique_id: v.file_unique_id,
-      name: v.file_name || `video-${shortFileTag(v.file_unique_id, msg.message_id)}.mp4`,
-      mime_type: v.mime_type || 'video/mp4',
-      size: v.file_size || 0,
-      kind: 'video',
-    });
-  }
-  return items;
-}
+// ─── Attachment extraction ──────────────────────────────────────────
+// extractAttachments + shortFileTag live in lib/handlers/extract-attachments.js.
+// sanitizeFilename moved with downloadAttachments to lib/handlers/download.js.
+const { extractAttachments } = require('./lib/handlers/extract-attachments');
 
 // transcribeVoiceAttachments extracted to lib/handlers/voice.js.
 // Wired in main() once db + tg + config are available.
