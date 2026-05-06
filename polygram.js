@@ -42,6 +42,7 @@ const { createTranscribeVoiceAttachments } = require('./lib/handlers/voice');
 const { createDownloadAttachments } = require('./lib/handlers/download');
 const { createHandleConfigCallback } = require('./lib/handlers/config-callback');
 const { createHandleAbort } = require('./lib/handlers/abort');
+const { createAutosteerHandlers } = require('./lib/handlers/autosteer');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
   buildApprovalKeyboardWithAlways,
@@ -1381,6 +1382,8 @@ async function handleApprovalCallback(ctx) {
 let handleConfigCallback = null;
 // handleAbortIfRequested extracted to lib/handlers/abort.js.
 let handleAbortIfRequested = null;
+// autosteer (willAutosteer + tryAutosteer) extracted to lib/handlers/autosteer.js.
+let autosteer = null;
 
 function startApprovalSweeper(intervalMs = 30_000) {
   return setInterval(() => {
@@ -2106,18 +2109,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // voice transcription, don't overwrite it. Let onFirstStream
   // promote to 🤔 when Claude actually starts work.
   //
-  // rc.32 second guard: skip THINKING if we're going to autosteer
-  // this message. Pre-fix, autosteer messages briefly showed
-  // 🤔 → ✍ (THINKING set here, then AUTOSTEERED set inside the
-  // autosteer block ~50 lines below). The flash was visible to
-  // users. Detect the autosteer pre-condition (session in-flight AND
-  // chat hasn't opted out) and skip.
-  const willAutosteer = pm.has(sessionKey)
-    && pm.get(sessionKey)?.inFlight
-    && (chatConfig.autosteer != null
-      ? chatConfig.autosteer !== false
-      : config.bot?.autosteer !== false);
-  if (!voiceAck.ackEmitted && !willAutosteer) {
+  // Skip the 🤔 → ✍ flash for messages that are about to be
+  // autosteered. willAutosteer evaluates the same pre-condition
+  // tryAutosteer would.
+  if (!voiceAck.ackEmitted && !autosteer.willAutosteer(sessionKey, chatConfig)) {
     reactor.setState('THINKING');
   }
 
@@ -2127,82 +2122,33 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // exit paths below (NO_REPLY, streamed-reply preview-becomes-final,
   // discard+redeliver, regular reply at end) call it directly.
 
-  // 0.8.0 Phase 2 step 1 — AUTOSTEER. If SDK pm is active AND there's
-  // already an in-flight turn for this session AND autosteer isn't
-  // disabled in config, route this user message via pm.steer()
-  // instead of pm.send(). Matches OpenClaw's default UX: typing a
-  // follow-up while the bot is mid-reply MERGES into the active
-  // turn rather than queueing as a separate response. Saves a turn,
-  // saves tokens, feels more conversational.
+  // AUTOSTEER. If session is in-flight AND autosteer isn't disabled,
+  // route this user message via pm.injectUserMessage instead of
+  // pm.send (OpenClaw "merge into active" UX). The steered message
+  // gets a ✍ reaction so the user knows it landed; the in-flight
+  // turn's response covers both messages.
   //
-  // Opt-out: config.bot.autosteer === false (or per-chat
-  // chatConfig.autosteer === false) → falls through to FIFO queue.
+  // Mode: chatConfig.autosteerMode = 'merge' (priority='next', default)
+  // | 'queue' (priority='later'). Spike findings in
+  // scripts/spikes/native-queue.mjs.
   //
-  // The steered message gets a ✍ reaction so the user knows it
-  // landed; no separate reply is generated (the in-flight turn's
-  // response covers both messages, OpenClaw-style).
-  //
-  // Reaction emoji must be from Telegram's curated allowlist
-  // (~60 standard emoji per core.telegram.org/bots/api#availablereactions).
-  // 🛞 (steering wheel) is NOT on it — Telegram returns
-  // 400: REACTION_INVALID. ✍ ("writing/noting") is on the list and
-  // conveys "incorporating this".
-  const chatAutosteer = chatConfig.autosteer != null
-    ? chatConfig.autosteer
-    : config.bot?.autosteer;
-  // 0.8.0-rc.42: autosteer is now native — push the user message
-  // directly onto the SDK's input controller with a priority hint.
-  // The SDK manages absorption / queueing per the U7 spike findings
-  // (scripts/spikes/native-queue.mjs, 2026-05-01):
-  //
-  //   priority='next' (default): absorb into current turn at the next
-  //     natural pause (between tool calls / after subagent return).
-  //     ONE result event for the whole chain — same UX as the
-  //     deleted autosteer-buffer + PostToolBatch flow.
-  //   priority='later': queue for after current turn ends. SEPARATE
-  //     result event per absorbed message. Cleaner per-msg lifecycle
-  //     for chats that prefer accurate cost-row attribution.
-  //
-  // Per-chat opt-in via `chatConfig.autosteerMode: 'merge' | 'queue'`.
-  // 'merge' → priority='next' (default). 'queue' → priority='later'.
-  //
-  // Pre-rc.42 this used a custom autosteerBuffer + PostToolBatch hook
-  // returning <channel source="user-followup"> additionalContext. The
-  // SDK at the time rejected priority='now' mid-tool-use (m87 gate);
-  // 'next'/'later' were never tested. The U7 spike confirmed all
-  // three priorities now work cleanly — so the buffer/hook detour is
-  // gone. ~250 LOC + 2 test files deleted.
-  //
-  const autosteerEnabled = chatAutosteer !== false;
-  if (autosteerEnabled && pm.has(sessionKey)) {
-    const entry = pm.get(sessionKey);
-    if (entry?.inFlight) {
-      const autosteerMode = chatConfig.autosteerMode != null
-        ? chatConfig.autosteerMode
-        : config.bot?.autosteerMode;
-      const priority = autosteerMode === 'queue' ? 'later' : 'next';
-      const ok = pm.injectUserMessage(sessionKey, {
-        content: prompt,
-        priority,
-      });
-      if (ok) {
-        autosteeredRefs.add(sessionKey, { chatId, msgId: msg.message_id });
-        logEvent('autosteer', {
-          chat_id: chatId, msg_id: msg.message_id,
-          text_len: prompt?.length ?? 0,
-          priority,
-        });
-        stopTyping();
-        // setState('AUTOSTEERED') is terminal — bypasses the throttle,
-        // serializes after any in-flight QUEUED apply via applyChain.
-        await reactor.setState('AUTOSTEERED');
-        // rc.38: AUTOSTEERED is terminal; stop the reactor's STALL /
-        // TIMEOUT timers so they don't pin the closure for up to 30s.
-        reactor.stop();
-        markReplied();
-        return;
-      }
-    }
+  // Reaction emoji must be from Telegram's curated allowlist (~60
+  // standard emoji per core.telegram.org/bots/api#availablereactions).
+  // 🛞 is NOT on it (400: REACTION_INVALID). ✍ ("writing/noting")
+  // is on the list and conveys "incorporating this".
+  const steered = autosteer.tryAutosteer({
+    sessionKey, chatConfig, chatId, msg, prompt,
+  });
+  if (steered.autosteered) {
+    stopTyping();
+    // setState('AUTOSTEERED') is terminal — bypasses throttle,
+    // serializes after any in-flight QUEUED apply via applyChain.
+    await reactor.setState('AUTOSTEERED');
+    // AUTOSTEERED is terminal; stop the reactor's STALL / TIMEOUT
+    // timers so they don't pin the closure for up to 30s.
+    reactor.stop();
+    markReplied();
+    return;
   }
 
   try {
@@ -3249,6 +3195,9 @@ async function main() {
     pm, bot, tg, logEvent, isAbortRequest,
     markSessionAborted, clearAutosteeredReactions, getSessionKey,
     botName: BOT_NAME, logger: console,
+  });
+  autosteer = createAutosteerHandlers({
+    config, pm, autosteeredRefs, logEvent,
   });
   const sdkPm = new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions });
   pm = createPmRouter({ pm: sdkPm });
