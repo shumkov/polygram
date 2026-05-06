@@ -32,7 +32,7 @@ describe('Pm interface — required methods on every fake', () => {
 describe('Pm interface — optional methods are off by default', () => {
   const OPTIONAL_METHODS = [
     'steer', 'setModel', 'applyFlagSettings', 'setPermissionMode',
-    'requestRespawn', 'drainQueue', 'interrupt', 'resetSession',
+    'drainQueue', 'interrupt', 'resetSession',
   ];
 
   for (const m of OPTIONAL_METHODS) {
@@ -90,13 +90,6 @@ describe('Pm interface — opted-in optional methods record', () => {
     assert.equal(await pm.setModel('a', 'sonnet'), true);
     assert.equal(await pm.applyFlagSettings('a', { effortLevel: 'high' }), true);
     assert.equal(await pm.setPermissionMode('a', 'default'), true);
-  });
-
-  test('requestRespawn returns sentinel-shape sync object', () => {
-    const pm = makeFakePm('cli', { requestRespawn: true });
-    const r = pm.requestRespawn('a', 'reason');
-    assert.equal(r.killed, true);
-    assert.equal(r.queued, 0);
   });
 
   test('resetSession returns Promise of {closed, drainedPendings}', async () => {

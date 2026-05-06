@@ -333,15 +333,6 @@ describe('createPmRouter — optional method routing', () => {
     assert.deepEqual(cli.calls, []);  // never called
   });
 
-  test('requestRespawn returns sentinel {killed:false, queued:0} when not supported', () => {
-    const cli = makeFakePm('cli');                                // no requestRespawn
-    const router = createPmRouter({
-      cliPm: cli, sdkPm: null,
-      pickPmKindFor: () => 'cli',
-    });
-    assert.deepEqual(router.requestRespawn('chat-1', 'reason'), { killed: false, queued: 0 });
-  });
-
   test('resetSession returns sentinel Promise when not supported', async () => {
     const cli = makeFakePm('cli');                                // no resetSession
     const router = createPmRouter({
