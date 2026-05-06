@@ -155,3 +155,156 @@ describe('filterAttachments', () => {
     for (const r of rejected) assert.match(r.reason, /total size cap/);
   });
 });
+
+// rc.68: widen MIME allowlist to cover archives, the markup formats Claude
+// already reads natively, and a filename-extension fallback for the
+// octet-stream / missing-MIME case (Telegram ships unknown-extension
+// documents with no usable MIME). Per-file (10MB) and total (20MB) caps
+// remain the real safety net; the MIME list always was a "what's worth
+// running through the agent" filter, not a security control.
+//
+// Trigger: Ivan tried to share a WhatsApp chat export (.zip) for analysis
+// and got "mime not allowed (application/zip)" rejected.
+describe('filterAttachments — rc.68 widened MIME allowlist', () => {
+  test('zip is accepted (application/zip)', () => {
+    const atts = [{ name: 'chat-export.zip', mime_type: 'application/zip', size: 100 }];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 1);
+    assert.equal(rejected.length, 0);
+  });
+
+  test('zip is accepted under the alt MIME some Telegram clients send', () => {
+    const atts = [{ name: 'chat-export.zip', mime_type: 'application/x-zip-compressed', size: 100 }];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 1);
+    assert.equal(rejected.length, 0);
+  });
+
+  test('markdown accepted (was silently slipping through as text/plain)', () => {
+    const atts = [{ name: 'notes.md', mime_type: 'text/markdown', size: 100 }];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 1);
+    assert.equal(rejected.length, 0);
+  });
+
+  test('html accepted', () => {
+    const atts = [{ name: 'page.html', mime_type: 'text/html', size: 100 }];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 1);
+  });
+
+  test('yaml accepted (text/yaml AND application/yaml)', () => {
+    const atts = [
+      { name: 'a.yml', mime_type: 'text/yaml', size: 100 },
+      { name: 'b.yaml', mime_type: 'application/yaml', size: 100 },
+    ];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 2);
+    assert.equal(rejected.length, 0);
+  });
+
+  test('xml accepted (application/xml AND text/xml)', () => {
+    const atts = [
+      { name: 'a.xml', mime_type: 'application/xml', size: 100 },
+      { name: 'b.xml', mime_type: 'text/xml', size: 100 },
+    ];
+    const { accepted } = filterAttachments(atts);
+    assert.equal(accepted.length, 2);
+  });
+
+  test('extension fallback: octet-stream + .zip is accepted', () => {
+    // Telegram's MIME detection often degrades to octet-stream for
+    // documents the client doesn't sniff. Trust the extension when it's
+    // on the well-known list — same set the explicit MIMEs cover.
+    const atts = [{ name: 'chat-export.zip', mime_type: 'application/octet-stream', size: 100 }];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 1);
+    assert.equal(rejected.length, 0);
+  });
+
+  test('extension fallback: empty MIME + .csv is accepted', () => {
+    const atts = [{ name: 'data.csv', mime_type: '', size: 100 }];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 1);
+    assert.equal(rejected.length, 0);
+  });
+
+  test('extension fallback: missing MIME + .md is accepted', () => {
+    const atts = [{ name: 'README.md', size: 100 }]; // no mime_type field
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 1);
+    assert.equal(rejected.length, 0);
+  });
+
+  test('extension fallback: octet-stream + UNKNOWN extension still rejected', () => {
+    // Generic octet-stream without a recognised extension stays blocked
+    // — the fallback is "trust extension when MIME is missing", not
+    // "octet-stream is universally allowed".
+    const atts = [{ name: 'mystery.bin', mime_type: 'application/octet-stream', size: 100 }];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 0);
+    assert.equal(rejected.length, 1);
+    assert.match(rejected[0].reason, /mime not allowed/);
+  });
+
+  test('extension fallback: empty MIME + no extension still rejected', () => {
+    const atts = [{ name: 'noextension', mime_type: '', size: 100 }];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 0);
+    assert.equal(rejected.length, 1);
+  });
+
+  test('extension fallback: explicit .exe MIME stays rejected (no extension override)', () => {
+    // Defense-in-depth: if a malicious client sets mime_type to
+    // application/x-msdownload (executable) AND names the file .zip,
+    // the explicit-MIME path should reject — extension fallback only
+    // kicks in when MIME is unhelpful (empty / octet-stream).
+    const atts = [{ name: 'malware.zip', mime_type: 'application/x-msdownload', size: 100 }];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 0);
+    assert.equal(rejected.length, 1);
+    assert.match(rejected[0].reason, /mime not allowed/);
+  });
+
+  test('iWork stays blocked (no agent path to read .pages/.numbers/.keynote)', () => {
+    const atts = [
+      { name: 'doc.pages', mime_type: 'application/vnd.apple.pages', size: 100 },
+      { name: 'data.numbers', mime_type: 'application/vnd.apple.numbers', size: 100 },
+      { name: 'deck.keynote', mime_type: 'application/vnd.apple.keynote', size: 100 },
+    ];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 0);
+    assert.equal(rejected.length, 3);
+  });
+
+  test('rtf and legacy .ppt stay blocked (Claude cannot read directly)', () => {
+    const atts = [
+      { name: 'doc.rtf', mime_type: 'application/rtf', size: 100 },
+      { name: 'deck.ppt', mime_type: 'application/vnd.ms-powerpoint', size: 100 },
+    ];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 0);
+    assert.equal(rejected.length, 2);
+  });
+
+  test('size caps still apply to newly-allowed types', () => {
+    const atts = [
+      { name: 'huge.zip', mime_type: 'application/zip', size: 50 * 1024 * 1024 },
+    ];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 0);
+    assert.match(rejected[0].reason, /per-file cap/);
+  });
+
+  test('extension match is case-insensitive', () => {
+    // Some clients uppercase the extension (.ZIP, .CSV). The fallback
+    // shouldn't care about case.
+    const atts = [
+      { name: 'EXPORT.ZIP', mime_type: 'application/octet-stream', size: 100 },
+      { name: 'DATA.CSV', mime_type: '', size: 100 },
+    ];
+    const { accepted, rejected } = filterAttachments(atts);
+    assert.equal(accepted.length, 2);
+    assert.equal(rejected.length, 0);
+  });
+});
