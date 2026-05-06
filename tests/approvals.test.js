@@ -236,6 +236,72 @@ describe('approvals store', () => {
     assert.notEqual(r2.id, r1.id);
   });
 
+  // 0.9.0-cleanup commit 10: tool_use_id dedup. Migration 010 added the
+  // column + partial index but the insert path never populated it
+  // until now. Pre-fix, dedup relied on (turn_id, tool_input_digest);
+  // a JSON-key reordering between retries within the same turn would
+  // miss dedup and produce duplicate approval cards.
+  test('dedup by tool_use_id reuses row across input-digest changes', () => {
+    // Same SDK call (same tool_use_id), but the SDK reorders JSON keys
+    // on retry — input digest differs but tool_use_id is stable.
+    const r1 = store.issue({
+      bot_name: 'shumabit', turn_id: 'turn-A', tool_use_id: 'toolu_abc',
+      requester_chat_id: '-100', approver_chat_id: '111111111',
+      tool_name: 'Bash', tool_input: { command: 'rm', cwd: '/tmp' },
+    });
+    const r2 = store.issue({
+      bot_name: 'shumabit', turn_id: 'turn-A', tool_use_id: 'toolu_abc',
+      requester_chat_id: '-100', approver_chat_id: '111111111',
+      tool_name: 'Bash', tool_input: { cwd: '/tmp', command: 'rm' }, // reordered
+    });
+    assert.equal(r2.id, r1.id, 'tool_use_id dedup should reuse row');
+    assert.equal(r2.reused, true);
+    assert.equal(r2.tool_use_id, 'toolu_abc');
+  });
+
+  test('tool_use_id dedup is scoped to bot_name (no cross-bot collision)', () => {
+    const r1 = store.issue({
+      bot_name: 'shumabit', tool_use_id: 'toolu_xyz',
+      requester_chat_id: '-100', approver_chat_id: '111111111',
+      tool_name: 'Bash', tool_input: {},
+    });
+    const r2 = store.issue({
+      bot_name: 'umi-assistant', tool_use_id: 'toolu_xyz',
+      requester_chat_id: '-200', approver_chat_id: '222222222',
+      tool_name: 'Bash', tool_input: {},
+    });
+    assert.notEqual(r2.id, r1.id, 'different bots must NOT dedup against each other');
+  });
+
+  test('tool_use_id NULL falls back to legacy (turn_id, digest) dedup', () => {
+    // Pre-0.9.0 callers without SDK tool_use_id (cron, IPC) still
+    // need dedup. Same input + same turn_id + null tool_use_id on
+    // both inserts → reuse via legacy path.
+    const r1 = store.issue({
+      bot_name: 'shumabit', turn_id: 'cron-1',
+      requester_chat_id: '-100', approver_chat_id: '111111111',
+      tool_name: 'Bash', tool_input: { command: 'ls' },
+    });
+    const r2 = store.issue({
+      bot_name: 'shumabit', turn_id: 'cron-1',
+      requester_chat_id: '-100', approver_chat_id: '111111111',
+      tool_name: 'Bash', tool_input: { command: 'ls' },
+    });
+    assert.equal(r2.id, r1.id);
+    assert.equal(r2.reused, true);
+    assert.equal(r1.tool_use_id, null);
+  });
+
+  test('tool_use_id row is INSERTed with the column populated', () => {
+    const row = store.issue({
+      bot_name: 'shumabit', tool_use_id: 'toolu_pin',
+      requester_chat_id: '-100', approver_chat_id: '111111111',
+      tool_name: 'Bash', tool_input: {},
+    });
+    assert.equal(row.tool_use_id, 'toolu_pin',
+      'pre-rc.10 the column was NULL despite migration 010 — verify the fix');
+  });
+
   test('setApproverMsgId updates the row', () => {
     const row = store.issue({
       bot_name: 'shumabit', requester_chat_id: '-100',

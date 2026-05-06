@@ -1508,21 +1508,19 @@ function makeCanUseTool(sessionKey) {
     const gated = matchesApprovalPattern(toolName, input, apprCfg.gatedTools || []);
     if (!gated.matched) return { behavior: 'allow' };
 
-    // Step 4: issue + post + park.
+    // Step 4: issue + post + park. tool_use_id (the SDK's stable
+    // per-call identifier) is the dedup key when the SDK supplies
+    // it — falls back to the legacy (turn_id, tool_input_digest)
+    // tuple otherwise (cron / IPC / pre-SDK callers).
     const row = approvals.issue({
-      bot_name: BOT_NAME, turn_id: opts?.toolUseID || null,
+      bot_name: BOT_NAME,
+      turn_id: opts?.toolUseID || null,
+      tool_use_id: opts?.toolUseID || null,
       requester_chat_id: chatId,
       approver_chat_id: String(apprCfg.adminChatId),
       tool_name: toolName, tool_input: input,
       timeoutMs: apprCfg.timeoutMs || APPROVAL_DEFAULT_TIMEOUT_MS,
     });
-    if (opts?.toolUseID) {
-      // Persist the SDK's stable per-call ID so dedup-by-toolUseId
-      // works on retries (same call, same row).
-      try {
-        approvals.setToolUseId?.(row.id, opts.toolUseID);
-      } catch { /* swallow if older approvals store */ }
-    }
     if (!bot) {
       approvals.resolve({ id: row.id, status: 'cancelled', reason: 'bot not ready' });
       return { behavior: 'deny', message: 'bot not ready' };
