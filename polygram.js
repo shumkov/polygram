@@ -36,6 +36,7 @@ const { ProcessManagerSdk, extractAssistantText } = require('./lib/sdk/process-m
 // (pm.injectUserMessage) replaces the buffer + PostToolBatch detour.
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
 const { createPmRouter } = require('./lib/sdk/router');
+const { createBuildSdkOptions } = require('./lib/sdk/build-options');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
   buildApprovalKeyboardWithAlways,
@@ -122,22 +123,8 @@ let bot = null;       // grammy Bot for BOT_NAME
 // Allowlist of env var names passed through to spawned Claude processes.
 // Anything not listed here is dropped to prevent leaked secrets/ssh agents
 // from being read by a prompt-injected child. Prefixes match any var whose
-// name starts with that string.
-const CHILD_ENV_ALLOWLIST = new Set([
-  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'COLORTERM',
-  'TMPDIR', 'TMP', 'TEMP', 'TZ', 'LANG', 'PWD', 'SHLVL',
-]);
-const CHILD_ENV_PREFIXES = ['LC_', 'NODE_', 'CLAUDE_', 'ANTHROPIC_'];
-
-function filterEnv(src) {
-  const out = {};
-  for (const [k, v] of Object.entries(src)) {
-    if (CHILD_ENV_ALLOWLIST.has(k) || CHILD_ENV_PREFIXES.some((p) => k.startsWith(p))) {
-      out[k] = v;
-    }
-  }
-  return out;
-}
+// name starts with that string. (filterEnv + lists moved to
+// lib/sdk/build-options.js with the buildSdkOptions extraction.)
 
 function loadConfig() {
   config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
@@ -785,168 +772,11 @@ async function clearAutosteeredReactions(sessionKey) {
   return autosteeredRefs.clear(sessionKey);
 }
 
-/**
- * SDK pm spawn factory.
- *
- * Returns SdkOptions for the SDK pm to pass to
- * `query({ prompt, options })`. The SDK pm wraps this in its
- * inputController + iteration loop; polygram only needs to compose
- * the Options object.
- *
- * Per v4 plan §6.5.7 — explicit env enumeration (Options.env is
- * SHADOW per Phase 0 gate 33), bypassPermissions +
- * allowDangerouslySkipPermissions both set for forward-compat,
- * agent-loader composes per-chat agent into systemPrompt + skills +
- * mcpServers, optional resume sessionId for continuity.
- */
-function buildSdkOptions(sessionKey, ctx) {
-  const { chatConfig, existingSessionId, label, chatId, threadId } = ctx;
-
-  // rc.48: per-topic config overrides. When `topics[threadId]` is an
-  // object (not a legacy string label), these fields take precedence
-  // over chat-level config. Principal use case: scope a single topic
-  // to a different agent, cwd, or permissionMode (e.g. flip music
-  // topic from `bypassPermissions` to `default` so settings.json
-  // permissions.allow gates apply).
-  //
-  // Per-topic overrides only apply meaningfully when isolateTopics is
-  // true — each topic has its own SDK Query. With isolateTopics: false
-  // all topics share one Query whose options are fixed at first-spawn.
-  // Startup validation (validateTopicConfigs) emits a one-time warning
-  // when a chat has topic overrides + isolateTopics: false.
-  const topicConfig = getTopicConfig(chatConfig, threadId);
-  const effectiveAgent = topicConfig.agent || chatConfig.agent;
-
-  // Per-chat agent (D14): if pinned, load & compose. Failure is
-  // non-fatal — chat falls back to defaults; logged for ops.
-  let agentBundle = null;
-  if (effectiveAgent) {
-    try {
-      agentBundle = agentLoader.loadAgent(effectiveAgent, {
-        homeDir: CHILD_HOME,
-        // Pass cwd so the loader checks Claude Code's project-level
-        // path (`<cwd>/.claude/agents/<name>.md`) before the
-        // user-level path or polygram's directory convention. rc.48:
-        // topic-level cwd takes precedence so topic-scoped agents
-        // load from the topic's project dir.
-        cwd: topicConfig.cwd || chatConfig.cwd,
-        logger: console,
-      });
-    } catch (err) {
-      console.error(`[${label}] agent-loader: ${err.message}`);
-      logEvent('agent-load-failed', {
-        chat_id: chatId, agent: effectiveAgent, error: err.message,
-        topic: threadId || null,
-      });
-    }
-  }
-
-  const effectiveModel = topicConfig.model || chatConfig.model;
-  const effectiveEffort = topicConfig.effort || chatConfig.effort;
-  const agentSuffix = effectiveAgent && effectiveAgent !== chatConfig.agent
-    ? ` agent=${effectiveAgent}` : '';
-  console.log(`[${label}] Spawning SDK Query (${effectiveModel}/${effectiveEffort}${agentSuffix})`);
-
-  // Env: SHADOW semantics (gate 33) — must enumerate every var
-  // pollygram needs in the spawned worker.
-  const botConfig = config.bot || {};
-  const childEnv = filterEnv(process.env);
-  childEnv.HOME = CHILD_HOME;
-  childEnv.CLAUDE_CHANNEL_BOT = BOT_NAME;
-  // 0.9.0: gated behind explicit opt-in. Pre-cleanup, this was wired
-  // unconditionally so the deleted bin/approval-hook.js (a Claude Code
-  // PreToolUse hook running inside the Claude child) could authenticate
-  // to polygram's IPC socket. With the hook deleted, the only remaining
-  // IPC consumers are external scripts (cron-driven sends) running in
-  // their own processes with their own access to /tmp/polygram-<bot>.secret.
-  // Leaking the secret to every Claude child is now an unnecessary
-  // injection-amplification surface — a prompt-injected child under
-  // bypassPermissions could authenticate as polygram and `send` to its
-  // own chats. Opt in via `config.bot.exposeIpcSecretToChildren: true`
-  // when a bot genuinely needs cron-style sub-scripts inside Claude
-  // (none today on the shumabit fleet).
-  if (botConfig.exposeIpcSecretToChildren && process.env.POLYGRAM_IPC_SECRET) {
-    childEnv.POLYGRAM_IPC_SECRET = process.env.POLYGRAM_IPC_SECRET;
-  }
-  if (botConfig.needsToken) {
-    childEnv.TELEGRAM_BOT_TOKEN = botConfig.token || '';
-  }
-
-  // 0.8.0 Phase 2 step 6: in-process approval flow via canUseTool.
-  // Wire up only when approvals.gatedTools is configured for this
-  // bot — otherwise leave canUseTool unset and rely on
-  // bypassPermissions for the full allow-all path.
-  const apprCfg = config.bot?.approvals;
-  const useCanUseTool = apprCfg && apprCfg.adminChatId
-    && Array.isArray(apprCfg.gatedTools) && apprCfg.gatedTools.length > 0;
-
-  // rc.42: PostToolBatch hook removed. Native SDK priority push
-  // (pm.injectUserMessage) replaces the absorb-via-additionalContext
-  // detour. The autosteered ✍ reaction now clears via the regular
-  // turn-end path (handleMessage finally + success branches —
-  // existing rc.38 cleanup).
-
-  // rc.52: dropped the SDK SessionStart hook registration. The hook
-  // never fired in production (verified: zero history-preloaded events
-  // across both production DBs since rc.21; SDK runtime grep showed
-  // exactly one occurrence of "SessionStart" — in the type listing,
-  // not in dispatch logic). The history preload is now done inline at
-  // formatPrompt time when the upcoming Query has no resume target,
-  // via lib/history-preload.buildHistoryBlock. See formatPrompt above.
-  const baseOpts = {
-    model: chatConfig.model || config.defaults.model,
-    effort: chatConfig.effort || config.defaults.effort,
-    cwd: chatConfig.cwd,
-    env: childEnv,
-    // permissionMode 'default' when canUseTool is wired (so the SDK
-    // actually consults our callback). Otherwise stick with
-    // bypassPermissions (matches today's CLI behaviour).
-    permissionMode: useCanUseTool ? 'default' : 'bypassPermissions',
-    allowDangerouslySkipPermissions: !useCanUseTool,
-    ...(useCanUseTool && { canUseTool: makeCanUseTool(sessionKey) }),
-    hooks: {},
-    executable: 'node',
-    ...(existingSessionId && { resume: existingSessionId }),
-    ...(process.env.POLYGRAM_CLAUDE_BIN && {
-      pathToClaudeCodeExecutable: process.env.POLYGRAM_CLAUDE_BIN,
-    }),
-  };
-
-  // Compose with agent overlay + chat-level config + per-topic overrides.
-  // agent-loader precedence: topicConfig > chatConfig > agent > defaults.
-  // The chatConfig keys we care about for SDK options are
-  // model/effort/cwd/thinking; others (agent, chrome, isolateTopics)
-  // are polygram-only and stripped by composeSdkOptions.
-  const composed = agentLoader.composeSdkOptions(
-    {
-      // chat-level overrides — only the keys SDK understands.
-      model: chatConfig.model,
-      effort: chatConfig.effort,
-      cwd: chatConfig.cwd,
-      ...(chatConfig.thinking && { thinking: chatConfig.thinking }),
-    },
-    agentBundle,
-    baseOpts,
-    topicConfig,  // rc.48: highest precedence — overrides chat-level fields.
-  );
-
-  // rc.48: keep permissionMode + allowDangerouslySkipPermissions
-  // consistent. baseOpts sets allowDangerouslySkipPermissions=true when
-  // permissionMode='bypassPermissions'. If a topic flipped permissionMode
-  // to anything else (typically 'default' to gate via settings.json),
-  // also disable allowDangerouslySkipPermissions so the SDK actually
-  // honours the permission gates instead of skipping them.
-  if (composed.permissionMode && composed.permissionMode !== 'bypassPermissions') {
-    composed.allowDangerouslySkipPermissions = false;
-  }
-
-  // Append polygram's display constraints to the systemPrompt.
-  // Infrastructure-layer hint — the agent's own prompt covers
-  // business logic; polygram adds "your output renders in Telegram,
-  // here's the width budget for tables".
-  composed.systemPrompt = appendDisplayHint(composed.systemPrompt);
-  return composed;
-}
+// SDK pm spawn factory — extracted to lib/sdk/build-options.js.
+// `buildSdkOptions` is wired in main() via createBuildSdkOptions(deps)
+// once the runtime context (config, BOT_NAME, makeCanUseTool, logEvent)
+// is available.
+let buildSdkOptions = null;
 
 function buildSpawnContext(sessionKey) {
   const chatId = getChatIdFromKey(sessionKey);
@@ -3971,6 +3801,17 @@ async function main() {
 
   // 0.9.0: single SDK pm wrapped by the (now thin) router for
   // forward compatibility with future alternate impls.
+  // buildSdkOptions is the per-call spawn factory; we wire it now
+  // that the runtime context (config, BOT_NAME, makeCanUseTool,
+  // logEvent) exists.
+  buildSdkOptions = createBuildSdkOptions({
+    config,
+    botName: BOT_NAME,
+    childHome: CHILD_HOME,
+    makeCanUseTool,
+    logEvent,
+    logger: console,
+  });
   const sdkPm = new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions });
   pm = createPmRouter({ pm: sdkPm });
   console.log('[polygram] using SDK ProcessManager');
