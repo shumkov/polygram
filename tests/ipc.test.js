@@ -153,3 +153,61 @@ describe('tell()', () => {
     assert.match(received.source, /^cron:/);
   });
 });
+
+// 0.9.0-cleanup commit 12: pin the IPC auth path. Pre-cleanup,
+// tests/approvals-integration.test.js was the only test that
+// exercised `ipcServer.start({secret})` end-to-end. Deleting it
+// (commit 7) left the timingSafeEqual branch in lib/ipc-server.js
+// uncovered — a future refactor could disable auth without breaking
+// any test. These three tests close that gap.
+describe('ipc auth (rc.69)', () => {
+  afterEach(stopServer);
+
+  async function startWithSecret(handlers, secret) {
+    sockPath = uniquePath();
+    server = await ipcServer.start({
+      path: sockPath, secret, handlers, logger: silentLogger,
+    });
+  }
+
+  test('rejects requests with no secret when server requires one', async () => {
+    await startWithSecret({
+      send: async () => ({ result: {} }),
+    }, 's3cret');
+    const res = await ipcClient.call({ path: sockPath, op: 'send', payload: {} });
+    assert.equal(res.ok, false, 'no-secret request should NOT succeed');
+    assert.equal(res.error, 'auth');
+  });
+
+  test('rejects requests with wrong secret', async () => {
+    await startWithSecret({
+      send: async () => ({ result: {} }),
+    }, 's3cret');
+    const res = await ipcClient.call({
+      path: sockPath, op: 'send', payload: {}, secret: 'wrong',
+    });
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'auth');
+  });
+
+  test('ping is exempt from auth (so health checks work without the secret)', async () => {
+    await startWithSecret({
+      ping: async () => ({ pong: true }),
+    }, 's3cret');
+    const res = await ipcClient.call({ path: sockPath, op: 'ping' });
+    assert.equal(res.ok, true,
+      'ping should bypass auth — used for liveness checks by polygram-doctor');
+    assert.equal(res.pong, true);
+  });
+
+  test('correct secret authenticates', async () => {
+    await startWithSecret({
+      send: async () => ({ result: { ok: 1 } }),
+    }, 's3cret');
+    const res = await ipcClient.call({
+      path: sockPath, op: 'send', payload: {}, secret: 's3cret',
+    });
+    assert.equal(res.ok, true);
+    assert.deepEqual(res.result, { ok: 1 });
+  });
+});

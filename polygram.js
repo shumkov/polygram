@@ -853,7 +853,19 @@ function buildSdkOptions(sessionKey, ctx) {
   const childEnv = filterEnv(process.env);
   childEnv.HOME = CHILD_HOME;
   childEnv.CLAUDE_CHANNEL_BOT = BOT_NAME;
-  if (process.env.POLYGRAM_IPC_SECRET) {
+  // 0.9.0: gated behind explicit opt-in. Pre-cleanup, this was wired
+  // unconditionally so the deleted bin/approval-hook.js (a Claude Code
+  // PreToolUse hook running inside the Claude child) could authenticate
+  // to polygram's IPC socket. With the hook deleted, the only remaining
+  // IPC consumers are external scripts (cron-driven sends) running in
+  // their own processes with their own access to /tmp/polygram-<bot>.secret.
+  // Leaking the secret to every Claude child is now an unnecessary
+  // injection-amplification surface — a prompt-injected child under
+  // bypassPermissions could authenticate as polygram and `send` to its
+  // own chats. Opt in via `config.bot.exposeIpcSecretToChildren: true`
+  // when a bot genuinely needs cron-style sub-scripts inside Claude
+  // (none today on the shumabit fleet).
+  if (botConfig.exposeIpcSecretToChildren && process.env.POLYGRAM_IPC_SECRET) {
     childEnv.POLYGRAM_IPC_SECRET = process.env.POLYGRAM_IPC_SECRET;
   }
   if (botConfig.needsToken) {
