@@ -25,8 +25,8 @@ const dbClient = require('./lib/db');
 const { migrateJsonToDb, getClaudeSessionId } = require('./lib/sessions');
 const { buildPrompt } = require('./lib/prompt');
 const { filterAttachments, MAX_FILE_BYTES } = require('./lib/attachments');
-const { ProcessManager } = require('./lib/process-manager');
-// 0.8.0 Phase 3: SDK-backed pm available behind POLYGRAM_USE_SDK=1.
+// 0.9.0: SDK ProcessManager is the only pm. CLI pm
+// (lib/process-manager.js) deleted in commit 6.
 // Both implementations expose the same public API (constructor +
 // callbacks), so the rest of polygram.js doesn't branch beyond the
 // pick-at-startup. Phase 4 deletes the CLI version after Phase 5
@@ -35,7 +35,7 @@ const { ProcessManagerSdk, extractAssistantText } = require('./lib/process-manag
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
 // (pm.injectUserMessage) replaces the buffer + PostToolBatch detour.
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
-const { makeRouterPolicy, createPmRouter } = require('./lib/pm-router');
+const { createPmRouter } = require('./lib/pm-router');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
   buildApprovalKeyboard,
@@ -48,7 +48,6 @@ const { formatContextReply, maybeContextFullHint } = require('./lib/context-form
 const { appendDisplayHint, appendDisplayHintCliArgs } = require('./lib/telegram-prompt');
 const { createAbortGrace } = require('./lib/abort-grace');
 const agentLoader = require('./lib/agent-loader');
-const USE_SDK = process.env.POLYGRAM_USE_SDK === '1';
 const { createSender } = require('./lib/telegram');
 const { createAsyncLock } = require('./lib/async-lock');
 const { sweepInbox } = require('./lib/inbox');
@@ -787,79 +786,13 @@ async function clearAutosteeredReactions(sessionKey) {
   return autosteeredRefs.clear(sessionKey);
 }
 
-function spawnClaude(sessionKey, ctx) {
-  const { chatConfig, existingSessionId, label, chatId } = ctx;
-  // 0.7.3: Claude Code's Chrome-extension integration (browser
-  // automation via the "Claude in Chrome" extension) is OPT-IN and
-  // NOT enabled by default in `claude`. Polygram lets chats turn it
-  // on via `config.chats.<id>.chrome: true` (chat-level wins) or
-  // `config.bot.chrome: true` (per-bot default). When opting in, the
-  // extension must be installed in the daemon-user's Chrome and the
-  // user must have a live Aqua session (so Chrome is running). Falls
-  // back to --no-chrome for chats that don't opt in (matches our
-  // pre-0.7.3 default — defensive against any "enabled by default"
-  // that might have been set in claude's persistent state).
-  const wantChrome = chatConfig.chrome != null
-    ? chatConfig.chrome === true
-    : config.bot?.chrome === true;
-  const args = [
-    '-p',
-    '--input-format', 'stream-json',
-    '--output-format', 'stream-json',
-    '--verbose',
-    '--model', chatConfig.model || config.defaults.model,
-    '--effort', chatConfig.effort || config.defaults.effort,
-    '--permission-mode', 'bypassPermissions',
-    wantChrome ? '--chrome' : '--no-chrome',
-  ];
-  if (chatConfig.agent) args.push('--agent', chatConfig.agent);
-  if (existingSessionId) args.push('--resume', existingSessionId);
-  // Polygram-side display constraints — same hint the SDK pm appends
-  // via Options.systemPrompt. Keeps the table-width rule in
-  // infrastructure, not in agent docs.
-  args.push(...appendDisplayHintCliArgs());
-
-  console.log(`[${label}] Spawning process (${chatConfig.model}/${chatConfig.effort})`);
-
-  // Scrub env to an allowlist: under bypassPermissions a prompt-injected
-  // child can exfiltrate any env var, so we pass only what Claude Code and
-  // normal shell tools need. TELEGRAM_BOT_TOKEN is opt-in per bot via
-  // config.bot.needsToken — partner bots go through polygram for every
-  // outbound message and never need direct API access.
-  const botConfig = config.bot || {};
-  const childEnv = filterEnv(process.env);
-  childEnv.HOME = CHILD_HOME;
-  childEnv.CLAUDE_CHANNEL_BOT = BOT_NAME;
-  // Approval hook integration: the hook runs as a child of Claude and reads
-  // these to route its IPC. POLYGRAM_TURN_ID isn't set here (one session can
-  // run many turns) — the hook treats it as optional.
-  childEnv.POLYGRAM_BOT = BOT_NAME;
-  childEnv.POLYGRAM_CHAT_ID = String(chatId || '');
-  // Allow the PreToolUse approval hook to authenticate to the IPC socket.
-  if (process.env.POLYGRAM_IPC_SECRET) childEnv.POLYGRAM_IPC_SECRET = process.env.POLYGRAM_IPC_SECRET;
-  if (botConfig.needsToken) {
-    childEnv.TELEGRAM_BOT_TOKEN = botConfig.token || '';
-  }
-
-  const proc = spawn(CLAUDE_BIN, args, {
-    cwd: chatConfig.cwd,
-    env: childEnv,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  proc.stderr.on('data', (d) => {
-    const m = d.toString().trim();
-    if (m) console.error(`[${label}] stderr: ${m.slice(0, 200)}`);
-  });
-  return proc;
-}
-
 /**
- * 0.8.0 Phase 3 — SDK pm spawn factory.
+ * SDK pm spawn factory.
  *
- * Replacement for `spawnClaude` when POLYGRAM_USE_SDK=1. Returns
- * SdkOptions for the SDK pm to pass to `query({ prompt, options })`.
- * The SDK pm wraps this in its inputController + iteration loop;
- * polygram only needs to compose the Options object.
+ * Returns SdkOptions for the SDK pm to pass to
+ * `query({ prompt, options })`. The SDK pm wraps this in its
+ * inputController + iteration loop; polygram only needs to compose
+ * the Options object.
  *
  * Per v4 plan §6.5.7 — explicit env enumeration (Options.env is
  * SHADOW per Phase 0 gate 33), bypassPermissions +
@@ -3895,29 +3828,9 @@ async function main() {
 
   const cap = config.maxWarmProcesses || DEFAULT_MAX_WARM_PROCS;
 
-  // 0.8.0-rc.6: per-chat pm selection. Three modes:
-  //   1. POLYGRAM_USE_SDK=1 with no POLYGRAM_SDK_CHATS list  → all chats SDK
-  //   2. POLYGRAM_SDK_CHATS=id1,id2,...                       → those chats
-  //      use SDK; everyone else uses CLI (both pms live in the daemon)
-  //   3. neither set                                          → all chats CLI
-  // The per-chat mode lets us soak SDK pm against real traffic in one
-  // chat (Ivan's DM) while keeping partner-facing chats on the
-  // battle-tested CLI path. When both pms run, killChat /shutdown
-  // broadcast to both; everything else routes per-sessionKey via
-  // pickPmFor() based on the chat's set membership.
-  // rc.17: router policy + proxy live in lib/pm-router.js for
-  // testability. Policy parses env config and produces
-  // pickPmKindFor; createPmRouter wraps the cli/sdk pms with the
-  // routed surface.
-  const { sdkActive, sdkAllChats, sdkSomeChats, sdkChatIdSet, pickPmKindFor } = makeRouterPolicy({
-    useSdkAll: USE_SDK,
-    sdkChats: String(process.env.POLYGRAM_SDK_CHATS || '').split(','),
-    getChatIdFromKey,
-  });
-
-  // Shared callbacks: identical instance passed to both pms so a
-  // chat's lifecycle events look the same regardless of which pm
-  // is handling it.
+  // 0.9.0: single pm. SDK ProcessManager is the only impl after the
+  // CLI pm + dual-pm router were deleted (see lib/pm-router.js
+  // header comment for the migration history).
   const pmOpts = {
     cap,
     db,
@@ -4150,26 +4063,11 @@ async function main() {
     },
   };
 
-  // Instantiate the actual pm(s). When sdkActive is false we still
-  // build a CLI pm; SDK pm is null. When sdkActive is true we always
-  // build BOTH so chats outside the SDK list still get the CLI path.
-  const cliPm = new ProcessManager({ ...pmOpts, spawnFn: spawnClaude });
-  const sdkPm = sdkActive
-    ? new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions })
-    : null;
-
-  // Routing pm: same surface as a single pm, but per-method routing
-  // through pickPmKindFor(sessionKey). Per-method semantics
-  // documented in lib/pm-router.js.
-  pm = createPmRouter({ cliPm, sdkPm, pickPmKindFor });
-
-  if (sdkAllChats) {
-    console.log('[polygram] using SDK ProcessManager (all chats)');
-  } else if (sdkSomeChats) {
-    console.log(`[polygram] router active: SDK pm for chats {${Array.from(sdkChatIdSet).join(',')}}, CLI pm for everyone else`);
-  } else {
-    console.log('[polygram] using CLI ProcessManager');
-  }
+  // 0.9.0: single SDK pm wrapped by the (now thin) router for
+  // forward compatibility with future alternate impls.
+  const sdkPm = new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions });
+  pm = createPmRouter({ pm: sdkPm });
+  console.log('[polygram] using SDK ProcessManager');
 
   console.log(`polygram (LRU cap=${cap}, SQLite source of truth)`);
   console.log(`Chats: ${Object.entries(config.chats).map(([id, c]) => `${c.name} (${c.model}/${c.effort})`).join(', ')}`);
