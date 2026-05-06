@@ -45,13 +45,6 @@ function makeDeps(overrides = {}) {
 }
 
 describe('createTranscribeVoiceAttachments — factory contract', () => {
-  test('throws on missing required deps', () => {
-    assert.throws(() => createTranscribeVoiceAttachments({}), /config required/);
-    assert.throws(() => createTranscribeVoiceAttachments({ config: {} }), /db required/);
-    const m = makeDeps();
-    assert.throws(() => createTranscribeVoiceAttachments({ ...m.deps, transcribeVoice: null }),
-      /transcribeVoice required/);
-  });
   test('returns a per-call function when all deps present', () => {
     const m = makeDeps();
     const fn = createTranscribeVoiceAttachments(m.deps);

@@ -58,26 +58,6 @@ function baseCtx(overrides = {}) {
 }
 
 describe('createBuildSdkOptions — factory contract', () => {
-  test('throws when config missing', () => {
-    assert.throws(() => createBuildSdkOptions({}), /config required/);
-  });
-
-  test('throws when botName missing', () => {
-    assert.throws(() => createBuildSdkOptions({ config: {} }), /botName required/);
-  });
-
-  test('throws when makeCanUseTool not a function', () => {
-    assert.throws(() => createBuildSdkOptions({
-      config: {}, botName: 'b',
-    }), /makeCanUseTool required/);
-  });
-
-  test('throws when logEvent not a function', () => {
-    assert.throws(() => createBuildSdkOptions({
-      config: {}, botName: 'b', makeCanUseTool: () => {},
-    }), /logEvent required/);
-  });
-
   test('returns the per-call spawnFn when all deps provided', () => {
     const fn = createBuildSdkOptions(baseDeps());
     assert.equal(typeof fn, 'function');

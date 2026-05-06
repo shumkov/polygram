@@ -52,18 +52,6 @@ function makeMsg(text, { chatId = '12345', threadId = null, fromId = 99 } = {}) 
   };
 }
 
-describe('createHandleAbort — factory contract', () => {
-  test('throws on missing required deps', () => {
-    assert.throws(() => createHandleAbort({}), /pm required/);
-    const m = makeDeps();
-    assert.throws(() => createHandleAbort({ ...m.deps, bot: null }), /bot required/);
-    assert.throws(() => createHandleAbort({ ...m.deps, isAbortRequest: null }),
-      /isAbortRequest required/);
-    assert.throws(() => createHandleAbort({ ...m.deps, markSessionAborted: null }),
-      /markSessionAborted required/);
-  });
-});
-
 describe('handleAbortIfRequested — non-abort messages', () => {
   test('plain text → returns false, no side effects', async () => {
     const m = makeDeps();

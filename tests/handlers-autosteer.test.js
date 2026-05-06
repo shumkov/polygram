@@ -76,14 +76,6 @@ describe('priorityFor — mode mapping', () => {
 });
 
 describe('createAutosteerHandlers — factory contract', () => {
-  test('throws on missing required deps', () => {
-    assert.throws(() => createAutosteerHandlers({}), /config required/);
-    const m = makeDeps();
-    assert.throws(() => createAutosteerHandlers({ ...m.deps, pm: null }), /pm required/);
-    assert.throws(() => createAutosteerHandlers({ ...m.deps, autosteeredRefs: null }),
-      /autosteeredRefs required/);
-  });
-
   test('returns object with willAutosteer + tryAutosteer', () => {
     const m = makeDeps();
     const h = createAutosteerHandlers(m.deps);

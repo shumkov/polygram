@@ -35,7 +35,6 @@ const { ProcessManagerSdk, extractAssistantText } = require('./lib/sdk/process-m
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
 // (pm.injectUserMessage) replaces the buffer + PostToolBatch detour.
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
-const { createPmRouter } = require('./lib/sdk/router');
 const { createBuildSdkOptions } = require('./lib/sdk/build-options');
 const { createSdkCallbacks } = require('./lib/sdk/callbacks');
 const { createTranscribeVoiceAttachments } = require('./lib/handlers/voice');
@@ -3199,8 +3198,7 @@ async function main() {
   autosteer = createAutosteerHandlers({
     config, pm, autosteeredRefs, logEvent,
   });
-  const sdkPm = new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions });
-  pm = createPmRouter({ pm: sdkPm });
+  pm = new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions });
   console.log('[polygram] using SDK ProcessManager');
 
   console.log(`polygram (LRU cap=${cap}, SQLite source of truth)`);

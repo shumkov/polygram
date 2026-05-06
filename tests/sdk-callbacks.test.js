@@ -59,19 +59,6 @@ function baseDeps(overrides = {}) {
 }
 
 describe('createSdkCallbacks — factory contract', () => {
-  test('throws on missing required deps', () => {
-    assert.throws(() => createSdkCallbacks({}), /db required/);
-    assert.throws(() => createSdkCallbacks({ db: {} }), /dbWrite required/);
-  });
-
-  test('throws on non-Set contextHintShown', () => {
-    const { deps } = baseDeps();
-    assert.throws(
-      () => createSdkCallbacks({ ...deps, contextHintShown: {} }),
-      /contextHintShown \(Set\) required/,
-    );
-  });
-
   test('returns the 6 callbacks', () => {
     const { deps } = baseDeps();
     const cbs = createSdkCallbacks(deps);

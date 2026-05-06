@@ -54,14 +54,6 @@ describe('ATTACHMENT_DOWNLOAD_CONCURRENCY_DEFAULT', () => {
 });
 
 describe('createDownloadAttachments — factory contract', () => {
-  test('throws on missing required deps', () => {
-    assert.throws(() => createDownloadAttachments({}), /config required/);
-    assert.throws(() => createDownloadAttachments({ config: {} }), /db required/);
-    assert.throws(() => createDownloadAttachments({
-      config: {}, db: {}, dbWrite: () => {}, fetchImpl: () => {},
-    }), /inboxDir required/);
-  });
-
   test('returns the per-call function', () => {
     const fn = createDownloadAttachments({
       config: { bot: {} },

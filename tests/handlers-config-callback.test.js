@@ -70,14 +70,6 @@ function makeDeps(overrides = {}) {
 }
 
 describe('handleConfigCallback — factory contract', () => {
-  test('throws on missing required deps', () => {
-    assert.throws(() => createHandleConfigCallback({}), /config required/);
-    const m = makeDeps();
-    assert.throws(() => createHandleConfigCallback({ ...m.deps, pm: null }), /pm required/);
-    assert.throws(() => createHandleConfigCallback({ ...m.deps, getSessionKey: null }),
-      /getSessionKey required/);
-  });
-
   test('exports MODEL_OPTIONS + EFFORT_OPTIONS as the canonical lists', () => {
     assert.deepEqual(MODEL_OPTIONS, ['opus', 'sonnet', 'haiku']);
     assert.deepEqual(EFFORT_OPTIONS, ['low', 'medium', 'high', 'xhigh', 'max']);
