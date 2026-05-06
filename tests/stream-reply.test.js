@@ -6,8 +6,8 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { createStreamer } = require('../lib/stream-reply');
-const { extractAssistantText } = require('../lib/sdk/process-manager-sdk');
+const { createStreamer } = require('../lib/telegram/streamer');
+const { extractAssistantText } = require('../lib/sdk/process-manager');
 
 const silent = { error: () => {} };
 
@@ -661,7 +661,7 @@ describe('createStreamer — transformText option (rc.67)', () => {
 
   test('msg 205 reproduction — full flow', async () => {
     const stickerMap = { working: 'CAACAgIAAxkBAAEworking' };
-    const { stripInlineTags } = require('../lib/parse-response');
+    const { stripInlineTags } = require('../lib/telegram/parse');
     const h = makeHarnessWithTransform({
       transformText: (t) => stripInlineTags(t, { stickerMap }),
     });
@@ -681,7 +681,7 @@ describe('createStreamer — transformText option (rc.67)', () => {
   });
 
   test('[react:👍] gdocs reply — full flow, no edit needed at finalize', async () => {
-    const { stripInlineTags } = require('../lib/parse-response');
+    const { stripInlineTags } = require('../lib/telegram/parse');
     const h = makeHarnessWithTransform({
       transformText: (t) => stripInlineTags(t, { stickerMap: {} }),
     });

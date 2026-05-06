@@ -22,7 +22,7 @@ const {
   chunkMarkdownText,
   parseFenceSpans,
   scanParenAwareBreakpoints,
-} = require('../lib/telegram-chunk');
+} = require('../lib/telegram/chunk');
 
 describe('chunkText — early returns', () => {
   test('empty string → empty array', () => {

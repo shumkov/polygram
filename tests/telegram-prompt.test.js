@@ -20,7 +20,7 @@ const {
   POLYGRAM_DISPLAY_HINT,
   TELEGRAM_TABLE_WIDTH_BUDGET,
   appendDisplayHint,
-} = require('../lib/telegram-prompt');
+} = require('../lib/telegram/display-hint');
 
 describe('POLYGRAM_DISPLAY_HINT — content', () => {
   test('mentions the table width budget by number', () => {

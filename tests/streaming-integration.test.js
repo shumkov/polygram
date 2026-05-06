@@ -25,9 +25,9 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { createStreamer } = require('../lib/stream-reply');
-const { chunkMarkdownText } = require('../lib/telegram-chunk');
-const { deliverReplies } = require('../lib/deliver');
+const { createStreamer } = require('../lib/telegram/streamer');
+const { chunkMarkdownText } = require('../lib/telegram/chunk');
+const { deliverReplies } = require('../lib/telegram/deliver');
 
 const TG_MAX_LEN = 4096;
 

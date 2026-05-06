@@ -14,7 +14,7 @@ const {
   extractAssistantText,
   sumUsage,
   makeInputController,
-} = require('../lib/sdk/process-manager-sdk');
+} = require('../lib/sdk/process-manager');
 const { makeFakeQuery } = require('./_helpers/fake-query');
 
 function mockDb() {

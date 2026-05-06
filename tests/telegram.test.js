@@ -7,7 +7,7 @@ const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { freshDb, cleanupDb } = require('./helpers/db-fixture');
-const { send, createSender, nextPendingId } = require('../lib/telegram');
+const { send, createSender, nextPendingId } = require('../lib/telegram/api');
 
 let db;
 let dbPath;

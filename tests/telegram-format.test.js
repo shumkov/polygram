@@ -2,7 +2,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { toTelegramHtml, toTelegramMarkdown, wrapFileReferencesInHtml, escapeHtml } =
-  require('../lib/telegram-format');
+  require('../lib/telegram/format');
 
 describe('toTelegramHtml — basics', () => {
   test('empty string passes through with no parse_mode', () => {
@@ -293,7 +293,7 @@ describe('toTelegramMarkdown alias still works (back-compat)', () => {
 
 // ─── 0.7.0: Telegram error classification ──────────────────────────
 
-const { isHtmlParseError, isMessageNotModifiedError } = require('../lib/telegram-format');
+const { isHtmlParseError, isMessageNotModifiedError } = require('../lib/telegram/format');
 
 describe('isHtmlParseError', () => {
   test('matches canonical Telegram parse-error wording', () => {
@@ -358,7 +358,7 @@ describe('isMessageNotModifiedError', () => {
 
 // ─── 0.7.0: splitTelegramCaption ─────────────────────────────────
 
-const { splitTelegramCaption, TELEGRAM_MAX_CAPTION_LENGTH } = require('../lib/telegram-format');
+const { splitTelegramCaption, TELEGRAM_MAX_CAPTION_LENGTH } = require('../lib/telegram/format');
 
 describe('splitTelegramCaption', () => {
   test('empty input returns both undefined', () => {
@@ -400,7 +400,7 @@ describe('splitTelegramCaption', () => {
 
 // ─── 0.7.0: 429 rate-limit handling ───────────────────────────────
 
-const { isRateLimitError, getRetryAfterMs } = require('../lib/telegram-format');
+const { isRateLimitError, getRetryAfterMs } = require('../lib/telegram/format');
 
 describe('isRateLimitError', () => {
   test('matches Telegram 429 wording', () => {

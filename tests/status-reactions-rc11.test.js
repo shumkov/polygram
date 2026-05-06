@@ -15,7 +15,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { createReactionManager, STATES } = require('../lib/status-reactions');
+const { createReactionManager, STATES } = require('../lib/telegram/reactions');
 
 describe('reactor — rc.24 no-throttle: every setState lands', () => {
   test('rapid QUEUED → THINKING → CODING all reach Telegram', async () => {
@@ -328,7 +328,7 @@ describe('reactor — rc.32 thinking deepening cascade', () => {
     const {
       DEFAULT_THINKING_DEEPER_MS,
       DEFAULT_THINKING_DEEPEST_MS,
-    } = require('../lib/status-reactions');
+    } = require('../lib/telegram/reactions');
     // 12s / 30s per Ivan DM 14-day data + rc.35 "less eager" tuning:
     // 12s lets the entire 5-15s bracket (33%) resolve on plain 🤔;
     // 30s lets the 15-30s bracket (25%) resolve on 🤨 without a
@@ -489,7 +489,7 @@ describe('reactor — rc.25 default timing thresholds', () => {
   const {
     DEFAULT_STALL_MS,
     DEFAULT_FREEZE_MS,
-  } = require('../lib/status-reactions');
+  } = require('../lib/telegram/reactions');
 
   test('DEFAULT_STALL_MS is at least 30s (not OpenClaw\'s aggressive 10s)', () => {
     assert.ok(DEFAULT_STALL_MS >= 30_000,

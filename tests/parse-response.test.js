@@ -14,7 +14,7 @@ const assert = require('node:assert/strict');
 const {
   parseResponse, STICKER_TAG_RE, STICKER_TAG_INLINE_RE,
   stripInlineTags,
-} = require('../lib/parse-response');
+} = require('../lib/telegram/parse');
 
 const stickerMap = {
   working: 'CAACAgIAAxkBAAEworking',

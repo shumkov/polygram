@@ -13,7 +13,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { deliverReplies } = require('../lib/deliver');
+const { deliverReplies } = require('../lib/telegram/deliver');
 
 function silentLogger() {
   return { log: () => {}, error: () => {} };

@@ -6,7 +6,7 @@ const {
   classifyToolName,
   resolveEmoji,
   STATES,
-} = require('../lib/status-reactions');
+} = require('../lib/telegram/reactions');
 
 function makeHarness({ availableEmojis, throttleMs = 10 } = {}) {
   const applied = [];

@@ -31,11 +31,11 @@ const { filterAttachments, MAX_FILE_BYTES } = require('./lib/attachments');
 // callbacks), so the rest of polygram.js doesn't branch beyond the
 // pick-at-startup. Phase 4 deletes the CLI version after Phase 5
 // soak proves SDK stable. See docs/0.8.0-architecture-decisions.md.
-const { ProcessManagerSdk, extractAssistantText } = require('./lib/sdk/process-manager-sdk');
+const { ProcessManagerSdk, extractAssistantText } = require('./lib/sdk/process-manager');
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
 // (pm.injectUserMessage) replaces the buffer + PostToolBatch detour.
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
-const { createPmRouter } = require('./lib/sdk/pm-router');
+const { createPmRouter } = require('./lib/sdk/router');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
   buildApprovalKeyboardWithAlways,
@@ -44,23 +44,23 @@ const {
 } = require('./lib/approval-ui');
 const { buildHistoryBlock } = require('./lib/history-preload');
 const { formatContextReply, maybeContextFullHint } = require('./lib/context-format');
-const { appendDisplayHint } = require('./lib/telegram-prompt');
+const { appendDisplayHint } = require('./lib/telegram/display-hint');
 const { createAbortGrace } = require('./lib/abort-grace');
 const agentLoader = require('./lib/agent-loader');
-const { createSender } = require('./lib/telegram');
+const { createSender } = require('./lib/telegram/api');
 const { createAsyncLock } = require('./lib/async-lock');
 const { sweepInbox } = require('./lib/inbox');
 const { parseBotArg, parseDbArg, filterConfigToBot } = require('./lib/config-scope');
 const { createStore: createPairingsStore, parseTtl: parsePairingTtl } = require('./lib/pairings');
-const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/voice');
-const { createStreamer } = require('./lib/stream-reply');
-const { chunkMarkdownText } = require('./lib/telegram-chunk');
-const { deliverReplies } = require('./lib/deliver');
+const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/telegram/voice');
+const { createStreamer } = require('./lib/telegram/streamer');
+const { chunkMarkdownText } = require('./lib/telegram/chunk');
+const { deliverReplies } = require('./lib/telegram/deliver');
 const { announce, shouldAnnounce } = require('./lib/announces');
 const { isAbortRequest } = require('./lib/abort-detector');
-const { startTyping } = require('./lib/typing-indicator');
+const { startTyping } = require('./lib/telegram/typing');
 const { redactBotToken } = require('./lib/net-errors');
-const { createReactionManager, classifyToolName } = require('./lib/status-reactions');
+const { createReactionManager, classifyToolName } = require('./lib/telegram/reactions');
 const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
 const { classify: classifyError, isTransientHttpError } = require('./lib/error-classify');
 const { createAutoResumeTracker, isAutoResumable } = require('./lib/auto-resume');
@@ -1324,7 +1324,7 @@ const stdinLock = createAsyncLock();
 const {
   parseResponse: parseResponseImpl,
   stripInlineTags: stripInlineTagsImpl,
-} = require('./lib/parse-response');
+} = require('./lib/telegram/parse');
 function parseResponse(text) {
   return parseResponseImpl(text, { stickerMap, emojiToSticker });
 }
@@ -1851,7 +1851,7 @@ async function handleConfigCallback(ctx) {
     // called with the right parse_mode (the bot.api.editMessageText path
     // bypasses tg() / applyFormatting in the chat-action approval card,
     // but here we DO want HTML).
-    const { toTelegramHtml } = require('./lib/telegram-format');
+    const { toTelegramHtml } = require('./lib/telegram/format');
     const { text: html, parseMode } = toTelegramHtml(newInfo);
     await ctx.editMessageText(html, {
       reply_markup: newKeyboard,

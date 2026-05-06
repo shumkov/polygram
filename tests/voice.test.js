@@ -13,7 +13,7 @@ const {
   transcribe, transcribeOpenAI,
   isVoiceAttachment, isLikelyAudioMime, normaliseLanguage,
   OPENAI_COST_PER_MINUTE_USD,
-} = require('../lib/voice');
+} = require('../lib/telegram/voice');
 
 let tmpDir, audioFile;
 

@@ -7,7 +7,7 @@ const {
   getChatTypingState,
   isAuthFailure,
   backoffDelay,
-} = require('../lib/typing-indicator');
+} = require('../lib/telegram/typing');
 
 function makeBot({ failWith = null, failFirst = 0 } = {}) {
   const calls = [];
