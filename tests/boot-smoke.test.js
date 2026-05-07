@@ -63,34 +63,67 @@ describe('polygram.js boot smoke', () => {
       }
     }
 
+    // Hardcoded list of factories that destructure their dep as a
+    // FIRST-CLASS parameter (not just reference it lazily inside an
+    // inner closure). These are the call sites where wire-order
+    // matters — late-rebinding the module-level `let bot` doesn't
+    // propagate into the factory's captured local because the
+    // factory grabs by VALUE at call time.
+    //
+    // Add a row when extracting a new factory that destructures
+    // `bot` or `pm` directly. Lazy references inside callback
+    // bodies (createMediaGroupBuffer.onFlush, createStreamer.send)
+    // capture the let-binding and DON'T need to be in this list.
+    // Verified by reading each factory's parameter destructure
+    // (lib/handlers/*.js, lib/sdk/*.js). Update when extracting a
+    // new factory that takes `bot` or `pm` as a first-class param.
+    // Factories that only LAZILY reference bot/pm inside callback
+    // bodies (createMediaGroupBuffer.onFlush, createStreamer.send)
+    // capture the let-binding at firing time and don't need to be
+    // listed here.
+    const FACTORIES_DESTRUCTURING_BOT = [
+      'createApprovals',
+      'createSdkCallbacks',
+      'createHandleSendOverIpc',
+    ];
+    const FACTORIES_DESTRUCTURING_PM = [
+      'createSlashCommands',
+      'createHandleConfigCallback',
+    ];
+
+    function findFactoryCallLine(factoryName) {
+      const re = new RegExp('^\\s+(?:(?:const|let|var)\\s+)?[\\w$]+(?:\\s*=\\s*|\\s*\\}\\s*=\\s*)' + factoryName + '\\b', 'm');
+      const m = re.exec(src);
+      if (m) return src.slice(0, m.index).split('\n').length;
+      // Try destructure form: `({...} = createX(...));`
+      const destructRe = new RegExp('^\\s*\\(\\{[^}]*\\}\\s*=\\s*' + factoryName + '\\b', 'm');
+      const m2 = destructRe.exec(src);
+      if (m2) return src.slice(0, m2.index).split('\n').length;
+      return -1;
+    }
+
     const botLine = lineOf(/^\s+bot\s*=\s*createBot\(/m);
     if (botLine !== -1) {
-      const factoryRe = /^\s+\w+\s*=\s*create[A-Z]\w*\s*\(\s*\{[^}]*\bbot\b/gm;
-      let bug;
-      let factoryMatch;
-      while ((factoryMatch = factoryRe.exec(src)) !== null) {
-        const factoryLine = src.slice(0, factoryMatch.index).split('\n').length;
-        if (factoryLine < botLine) {
-          bug = `factory taking 'bot' on line ${factoryLine} runs BEFORE bot=createBot() on line ${botLine}`;
-          break;
+      for (const factory of FACTORIES_DESTRUCTURING_BOT) {
+        const factoryLine = findFactoryCallLine(factory);
+        if (factoryLine !== -1 && factoryLine < botLine) {
+          assert.fail(
+            `${factory} on line ${factoryLine} destructures 'bot' BEFORE bot=createBot() on line ${botLine}. Closure captures null — runtime crash on first use.`,
+          );
         }
       }
-      assert.ok(!bug, bug || 'bot wiring order OK');
     }
 
     const pmLine = lineOf(/^\s+pm\s*=\s*new ProcessManagerSdk/m);
     if (pmLine !== -1) {
-      const factoryRe = /^\s+\w+\s*=\s*create[A-Z]\w*\s*\(\s*\{[^}]*\bpm\b/gm;
-      let bug;
-      let factoryMatch;
-      while ((factoryMatch = factoryRe.exec(src)) !== null) {
-        const factoryLine = src.slice(0, factoryMatch.index).split('\n').length;
-        if (factoryLine < pmLine) {
-          bug = `factory taking 'pm' on line ${factoryLine} runs BEFORE pm=new ProcessManagerSdk(...) on line ${pmLine}`;
-          break;
+      for (const factory of FACTORIES_DESTRUCTURING_PM) {
+        const factoryLine = findFactoryCallLine(factory);
+        if (factoryLine !== -1 && factoryLine < pmLine) {
+          assert.fail(
+            `${factory} on line ${factoryLine} destructures 'pm' BEFORE pm=new ProcessManagerSdk(...) on line ${pmLine}. Closure captures null — runtime crash on first use.`,
+          );
         }
       }
-      assert.ok(!bug, bug || 'pm wiring order OK');
     }
   });
 });

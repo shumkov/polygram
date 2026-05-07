@@ -1868,17 +1868,18 @@ async function main() {
   // factory threads the runtime context in via DI. onRespawn dropped
   // earlier — SDK pm applies /model + /effort live so there's no
   // drain event to hook.
-  const sdkCallbacks = createSdkCallbacks({
-    db, dbWrite, config, bot, botName: BOT_NAME, tg, logEvent,
-    classifyToolName, announce, shouldAnnounce, contextHintShown,
-    extractAssistantText, getChatIdFromKey, getThreadIdFromKey,
-    logger: console,
-  });
+  //
+  // Wire-order: sdkCallbacks destructures `bot` at call time and
+  // its onCompactBoundary closure captures that local binding. Must
+  // run AFTER `bot = createBot(...)` below — see "Order encoded
+  // below" further down. The pmOpts construction is split: cap+db
+  // here, ...sdkCallbacks merged in once bot is alive. v4-rc.2 had
+  // this in the wrong order — post-compact reply crashed with
+  // "Cannot read properties of null (reading 'api')".
   const pmOpts = {
     cap,
     db,
     logger: console,
-    ...sdkCallbacks,
   };
 
   // 0.9.0 wiring order matters here. The factories destructure
@@ -1898,6 +1899,14 @@ async function main() {
   //   5. handler factories that need pm/bot  — see them as live refs
 
   bot = createBot(config.bot.token);
+
+  const sdkCallbacks = createSdkCallbacks({
+    db, dbWrite, config, bot, botName: BOT_NAME, tg, logEvent,
+    classifyToolName, announce, shouldAnnounce, contextHintShown,
+    extractAssistantText, getChatIdFromKey, getThreadIdFromKey,
+    logger: console,
+  });
+  Object.assign(pmOpts, sdkCallbacks);
 
   ({
     makeCanUseTool,
