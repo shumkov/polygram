@@ -143,7 +143,7 @@ let bot = null;       // grammy Bot for BOT_NAME
 // `config` / `stickerMap` / `emojiToSticker` and assigns from the
 // pure I/O functions.
 const configIO = require('./lib/config');
-const { isWellFormedMessage } = configIO;
+const { isWellFormedMessage, isWellFormedCallbackQuery } = configIO;
 
 function loadConfig() { config = configIO.loadConfig(CONFIG_PATH); }
 function saveConfig() {
@@ -1662,8 +1662,18 @@ function createBot(token) {
   });
 
   bot.on('callback_query:data', async (ctx) => {
+    if (!isWellFormedCallbackQuery(ctx.callbackQuery)) {
+      logEvent('malformed-update', {
+        bot: BOT_NAME,
+        update_id: ctx.update?.update_id,
+        reason: 'callback_query missing message/from/data or inline-mode',
+      });
+      // Best-effort ack so Telegram stops re-sending. May fail silently.
+      await ctx.answerCallbackQuery({ text: 'Stale or invalid button.' }).catch(() => {});
+      return;
+    }
     try {
-      const data = ctx.callbackQuery?.data || '';
+      const data = ctx.callbackQuery.data;
       if (data.startsWith('cfg:')) {
         await handleConfigCallback(ctx);
       } else {

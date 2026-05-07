@@ -17,6 +17,7 @@ const {
   saveConfig,
   loadStickers,
   isWellFormedMessage,
+  isWellFormedCallbackQuery,
 } = require('../lib/config');
 
 const silentLogger = { log: () => {}, error: () => {} };
@@ -201,5 +202,56 @@ describe('isWellFormedMessage', () => {
 
   test('message_id as string → false', () => {
     assert.equal(isWellFormedMessage({ chat: { id: 1 }, message_id: '1' }), false);
+  });
+});
+
+describe('isWellFormedCallbackQuery', () => {
+  const ok = {
+    id: 'cb1',
+    from: { id: 42 },
+    data: 'cfg:model:sonnet',
+    message: { chat: { id: 100 }, message_id: 5 },
+  };
+
+  test('valid callback_query → true', () => {
+    assert.equal(isWellFormedCallbackQuery(ok), true);
+  });
+
+  test('null / undefined → false', () => {
+    assert.equal(isWellFormedCallbackQuery(null), false);
+    assert.equal(isWellFormedCallbackQuery(undefined), false);
+  });
+
+  test('missing id → false', () => {
+    const cb = { ...ok, id: undefined };
+    assert.equal(isWellFormedCallbackQuery(cb), false);
+  });
+
+  test('missing from.id → false', () => {
+    assert.equal(isWellFormedCallbackQuery({ ...ok, from: {} }), false);
+  });
+
+  test('missing data → false', () => {
+    assert.equal(isWellFormedCallbackQuery({ ...ok, data: undefined }), false);
+  });
+
+  test('inline-mode (inline_message_id, no message) → false', () => {
+    const cb = {
+      id: 'cb1',
+      from: { id: 42 },
+      data: 'cfg:model:sonnet',
+      inline_message_id: 'inline-xyz',
+    };
+    assert.equal(isWellFormedCallbackQuery(cb), false);
+  });
+
+  test('message present but malformed → false', () => {
+    assert.equal(isWellFormedCallbackQuery({
+      ...ok, message: { chat: {}, message_id: 5 },
+    }), false);
+  });
+
+  test('numeric id (Telegram sometimes sends as number) → true', () => {
+    assert.equal(isWellFormedCallbackQuery({ ...ok, id: 12345 }), true);
   });
 });
