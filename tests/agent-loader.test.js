@@ -189,6 +189,60 @@ describe('loadAgent — rc.49 plugin-qualified names', () => {
     assert.equal(b.raw.model, 'haiku');
   });
 
+  test('falls back to <cwd>/.claude-plugins-local/<plugin>/agents/ when project vendors a plugin', () => {
+    // 2026-05-08 gap discovered: when a project's CLAUDE.md sets
+    //   extraKnownMarketplaces.<name>.source.path = <cwd>/.claude-plugins-local
+    // its agents live at <cwd>/.claude-plugins-local/<plugin>/agents/<agent>.md
+    // — but pre-fix the resolver only checked installed_plugins.json (empty
+    // for never-enabled plugins) and ~/.claude-plugins-local/ (user-level,
+    // wrong scope). Result: polygram chats configured with
+    // agent: 'music-curation:music-curator' silently fell back to defaults.
+    const projectCwd = path.join(tmp, 'project-cwd');
+    const projectLocal = path.join(projectCwd, '.claude-plugins-local', 'music-curation', 'agents');
+    fs.mkdirSync(projectLocal, { recursive: true });
+    fs.writeFileSync(
+      path.join(projectLocal, 'music-curator.md'),
+      '---\nname: music-curator\nmodel: sonnet\n---\n\nProject-vendored music-curator.',
+    );
+    // No installed_plugins.json registry, no ~/.claude-plugins-local/ entry —
+    // ONLY the project-local marketplace path resolves it.
+    const b = loadAgent('music-curation:music-curator', { homeDir: tmp, cwd: projectCwd });
+    assert.equal(b.systemPrompt.trim(), 'Project-vendored music-curator.');
+    assert.equal(b.raw.model, 'sonnet');
+  });
+
+  test('cwd-local plugin path is checked AFTER user-local but BEFORE failing', () => {
+    // Resolution order verified: registry → ~/.claude-plugins-local/ →
+    // <cwd>/.claude-plugins-local/. cwd-local is the LAST fallback so
+    // user-level overrides still win when both are present (matches the
+    // existing registry-takes-precedence-over-user-local invariant).
+    const projectCwd = path.join(tmp, 'project-cwd2');
+    fs.mkdirSync(path.join(projectCwd, '.claude-plugins-local', 'overlap', 'agents'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projectCwd, '.claude-plugins-local', 'overlap', 'agents', 'helper.md'),
+      'from cwd-local',
+    );
+    const userLocal = path.join(tmp, '.claude-plugins-local', 'overlap', 'agents');
+    fs.mkdirSync(userLocal, { recursive: true });
+    fs.writeFileSync(path.join(userLocal, 'helper.md'), 'from user-local');
+
+    const b = loadAgent('overlap:helper', { homeDir: tmp, cwd: projectCwd });
+    assert.equal(b.systemPrompt, 'from user-local',
+      'user-local must win over cwd-local — operator-controlled scope is more authoritative');
+  });
+
+  test('cwd-local fallback is skipped when cwd is not provided', () => {
+    // Defence-in-depth: passing cwd=null shouldn't pick up arbitrary
+    // .claude-plugins-local/ from process.cwd or anywhere else.
+    const projectCwd = path.join(tmp, 'project-cwd3');
+    fs.mkdirSync(path.join(projectCwd, '.claude-plugins-local', 'p', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(projectCwd, '.claude-plugins-local', 'p', 'agents', 'a.md'), 'present but unreachable');
+    assert.throws(
+      () => loadAgent('p:a', { homeDir: tmp, cwd: null }),
+      { code: 'AGENT_NOT_FOUND' },
+    );
+  });
+
   test('installed_plugins.json takes precedence over .claude-plugins-local/', () => {
     const installPath = path.join(tmp, 'plugins-cache', 'overlap', '1.0');
     writeInstalledPlugins(tmp, {
