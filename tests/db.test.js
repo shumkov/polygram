@@ -911,3 +911,56 @@ describe('findOrphanedCompactCommands — rc.66 dedupe handled orphans', () => {
     assert.equal(orphans[0].ts, tsFresh);
   });
 });
+
+describe('isInboundLive', () => {
+  beforeEach(() => { ({ db, dbPath } = freshDb('inbound-live')); });
+  afterEach(() => { cleanupDb(dbPath, db); db = null; dbPath = null; });
+
+  function insertInbound(chatId, msgId, status) {
+    db.insertMessage({
+      chat_id: chatId, msg_id: msgId, direction: 'in',
+      text: 'hi', ts: Date.now(), bot_name: 'testbot',
+    });
+    if (status) db.setInboundHandlerStatus({ chat_id: chatId, msg_id: msgId, status });
+  }
+
+  test('returns true for dispatched message', () => {
+    insertInbound('100', 1, 'dispatched');
+    assert.equal(db.isInboundLive({ chat_id: '100', msg_id: 1 }), true);
+  });
+
+  test('returns true for processing message (legacy state)', () => {
+    insertInbound('100', 2, 'processing');
+    assert.equal(db.isInboundLive({ chat_id: '100', msg_id: 2 }), true);
+  });
+
+  test('returns false for replied message (turn complete)', () => {
+    insertInbound('100', 3, 'replied');
+    assert.equal(db.isInboundLive({ chat_id: '100', msg_id: 3 }), false);
+  });
+
+  test('returns false for aborted/failed/replay-* messages', () => {
+    insertInbound('100', 4, 'aborted');
+    insertInbound('100', 5, 'failed');
+    insertInbound('100', 6, 'replay-pending');
+    insertInbound('100', 7, 'replay-attempted');
+    assert.equal(db.isInboundLive({ chat_id: '100', msg_id: 4 }), false);
+    assert.equal(db.isInboundLive({ chat_id: '100', msg_id: 5 }), false);
+    assert.equal(db.isInboundLive({ chat_id: '100', msg_id: 6 }), false);
+    assert.equal(db.isInboundLive({ chat_id: '100', msg_id: 7 }), false);
+  });
+
+  test('returns false for unknown msg_id (never dispatched)', () => {
+    assert.equal(db.isInboundLive({ chat_id: '100', msg_id: 99999 }), false);
+  });
+
+  test('returns false for outbound message even with matching status', () => {
+    db.insertMessage({
+      chat_id: '100', msg_id: 50, direction: 'out',
+      text: 'bot reply', ts: Date.now(), bot_name: 'testbot',
+    });
+    // Manually set handler_status on outbound — query must still return false.
+    db.raw.prepare(`UPDATE messages SET handler_status = 'dispatched' WHERE msg_id = 50 AND direction = 'out'`).run();
+    assert.equal(db.isInboundLive({ chat_id: '100', msg_id: 50 }), false);
+  });
+});

@@ -44,6 +44,7 @@ const { createDownloadAttachments } = require('./lib/handlers/download');
 const { createHandleConfigCallback } = require('./lib/handlers/config-callback');
 const { createHandleAbort } = require('./lib/handlers/abort');
 const { createAutosteerHandlers } = require('./lib/handlers/autosteer');
+const { createEditCorrectionInjector } = require('./lib/handlers/edit-correction');
 const { createSlashCommands } = require('./lib/handlers/slash-commands');
 const { createApprovals } = require('./lib/handlers/approvals');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
@@ -525,6 +526,7 @@ let handleConfigCallback = null;
 let handleAbortIfRequested = null;
 let autosteer = null;
 let dispatchSlashCommand = null;
+let maybeInjectEditCorrection = null;
 
 // rc.20: approvalCardText + safeParse moved to lib/approvals/ui.js.
 // 0.9.0 commit 29: makeCanUseTool / handleApprovalCallback /
@@ -1702,6 +1704,18 @@ function createBot(token) {
       user_id: ctx.editedMessage.from?.id || null,
     });
     console.log(`[${BOT_NAME}] edited ${chatId}/${ctx.editedMessage.message_id}`);
+
+    // 0.9.0: typo-correction injection. If the SDK still has this turn
+    // in flight (handler_status in dispatched/processing AND
+    // pm.get(sk).inFlight), inject a `[edit] corrected: <NEW>` note
+    // via the same channel autosteer uses. Lets users fix typos
+    // mid-turn without /stop + resend. No-op when the turn already
+    // completed.
+    try {
+      maybeInjectEditCorrection?.(ctx.editedMessage);
+    } catch (err) {
+      console.error(`[${BOT_NAME}] edit-correction injector error: ${err.message}`);
+    }
   });
 
   bot.on('message:migrate_to_chat_id', async (ctx) => {
@@ -1954,6 +1968,9 @@ async function main() {
   });
   autosteer = createAutosteerHandlers({
     config, pm, autosteeredRefs, logEvent,
+  });
+  maybeInjectEditCorrection = createEditCorrectionInjector({
+    pm, db, getSessionKey, config, logEvent, logger: console,
   });
   recordInbound = createRecordInbound({
     db, dbWrite, config, botName: BOT_NAME, extractAttachments,
