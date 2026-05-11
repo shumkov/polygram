@@ -109,6 +109,15 @@ const CLAUDE_BIN = process.env.POLYGRAM_CLAUDE_BIN
   || path.join(process.env.HOME || '', '.npm-global/bin/claude');
 const CHILD_HOME = process.env.POLYGRAM_CHILD_HOME || process.env.HOME || '';
 const TG_MAX_LEN = 4096;
+// 0.9.0-rc.6: chunker budget is intentionally lower than TG_MAX_LEN to
+// leave HTML headroom. toTelegramHtml converts markdown to HTML for
+// parse_mode=HTML — that conversion adds <b>/<i>/<code>/<a> tags and
+// entity-escapes &/</> chars, inflating length by ~10-15% for realistic
+// markdown. 2026-05-11 incident proved a 4044-char chunk inflated to
+// 4506 HTML chars and Telegram rejected. 3500 raw → max ~4030 HTML on
+// observed inputs, with headroom for adversarial code-heavy text.
+// Override via POLYGRAM_CHUNK_BUDGET if your traffic profile differs.
+const TG_CHUNK_BUDGET = Number.parseInt(process.env.POLYGRAM_CHUNK_BUDGET, 10) || 3500;
 const DEFAULT_MAX_WARM_PROCS = 10;
 
 let stickerMap = {}; // name → file_id
@@ -1253,7 +1262,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         // send the body as proper chunks.
         try { await streamer.discard(); }
         catch (err) { console.error(`[${label}] discard failed: ${err.message}`); }
-        const chunks = chunkMarkdownText(parsed.text, TG_MAX_LEN);
+        const chunks = chunkMarkdownText(parsed.text, TG_CHUNK_BUDGET);
         const r = await deliverReplies({
           bot,
           send: (b, method, params, m) => tg(b, method, params, m),
@@ -1319,7 +1328,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // 0.7.0: use markdown-aware chunker + deliverReplies primitive.
       // The old chunkText was newline/byte-only; chunkMarkdownText also
       // respects code-fence boundaries (closes + reopens across chunks).
-      const chunks = chunkMarkdownText(parsed.text, TG_MAX_LEN);
+      const chunks = chunkMarkdownText(parsed.text, TG_CHUNK_BUDGET);
       await deliverReplies({
         bot,
         send: (b, method, params, m) => tg(b, method, params, m),
@@ -1990,7 +1999,7 @@ async function main() {
     classifyError, isAutoResumable,
     abortGrace, autoResumeTracker,
     chunkMarkdownText, deliverReplies,
-    TG_MAX_LEN,
+    chunkBudget: TG_CHUNK_BUDGET,
     getIsShuttingDown: () => isShuttingDown,
     logger: console,
   }));

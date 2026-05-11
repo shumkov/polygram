@@ -453,3 +453,77 @@ describe('chunkMarkdownText — defensive post-pass enforces limit', () => {
     });
   }
 });
+
+// 2026-05-11 production incident: shumabit replied to chat 45270985 with
+// Russian markdown ~4044 chars raw. chunkMarkdownText with limit=4096 kept
+// the chunk at length=4044 (in spec for the chunker's contract), but
+// toTelegramHtml inflated to 4506 chars (+11.4% from <b>/<i>/<code> tags +
+// HTML entity escapes). Telegram rejected with 400 "Bad Request: message
+// is too long".
+//
+// Fix: polygram.js calls chunkMarkdownText with a SAFE_CHUNK_LIMIT (3500),
+// not the raw TG_MAX_LEN (4096), so post-format HTML stays under the
+// Telegram hard cap even with realistic markdown inflation.
+//
+// This test pins the contract: at the budget polygram actually uses,
+// realistic Russian markdown + heavy formatting must produce chunks
+// whose toTelegramHtml output fits 4096 UTF-16 code units.
+describe('chunkMarkdownText — post-format HTML stays under Telegram limit', () => {
+  const { toTelegramHtml } = require('../lib/telegram/format');
+  const TG_HARD_LIMIT = 4096;
+  const TG_CHUNK_BUDGET = 3500;
+
+  function buildRealisticMarkdown(targetLen) {
+    const para = (
+      'Хороший вопрос — и он реально оголяет проблему текущей **структуры**. ' +
+      'Если кратко: у нас сейчас `parent_tool_use_id` фильтр работает в основном пути, ' +
+      'но в *subagent fanout* — нет. Это значит что когда `Task` запускает дочернюю сессию, ' +
+      'её output не маркируется и **дедупа нет**. Решение: либо переписать **subagent loop** ' +
+      'чтобы он использовал тот же `canUseTool` callback channel, либо добавить отдельный ' +
+      '`subagent-output` event который dispatcher знает как обработать. ' +
+      '*Второе проще, но даёт хуже UX*.\n\n'
+    );
+    let out = '';
+    while (out.length < targetLen) out += para;
+    return out.slice(0, targetLen);
+  }
+
+  test('regression: 4044-char markdown → HTML stays under 4096', () => {
+    const raw = buildRealisticMarkdown(4044);
+    const chunks = chunkMarkdownText(raw, TG_CHUNK_BUDGET);
+    for (const c of chunks) {
+      const { text: html } = toTelegramHtml(c);
+      assert.ok(html.length <= TG_HARD_LIMIT,
+        `chunk ${c.length} raw → ${html.length} HTML (over ${TG_HARD_LIMIT})`);
+    }
+  });
+
+  test('regression: 8000-char markdown → multi-chunk, all HTML-safe', () => {
+    const raw = buildRealisticMarkdown(8000);
+    const chunks = chunkMarkdownText(raw, TG_CHUNK_BUDGET);
+    assert.ok(chunks.length >= 2, 'long input must split into multiple chunks');
+    for (const c of chunks) {
+      const { text: html } = toTelegramHtml(c);
+      assert.ok(html.length <= TG_HARD_LIMIT,
+        `chunk ${c.length} raw → ${html.length} HTML (over ${TG_HARD_LIMIT})`);
+    }
+  });
+
+  test('regression: limit=4096 fails on the incident input (proves the bug existed)', () => {
+    // Anti-regression for the chunker config: calling chunker with
+    // the raw Telegram limit (4096) on realistic Russian markdown
+    // SHOULD produce at least one chunk whose HTML output exceeds 4096.
+    // If this test starts FAILING because the chunker now magically
+    // handles inflation at 4096, the SAFE_CHUNK_LIMIT in polygram.js
+    // can probably be raised back up.
+    const raw = buildRealisticMarkdown(4044);
+    const chunks = chunkMarkdownText(raw, 4096);
+    let anyOver = false;
+    for (const c of chunks) {
+      const { text: html } = toTelegramHtml(c);
+      if (html.length > TG_HARD_LIMIT) { anyOver = true; break; }
+    }
+    assert.ok(anyOver,
+      'expected at least one chunk to inflate over 4096 when chunker uses the raw 4096 limit');
+  });
+});

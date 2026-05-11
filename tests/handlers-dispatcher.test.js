@@ -79,7 +79,7 @@ function fixture(overrides = {}) {
     deliverReplies: async (args) => {
       calls.deliverReplies.push(args);
     },
-    TG_MAX_LEN: 4096,
+    chunkBudget: 4096,
     getIsShuttingDown: () => overrides.shuttingDown === true,
     logger: { log: () => {}, error: () => {} },
   });
