@@ -117,6 +117,98 @@ describe('classify — PATTERNS coverage (one sample per kind)', () => {
   test('transient5xx matches "temporarily overloaded"', () => {
     assert.equal(classify(new Error('The AI service is temporarily overloaded')).kind, 'transient5xx');
   });
+
+  // 2026-05-13 production incident: shumabit Dina DM accumulated 53
+  // images over 2 weeks. Session got wedged returning 400 "Could not
+  // process image" on EVERY new turn (Anthropic rejecting an old image
+  // block in the resumed transcript). Pre-fix this fell through to
+  // 'unknown' → raw JSON dumped into the chat as bot's reply.
+  test('imageProcess matches Anthropic "Could not process image" 400', () => {
+    const r = classify(new Error(
+      'API Error: 400 {"type":"error","error":{"type":"invalid_request_error",' +
+      '"message":"Could not process image"},"request_id":"req_011Cayz1auK3HVVWsG49JdBn"}'
+    ));
+    assert.equal(r.kind, 'imageProcess');
+    assert.match(r.userMessage, /image/i);
+    // Friendly message — NOT the raw API JSON.
+    assert.doesNotMatch(r.userMessage, /\{"type":"error"/);
+    // Session unwedge: this kind of error means the persisted transcript
+    // has bad image data. /compact may also fail (it has to load the
+    // same history). Reset is the only reliable recovery.
+    assert.equal(r.autoRecover, 'reset_session');
+  });
+
+  test('imageProcess matches bare "Could not process image"', () => {
+    assert.equal(classify(new Error('Could not process image')).kind, 'imageProcess');
+  });
+
+  test('imageProcess matches "invalid image" variations', () => {
+    assert.equal(classify(new Error('image content is invalid or corrupted')).kind, 'imageProcess');
+    assert.equal(classify(new Error('unsupported image type')).kind, 'imageProcess');
+  });
+
+  test('imageProcess does NOT match generic image references (regression guard)', () => {
+    // We don't want innocuous mentions of "image" to wrongly classify.
+    assert.notEqual(classify(new Error('Read the image at /tmp/foo.jpg')).kind, 'imageProcess');
+    assert.notEqual(classify(new Error('user shared a photo')).kind, 'imageProcess');
+  });
+});
+
+describe('detectWedgedSessionError', () => {
+  const { detectWedgedSessionError } = require('../lib/error/classify');
+
+  test('detects the 2026-05-13 Dina DM incident text', () => {
+    const text = 'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Could not process image"},"request_id":"req_011Cayz1auK3HVVWsG49JdBn"}';
+    const r = detectWedgedSessionError(text);
+    assert.ok(r, 'must detect wrapped API error in assistant text');
+    assert.equal(r.kind, 'imageProcess');
+    assert.equal(r.autoRecover, 'reset_session');
+    assert.match(r.userMessage, /image/i);
+    // Friendly text — NOT raw JSON.
+    assert.doesNotMatch(r.userMessage, /\{"type"/);
+  });
+
+  test('detects API Error wrapping for other classes (rate-limit on resume)', () => {
+    const text = 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Too many requests"}}';
+    const r = detectWedgedSessionError(text);
+    assert.ok(r);
+    assert.equal(r.kind, 'rateLimit');
+  });
+
+  test('null when assistant text is a normal reply', () => {
+    assert.equal(detectWedgedSessionError('Hello! Here is your answer.'), null);
+    assert.equal(detectWedgedSessionError('The order total is $42.00.'), null);
+  });
+
+  test('null when text MENTIONS API Error without the wrapper prefix', () => {
+    // A user could legitimately ask "explain API Error: 400 codes" and
+    // get a Claude response that includes that phrase mid-sentence.
+    // The detector should NOT classify these.
+    assert.equal(detectWedgedSessionError(
+      'When the API returns a 400 error, you should check the request body.'
+    ), null);
+    assert.equal(detectWedgedSessionError(
+      'Here is an example response:\nAPI Error: 400 {"type":"error"...}\nNotice it is structured JSON.'
+    ), null, 'embedded in body, not the literal prefix');
+  });
+
+  test('null on empty / non-string input', () => {
+    assert.equal(detectWedgedSessionError(''), null);
+    assert.equal(detectWedgedSessionError(null), null);
+    assert.equal(detectWedgedSessionError(undefined), null);
+    assert.equal(detectWedgedSessionError(42), null);
+  });
+
+  test('unknown wedge class still triggers reset_session (safe default)', () => {
+    // A wrapped API error with an unrecognised body — we still know the
+    // session is wedged because the SDK shouldn't be emitting these as
+    // assistant text. Return a safe imageProcess shape so the recovery
+    // path runs.
+    const text = 'API Error: 400 {"type":"error","error":{"type":"unknown_future_error","message":"something new"}}';
+    const r = detectWedgedSessionError(text);
+    assert.ok(r);
+    assert.equal(r.autoRecover, 'reset_session');
+  });
 });
 
 describe('classify — fall-through to "unknown"', () => {

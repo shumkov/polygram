@@ -75,7 +75,7 @@ const { startTyping } = require('./lib/telegram/typing');
 // consumer is lib/handlers/download.js.
 const { createReactionManager, classifyToolName } = require('./lib/telegram/reactions');
 const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
-const { classify: classifyError, isTransientHttpError } = require('./lib/error/classify');
+const { classify: classifyError, detectWedgedSessionError, isTransientHttpError } = require('./lib/error/classify');
 const { createAutoResumeTracker, isAutoResumable } = require('./lib/db/auto-resume');
 const { resolveReplayWindowMs } = require('./lib/db/replay-window');
 // validateIpcFileParam moved with handleSendOverIpc to
@@ -1019,14 +1019,41 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
 
     stopTyping();
 
+    // 2026-05-13 Dina-DM incident: SDK reports result_subtype=success
+    // but the "assistant text" is actually an API error JSON the SDK
+    // wrapped (e.g. wedged image content block in resumed transcript).
+    // Without this guard, polygram delivers the raw JSON to Telegram
+    // as the bot's reply AND never resets the session — every
+    // subsequent turn loops the same wedge.
+    //
+    // Sniff result.text for the wrapper pattern BEFORE the error/text
+    // branch decisions. When detected: synthesize an Error so the
+    // standard result.error path runs (classification → reset_session
+    // → friendly user message → no raw-JSON delivery).
+    if (!result.error && detectWedgedSessionError(result.text)) {
+      const wedge = detectWedgedSessionError(result.text);
+      logEvent('wedged-session-detected', {
+        chat_id: chatId, session_key: sessionKey,
+        kind: wedge.kind,
+        text_preview: result.text.slice(0, 200),
+      });
+      // Promote the wrapped error to result.error so the existing
+      // auto-recover + thrown-error machinery handles it uniformly.
+      // Clear result.text so downstream delivery doesn't send the
+      // raw JSON.
+      result.error = result.text;
+      result.text = '';
+    }
+
     if (result.error) {
       console.error(`[${label}] Error (${elapsed}s):`, result.error);
       reactor.setState('ERROR');
       // 0.8.0 Phase 2 step 8: classifier-driven auto-recovery. If
       // the error kind has autoRecover === 'reset_session' (i.e.
-      // role_ordering / context_overflow / missing_tool_input),
-      // tell pm to reset the session NOW so the user's NEXT
-      // message starts fresh — without them having to type /new.
+      // role_ordering / context_overflow / missing_tool_input /
+      // imageProcess), tell pm to reset the session NOW so the
+      // user's NEXT message starts fresh — without them having
+      // to type /new.
       const cls = classifyError(result.error);
       if (cls.autoRecover === 'reset_session') {
         pm.resetSession(sessionKey, { reason: cls.kind })
