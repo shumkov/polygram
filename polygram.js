@@ -33,7 +33,13 @@ const { filterAttachments } = require('./lib/attachments');
 // callbacks), so the rest of polygram.js doesn't branch beyond the
 // pick-at-startup. Phase 4 deletes the CLI version after Phase 5
 // soak proves SDK stable. See docs/0.8.0-architecture-decisions.md.
-const { ProcessManagerSdk, extractAssistantText } = require('./lib/sdk/process-manager');
+// 0.10.0: ProcessManager is generic (collection + LRU + dispatch).
+// Process subclasses (SdkProcess now, TmuxProcess in Phase 2) provide
+// per-session mechanics. The pre-0.10.0 monolithic ProcessManagerSdk
+// is deleted; SdkProcess inherits its per-entry guts.
+const { ProcessManager } = require('./lib/process-manager');
+const { createProcessFactory } = require('./lib/process/factory');
+const { extractAssistantText } = require('./lib/process/sdk-process');
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
 // (pm.injectUserMessage) replaces the buffer + PostToolBatch detour.
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
@@ -1956,7 +1962,12 @@ async function main() {
     extractAssistantText, getChatIdFromKey, getThreadIdFromKey,
     logger: console,
   });
-  Object.assign(pmOpts, sdkCallbacks);
+  // 0.10.0: sdkCallbacks (the polygram-side lifecycle handlers — status
+  // reactor, stream chunk → bubble edit, etc.) move from the underlying
+  // SDK pm to the generic ProcessManager. The SDK pm gets legacyCallbacks
+  // (a bridge that re-emits events on per-Process EventEmitters); the
+  // generic pm subscribes to those EventEmitters and forwards to
+  // sdkCallbacks. Same code path; one extra hop for the abstraction.
 
   ({
     makeCanUseTool,
@@ -1984,7 +1995,24 @@ async function main() {
   downloadAttachments = createDownloadAttachments({
     config, db, dbWrite, inboxDir: INBOX_DIR, logger: console,
   });
-  pm = new ProcessManagerSdk({ ...pmOpts, spawnFn: buildSdkOptions });
+  // 0.10.0: one ProcessManager, holds Process instances (SdkProcess
+  // today; TmuxProcess too in Phase 2). Factory mints the right
+  // subclass per-chat based on config.chats[X].pm. Lifecycle events
+  // (init / close / stream-chunk / result / tool-use / etc.) emit
+  // from each Process; the pm forwards to sdkCallbacks.
+  const processFactory = createProcessFactory({
+    config,
+    spawnFn: buildSdkOptions,
+    db,
+    logger: console,
+  });
+  pm = new ProcessManager({
+    processFactory,
+    db,
+    logger: console,
+    callbacks: sdkCallbacks,
+    budget: cap,
+  });
   // formatConfigInfoText MUST be wired BEFORE createHandleConfigCallback
   // — the latter destructures formatConfigInfoText from its deps at
   // call time and captures the value (closure-by-value). v4 reviewer

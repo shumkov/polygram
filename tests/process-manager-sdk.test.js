@@ -1,21 +1,61 @@
 /**
- * Smoke tests for lib/process-manager-sdk.js.
+ * Smoke tests for the SDK Process + generic ProcessManager combo.
  *
- * Covers the canonical happy paths and a handful of regression
- * scenarios. NOT exhaustive — Phase 1 step 9 will port the existing
- * 47+ pm tests via the fakeQuery harness in a follow-up commit.
+ * Pre-0.10.0: tested the monolithic `ProcessManagerSdk` class.
+ * 0.10.0: the same scenarios test SdkProcess (per-Process mechanics)
+ * via a generic ProcessManager + processFactory. Test surface is
+ * almost identical because the public method signatures match.
+ *
+ * Notable differences vs the old test set:
+ *   - constructor signature changed
+ *   - `entry.sessionId` → `process.claudeSessionId`
+ *   - `injectUserMessage` returns false on invalid content (was throw)
+ *     per R1-F1 audit finding
  */
 
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 
+const { ProcessManager } = require('../lib/process-manager');
+const { createProcessFactory } = require('../lib/process/factory');
 const {
-  ProcessManagerSdk,
   extractAssistantText,
   sumUsage,
   makeInputController,
-} = require('../lib/sdk/process-manager');
+} = require('../lib/process/sdk-process');
 const { makeFakeQuery } = require('./_helpers/fake-query');
+
+// Helper: build the pm the same way polygram.js does. Accepts both
+// flat callback fields (legacy test style: `onInit: fn`) AND a
+// `callbacks: { onInit: fn }` object. Internal aggregator merges
+// them — tests don't need to change shape.
+const CALLBACK_NAMES = [
+  'onInit', 'onClose', 'onResult', 'onStreamChunk', 'onToolUse',
+  'onAssistantMessageStart', 'onAutonomousAssistantMessage',
+  'onCompactBoundary', 'onQueueDrop', 'onThinking', 'onError',
+];
+function buildPm(opts) {
+  const callbacks = { ...(opts.callbacks || {}) };
+  for (const k of CALLBACK_NAMES) {
+    if (typeof opts[k] === 'function') callbacks[k] = opts[k];
+  }
+  const { spawnFn, db, logger, queryCloseTimeoutMs, queueCap, cap = 10 } = opts;
+  const processFactory = createProcessFactory({
+    config: { chats: {}, bot: {} },
+    spawnFn,
+    db,
+    logger,
+    queueCap,
+    queryCloseTimeoutMs,
+  });
+  return new ProcessManager({
+    processFactory,
+    db,
+    logger,
+    callbacks,
+    budget: cap,
+  });
+}
 
 function mockDb() {
   const events = [];
@@ -248,7 +288,7 @@ describe('ProcessManagerSdk — basic happy path', () => {
   beforeEach(() => {
     fq = makeFakeQuery();
     db = mockDb();
-    pm = new ProcessManagerSdk({
+    pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -263,7 +303,7 @@ describe('ProcessManagerSdk — basic happy path', () => {
     const entry = await pm.getOrSpawn('chat-1');
     fq.emitEvent({ type: 'system', subtype: 'init', session_id: 'sess-1' });
     await new Promise((r) => setImmediate(r));
-    assert.equal(entry.sessionId, 'sess-1');
+    assert.equal(entry.claudeSessionId, 'sess-1');
 
     const promise = pm.send('chat-1', 'hi');
     await new Promise((r) => setImmediate(r));
@@ -344,7 +384,7 @@ describe('ProcessManagerSdk — injectUserMessage (rc.42 native autosteer)', () 
   beforeEach(() => {
     fq = makeFakeQuery();
     db = mockDb();
-    pm = new ProcessManagerSdk({
+    pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -407,13 +447,16 @@ describe('ProcessManagerSdk — injectUserMessage (rc.42 native autosteer)', () 
     assert.equal(ok, false);
   });
 
-  test('throws TypeError when content is missing or non-string', async () => {
+  test('returns false when content is missing or non-string (R1-F1: never throws on hot path)', async () => {
+    // 0.10.0: changed from throw TypeError to return-false per R1-F1
+    // audit. autosteer's call site has no try/catch; throwing would
+    // crash the message handler. Invalid content → silent no-op.
     await pm.getOrSpawn('chat-4');
     fq.emitEvent({ type: 'system', subtype: 'init', session_id: 's4' });
     await new Promise((r) => setImmediate(r));
-    assert.throws(() => pm.injectUserMessage('chat-4', {}), /content.*required/);
-    assert.throws(() => pm.injectUserMessage('chat-4', { content: '' }), /content.*required/);
-    assert.throws(() => pm.injectUserMessage('chat-4', { content: 42 }), /content.*required/);
+    assert.equal(pm.injectUserMessage('chat-4', {}), false);
+    assert.equal(pm.injectUserMessage('chat-4', { content: '' }), false);
+    assert.equal(pm.injectUserMessage('chat-4', { content: 42 }), false);
   });
 
   test('returns false when entry is closed', async () => {
@@ -454,7 +497,7 @@ describe('ProcessManagerSdk — rc.45 multi-segment same-bubble streaming', () =
     fq = makeFakeQuery();
     chunks = [];
     messageStarts = 0;
-    pm = new ProcessManagerSdk({
+    pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -871,7 +914,7 @@ describe('ProcessManagerSdk — interrupt + drainQueue (D8)', () => {
 
   beforeEach(() => {
     fq = makeFakeQuery();
-    pm = new ProcessManagerSdk({
+    pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -913,7 +956,7 @@ describe('ProcessManagerSdk — interrupt + drainQueue (D8)', () => {
   test('warm-Query after interrupt: pm.has stays true, no respawn', async () => {
     let spawnCount = 0;
     const fq2 = makeFakeQuery();
-    const pm2 = new ProcessManagerSdk({
+    const pm2 = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => { spawnCount += 1; return fq2.query; },
@@ -965,7 +1008,7 @@ describe('ProcessManagerSdk — interrupt + drainQueue (D8)', () => {
     // Stronger version of the above: verify the actual SDKUserMessage
     // arrives on the SAME inputController that served the first turn.
     const fq2 = makeFakeQuery();
-    const pm2 = new ProcessManagerSdk({
+    const pm2 = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq2.query,
@@ -1014,7 +1057,7 @@ describe('ProcessManagerSdk — mid-session config (D3, D4)', () => {
 
   beforeEach(() => {
     fq = makeFakeQuery();
-    pm = new ProcessManagerSdk({
+    pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1055,7 +1098,7 @@ describe('ProcessManagerSdk — subagent filter (Phase 1 step 7)', () => {
   beforeEach(() => {
     fq = makeFakeQuery();
     chunks = [];
-    pm = new ProcessManagerSdk({
+    pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1097,7 +1140,7 @@ describe('ProcessManagerSdk — subagent filter (Phase 1 step 7)', () => {
   test('subagent tool_use does NOT fire onToolUse', async () => {
     const tools = [];
     const localFq = makeFakeQuery();
-    const localPm = new ProcessManagerSdk({
+    const localPm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => localFq.query,
@@ -1135,7 +1178,7 @@ describe('ProcessManagerSdk — subagent filter (Phase 1 step 7)', () => {
 
   test('subagent usage does NOT count toward turn token metrics', async () => {
     const localFq = makeFakeQuery();
-    const localPm = new ProcessManagerSdk({
+    const localPm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => localFq.query,
@@ -1186,7 +1229,7 @@ describe('ProcessManagerSdk — subagent filter (Phase 1 step 7)', () => {
   test('subagent text + tool_use do NOT trigger fireFirstStream', async () => {
     const localFq = makeFakeQuery();
     let firstStreamFired = false;
-    const localPm = new ProcessManagerSdk({
+    const localPm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => localFq.query,
@@ -1255,7 +1298,7 @@ describe('ProcessManagerSdk — rc.47 autonomous assistant messages (no head pen
     chunks = [];
     autonomous = [];
     messageStarts = 0;
-    pm = new ProcessManagerSdk({
+    pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1393,7 +1436,7 @@ describe('ProcessManagerSdk — rc.47 autonomous assistant messages (no head pen
     // event MUST NOT throw. Important for tests that don't care +
     // for backward compat with pre-rc.47 callers.
     const fq2 = makeFakeQuery();
-    const pm2 = new ProcessManagerSdk({
+    const pm2 = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq2.query,
@@ -1438,7 +1481,7 @@ describe('ProcessManagerSdk — rc.46 kill preserves session_id (/reload primiti
       clearSessionId: (key) => cleared.push(key),
     };
     const fq = makeFakeQuery();
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1459,7 +1502,7 @@ describe('ProcessManagerSdk — rc.46 kill preserves session_id (/reload primiti
 
   test('pm.kill drains pending turns with KILLED code', async () => {
     const fq = makeFakeQuery();
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1486,7 +1529,7 @@ describe('ProcessManagerSdk — resetSession (G9 primitive)', () => {
   // resetSession promises to its caller.
 
   test('unknown session returns no-op result', async () => {
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => makeFakeQuery().query,
@@ -1500,7 +1543,7 @@ describe('ProcessManagerSdk — resetSession (G9 primitive)', () => {
 
   test('drains pending queue with RESET_SESSION code', async () => {
     const fq = makeFakeQuery();
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1524,7 +1567,7 @@ describe('ProcessManagerSdk — resetSession (G9 primitive)', () => {
 
   test('closes the Query and removes from procs map', async () => {
     const fq = makeFakeQuery();
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1549,7 +1592,7 @@ describe('ProcessManagerSdk — resetSession (G9 primitive)', () => {
       clearSessionId: (key) => cleared.push(key),
     };
     const fq = makeFakeQuery();
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1571,7 +1614,7 @@ describe('ProcessManagerSdk — resetSession (G9 primitive)', () => {
       clearSessionId: () => { throw new Error('db locked'); },
     };
     const fq = makeFakeQuery();
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1591,7 +1634,7 @@ describe('ProcessManagerSdk — resetSession (G9 primitive)', () => {
   test('logs session-reset telemetry event', async () => {
     const events = [];
     const fq = makeFakeQuery();
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1615,7 +1658,7 @@ describe('ProcessManagerSdk — resetSession (G9 primitive)', () => {
   test('signals parked LRU waiter so a new spawn unparks', async () => {
     const fqs = [makeFakeQuery(), makeFakeQuery(), makeFakeQuery()];
     let idx = 0;
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fqs[idx++].query,
@@ -1645,7 +1688,7 @@ describe('ProcessManagerSdk — resetSession (G9 primitive)', () => {
 
   test('idempotent: second resetSession on same key is a no-op', async () => {
     const fq = makeFakeQuery();
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1671,7 +1714,7 @@ describe('ProcessManagerSdk — LRU eviction (G14)', () => {
     const fqs = [makeFakeQuery(), makeFakeQuery(), makeFakeQuery()];
     let spawnIdx = 0;
     const events = [];
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fqs[spawnIdx++].query,
@@ -1711,7 +1754,7 @@ describe('ProcessManagerSdk — LRU eviction (G14)', () => {
   test('in-flight entry is NOT evicted; idle one with later lastUsedTs is', async () => {
     const fqs = [makeFakeQuery(), makeFakeQuery(), makeFakeQuery()];
     let spawnIdx = 0;
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fqs[spawnIdx++].query,
@@ -1747,7 +1790,7 @@ describe('ProcessManagerSdk — LRU eviction (G14)', () => {
     const fqs = [makeFakeQuery(), makeFakeQuery(), makeFakeQuery()];
     let spawnIdx = 0;
     const events = [];
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fqs[spawnIdx++].query,
@@ -1790,7 +1833,7 @@ describe('ProcessManagerSdk — LRU eviction (G14)', () => {
     fqs[0].query.close = () => new Promise(() => {});
 
     const events = [];
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 25,                           // tight for the test
       spawnFn: () => fqs[spawnIdx++].query,
@@ -1821,7 +1864,7 @@ describe('ProcessManagerSdk — LRU eviction (G14)', () => {
   test('shutdown signals all parked LRU waiters with rejection', async () => {
     const fqs = [makeFakeQuery(), makeFakeQuery(), makeFakeQuery()];
     let spawnIdx = 0;
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fqs[spawnIdx++].query,
@@ -1856,7 +1899,7 @@ describe('ProcessManagerSdk — onThinking (rc.29 extended-thinking signal)', ()
   test('fires onThinking on first content_block_start type=thinking', async () => {
     const fq = makeFakeQuery();
     const calls = [];
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1900,7 +1943,7 @@ describe('ProcessManagerSdk — onThinking (rc.29 extended-thinking signal)', ()
   test('subsequent thinking blocks do NOT re-fire onThinking (idempotent)', async () => {
     const fq = makeFakeQuery();
     const calls = [];
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1938,7 +1981,7 @@ describe('ProcessManagerSdk — onThinking (rc.29 extended-thinking signal)', ()
   test('non-thinking stream_events do NOT fire onThinking', async () => {
     const fq = makeFakeQuery();
     const calls = [];
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -1982,7 +2025,7 @@ describe('ProcessManagerSdk — onThinking (rc.29 extended-thinking signal)', ()
   test('next turn re-arms thinkingFired (fires once per pending)', async () => {
     const fq = makeFakeQuery();
     const calls = [];
-    const pm = new ProcessManagerSdk({
+    const pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
@@ -2038,7 +2081,7 @@ describe('ProcessManagerSdk — compact_boundary (D6 / §5)', () => {
   beforeEach(() => {
     fq = makeFakeQuery();
     boundaries = [];
-    pm = new ProcessManagerSdk({
+    pm = buildPm({
       cap: 2,
       queryCloseTimeoutMs: 100,
       spawnFn: () => fq.query,
