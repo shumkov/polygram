@@ -47,7 +47,7 @@ async function killTmuxSession(name) {
 
 // ─── Harness ─────────────────────────────────────────────────────────
 
-async function setupRealTui(label) {
+async function setupRealTui(label, opts = {}) {
   const runner = createTmuxRunner({ logger: console });
   const cwd = path.resolve(process.cwd());
 
@@ -60,7 +60,7 @@ async function setupRealTui(label) {
     botName: 'spike',
     logger: SILENT,
     readyTimeoutMs: 60_000,
-    turnTimeoutMs: 120_000,
+    turnTimeoutMs: opts.turnTimeoutMs ?? 120_000,
   });
 
   const events = [];
@@ -705,25 +705,41 @@ S('L5', 'distinct-replies-no-cross-attribution', async () => {
 
 /** L6: production trace 2026-05-16 00:30:21 showed a turn going
  *  THINKING → CODING → STALL at 00:31:06 (~50s in CODING with no
- *  completion). The agent was stuck on tool execution. Test that
- *  polygram handles a long-running tool turn gracefully — no
- *  empty replies, no premature resolution, reactor cascades
- *  THINKING → CODING → STALL → FREEZE as designed. Slow scenario
- *  (~4 min); tag 'slow' so it's opt-in. */
+ *  completion). The reactor's STALL threshold is 45s
+ *  (lib/telegram/reactions.js DEFAULT_STALL_MS). The agent was
+ *  stuck on tool execution for >45s.
+ *
+ *  This spike test exercises TmuxProcess directly (not the reactor),
+ *  verifying that a long-running tool turn STILL returns non-empty
+ *  reply text, resolves via JSONL (not capture-pane fallback), and
+ *  emits a single result event. If TmuxProcess handles a 60s tool
+ *  turn cleanly, the production stall is purely a reactor-level
+ *  visual concern (which is by design — STALL is a UX warning,
+ *  not an abort).
+ *
+ *  60s sleep > 45s STALL threshold; fits in the spike's 120s default
+ *  turnTimeoutMs with margin. */
 S('L6 slow', 'long-tool-turn-stall-handling', async () => {
-  const { p, events, cleanup } = await setupRealTui('l6');
+  // Bump turn timeout to 180s for headroom over the 60s wait +
+  // model think time.
+  const { p, events, cleanup } = await setupRealTui('l6', { turnTimeoutMs: 180_000 });
   try {
-    // sleep 200 makes the tool execute long enough to cross the
-    // 180s STALL auto-promote threshold. Adjust the test's
-    // turnTimeoutMs override below to match.
-    const sendP = p.send('Run `sleep 200 && echo TOOLDONE-L6` with Bash, then reply ONLY with "L6OK".');
-    // We expect this to complete in ~200-220s. Bumped turnTimeout
-    // in the helper covers this.
+    // python3 time.sleep avoids the CLI's `sleep N && cmd` block
+    // (CLAUDE.md anti-pattern). 60s > 45s reactor STALL threshold.
+    const sendP = p.send('Run this exact Bash command and wait for it: `python3 -c "import time; time.sleep(60); print(\'TOOLDONE-L6\')"`. After the command finishes, reply ONLY with "L6OK" (no other text).');
     const res = await sendP;
     ok(typeof res.text === 'string' && res.text.length > 0,
       `long-tool turn returned non-empty text (got ${JSON.stringify(res.text?.slice(0,80))})`);
     ok(/L6OK/i.test(res.text || ''),
       `long-tool turn reply contains L6OK (got ${JSON.stringify(res.text?.slice(0,80))})`);
+    // Exactly one result event (no spurious mid-turn resolves).
+    const resultEvents = events.filter((e) => e.name === 'result');
+    ok(resultEvents.length === 1,
+      `single result event for a long-tool turn (got ${resultEvents.length})`);
+    // Tool actually executed (tool-use event fired).
+    const toolUses = events.filter((e) => e.name === 'tool-use');
+    ok(toolUses.length >= 1,
+      `tool-use event fired during long-tool turn (got ${toolUses.length})`);
     assertInvariants(events);
   } finally { await cleanup(); }
 });
