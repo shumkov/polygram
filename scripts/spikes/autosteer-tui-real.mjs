@@ -730,16 +730,21 @@ S('L6 slow', 'long-tool-turn-stall-handling', async () => {
 
 // ── L7: setMessageReaction call rate under autosteer storm ───────────
 //
-// L7 is fundamentally a polygram.js concern, not a TmuxProcess one
-// (the rate-limit events are logged by the tg() wrapper in
-// polygram.js, not by TmuxProcess). So a SPIKE can't directly catch
-// the rate-limit storm. What we CAN check: the TmuxProcess-level
-// signal volume (extra-turn-started events per second) under autosteer
-// storm. If it stays high, the downstream reaction calls will too —
-// the rate-limit is just a symptom.
+// L7 root cause (found 2026-05-16, polygram side):
+//   `lib/autosteered-refs.js` `clear(sessionKey)` runs
+//      for (const ref of list) { await applyClear(ref); }
+//   at turn-end. Each applyClear is a setMessageReaction([]) call to
+//   Telegram. With N autosteers folded into one turn, that's N
+//   back-to-back calls. Telegram's setMessageReaction limit is
+//   ~5/sec/chat — N≥6 trips the rate-limit storm visible in
+//   production traces.
 //
-// This scenario primarily exists to document the storm pattern and
-// serve as a fast-iteration harness for any future coalescing fix.
+//   The TmuxProcess-level signal that predicts the storm volume is
+//   the count of `autosteer-resolution` events per turn (one per
+//   msgId regardless of fold/new-turn). This scenario captures that
+//   count under a 6-autosteer burst so any future coalescing fix
+//   (batched reaction-clear, rate-limited apply loop) has a
+//   reproducible harness to verify against.
 
 S('L7', 'autosteer-storm-event-rate', async () => {
   const { p, events, cleanup } = await setupRealTui('l7');
@@ -759,18 +764,22 @@ S('L7', 'autosteer-storm-event-rate', async () => {
     await waitForAllResolutions(events, msgIds, 120_000);
     await sleep(800);
 
-    // Count extra-turn-started events. Each one triggers a
-    // setMessageReaction in polygram.js → potential rate-limit.
-    // Under the rate-limit threshold (~5 calls/sec to Telegram for
-    // setMessageReaction), 6 within ~2s is borderline. The fix
-    // candidate (coalesce reactions) would reduce these but for
-    // now we just count and document.
+    // The reaction-storm metric: count of autosteer-resolution
+    // events for the burst. Each one corresponds to a
+    // setMessageReaction([]) call in autosteeredRefs.clear() at
+    // turn-end, fired sequentially. >5 within ~1s = production
+    // rate-limit storm vector.
+    const resolutions = events.filter(
+      (e) => e.name === 'autosteer-resolution' && msgIds.includes(e.payload?.msgId),
+    );
     const startedEvents = events.filter((e) => e.name === 'extra-turn-started');
-    log(`L7: ${startedEvents.length} extra-turn-started events fired`);
-    // Just an INFO assertion: this is the volume polygram.js would
-    // see when computing reactions.
-    ok(startedEvents.length >= 1,
-      `at least one extra-turn-started fired (got ${startedEvents.length})`);
+    log(`L7: ${resolutions.length} autosteer-resolutions, ${startedEvents.length} extra-turn-starteds for ${msgIds.length} autosteers`);
+
+    // Invariant: every msgId resolves exactly once. Fold OR new-turn,
+    // each msgId must produce exactly one autosteer-resolution. The
+    // count == msgIds.length is what drives the storm volume.
+    ok(resolutions.length === msgIds.length,
+      `each autosteered msgId resolves exactly once (got ${resolutions.length} resolutions for ${msgIds.length} msgIds)`);
     assertInvariants(events, { autosteeredMsgIds: msgIds });
   } finally { await cleanup(); }
 });
