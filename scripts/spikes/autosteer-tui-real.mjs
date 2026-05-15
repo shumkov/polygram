@@ -106,7 +106,15 @@ function fail(label) {
 }
 function ok(cond, label) { cond ? pass(label) : fail(label); return cond; }
 function notFired(events, name, label) {
-  return ok(!events.some((e) => e.name === name), `${label} (no '${name}')`);
+  const fired = events.filter((e) => e.name === name);
+  const passed = fired.length === 0;
+  if (!passed && name === 'autosteer-match-miss') {
+    console.error(`  [match-miss detail] ${fired.length} event(s):`);
+    for (const e of fired.slice(0, 5)) {
+      console.error(`    payload: ${JSON.stringify(e.payload)}`);
+    }
+  }
+  return ok(passed, `${label} (no '${name}')`);
 }
 
 async function waitForResolution(events, msgId, timeoutMs = 60_000) {
