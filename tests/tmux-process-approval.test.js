@@ -22,6 +22,33 @@ const APPROVAL_CAPTURE = [
   '❯ ',
 ].join('\n');
 
+// Production TUI rendering as observed on shumorobot 2026-05-15:
+// the ❯ selection cursor is rendered INLINE before the highlighted
+// option ("❯ 1. Yes"), not on a separate line at the bottom. This
+// fixture must stay byte-faithful to the real capture-pane output —
+// it's the regression that rc.5 fixes (rc.1–rc.4 regex assumed no
+// inline cursor, so every approval-gated tool call deadlocked in
+// the TUI without ever reaching Telegram).
+const APPROVAL_CAPTURE_INLINE_CURSOR = [
+  '⏺ Bash(./bin/dl "https://www.youtube.com/watch?v=abc" ~/Downloads/Music 2>&1)',
+  '  ⎿  Waiting…',
+  '',
+  '────────────────────────────────────────────────────────────',
+  ' Bash command',
+  '',
+  '   ./bin/dl "https://www.youtube.com/watch?v=abc" ~/Downloads/Music 2>&1',
+  '   Download YouTube track to Downloads/Music',
+  '',
+  ' This command requires approval',
+  '',
+  ' Do you want to proceed?',
+  ' ❯ 1. Yes',
+  '   2. Yes, and don’t ask again for: ./bin/dl *',
+  '   3. No',
+  '',
+  ' Esc to cancel · Tab to amend',
+].join('\n');
+
 const READY_CAPTURE = 'welcome\n? for shortcuts';
 
 function makeFakeRunner({ captureSequence } = {}) {
@@ -104,6 +131,35 @@ describe('TmuxProcess approval — detection', () => {
     assert.equal(ev.backend, 'tmux');
     assert.equal(typeof ev.respond, 'function');
     // Settle the lingering turn poll. Respond to release it.
+    await ev.respond('allow');
+    await turnPromise;
+  });
+
+  test('emits approval-required for production TUI rendering with inline ❯ cursor', async () => {
+    // REGRESSION: rc.1-rc.4 regex required `\s*1\.` directly after a
+    // newline, but the real TUI renders the selection cursor inline:
+    //   " ❯ 1. Yes"
+    // The ❯ breaks the [\s\S]{0,400}?(?:^|\n)\s*1\.\s+ chain — once
+    // [\s\S] consumes past the `\n`, only one [^\S\n]* space matches
+    // before `1.`, but the next char is `❯`, not `1`. Symptom: every
+    // approval-gated tool call in shumorobot hung in the TUI for
+    // 8m+ until orphan-sweep killed the session, NEVER surfacing
+    // to Telegram. Discovered via shumorobot--1003807211164-3 stuck
+    // on ./bin/dl after rc.4 deploy.
+    const runner = makeFakeRunner({
+      captureSequence: [READY_CAPTURE, APPROVAL_CAPTURE_INLINE_CURSOR],
+    });
+    const p = makeProc(runner);
+    p.tmuxName = 'polygram-test';
+    const fired = new Promise((resolve) => p.once('approval-required', resolve));
+    const turnPromise = p._awaitTurnComplete({ timeoutMs: 1000 }).catch(() => null);
+    const ev = await Promise.race([
+      fired,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('approval-required not emitted — inline ❯ cursor broke detection')), 500)),
+    ]);
+    assert.equal(ev.toolName, 'Bash');
+    assert.match(ev.toolInput, /bin\/dl/);
+    assert.equal(ev.backend, 'tmux');
     await ev.respond('allow');
     await turnPromise;
   });
