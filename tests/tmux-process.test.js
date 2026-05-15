@@ -130,6 +130,44 @@ describe('TmuxProcess.start', () => {
     assert.ok(!spawn.args.includes('--dangerously-skip-permissions'));
   });
 
+  test('REGRESSION (rc.1 incident): topic config overrides chat config (agent/cwd/model/effort)', async () => {
+    // Music topic in shumorobot has agent=music-curation:music-curator
+    // + cwd=/Users/ivanshumkov/Music/rekordbox while chat-level is
+    // agent=shumabit + cwd=/Users/ivanshumkov. Pre-fix, TmuxProcess
+    // used chat-level only → TUI spawned with wrong agent and didn't
+    // signal ready in 30s. Mirror SDK's getTopicConfig merge.
+    const runner = makeFakeRunner({ captureWide: async () => '? for shortcuts' });
+    const p = makeTmuxProcess(runner);
+    await p.start({
+      threadId: '3',
+      chatConfig: {
+        model: 'haiku',         // chat-level (should be overridden)
+        effort: 'low',
+        cwd: '/Users/ivanshumkov',
+        agent: 'shumabit',
+        topics: {
+          3: {
+            name: 'Music',
+            model: 'sonnet',       // topic override
+            effort: 'high',
+            cwd: '/Users/ivanshumkov/Music/rekordbox',
+            agent: 'music-curation:music-curator',
+          },
+        },
+      },
+    });
+    const spawn = runner._calls.find((c) => c.kind === 'spawn');
+    assert.equal(spawn.cwd, '/Users/ivanshumkov/Music/rekordbox',
+      'topic cwd must override chat cwd');
+    assert.ok(spawn.args.includes('sonnet'), 'topic model must override');
+    assert.ok(spawn.args.includes('high'), 'topic effort must override');
+    assert.ok(spawn.args.includes('--agent'));
+    assert.ok(spawn.args.includes('music-curation:music-curator'),
+      'topic agent must override chat agent');
+    assert.ok(!spawn.args.includes('shumabit'),
+      'chat-level shumabit agent must NOT leak through when topic overrides');
+  });
+
   test('pulls model/effort/cwd from chatConfig when not on ctx', async () => {
     const runner = makeFakeRunner({ captureWide: async () => '? for shortcuts' });
     const p = makeTmuxProcess(runner);
