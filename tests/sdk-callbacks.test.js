@@ -69,6 +69,10 @@ describe('createSdkCallbacks — factory contract', () => {
       // rc.7 + rc.9 additions — tmux backend NEW-TURN autosteer
       // visual bridge:
       'onExtraTurnStarted', 'onExtraTurnReply',
+      // rc.11.1 observability — autosteer resolution / match-miss
+      // events so post-hoc diagnosis of autosteer regressions is
+      // possible without re-running with live capture-pane.
+      'onAutosteerResolution', 'onAutosteerMatchMiss',
     ]) {
       assert.equal(typeof cbs[k], 'function', `${k} should be a function`);
     }

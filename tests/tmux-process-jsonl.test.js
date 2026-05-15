@@ -720,6 +720,79 @@ describe('TmuxProcess — JSONL session-log path', () => {
     } finally { env.cleanup(); }
   });
 
+  test('rc.11.1 REGRESSION: autosteer NEW TURN works for multi-line content (pasteText \\n → / oneLine transform)', async () => {
+    // Pre-rc.11.1: _pendingAutosteers stored content AS-IS (with \n).
+    // But TmuxRunner.pasteText() normalises \r?\n → ' / ' before
+    // pasting into the TUI, and the JSONL queue-operation/user
+    // entries record the post-paste oneLine form. Match-by-content
+    // always failed for multi-line prompts → NEW-TURN extra-turn-
+    // started/reply never fired → the second-turn reply leaked
+    // through autonomous-wakeup-message instead of being routed
+    // back to the autosteered msgId. Ivan caught this on
+    // shumorobot 2026-05-15 — every polygram prompt is multi-line
+    // (the <polygram-info> wrapper has newlines), so this was a
+    // 100%-broken path in production.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = 'aabbccdd-aaaa-bbbb-cccc-dddddddddddd';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      // Multi-line autosteer content — what real polygram prompts
+      // look like (wrapped with <polygram-info>...</polygram-info>).
+      const multiLineContent = '<polygram-info>line1\nline2\nline3</polygram-info>\n\n<channel>foo</channel>';
+      const autosteeredMsgId = 686;
+      const extraReplies = [];
+      p.on('extra-turn-reply', (ev) => extraReplies.push(ev));
+
+      const sendP = p.send('primary turn');
+      await sleep(20);
+      // Inject the multi-line autosteer. Internally, pasteText would
+      // transform \n → ' / ' before sending to the TUI; the JSONL
+      // queue-operation/user records the oneLine form too.
+      assert.equal(
+        p.injectUserMessage({ content: multiLineContent, msgId: autosteeredMsgId }),
+        true,
+      );
+
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      // Primary turn 1 completes (short, no tools).
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: { content: [{ type: 'text', text: '👍' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      await sendP;
+
+      // TUI dequeues the autosteer as a NEW user turn. The content
+      // is the ONELINE form (' / ' separators), matching what
+      // pasteText put into the TUI.
+      const oneLineForm = multiLineContent.replace(/\r?\n/g, ' / ');
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'user',
+        sessionId,
+        message: { role: 'user', content: oneLineForm },
+      }) + '\n');
+      await sleep(20);
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: { content: [{ type: 'text', text: 'extra-reply content' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      await sleep(80);
+
+      assert.equal(extraReplies.length, 1,
+        'rc.11.1: extra-turn-reply MUST fire for multi-line autosteer (was 0/100% broken pre-rc.11.1)');
+      assert.equal(extraReplies[0].msgId, autosteeredMsgId);
+      assert.match(extraReplies[0].text, /extra-reply content/);
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
   test('autosteer NEW TURN path: dequeued user-message triggers second-turn extraction; emits extra-turn-reply with correct msgId', async () => {
     const env = setupTempCwd();
     try {
