@@ -643,7 +643,9 @@ describe('TmuxProcess — JSONL session-log path', () => {
       const autosteeredContent = 'and this https://discogs/release/abc';
       const autosteeredMsgId = 658;
       const extraReplies = [];
+      const extraStarts = [];
       p.on('extra-turn-reply', (ev) => extraReplies.push(ev));
+      p.on('extra-turn-started', (ev) => extraStarts.push(ev));
 
       const sendP = p.send('download https://youtube/foo');
       await sleep(20);
@@ -695,6 +697,15 @@ describe('TmuxProcess — JSONL session-log path', () => {
         'extra-turn-reply must carry the autosteered msgId so polygram routes the reply correctly');
       assert.ok(extraReplies[0].text.includes('Neon Affair'),
         'extra-turn-reply text must be the second turn\'s assistant reply');
+      // rc.9: extra-turn-started fires the MOMENT the queue-dequeue
+      // user message is seen — gives polygram a hook to re-engage
+      // typing indicator + ✍ reaction during turn 2 (was getting
+      // cleared by clearAutosteeredReactions when primary turn 1
+      // succeeded, leaving a silent gap in shumorobot Ivan flagged).
+      assert.equal(extraStarts.length, 1,
+        'NEW TURN path must emit exactly one extra-turn-started');
+      assert.equal(extraStarts[0].msgId, autosteeredMsgId,
+        'extra-turn-started must carry the autosteered msgId');
       await p.kill('done');
     } finally { env.cleanup(); }
   });
