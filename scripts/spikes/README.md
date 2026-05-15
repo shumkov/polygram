@@ -15,7 +15,18 @@ node scripts/spikes/auth-expired.mjs          # G5 — auth UX (DESTRUCTIVE: rev
 node scripts/spikes/boot-replay.mjs           # G6 — kill mid-turn + restart (DAEMON ONLY)
 node scripts/spikes/subagent-task.mjs         # G7 — Task tool subagent + parent_tool_use_id
 node scripts/spikes/session-resume.mjs        # G12 — resume after restart
+node scripts/spikes/autosteer-tui-real.mjs    # rc.14 gate — real claude TUI autosteer
 ```
+
+`autosteer-tui-real.mjs` exists alongside the fast scenario suite
+in `tests/autosteer-scenarios.test.js`. The fast suite uses a TUI
+simulator (deterministic, runs in CI, no token cost). The spike
+checks the simulator's FIDELITY against a real claude TUI:
+spawns tmux + claude, drives the same dialog patterns, asserts
+the polygram-level event chain (`autosteer-resolution`,
+`extra-turn-started`/`reply`, no `autosteer-match-miss`). Cost
+~$0.10/run. Run before each rc tag that touches autosteer,
+tmux-process, or tmux-runner.
 
 Conventions:
 
