@@ -215,12 +215,103 @@ describe('TmuxProcess — JSONL session-log path', () => {
       }) + '\n');
 
       const res = await sendP;
-      // Note: first stop_reason was tool_use; result event for it resolves the
-      // race. text may be partial. Verify tools captured + numToolUses tracked.
+      // rc.11 update: the first stop_reason='tool_use' is NON-TERMINAL
+      // and no longer resolves the turn — pm.send waits for
+      // 'end_turn'. So res.text reflects the FULL accumulated text
+      // ("OK\n\nDone.") rather than the partial "OK" we'd see if the
+      // turn had resolved early.
       assert.ok(tools.includes('Bash'));
       assert.ok(res.metrics.numToolUses >= 1);
+      assert.match(res.text, /Done\./, 'rc.11: pm.send waits past intermediate tool_use stop_reason and includes the post-tool text');
       await p.kill('done');
     } finally { env.cleanup(); }
+  });
+
+  test('rc.11 REGRESSION: pm.send does NOT resolve on stop_reason=tool_use (intermediate); waits for end_turn', async () => {
+    // Ivan caught this on shumorobot 2026-05-15 (msg 681 "how many
+    // folders" → 18:23:44 tool_use → reactor cleared → 14s of silent
+    // gap → reply landed via autonomous-wakeup at 18:23:58). Pre-rc.11
+    // the parser's synthesized 'result' event for stop_reason='tool_use'
+    // resolved _turnState and pm.send returned with empty text + 1
+    // numToolUses, so polygram's tool-only-completion branch fired
+    // and cleared reactions while the agent was STILL processing.
+    // This test pins the fix: intermediate tool_use does NOT end
+    // the turn; only end_turn (or another terminal stop_reason) does.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = 'aabbccdd-1111-2222-3333-eeeeeeeeeeee';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'haiku', effort: 'low', cwd: env.cwd },
+      });
+
+      let sendResolved = false;
+      const sendP = p.send('list folders').then((r) => { sendResolved = true; return r; });
+      await sleep(20);
+
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      // Step 1: intermediate tool_use — must NOT resolve pm.send.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Bash', input: { command: 'ls' } },
+          ],
+          stop_reason: 'tool_use',
+        },
+      }) + '\n');
+      await sleep(80);
+      assert.equal(sendResolved, false,
+        'pm.send MUST NOT resolve on intermediate tool_use — pre-rc.11 it did, causing the 14s reaction-gap regression');
+
+      // Step 2: terminal end_turn — must resolve pm.send.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: { content: [{ type: 'text', text: '2 folders.' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      const res = await sendP;
+      assert.equal(sendResolved, true);
+      assert.match(res.text, /2 folders/,
+        'pm.send returns the FINAL terminal-turn text, not the empty intermediate state');
+      assert.equal(res.metrics.numToolUses, 1);
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
+  test('rc.11: max_tokens and stop_sequence ARE terminal — pm.send resolves', async () => {
+    // Defensive: only 'tool_use' is non-terminal; other stop_reasons
+    // (max_tokens, stop_sequence, refusal) end the turn cleanly.
+    for (const stop of ['max_tokens', 'stop_sequence']) {
+      const env = setupTempCwd();
+      try {
+        const runner = makeRunner();
+        const p = makeProc(runner, { turnTimeoutMs: 3000 });
+        const sessionId = 'aabbccdd-1111-2222-3333-eeeeeeeeeee' + (stop === 'max_tokens' ? '1' : '2');
+        await p.start({
+          existingSessionId: sessionId,
+          chatConfig: { model: 'haiku', effort: 'low', cwd: env.cwd },
+        });
+        const sendP = p.send('terse');
+        await sleep(20);
+        const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+        fs.appendFileSync(logPath, JSON.stringify({
+          type: 'assistant',
+          sessionId,
+          message: {
+            content: [{ type: 'text', text: 'truncated' }],
+            stop_reason: stop,
+          },
+        }) + '\n');
+        const res = await sendP;
+        assert.match(res.text, /truncated/,
+          `${stop} is terminal — pm.send must resolve and return the text`);
+        await p.kill('done');
+      } finally { env.cleanup(); }
+    }
   });
 
   test('last-prompt acts as fallback turn-complete when no stop_reason fires', async () => {
