@@ -100,6 +100,29 @@ describe('TmuxProcess.start', () => {
     assert.ok(spawn.args.includes('--debug-file'));
   });
 
+  test('spawns with --append-system-prompt carrying the polygram Telegram display hint (parity with SDK)', async () => {
+    // REGRESSION: SDK backend appends POLYGRAM_DISPLAY_HINT to every
+    // agent's systemPrompt (lib/sdk/build-options.js:165). The tmux
+    // backend previously passed only --agent/--model/--effort/cwd and
+    // never told the spawned claude session it was talking to
+    // Telegram. Production symptom (shumorobot 2026-05-15): the agent
+    // emitted shell-style canned strings like "No response requested."
+    // as actual Telegram replies. Cross-backend parity gap.
+    const { POLYGRAM_DISPLAY_HINT } = require('../lib/telegram/display-hint');
+    const runner = makeFakeRunner({ captureWide: async () => '? for shortcuts' });
+    const p = makeTmuxProcess(runner);
+    await p.start({ model: 'sonnet', effort: 'high', cwd: '/work' });
+
+    const spawn = runner._calls.find((c) => c.kind === 'spawn');
+    const flagIdx = spawn.args.indexOf('--append-system-prompt');
+    assert.ok(flagIdx >= 0, '--append-system-prompt flag must be present');
+    const hint = spawn.args[flagIdx + 1];
+    assert.equal(hint, POLYGRAM_DISPLAY_HINT,
+      'flag value must be exactly the polygram display hint, byte-faithful');
+    assert.match(hint, /Telegram/,
+      'sanity: hint must mention Telegram so the model frames replies for the right surface');
+  });
+
   test('--resume <id> when existingSessionId provided', async () => {
     const runner = makeFakeRunner({ captureWide: async () => '? for shortcuts' });
     const p = makeTmuxProcess(runner);
