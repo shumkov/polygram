@@ -89,6 +89,24 @@ The discipline above turns "the CLI just updated and prod broke"
 (reactive, painful) into "we bumped the pin after running 50
 scenarios; here's the release-note diff" (proactive, auditable).
 
+### Open work: hard binary pin (TODO before 0.10.0 final)
+
+The current pin is a `--version` string check at daemon boot —
+better than nothing, but the CLI binary can be auto-updated under
+us between checks. The remaining task is to ensure polygram spawns
+a SPECIFIC binary (not just whatever's first on PATH).
+
+See [`docs/0.10.0-claude-binary-pinning.md`](./docs/0.10.0-claude-binary-pinning.md)
+for the research plan. Tracks options:
+- bundle the binary in the polygram repo
+- `npm-install @anthropic-ai/claude-code@<version>` as a polygram
+  dep and spawn from `node_modules/.bin/claude`
+- a polygram-managed binary cache at `~/.polygram/claude-cache/`
+
+Acceptance: polygram cannot accidentally run against an unpinned
+claude version; a system-wide `claude update` does NOT affect the
+running daemon.
+
 ## Test layers
 
 - `npm test` — fast unit + integration tests, no CLI needed, no
