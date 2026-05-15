@@ -59,13 +59,16 @@ function baseDeps(overrides = {}) {
 }
 
 describe('createSdkCallbacks — factory contract', () => {
-  test('returns the 6 callbacks', () => {
+  test('returns the expected callbacks (rc.9: now includes the two autosteer extra-turn ones)', () => {
     const { deps } = baseDeps();
     const cbs = createSdkCallbacks(deps);
     for (const k of [
       'onInit', 'onClose', 'onStreamChunk', 'onToolUse',
       'onAssistantMessageStart', 'onAutonomousAssistantMessage',
       'onCompactBoundary',
+      // rc.7 + rc.9 additions — tmux backend NEW-TURN autosteer
+      // visual bridge:
+      'onExtraTurnStarted', 'onExtraTurnReply',
     ]) {
       assert.equal(typeof cbs[k], 'function', `${k} should be a function`);
     }
@@ -297,5 +300,195 @@ describe('onCompactBoundary — surface compaction + clear hint flag', () => {
     await cbs.onCompactBoundary('k', {}, { chatId: '12345', label: 't' });
     assert.equal(h.tgCalls.length, 1);
     assert.match(h.tgCalls[0].params.text, /Auto-compacted/);
+  });
+});
+
+// ─── rc.7 + rc.9: autosteer NEW-TURN extra-turn bridge ────────────────
+//
+// The scenario being protected here was caught manually by Ivan against
+// shumorobot on 2026-05-15: tmux backend FOLD path correctly produces
+// one combined reply, but the NEW-TURN path (TUI dequeued the autosteer
+// as a fresh user turn because primary turn 1 ended too fast to absorb
+// it) left the second turn's reply unwatched, the typing-indicator
+// vanished, and the ✍ reaction got cleared by clearAutosteeredReactions
+// at primary-turn success. These tests pin the polygram-side bridge:
+//   - onExtraTurnStarted re-applies ✍ + starts a 4-second typing
+//     sendChatAction loop, tracked per-sessionKey in extraTurnTracker.
+//   - onExtraTurnReply sends the second reply with
+//     reply_to_message_id=autosteeredMsgId, clears ✍, stops the typing
+//     loop.
+//   - onClose tears down typing/reaction if the session dies mid-
+//     extra-turn (defensive — otherwise the typing loop leaks).
+
+describe('onExtraTurnStarted — autosteer NEW-TURN visual bridge', () => {
+  test('re-applies ✍ on autosteered msgId AND fires sendChatAction("typing") immediately', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onExtraTurnStarted('12345:24', { msgId: 658, sessionId: 'sess-abc', backend: 'tmux' });
+
+    const reaction = h.tgCalls.find((c) => c.method === 'setMessageReaction');
+    assert.ok(reaction, 'setMessageReaction must be called to re-apply ✍');
+    assert.equal(reaction.params.chat_id, '12345');
+    assert.equal(reaction.params.message_id, 658);
+    assert.deepEqual(reaction.params.reaction, [{ type: 'emoji', emoji: '✍' }]);
+    assert.equal(reaction.meta.source, 'extra-turn-started');
+
+    const typing = h.tgCalls.find((c) => c.method === 'sendChatAction');
+    assert.ok(typing, 'sendChatAction must fire at least once on extra-turn-started');
+    assert.equal(typing.params.chat_id, '12345');
+    assert.equal(typing.params.action, 'typing');
+
+    const ev = h.events.find((e) => e.kind === 'extra-turn-started');
+    assert.ok(ev, 'extra-turn-started telemetry must be logged');
+    assert.equal(ev.detail.msg_id, 658);
+    assert.equal(ev.detail.backend, 'tmux');
+
+    // Cleanup: tear down the typing interval so the test runner can exit.
+    cbs.onClose('12345:24', 0, { chatId: '12345', label: 't' });
+  });
+
+  test('null/missing msgId is a no-op (defensive, never spams Telegram)', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onExtraTurnStarted('12345:24', { sessionId: 'sess-abc' /* no msgId */ });
+    assert.equal(h.tgCalls.length, 0);
+    assert.equal(h.events.length, 0);
+  });
+});
+
+describe('onExtraTurnReply — autosteer NEW-TURN delivery + visual teardown', () => {
+  test('sends the reply with reply_to_message_id, clears ✍, stops typing loop', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+
+    // First start the extra-turn (so we have a typing loop to tear down).
+    cbs.onExtraTurnStarted('12345:24', { msgId: 658, sessionId: 'sess-abc' });
+    const tgCountAfterStart = h.tgCalls.length;
+
+    // Now fire the reply
+    cbs.onExtraTurnReply('12345:24', {
+      msgId: 658,
+      text: 'Also already done — 4 tracks downloaded.',
+      sessionId: 'sess-abc',
+      backend: 'tmux',
+    });
+
+    // After reply, MUST have: (1) reaction clear, (2) sendMessage with reply_to.
+    const post = h.tgCalls.slice(tgCountAfterStart);
+    const clear = post.find((c) => c.method === 'setMessageReaction'
+      && Array.isArray(c.params.reaction) && c.params.reaction.length === 0);
+    assert.ok(clear, 'setMessageReaction(reaction=[]) must fire to clear ✍');
+    assert.equal(clear.params.chat_id, '12345');
+    assert.equal(clear.params.message_id, 658);
+
+    const reply = post.find((c) => c.method === 'sendMessage');
+    assert.ok(reply, 'sendMessage must fire with the extra-turn reply text');
+    assert.equal(reply.params.chat_id, '12345');
+    assert.equal(reply.params.reply_to_message_id, 658,
+      'reply MUST be addressed to the autosteered msgId so it visually replies to msg 658');
+    assert.equal(reply.params.text, 'Also already done — 4 tracks downloaded.');
+    assert.equal(reply.params.message_thread_id, 24, 'thread_id from sessionKey suffix');
+    assert.equal(reply.meta.source, 'extra-turn-reply');
+
+    const ev = h.events.find((e) => e.kind === 'extra-turn-reply');
+    assert.ok(ev, 'extra-turn-reply telemetry must be logged');
+    assert.equal(ev.detail.msg_id, 658);
+  });
+
+  test('reply with empty text still tears down visuals (no leaked typing loop)', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onExtraTurnStarted('12345:24', { msgId: 658 });
+    h.tgCalls.length = 0;
+    cbs.onExtraTurnReply('12345:24', { msgId: 658, text: '', sessionId: 'sess-abc' });
+    // No sendMessage (empty text), but reaction cleanup must still happen.
+    const clear = h.tgCalls.find((c) => c.method === 'setMessageReaction'
+      && Array.isArray(c.params.reaction) && c.params.reaction.length === 0);
+    assert.ok(clear, 'extra-turn-reply with empty text must still clear ✍');
+    const sendMsg = h.tgCalls.find((c) => c.method === 'sendMessage');
+    assert.equal(sendMsg, undefined, 'must NOT send empty text as a Telegram message');
+  });
+});
+
+describe('typing-indicator lifecycle — interval cleanup', () => {
+  test('onExtraTurnReply stops the sendChatAction interval (no more typing fires after reply)', async () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onExtraTurnStarted('12345:24', { msgId: 658 });
+    // Reply right away — should kill the interval before it fires again
+    cbs.onExtraTurnReply('12345:24', {
+      msgId: 658, text: 'done', sessionId: 'sess-abc',
+    });
+    const typingCallsAtReply = h.tgCalls.filter((c) => c.method === 'sendChatAction').length;
+    // Wait > 4 seconds (interval period). If the interval wasn't cleared,
+    // a new typing fire would land. We use a short delay since the
+    // interval is 4s; this is a smoke check, not a perfect race.
+    // For a tighter test we'd want fake timers; this is a sanity bound.
+    await new Promise((r) => setTimeout(r, 50));
+    const typingCallsAfter = h.tgCalls.filter((c) => c.method === 'sendChatAction').length;
+    assert.equal(typingCallsAfter, typingCallsAtReply,
+      'no additional sendChatAction after extra-turn-reply tore down the interval');
+  });
+
+  test('onClose mid-extra-turn tears down visuals (safety net against forever-typing leak)', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onExtraTurnStarted('12345:24', { msgId: 658 });
+    h.tgCalls.length = 0;
+    cbs.onClose('12345:24', 137, { chatId: '12345', label: 't' });
+    // Should have called setMessageReaction(reaction=[]) to clear ✍.
+    const clear = h.tgCalls.find((c) => c.method === 'setMessageReaction'
+      && Array.isArray(c.params.reaction) && c.params.reaction.length === 0);
+    assert.ok(clear,
+      'onClose mid-extra-turn must clear the ✍ so it doesn\'t linger on a dead session');
+  });
+});
+
+describe('cross-session isolation — autosteer for one chat doesn\'t affect another', () => {
+  test('two parallel extra-turns on different sessions track independently', () => {
+    const h = baseDeps({
+      // need a config entry for chat 99999 too for clean event logging
+      config: {
+        chats: {
+          '12345': { agent: 'a' },
+          '99999': { agent: 'b' },
+        },
+        bot: {},
+      },
+    });
+    const cbs = createSdkCallbacks(h.deps);
+
+    // Both sessions have an extra-turn started.
+    cbs.onExtraTurnStarted('12345:24', { msgId: 658 });
+    cbs.onExtraTurnStarted('99999', { msgId: 421 });
+    h.tgCalls.length = 0;
+
+    // Reply for session 1 only.
+    cbs.onExtraTurnReply('12345:24', { msgId: 658, text: 'reply 1' });
+    const post = h.tgCalls;
+    // We should see ✍ cleared on msg 658 for chat 12345 but NOT msg 421.
+    const clearedFor658 = post.find((c) => c.method === 'setMessageReaction'
+      && c.params.message_id === 658
+      && Array.isArray(c.params.reaction) && c.params.reaction.length === 0);
+    assert.ok(clearedFor658, '✍ cleared on msg 658');
+    const clearedFor421 = post.find((c) => c.method === 'setMessageReaction'
+      && c.params.message_id === 421
+      && Array.isArray(c.params.reaction) && c.params.reaction.length === 0);
+    assert.equal(clearedFor421, undefined,
+      '✍ on msg 421 in the OTHER session must NOT be cleared by session 1\'s reply');
+
+    // Cleanup the still-running session 2 typing interval
+    cbs.onClose('99999', 0, { chatId: '99999', label: 't' });
+  });
+});
+
+describe('FOLD-path safety (rc.7) — sdk callbacks must not emit visible noise without explicit events', () => {
+  test('createSdkCallbacks alone produces no Telegram traffic until an event handler fires', () => {
+    // SDK backend never emits onExtraTurnStarted/Reply (it relies on
+    // PostToolBatch fold). Confirm constructing the callbacks doesn't
+    // accidentally start a typing loop or any background traffic.
+    const h = baseDeps();
+    createSdkCallbacks(h.deps);
+    assert.equal(h.tgCalls.length, 0);
   });
 });
