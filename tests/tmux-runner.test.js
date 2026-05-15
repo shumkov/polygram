@@ -150,16 +150,21 @@ describe('runner.spawn', () => {
     assert.ok(spawnCall.args.includes('HOME=/root'));
   });
 
-  test('sets pane-width via set-option after spawn', async () => {
+  test('widens pane via resize-window after spawn (was buggy set-option pane-width)', async () => {
     const mockRun = makeMockRun();
     const runner = createTmuxRunner({ runFn: mockRun });
     await runner.spawn({
       name: 'sess', cwd: '.', command: 'claude', paneWidth: 250,
     });
-    const setOpt = mockRun.calls.find((c) => c.args[0] === 'set-option');
-    assert.ok(setOpt);
-    assert.ok(setOpt.args.includes('pane-width'));
-    assert.ok(setOpt.args.includes('250'));
+    const resize = mockRun.calls.find((c) => c.args[0] === 'resize-window');
+    assert.ok(resize, 'should issue resize-window');
+    assert.ok(resize.args.includes('-x'));
+    assert.ok(resize.args.includes('250'));
+    // The pre-incident set-option pane-width call MUST NOT happen
+    // (it's a tmux format variable, not a settable option, and always
+    // errored "invalid option: pane-width" on tmux 3.x).
+    assert.ok(!mockRun.calls.some((c) => c.args[0] === 'set-option' && c.args.includes('pane-width')),
+      'set-option pane-width is a bug — must not appear');
   });
 
   test('throws structured error on spawn failure', async () => {
