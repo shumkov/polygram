@@ -255,6 +255,107 @@ describe('runner.pasteText', () => {
   });
 });
 
+describe('runner.pasteAndEnter — rc.13.1 paste+Enter atomic lock', () => {
+  // rc.13.1 root cause: pre-fix, two parallel pasteText + sendControl
+  // pairs would interleave their tmux command streams. Real-world
+  // symptom on shumorobot 2026-05-15: msg 696's prompt was truncated
+  // at `chat_id="-1003` because msg 698's autosteer pasteText cut
+  // in mid-flight, concatenating two distinct polygram prompts into
+  // ONE TUI user message → agent mis-attributed the reply (msg 697
+  // got msg 698's answer; msg 696 was served last).
+  //
+  // The fix: pasteAndEnter holds a per-session async lock around
+  // the paste + Enter pair so the keystrokes are atomic from the
+  // TUI's bracketed-paste-mode perspective.
+
+  test('two concurrent pasteAndEnter calls serialise per session — no interleave', async () => {
+    // We track the order of (paste-buffer, send-keys Enter) commands.
+    // The atomic guarantee is: paste-buffer for call N MUST be
+    // followed by its Enter BEFORE any commands from call N+1 begin.
+    const orderedOps = [];
+    let activeCallTag = null;
+    const slowRun = (cmd, args) => {
+      const op = args[0];
+      // Tag the active call by inspecting the buffer name set
+      // earliest in the call's chain.
+      if (op === 'set-buffer') {
+        // Buffer name is the 3rd arg (after -b)
+        activeCallTag = args[2];
+      }
+      orderedOps.push({ tag: activeCallTag, op });
+      // Simulate tmux latency so concurrent calls have time to race
+      return new Promise((r) => setTimeout(() => r({ stdout: '', stderr: '' }), 10));
+    };
+    const runner = createTmuxRunner({ runFn: slowRun });
+    // Two concurrent pasteAndEnter calls on the SAME session.
+    await Promise.all([
+      runner.pasteAndEnter('sess-A', 'prompt-1'),
+      runner.pasteAndEnter('sess-A', 'prompt-2'),
+    ]);
+
+    // Group ops by their tag (each pasteAndEnter has its own buffer
+    // name). Within each group, the ops should be contiguous in
+    // orderedOps — meaning no other call's ops landed in between.
+    const groups = {};
+    for (let i = 0; i < orderedOps.length; i++) {
+      const t = orderedOps[i].tag;
+      if (!groups[t]) groups[t] = { firstIdx: i, lastIdx: i };
+      else groups[t].lastIdx = i;
+    }
+    for (const tag of Object.keys(groups)) {
+      const { firstIdx, lastIdx } = groups[tag];
+      const span = lastIdx - firstIdx + 1;
+      // For each pasteAndEnter we expect 3 tmux commands:
+      // set-buffer, paste-buffer (with -d), send-keys (Enter).
+      // (delete-buffer error path doesn't run on success.)
+      assert.equal(span, 3,
+        `commands for buffer ${tag} must be contiguous (3 ops in a row); got span=${span}, ops=${JSON.stringify(orderedOps)}`);
+      // Verify the order within the group: set-buffer → paste-buffer → send-keys
+      assert.equal(orderedOps[firstIdx].op, 'set-buffer');
+      assert.equal(orderedOps[firstIdx + 1].op, 'paste-buffer');
+      assert.equal(orderedOps[firstIdx + 2].op, 'send-keys');
+    }
+  });
+
+  test('different sessions do NOT block each other (per-session lock keying)', async () => {
+    let pasteABusy = false;
+    let bothInFlight = false;
+    const concurrentRun = (cmd, args) => {
+      const op = args[0];
+      // Detect overlapping paste-buffer calls across sessions
+      if (op === 'paste-buffer') {
+        const target = args[args.indexOf('-t') + 1];
+        if (target === 'sess-A') pasteABusy = true;
+      }
+      return new Promise((r) => setTimeout(() => {
+        if (op === 'paste-buffer' && args[args.indexOf('-t') + 1] === 'sess-B' && pasteABusy) {
+          bothInFlight = true;
+        }
+        r({ stdout: '', stderr: '' });
+      }, 20));
+    };
+    const runner = createTmuxRunner({ runFn: concurrentRun });
+    await Promise.all([
+      runner.pasteAndEnter('sess-A', 'A'),
+      runner.pasteAndEnter('sess-B', 'B'),
+    ]);
+    assert.equal(bothInFlight, true,
+      'paste-buffer for two different sessions should be allowed to overlap (the lock is per-session, not global)');
+  });
+
+  test('pasteAndEnter returns the pasteText result shape', async () => {
+    const mockRun = makeMockRun();
+    const runner = createTmuxRunner({ runFn: mockRun });
+    const result = await runner.pasteAndEnter('sess', 'hello');
+    assert.equal(typeof result.sanitized, 'string');
+    assert.equal(typeof result.oneLine, 'string');
+    assert.equal(typeof result.stripped, 'number');
+    // And the Enter actually fired.
+    const enter = mockRun.calls.find((c) => c.args[0] === 'send-keys' && c.args.includes('Enter'));
+    assert.ok(enter, 'send-keys Enter must fire as part of pasteAndEnter');
+  });
+});
+
 // ── capturePane / captureWide ───────────────────────────────────────
 
 describe('runner.capturePane', () => {
