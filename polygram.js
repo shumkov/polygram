@@ -2052,16 +2052,16 @@ async function main() {
   // operator can decide.
   (async () => {
     try {
-      const { TmuxProcess } = require('./lib/process/tmux-process');
+      const { CLAUDE_CLI_PINNED_VERSION } = require('./lib/process/tmux-process');
       const child = require('child_process');
       const { promisify } = require('util');
       const exec = promisify(child.execFile);
       const { stdout } = await exec('claude', ['--version']);
       const m = stdout.match(/(\d+\.\d+\.\d+)/);
       const installed = m ? m[1] : '(parse failed)';
-      if (installed !== TmuxProcess.CLAUDE_CLI_PINNED_VERSION) {
+      if (installed !== CLAUDE_CLI_PINNED_VERSION) {
         console.warn(
-          `[polygram] WARNING: installed claude CLI v${installed} does not match polygram's pinned v${TmuxProcess.CLAUDE_CLI_PINNED_VERSION}. `
+          `[polygram] WARNING: installed claude CLI v${installed} does not match polygram's pinned v${CLAUDE_CLI_PINNED_VERSION}. `
           + 'Tmux backend behaviour may drift. See AGENTS.md "Pinned claude CLI version" for the upgrade procedure.',
         );
       } else {
