@@ -664,6 +664,117 @@ S('content', 'autosteer-emoji-only', async () => {
   } finally { await cleanup(); }
 });
 
+// ── L5: distinct reply per msgId (no cross-attribution) ──────────────
+
+/** L5: when primary turn + autosteer both produce DISTINCT outputs,
+ *  the primary reply must NOT leak into the autosteered msg's
+ *  extra-turn-reply text (and vice versa).
+ *  Production trace 2026-05-16 00:30:54-57 showed msg 722 ("yes")
+ *  got attributed the same "Got it — send away." text as msg 721. */
+S('L5', 'distinct-replies-no-cross-attribution', async () => {
+  const { p, events, cleanup } = await setupRealTui('l5');
+  try {
+    const sendP = p.send('Reply with ONLY the literal word "PRIMARYOUT" — one word, no other text.');
+    await sleep(100);
+    p.injectUserMessage({
+      content: 'Reply with ONLY the literal word "AUTOOUT" — one word, no other text.',
+      msgId: 95001,
+    });
+    const r1 = await sendP;
+    await waitForResolution(events, 95001, 60_000);
+    await sleep(500);
+
+    assertInvariants(events, { autosteeredMsgIds: [95001] });
+
+    const reply = events.find((e) => e.name === 'extra-turn-reply' && e.payload?.msgId === 95001);
+    if (reply) {
+      // NEW-TURN path: autosteer reply must NOT contain the
+      // primary's reply text (would indicate cross-attribution).
+      ok(!/PRIMARYOUT/i.test(reply.payload.text || ''),
+        `extra-turn-reply for autosteered msg MUST NOT contain primary's "PRIMARYOUT" (got ${JSON.stringify(reply.payload.text?.slice(0, 80))})`);
+      // And the primary reply must NOT contain the autosteered text.
+      ok(!/AUTOOUT/i.test(r1.text || '') || /PRIMARYOUT/i.test(r1.text || ''),
+        `primary reply should reflect its own prompt — either has PRIMARYOUT or doesn't accidentally have AUTOOUT (primary text: ${JSON.stringify(r1.text?.slice(0, 80))})`);
+    }
+    // (FOLD path: agent's single reply may address both prompts;
+    // that's correct behaviour, no cross-attribution issue exists.)
+  } finally { await cleanup(); }
+});
+
+// ── L6: long-running tool turn that may stall ────────────────────────
+
+/** L6: production trace 2026-05-16 00:30:21 showed a turn going
+ *  THINKING → CODING → STALL at 00:31:06 (~50s in CODING with no
+ *  completion). The agent was stuck on tool execution. Test that
+ *  polygram handles a long-running tool turn gracefully — no
+ *  empty replies, no premature resolution, reactor cascades
+ *  THINKING → CODING → STALL → FREEZE as designed. Slow scenario
+ *  (~4 min); tag 'slow' so it's opt-in. */
+S('L6 slow', 'long-tool-turn-stall-handling', async () => {
+  const { p, events, cleanup } = await setupRealTui('l6');
+  try {
+    // sleep 200 makes the tool execute long enough to cross the
+    // 180s STALL auto-promote threshold. Adjust the test's
+    // turnTimeoutMs override below to match.
+    const sendP = p.send('Run `sleep 200 && echo TOOLDONE-L6` with Bash, then reply ONLY with "L6OK".');
+    // We expect this to complete in ~200-220s. Bumped turnTimeout
+    // in the helper covers this.
+    const res = await sendP;
+    ok(typeof res.text === 'string' && res.text.length > 0,
+      `long-tool turn returned non-empty text (got ${JSON.stringify(res.text?.slice(0,80))})`);
+    ok(/L6OK/i.test(res.text || ''),
+      `long-tool turn reply contains L6OK (got ${JSON.stringify(res.text?.slice(0,80))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// ── L7: setMessageReaction call rate under autosteer storm ───────────
+//
+// L7 is fundamentally a polygram.js concern, not a TmuxProcess one
+// (the rate-limit events are logged by the tg() wrapper in
+// polygram.js, not by TmuxProcess). So a SPIKE can't directly catch
+// the rate-limit storm. What we CAN check: the TmuxProcess-level
+// signal volume (extra-turn-started events per second) under autosteer
+// storm. If it stays high, the downstream reaction calls will too —
+// the rate-limit is just a symptom.
+//
+// This scenario primarily exists to document the storm pattern and
+// serve as a fast-iteration harness for any future coalescing fix.
+
+S('L7', 'autosteer-storm-event-rate', async () => {
+  const { p, events, cleanup } = await setupRealTui('l7');
+  try {
+    // Long primary so all the autosteers land while it's running.
+    const sendP = p.send('Run `sleep 8` with Bash, then reply "L7DONE".');
+    await sleep(400);
+    // 6 rapid autosteers — same pattern as stress-many-rapid-autosteers
+    // but with shorter content so the model handles them quickly.
+    const msgIds = [];
+    for (let i = 0; i < 6; i++) {
+      const id = 97000 + i;
+      msgIds.push(id);
+      p.injectUserMessage({ content: `Inject ${i}: just say "I${i}" once.`, msgId: id });
+    }
+    await sendP;
+    await waitForAllResolutions(events, msgIds, 120_000);
+    await sleep(800);
+
+    // Count extra-turn-started events. Each one triggers a
+    // setMessageReaction in polygram.js → potential rate-limit.
+    // Under the rate-limit threshold (~5 calls/sec to Telegram for
+    // setMessageReaction), 6 within ~2s is borderline. The fix
+    // candidate (coalesce reactions) would reduce these but for
+    // now we just count and document.
+    const startedEvents = events.filter((e) => e.name === 'extra-turn-started');
+    log(`L7: ${startedEvents.length} extra-turn-started events fired`);
+    // Just an INFO assertion: this is the volume polygram.js would
+    // see when computing reactions.
+    ok(startedEvents.length >= 1,
+      `at least one extra-turn-started fired (got ${startedEvents.length})`);
+    assertInvariants(events, { autosteeredMsgIds: msgIds });
+  } finally { await cleanup(); }
+});
+
 S('content', 'autosteer-with-special-chars', async () => {
   const { p, events, cleanup } = await setupRealTui('c-special');
   try {
