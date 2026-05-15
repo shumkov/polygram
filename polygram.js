@@ -2045,6 +2045,32 @@ async function main() {
   // instances. Construction is cheap (no system call until first
   // spawn/send). Only used if any chat in config has pm:'tmux'.
   const tmuxRunner = createTmuxRunner({ logger: console });
+  // Verify the installed claude CLI matches polygram's pinned
+  // version. Mismatch = potential TUI-format drift (see AGENTS.md).
+  // Non-fatal warning — production may be mid-upgrade — but the
+  // event lands in stdout so log aggregation catches it and the
+  // operator can decide.
+  (async () => {
+    try {
+      const { TmuxProcess } = require('./lib/process/tmux-process');
+      const child = require('child_process');
+      const { promisify } = require('util');
+      const exec = promisify(child.execFile);
+      const { stdout } = await exec('claude', ['--version']);
+      const m = stdout.match(/(\d+\.\d+\.\d+)/);
+      const installed = m ? m[1] : '(parse failed)';
+      if (installed !== TmuxProcess.CLAUDE_CLI_PINNED_VERSION) {
+        console.warn(
+          `[polygram] WARNING: installed claude CLI v${installed} does not match polygram's pinned v${TmuxProcess.CLAUDE_CLI_PINNED_VERSION}. `
+          + 'Tmux backend behaviour may drift. See AGENTS.md "Pinned claude CLI version" for the upgrade procedure.',
+        );
+      } else {
+        console.log(`[polygram] claude CLI v${installed} matches pin`);
+      }
+    } catch (err) {
+      console.warn(`[polygram] could not verify claude CLI version: ${err.message}`);
+    }
+  })();
   // O1 optimization: shared poll-tick scheduler. N TmuxProcess
   // instances share ONE setInterval instead of spawning N independent
   // setTimeout chains. Idle when no chats are in flight (zero timers
