@@ -874,6 +874,97 @@ describe('TmuxProcess — JSONL session-log path', () => {
     } finally { env.cleanup(); }
   });
 
+  test('rc.12.1 REGRESSION: _extraTurnState drains BEFORE _turnState when both coexist (concurrent extra-turn + new primary)', async () => {
+    // Captured live on shumorobot 2026-05-15 19:32:31-19:32:51:
+    //   1) msg 691 IN → primary turn 1
+    //   2) msg 692 IN (during turn 1) → autosteered, ✍
+    //   3) turn 1 ends short → TUI dequeues msg 692 as turn 2 →
+    //      extra-turn-started fires, _extraTurnState set for msg 692.
+    //   4) msg 694 IN → polygram pm.send → _turnState set for turn 3
+    //      (TUI queues it behind turn 2's still-running work).
+    //   5) JSONL emits msg 692's turn 2 assistant chunks + result.
+    //      PRE-rc.12.1: _turnState (msg 694) was checked first →
+    //      chunks/result mis-attributed → msg 692's extra-turn
+    //      never flushed → typing loop leaked.
+    //   POST-rc.12.1: _extraTurnState drains first → msg 692's
+    //   reply flushes via extra-turn-reply (correctly addressed
+    //   to msgId 692) → _turnState then handles msg 694 cleanly.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 5000 });
+      const sessionId = 'aabbccdd-1212-1212-1212-aaaaaaaaaaaa';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      const autoContent = 'autosteered turn 2 content';
+      const autoMsgId = 692;
+      const newMsgId = 694;
+      const extraReplies = [];
+      p.on('extra-turn-reply', (ev) => extraReplies.push(ev));
+
+      // Primary turn 1 (msg 691) — happens fast, completes.
+      const turn1P = p.send('primary turn 1');
+      await sleep(20);
+      // Mid-turn-1 autosteer arrives for msg 692.
+      assert.equal(
+        p.injectUserMessage({ content: autoContent, msgId: autoMsgId }),
+        true,
+      );
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: { content: [{ type: 'text', text: 'turn1-reply' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      await turn1P;
+
+      // TUI dequeues msg 692 as turn 2 → extra-turn-started.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'user',
+        sessionId,
+        message: { role: 'user', content: autoContent },
+      }) + '\n');
+      await sleep(30);
+
+      // Now msg 694's primary turn starts BEFORE msg 692's turn 2
+      // assistant chunks arrive — this is the race condition shape.
+      const turn3P = p.send('primary turn 3 (msg 694)');
+      await sleep(20);
+
+      // JSONL: msg 692's turn 2 assistant chunks + result arrive now.
+      // PRE-rc.12.1, these would be mis-attributed to msg 694's
+      // _turnState. POST-rc.12.1, they flow to _extraTurnState.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: { content: [{ type: 'text', text: 'turn2-extra-reply' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      await sleep(40);
+      // Now msg 694's turn assistant chunks arrive.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: { content: [{ type: 'text', text: 'turn3-reply' }], stop_reason: 'end_turn' },
+      }) + '\n');
+
+      const turn3Result = await turn3P;
+
+      // rc.12.1 invariants:
+      assert.equal(extraReplies.length, 1,
+        'extra-turn-reply MUST fire for msg 692 even though msg 694\'s _turnState was also active');
+      assert.equal(extraReplies[0].msgId, autoMsgId,
+        'the extra-turn-reply must carry msgId=692, NOT msg 694');
+      assert.match(extraReplies[0].text, /turn2-extra-reply/,
+        'msg 692\'s reply text must NOT be mis-attributed to msg 694\'s _turnState');
+      assert.match(turn3Result.text, /turn3-reply/,
+        'msg 694\'s primary turn must receive its own reply text, NOT msg 692\'s');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
   test('user-message that does NOT match a pending autosteer is ignored (no spurious extra-turn-reply)', async () => {
     const env = setupTempCwd();
     try {
