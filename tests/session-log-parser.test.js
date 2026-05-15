@@ -81,7 +81,14 @@ describe('parseLine — assistant text', () => {
     assert.deepEqual(parseLine(line), []);
   });
 
-  test('multiple text blocks produce multiple events', () => {
+  test('multiple text blocks collapse into ONE chunk (rc.8: SDK extractAssistantText parity)', () => {
+    // Pre-rc.8 this test asserted N events for N text blocks. SDK
+    // backend always joined text blocks into a single string before
+    // emitting the user-visible text (lib/process/sdk-process.js
+    // extractAssistantText). rc.8 brings tmux to parity so the
+    // trailing-colon → ellipsis transform can apply to the joined
+    // string (otherwise the transform would only ever see the LAST
+    // block in isolation).
     const line = JSON.stringify({
       type: 'assistant',
       message: {
@@ -92,9 +99,9 @@ describe('parseLine — assistant text', () => {
       },
     });
     const events = parseLine(line);
-    assert.equal(events.length, 2);
-    assert.equal(events[0].text, 'first');
-    assert.equal(events[1].text, 'second');
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'assistant-chunk');
+    assert.equal(events[0].text, 'first\n\nsecond');
   });
 });
 
@@ -112,6 +119,67 @@ describe('parseLine — tool_use blocks', () => {
     assert.equal(events[0].name, 'Bash');
     assert.deepEqual(events[0].input, { command: 'ls' });
     assert.equal(events[0].id, 'toolu_1');
+  });
+
+  test('trailing colon in assistant text is replaced with ellipsis (parity with SDK extractAssistantText)', () => {
+    // rc.8: SDK's lib/process/sdk-process.js:62-73 applies
+    // trailing-colon → ellipsis on every assistant message ("Listing
+    // deps:" → "Listing deps…") so streamed-but-not-final text reads
+    // complete during the pause while a tool runs. The tmux parser
+    // previously emitted raw text per block; Telegram bubbles would
+    // briefly show "in place:" while the agent ran follow-up tools.
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'Checking the file:' }] },
+    });
+    const events = parseLine(line);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'assistant-chunk');
+    assert.equal(events[0].text, 'Checking the file…');
+  });
+
+  test('trailing colon with trailing whitespace also replaced', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'Listing deps:  \n' }] },
+    });
+    assert.equal(parseLine(line)[0].text, 'Listing deps…');
+  });
+
+  test('mid-text colons preserved; only the FINAL trailing colon transformed', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'Found: 3 items, status: ok:' }] },
+    });
+    assert.equal(parseLine(line)[0].text, 'Found: 3 items, status: ok…');
+  });
+
+  test('text without trailing colon unchanged', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'All done.' }] },
+    });
+    assert.equal(parseLine(line)[0].text, 'All done.');
+  });
+
+  test('multiple text blocks in one assistant message are joined into a single chunk (matches SDK extractAssistantText)', () => {
+    // Pre-rc.8 the parser emitted N events for N text blocks. SDK
+    // backend joined them into one string before applying the colon
+    // transform. rc.8 brings tmux to parity: ONE assistant-chunk per
+    // message, all text blocks joined with '\n\n'.
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'text', text: 'First part' },
+          { type: 'text', text: 'Second part:' },
+        ],
+      },
+    });
+    const events = parseLine(line);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'assistant-chunk');
+    assert.equal(events[0].text, 'First part\n\nSecond part…');
   });
 
   test('text + tool_use in same message → both events', () => {
