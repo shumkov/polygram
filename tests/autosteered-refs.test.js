@@ -147,6 +147,71 @@ describe('autosteered-refs — clear', () => {
   });
 });
 
+describe('autosteered-refs — clear rate-limiting (L7 fix)', () => {
+  // L7 production-trace finding 2026-05-16: clear(sessionKey) ran
+  // setMessageReaction([]) calls back-to-back (await loop, no
+  // inter-call delay). Under N≥6 autosteers per turn that exceeds
+  // Telegram's ~5/sec setMessageReaction limit, producing
+  // telegram-rate-limit events and delaying ✍ clearing.
+  //
+  // Fix: clear() accepts a minIntervalMs option; with N>1 refs it
+  // spaces calls by at least that interval. Default 250ms = 4/sec
+  // (safe headroom below Telegram's cap). Tests pin both the
+  // default behavior AND the opt-out (minIntervalMs=0 for tests
+  // that don't care about timing).
+
+  test('default clear paces N>1 calls by ≥250ms (rate-limit safety)', async () => {
+    const ts = [];
+    const refs = createAutosteeredRefs({
+      applyClear: async () => { ts.push(Date.now()); },
+    });
+    refs.add('s1', { chatId: 1, msgId: 1 });
+    refs.add('s1', { chatId: 1, msgId: 2 });
+    refs.add('s1', { chatId: 1, msgId: 3 });
+    const start = Date.now();
+    await refs.clear('s1');
+    const elapsed = Date.now() - start;
+    // Three calls = two intervals, each ≥250ms → ≥500ms total.
+    // Subtract 20ms tolerance for the very first call landing fast.
+    assert.ok(elapsed >= 480,
+      `clearing 3 refs should take ≥480ms (got ${elapsed}ms)`);
+    // Inter-call gaps must all be ≥240ms (250ms minus tolerance).
+    for (let i = 1; i < ts.length; i += 1) {
+      const gap = ts[i] - ts[i - 1];
+      assert.ok(gap >= 240,
+        `gap ${i} should be ≥240ms (got ${gap}ms)`);
+    }
+  });
+
+  test('minIntervalMs:0 disables pacing (back-compat / test-mode)', async () => {
+    const refs = createAutosteeredRefs({
+      applyClear: async () => {},
+      minIntervalMs: 0,
+    });
+    refs.add('s1', { chatId: 1, msgId: 1 });
+    refs.add('s1', { chatId: 1, msgId: 2 });
+    refs.add('s1', { chatId: 1, msgId: 3 });
+    const start = Date.now();
+    await refs.clear('s1');
+    // Without pacing 3 in-process awaits complete near-instantly.
+    assert.ok(Date.now() - start < 50,
+      `unpaced clear should be <50ms (got ${Date.now() - start}ms)`);
+  });
+
+  test('single-ref clear: no pacing delay applied (only N>1 paces)', async () => {
+    const refs = createAutosteeredRefs({
+      applyClear: async () => {},
+      minIntervalMs: 250,
+    });
+    refs.add('s1', { chatId: 1, msgId: 1 });
+    const start = Date.now();
+    await refs.clear('s1');
+    // One ref = no inter-call gap to apply.
+    assert.ok(Date.now() - start < 50,
+      `single-ref clear should be <50ms (got ${Date.now() - start}ms)`);
+  });
+});
+
 describe('autosteered-refs — error handling during clear', () => {
   test('continues clearing remaining refs after one applyClear throws', async () => {
     const cleared = [];
