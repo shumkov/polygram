@@ -314,6 +314,49 @@ describe('TmuxProcess — JSONL session-log path', () => {
     }
   });
 
+  test('L2 REGRESSION: last-prompt WITHOUT prior text does NOT resolve the turn (it\'s a "prompt registered" marker, not "turn done")', async () => {
+    // claude v2.1.142 writes last-prompt JSONL events when a user
+    // prompt is REGISTERED (before the agent replies). Pre-L2 the
+    // parser treated any last-prompt as a turn-complete fallback,
+    // which resolved pm.send with empty text in sequential
+    // scenarios (caught in spike's three-sequential-sends turn 3:
+    // 4/5 runs returned empty before the agent emitted ANY text).
+    // Post-L2, last-prompt only resolves the turn if accumulated
+    // text is non-empty (treating last-prompt as a safety net for
+    // missing end_turn, NOT as a primary turn-end signal).
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 500 });
+      const sessionId = 'cccccccc-2222-3333-4444-eeeeeeeeeeee';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'haiku', effort: 'low', cwd: env.cwd },
+      });
+      const sendP = p.send('hi');
+      await sleep(20);
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      // Write JUST a last-prompt — no assistant text before it. The
+      // OLD behaviour would have synthesised a success result with
+      // text='' and resolved pm.send immediately. Post-L2, this
+      // event is IGNORED (no text accumulated yet).
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'last-prompt',
+        lastPrompt: 'hi',
+      }) + '\n');
+      // sendP should NOT resolve from the last-prompt alone. It
+      // should run to turnTimeoutMs (500ms) and return a timeout
+      // result (text=''). That's correct — a turn with NO text
+      // emission should time out, not pretend to succeed.
+      const res = await sendP;
+      // Should have timed out, NOT come back with stopReason='last-prompt'
+      // (which was the old wrong behaviour).
+      assert.notEqual(res.metrics.stopReason, 'last-prompt',
+        'last-prompt without text must NOT short-circuit the turn');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
   test('last-prompt acts as fallback turn-complete when no stop_reason fires', async () => {
     const env = setupTempCwd();
     try {

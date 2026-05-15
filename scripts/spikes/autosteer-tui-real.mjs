@@ -493,10 +493,13 @@ S('sequential', 'three-sequential-sends', async () => {
   const { p, events, cleanup } = await setupRealTui('seq-3');
   try {
     const r1 = await p.send('Reply ONLY with "ONE".');
+    log(`turn 1: resolvedVia=${r1.metrics?.resolvedVia} text=${JSON.stringify(r1.text?.slice(0,40))}`);
     ok(/ONE/i.test(r1.text || ''), `turn 1: ONE`);
     const r2 = await p.send('Reply ONLY with "TWO".');
+    log(`turn 2: resolvedVia=${r2.metrics?.resolvedVia} text=${JSON.stringify(r2.text?.slice(0,40))}`);
     ok(/TWO/i.test(r2.text || ''), `turn 2: TWO`);
     const r3 = await p.send('Reply ONLY with "THREE".');
+    log(`turn 3: resolvedVia=${r3.metrics?.resolvedVia} text=${JSON.stringify(r3.text?.slice(0,40))}`);
     ok(/THREE/i.test(r3.text || ''), `turn 3: THREE`);
     assertInvariants(events);
   } finally { await cleanup(); }
