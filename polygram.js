@@ -1083,15 +1083,16 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // (→ 'failed', user gets an apology with retry hint).
       if (!result.text) throw new Error(result.error);
     } else {
-      // Clear the progress reaction instead of stamping 👍 — the reply
-      // bubble itself is the "done" signal and a permanent thumbs-up on
-      // every answered message is chat noise (plus triggers reaction
-      // notifications for other group members).
-      reactor.clear().catch(() => {});
-      // 0.8.0-rc.14: also clear ✍ reactions on every follow-up
-      // message that was autosteered into THIS turn — they live in
-      // separate handleMessage scopes whose reactors are already GC'd.
-      clearAutosteeredReactions(sessionKey).catch(() => {});
+      // rc.10: reactor.clear() and clearAutosteeredReactions() moved
+      // to AFTER deliverReplies completes (see just before
+      // markReplied() below). Pre-rc.10 they fired the moment pm.send
+      // returned (JSONL result event), which was ~1-3s BEFORE the
+      // Telegram reply actually landed via the streamer / chunked
+      // delivery path. User saw: 🤔/✍ visible → reactions cleared →
+      // ~1-3s of nothing → reply bubble lands. Ivan caught this on
+      // shumorobot 2026-05-15 ("both reactions disappeared, typing
+      // disappeared, at some point he responded"). Deferring the
+      // clears closes the visual gap.
       // rc.42: tool-less-turn stale-drain DELETED. With native priority
       // push, the SDK's input controller has the followups directly —
       // there's no buffer for us to drain. Tool-less turns just emit
@@ -1385,6 +1386,23 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
 
     await sendInlineStickers();
           await sendInlineReactions();
+    // rc.10: clear progress reactions AFTER the reply has been
+    // delivered so the user doesn't see a "reactions cleared, then
+    // ~1-3s of nothing, then reply bubble" gap. The reply bubble
+    // itself is the "done" signal; clearing the emoji simultaneously
+    // with the delivery completion is the smooth UX path. Both
+    // fire-and-forget — these are best-effort cleanups, not part of
+    // the reply contract.
+    reactor.clear().catch(() => {});
+    // 0.8.0-rc.14: also clear ✍ reactions on every follow-up
+    // message that was autosteered into THIS turn — they live in
+    // separate handleMessage scopes whose reactors are already GC'd.
+    // rc.9 caveat: TmuxProcess.extra-turn-started re-applies ✍ if
+    // there's a pending autosteer dequeue happening (NEW-TURN case),
+    // and extra-turn-reply clears it again when the second reply
+    // lands. So the FOLD path benefits from this deferred clear
+    // without breaking NEW-TURN.
+    clearAutosteeredReactions(sessionKey).catch(() => {});
     console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
     markReplied();
   } catch (err) {
