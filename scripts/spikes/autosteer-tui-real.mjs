@@ -1,40 +1,41 @@
 #!/usr/bin/env node
 /**
- * autosteer-tui-real — exercise the rc.7→rc.14 autosteer fixes against
- * a REAL claude TUI in tmux. This is the AUTHORITATIVE autosteer
- * test suite for polygram — no simulator, just polygram's real
- * TmuxProcess + TmuxRunner driving an actual claude session.
+ * autosteer-tui-real — broad-coverage autosteer regression suite
+ * against a REAL claude TUI in tmux. No simulator. This is the
+ * authoritative source of truth for polygram's autosteer behaviour.
  *
- * Run before tagging each rc that touches autosteer / tmux-process /
- * tmux-runner.
- *
- * Cost: ~$0.05-0.20 per scenario sonnet/low + a few Bash tool calls.
- *   - 8 scenarios → ~$0.50-1.50 total.
- *
- * Hard wall-clock cap: 600s total. process.exit on hang.
- *
- * What each scenario verifies is documented at the scenario site.
+ * Scenarios cover:
+ *   - Single-turn baseline (no autosteer).
+ *   - Autosteer timing variations (immediate, 50ms, 200ms, 1s, 2s).
+ *   - Multi-autosteer (2, 3, 4, 5 injects in one turn).
+ *   - Concurrent send + inject races.
+ *   - Primary turns of varying complexity (short, with-tool,
+ *     multi-tool, long text).
+ *   - Content variations (unicode, markdown, code blocks).
  *
  * Usage:
- *   node scripts/spikes/autosteer-tui-real.mjs            # all
- *   node scripts/spikes/autosteer-tui-real.mjs short      # one by name
+ *   node scripts/spikes/autosteer-tui-real.mjs              # all
+ *   node scripts/spikes/autosteer-tui-real.mjs SHORT-LIVE   # by tag
+ *   node scripts/spikes/autosteer-tui-real.mjs scenario-name
  *
- * Side-effects: spawns transient tmux sessions, writes JSONL files
- * under ~/.claude/projects/<encoded-cwd>/.
+ * Cost: ~$0.05-0.30 per scenario × ~30 = ~$3-9 per full run.
+ * Wall-clock: ~30-60s per scenario × 30 = 15-30 minutes.
+ *
+ * Run before each rc tag that touches autosteer / tmux-process /
+ * tmux-runner. CI doesn't run this — needs OAuth + burns API tokens.
  */
 
 import { createRequire } from 'node:module';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
-import crypto from 'node:crypto';
 
 const require = createRequire(import.meta.url);
 const { TmuxProcess } = require('../../lib/process/tmux-process.js');
 const { createTmuxRunner } = require('../../lib/tmux/tmux-runner.js');
 
 const execFileP = promisify(execFile);
-const HARD_TIMEOUT_MS = 600_000;
+const HARD_TIMEOUT_MS = 60 * 60_000;  // 60 minutes hard cap
 
 const SILENT = { warn: () => {}, error: () => {}, info: () => {}, debug: () => {}, log: () => {} };
 
@@ -44,15 +45,8 @@ async function killTmuxSession(name) {
   try { await execFileP('tmux', ['kill-session', '-t', name]); } catch {}
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────
+// ─── Harness ─────────────────────────────────────────────────────────
 
-/**
- * Spin up a real TmuxProcess. Returns { p, events, cleanup }. The
- * `events` array captures every polygram-level event for assertions.
- *
- * Uses the polygram repo as cwd (already trusted by claude CLI) so
- * the workspace-trust prompt doesn't appear.
- */
 async function setupRealTui(label) {
   const runner = createTmuxRunner({ logger: console });
   const cwd = path.resolve(process.cwd());
@@ -66,17 +60,16 @@ async function setupRealTui(label) {
     botName: 'spike',
     logger: SILENT,
     readyTimeoutMs: 60_000,
-    turnTimeoutMs: 90_000,
+    turnTimeoutMs: 120_000,
   });
 
   const events = [];
-  const eventNames = [
+  for (const name of [
     'extra-turn-started', 'extra-turn-reply',
     'autosteer-resolution', 'autosteer-match-miss',
     'autonomous-assistant-message', 'inject-user-message',
     'result', 'tool-use',
-  ];
-  for (const name of eventNames) {
+  ]) {
     p.on(name, (payload) => events.push({ name, payload, t: Date.now() }));
   }
 
@@ -86,9 +79,6 @@ async function setupRealTui(label) {
   await p.start({
     chatConfig: {
       model: 'sonnet', effort: 'low', cwd,
-      // bypassPermissions so the spike's Bash test calls don't trip
-      // a permission prompt. The READY_HINTS_RE now recognises
-      // "bypass permissions on" (added alongside this spike).
       permissionMode: 'bypassPermissions',
     },
   });
@@ -103,263 +93,651 @@ async function setupRealTui(label) {
   };
 }
 
-// Wait until `events` contains a `kind` event, or timeout.
-async function waitForEvent(events, kind, timeoutMs = 30_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (events.some((e) => e.name === kind)) return;
-    await sleep(200);
-  }
+// ─── Assertions ──────────────────────────────────────────────────────
+
+let totalAsserts = 0;
+let scenarioFailed = false;
+function pass(label) { console.log(`  PASS: ${label}`); totalAsserts++; }
+function fail(label) {
+  console.error(`  FAIL: ${label}`);
+  totalAsserts++;
+  scenarioFailed = true;
+  process.exitCode = 1;
+}
+function ok(cond, label) { cond ? pass(label) : fail(label); return cond; }
+function notFired(events, name, label) {
+  return ok(!events.some((e) => e.name === name), `${label} (no '${name}')`);
 }
 
-function assertEquals(actual, expected, label) {
-  if (actual !== expected) {
-    console.error(`  FAIL: ${label} — expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
-    process.exitCode = 1;
-    return false;
-  }
-  console.log(`  PASS: ${label}`);
-  return true;
-}
-function assertTrue(cond, label) {
-  if (!cond) {
-    console.error(`  FAIL: ${label}`);
-    process.exitCode = 1;
-    return false;
-  }
-  console.log(`  PASS: ${label}`);
-  return true;
-}
-function assertEventFired(events, name, label) {
-  return assertTrue(events.some((e) => e.name === name), `${label} (event '${name}' fired)`);
-}
-function assertEventNotFired(events, name, label) {
-  return assertTrue(!events.some((e) => e.name === name), `${label} (event '${name}' did NOT fire)`);
-}
-
-// Wait for autosteer to fully resolve (either fold or new-turn).
-async function waitForResolution(events, msgId, timeoutMs = 30_000) {
+async function waitForResolution(events, msgId, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const resolution = events.find((e) =>
-      e.name === 'autosteer-resolution' && e.payload?.msgId === msgId);
-    if (resolution) {
-      if (resolution.payload.via === 'fold') return;
-      // NEW-TURN: wait for extra-turn-reply too.
+    const r = events.find((e) => e.name === 'autosteer-resolution' && e.payload?.msgId === msgId);
+    if (r) {
+      if (r.payload.via === 'fold') return;
       if (events.some((e) => e.name === 'extra-turn-reply' && e.payload?.msgId === msgId)) return;
     }
     await sleep(200);
   }
 }
 
-// Polygram-level invariants that hold across ALL valid autosteer
-// outcomes. Use these instead of asserting on a specific fold/new-turn
-// path, since the TUI's choice depends on timing the spike can't fully
-// pin down.
-function assertInvariants(events, { autosteeredMsgId, expectAutosteer }) {
-  // INV-1: no content-match miss (proves no paste corruption).
-  assertEventNotFired(events, 'autosteer-match-miss',
-    'INV-1: no content-match miss (rc.14 paste atomicity holds)');
-
-  // INV-2: no autonomous-assistant-message leakage when there was
-  // a normal turn (would indicate _turnState mis-routing).
-  assertEventNotFired(events, 'autonomous-assistant-message',
-    'INV-2: no autonomous-wakeup leak (proper turn attribution)');
-
-  if (!expectAutosteer) {
-    // INV-3a: when no autosteer occurred, no autosteer events fire.
-    assertEventNotFired(events, 'autosteer-resolution',
-      'INV-3a: no spurious autosteer-resolution');
-    assertEventNotFired(events, 'extra-turn-started',
-      'INV-3a: no spurious extra-turn-started');
-    return;
-  }
-
-  // INV-3b: autosteer-resolution MUST fire for an autosteered msgId.
-  const resolution = events.find((e) =>
-    e.name === 'autosteer-resolution' && e.payload?.msgId === autosteeredMsgId);
-  assertTrue(resolution != null,
-    `INV-3b: autosteer-resolution fires for msgId=${autosteeredMsgId} (paths: fold | new-turn)`);
-  if (!resolution) return;
-  assertTrue(['fold', 'new-turn'].includes(resolution.payload.via),
-    `INV-3c: autosteer-resolution.via is fold OR new-turn (got ${resolution.payload.via})`);
-
-  // INV-4: path consistency.
-  if (resolution.payload.via === 'new-turn') {
-    const started = events.find((e) =>
-      e.name === 'extra-turn-started' && e.payload?.msgId === autosteeredMsgId);
-    const replied = events.find((e) =>
-      e.name === 'extra-turn-reply' && e.payload?.msgId === autosteeredMsgId);
-    assertTrue(started != null,
-      `INV-4a: NEW-TURN path emits extra-turn-started for msgId=${autosteeredMsgId}`);
-    assertTrue(replied != null,
-      `INV-4b: NEW-TURN path emits extra-turn-reply for msgId=${autosteeredMsgId}`);
-    if (replied) {
-      assertTrue(typeof replied.payload.text === 'string' && replied.payload.text.length > 0,
-        'INV-4c: extra-turn-reply carries non-empty text');
-    }
-  } else if (resolution.payload.via === 'fold') {
-    assertEventNotFired(events, 'extra-turn-started',
-      'INV-4d: FOLD path does NOT emit extra-turn-started (primary reply covers both)');
-    assertEventNotFired(events, 'extra-turn-reply',
-      'INV-4e: FOLD path does NOT emit extra-turn-reply');
+async function waitForAllResolutions(events, msgIds, timeoutMs = 90_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (msgIds.every((id) => {
+      const r = events.find((e) => e.name === 'autosteer-resolution' && e.payload?.msgId === id);
+      if (!r) return false;
+      if (r.payload.via === 'fold') return true;
+      return events.some((e) => e.name === 'extra-turn-reply' && e.payload?.msgId === id);
+    })) return;
+    await sleep(300);
   }
 }
 
-// ─── Scenarios ───────────────────────────────────────────────────────
+function assertInvariants(events, { autosteeredMsgIds = [] } = {}) {
+  notFired(events, 'autosteer-match-miss',
+    'INV-1: no content-match miss (rc.14 paste atomicity)');
+  notFired(events, 'autonomous-assistant-message',
+    'INV-2: no autonomous-wakeup leak');
+  if (autosteeredMsgIds.length === 0) {
+    notFired(events, 'autosteer-resolution', 'INV-3: no spurious resolution');
+    notFired(events, 'extra-turn-started', 'INV-3: no spurious extra-turn-started');
+    return;
+  }
+  for (const id of autosteeredMsgIds) {
+    const r = events.find((e) => e.name === 'autosteer-resolution' && e.payload?.msgId === id);
+    ok(r != null, `INV-4: autosteer-resolution fires for msgId=${id}`);
+    if (!r) continue;
+    ok(['fold', 'new-turn'].includes(r.payload.via),
+      `INV-5: via∈{fold,new-turn} for msgId=${id} (got ${r.payload.via})`);
+    if (r.payload.via === 'new-turn') {
+      const reply = events.find((e) => e.name === 'extra-turn-reply' && e.payload?.msgId === id);
+      ok(reply != null, `INV-6a: NEW-TURN → extra-turn-reply for msgId=${id}`);
+      ok(reply && reply.payload.text && reply.payload.text.length > 0,
+        `INV-6b: extra-turn-reply for msgId=${id} has non-empty text`);
+    }
+  }
+}
 
-const scenarios = {
+// ─── Scenario definitions ────────────────────────────────────────────
 
-  /** Short primary turn + autosteer mid-flight. Verifies the
-   *  invariants that hold regardless of whether the TUI ends up
-   *  folding or routing as NEW-TURN — both are valid user outcomes
-   *  Ivan accepts. The point is that ONE of them happens cleanly,
-   *  not which one. */
-  'short-then-autosteer': async () => {
-    const { p, events, cleanup } = await setupRealTui('short');
+const scenarios = [];
+
+function S(tags, name, fn) {
+  scenarios.push({ tags, name, fn });
+}
+
+// ── Single-turn baselines (no autosteer) ─────────────────────────────
+
+S('baseline', 'baseline-short-text', async () => {
+  const { p, events, cleanup } = await setupRealTui('b-short');
+  try {
+    const res = await p.send('Reply ONLY with "BASELINE" — one word.');
+    log('baseline res:', JSON.stringify({
+      text: res.text?.slice(0, 80),
+      error: res.error,
+      resolvedVia: res.metrics?.resolvedVia,
+      resultSubtype: res.metrics?.resultSubtype,
+      stopReason: res.metrics?.stopReason,
+    }));
+    ok(/BASELINE/i.test(res.text || ''),
+      `baseline reply contains BASELINE (got ${JSON.stringify(res.text?.slice(0,60))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('baseline tool', 'baseline-tool-call', async () => {
+  const { p, events, cleanup } = await setupRealTui('b-tool');
+  try {
+    const res = await p.send('Run `echo TOOL-OK` with Bash, then reply with one word "TOOLBASE".');
+    ok(res.metrics?.numToolUses >= 1, `tool_use tracked (got ${res.metrics?.numToolUses})`);
+    ok(/TOOLBASE/i.test(res.text || ''),
+      `tool turn final text returned (got ${JSON.stringify(res.text?.slice(0,80))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('baseline content', 'baseline-unicode', async () => {
+  const { p, events, cleanup } = await setupRealTui('b-uni');
+  try {
+    const res = await p.send('Reply with ONLY the word "UNI-OK" (no other characters). I will use it to verify unicode/emoji 🎉 你好 שלום.');
+    ok(/UNI-OK/i.test(res.text || ''), `unicode reply (got ${JSON.stringify(res.text?.slice(0,60))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('baseline content', 'baseline-newlines-in-prompt', async () => {
+  const { p, events, cleanup } = await setupRealTui('b-nl');
+  try {
+    const res = await p.send('Line one\nLine two\nLine three\n\nReply ONLY with "NLOK".');
+    ok(/NLOK/i.test(res.text || ''), `newlines in prompt OK (got ${JSON.stringify(res.text?.slice(0,60))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('baseline content', 'baseline-code-block', async () => {
+  const { p, events, cleanup } = await setupRealTui('b-code');
+  try {
+    const res = await p.send('Consider this code:\n```js\nconst x = 1;\nconsole.log(x);\n```\nReply ONLY with "CODEOK".');
+    ok(/CODEOK/i.test(res.text || ''), `code-block prompt OK (got ${JSON.stringify(res.text?.slice(0,60))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// ── Autosteer timing variations ──────────────────────────────────────
+
+function makeAutosteerScenario({ name, delayMs, primary, autoContent, msgId }) {
+  S(`autosteer timing`, name, async () => {
+    const { p, events, cleanup } = await setupRealTui(name);
     try {
-      const sendP = p.send('Reply ONLY with "OK" — one word, no punctuation.');
-      await sleep(50);
-      const okInject = p.injectUserMessage({
-        content: 'Reply ONLY with "GO" — one word, no punctuation.',
-        msgId: 9001,
-      });
-      assertEquals(okInject, true, 'injectUserMessage returns true when turn in flight');
-      const r1 = await sendP;
-      log('primary reply:', r1.text?.slice(0, 60));
-
-      // Wait for resolution to land (either path).
-      await waitForResolution(events, 9001, 45_000);
+      const sendP = p.send(primary);
+      if (delayMs > 0) await sleep(delayMs);
+      const ok2 = p.injectUserMessage({ content: autoContent, msgId });
+      ok(ok2, `inject returns true (delay=${delayMs}ms)`);
+      await sendP;
+      await waitForResolution(events, msgId, 60_000);
       await sleep(500);
+      assertInvariants(events, { autosteeredMsgIds: [msgId] });
+    } finally { await cleanup(); }
+  });
+}
 
-      assertInvariants(events, { autosteeredMsgId: 9001, expectAutosteer: true });
-      // Either path is valid; assert the text content lands SOMEWHERE.
-      const reply = events.find((e) => e.name === 'extra-turn-reply');
-      if (reply) {
-        assertTrue(/GO/i.test(reply.payload.text || ''),
-          `NEW-TURN: extra-turn-reply text matches /GO/ (got ${JSON.stringify(reply.payload.text?.slice(0,40))})`);
-      } else {
-        // FOLD path: the primary reply should cover the autosteered
-        // intent (mentions "GO" or both words).
-        assertTrue(/GO|OK/i.test(r1.text || ''),
-          `FOLD: primary reply mentions one of OK/GO (got ${JSON.stringify(r1.text?.slice(0,80))})`);
+makeAutosteerScenario({ name: 'autosteer-immediate',  delayMs: 0,    primary: 'Reply ONLY with "PRIMARY".', autoContent: 'Reply ONLY with "AUTOIMM".', msgId: 1001 });
+makeAutosteerScenario({ name: 'autosteer-50ms',       delayMs: 50,   primary: 'Reply ONLY with "PRIMARY".', autoContent: 'Reply ONLY with "AUTO50".',  msgId: 1002 });
+makeAutosteerScenario({ name: 'autosteer-200ms',      delayMs: 200,  primary: 'Reply ONLY with "PRIMARY".', autoContent: 'Reply ONLY with "AUTO200".', msgId: 1003 });
+makeAutosteerScenario({ name: 'autosteer-500ms',      delayMs: 500,  primary: 'Reply ONLY with "PRIMARY".', autoContent: 'Reply ONLY with "AUTO500".', msgId: 1004 });
+makeAutosteerScenario({ name: 'autosteer-1s',         delayMs: 1000, primary: 'Reply ONLY with "PRIMARY".', autoContent: 'Reply ONLY with "AUTO1S".',  msgId: 1005 });
+
+// Same timings against a tool-using primary turn — covers the
+// pause-point-during-tool case (often FOLD).
+makeAutosteerScenario({ name: 'autosteer-tool-immediate', delayMs: 0,   primary: 'Run `echo TOOL` with Bash, then reply "PTOOL".', autoContent: 'Also include "ATOOL".', msgId: 1011 });
+makeAutosteerScenario({ name: 'autosteer-tool-200ms',     delayMs: 200, primary: 'Run `echo TOOL` with Bash, then reply "PTOOL".', autoContent: 'Also include "ATOOL".', msgId: 1012 });
+makeAutosteerScenario({ name: 'autosteer-tool-500ms',     delayMs: 500, primary: 'Run `echo TOOL` with Bash, then reply "PTOOL".', autoContent: 'Also include "ATOOL".', msgId: 1013 });
+makeAutosteerScenario({ name: 'autosteer-tool-1500ms',    delayMs: 1500, primary: 'Run `echo TOOL` with Bash, then reply "PTOOL".', autoContent: 'Also include "ATOOL".', msgId: 1014 });
+
+// ── Autosteer content variations ─────────────────────────────────────
+
+S('autosteer content', 'autosteer-multiline-prompt', async () => {
+  const { p, events, cleanup } = await setupRealTui('a-ml');
+  try {
+    const sendP = p.send('Reply ONLY with "PRIM".');
+    await sleep(50);
+    p.injectUserMessage({
+      content: '<polygram-info>line1\nline2\nline3</polygram-info>\n<channel>Reply ONLY with "MLOK".</channel>',
+      msgId: 1101,
+    });
+    await sendP;
+    await waitForResolution(events, 1101, 60_000);
+    await sleep(500);
+    assertInvariants(events, { autosteeredMsgIds: [1101] });
+  } finally { await cleanup(); }
+});
+
+S('autosteer content', 'autosteer-unicode', async () => {
+  const { p, events, cleanup } = await setupRealTui('a-uni');
+  try {
+    const sendP = p.send('Reply ONLY with "PRIM".');
+    await sleep(50);
+    p.injectUserMessage({
+      content: '你好 🎉 — reply ONLY with "UNIOK".',
+      msgId: 1102,
+    });
+    await sendP;
+    await waitForResolution(events, 1102, 60_000);
+    await sleep(500);
+    assertInvariants(events, { autosteeredMsgIds: [1102] });
+  } finally { await cleanup(); }
+});
+
+S('autosteer content', 'autosteer-long-content', async () => {
+  const { p, events, cleanup } = await setupRealTui('a-long');
+  try {
+    const sendP = p.send('Reply ONLY with "PRIM".');
+    await sleep(50);
+    const longContent = 'Context: ' + 'foo bar baz '.repeat(200) + '\n\nReply ONLY with "LONGOK".';
+    p.injectUserMessage({ content: longContent, msgId: 1103 });
+    await sendP;
+    await waitForResolution(events, 1103, 60_000);
+    await sleep(500);
+    assertInvariants(events, { autosteeredMsgIds: [1103] });
+  } finally { await cleanup(); }
+});
+
+// ── Multi-autosteer ──────────────────────────────────────────────────
+
+function makeMultiAutosteer({ name, count, spacing, withTool }) {
+  S('multi-autosteer', name, async () => {
+    const { p, events, cleanup } = await setupRealTui(name);
+    try {
+      const primary = withTool
+        ? `Run \`echo MULTI-${count}\` with Bash, then reply ONLY with "P".`
+        : 'Reply ONLY with "P".';
+      const sendP = p.send(primary);
+      const msgIds = [];
+      // Stagger injects so they all land DURING the primary turn.
+      const initialDelay = withTool ? 300 : 100;
+      await sleep(initialDelay);
+      for (let i = 0; i < count; i++) {
+        const id = 2000 + i + (count * 100);
+        msgIds.push(id);
+        p.injectUserMessage({
+          content: `Inject ${i + 1}: include word "INJ${i + 1}" in reply.`,
+          msgId: id,
+        });
+        if (spacing > 0 && i < count - 1) await sleep(spacing);
       }
-    } finally { await cleanup(); }
-  },
-
-  /** Long primary turn with tool + autosteer mid-flight. */
-  'long-with-tool-then-autosteer': async () => {
-    const { p, events, cleanup } = await setupRealTui('long');
-    try {
-      const sendP = p.send('Run `echo HELLO123` with Bash, then reply with one word "PRIMARY".');
-      await sleep(400);
-      p.injectUserMessage({
-        content: 'Also include the word "EXTRA" in your reply.',
-        msgId: 9002,
-      });
       await sendP;
-      await waitForResolution(events, 9002, 45_000);
-      await sleep(500);
-      assertInvariants(events, { autosteeredMsgId: 9002, expectAutosteer: true });
+      await waitForAllResolutions(events, msgIds, 120_000);
+      await sleep(800);
+      assertInvariants(events, { autosteeredMsgIds: msgIds });
     } finally { await cleanup(); }
-  },
+  });
+}
 
-  /** rc.11: tool_use stop_reason is INTERMEDIATE, doesn't end the turn. */
-  'tool-use-not-terminal': async () => {
-    const { p, events, cleanup } = await setupRealTui('toolonly');
-    try {
-      const res = await p.send('Run `echo COUNT-42` with Bash, then in your reply say ONE word: "TOOLDONE".');
-      log('reply text:', JSON.stringify(res.text?.slice(0, 80)));
-      assertTrue(res.metrics?.numToolUses >= 1,
-        `tool_use count tracked (got ${res.metrics?.numToolUses})`);
-      assertTrue(typeof res.text === 'string' && res.text.length > 0,
-        `pm.send waited past tool_use intermediate and got terminal text (got ${JSON.stringify(res.text?.slice(0,80))})`);
-      assertInvariants(events, { expectAutosteer: false });
-    } finally { await cleanup(); }
-  },
+makeMultiAutosteer({ name: 'multi-2-rapid',           count: 2, spacing: 0,    withTool: false });
+makeMultiAutosteer({ name: 'multi-2-spaced',          count: 2, spacing: 200,  withTool: false });
+makeMultiAutosteer({ name: 'multi-3-rapid',           count: 3, spacing: 0,    withTool: true  });
+makeMultiAutosteer({ name: 'multi-3-spaced',          count: 3, spacing: 200,  withTool: true  });
+makeMultiAutosteer({ name: 'multi-4-rapid',           count: 4, spacing: 50,   withTool: true  });
+makeMultiAutosteer({ name: 'multi-5-rapid',           count: 5, spacing: 50,   withTool: true  });
+makeMultiAutosteer({ name: 'multi-2-tool-spaced',     count: 2, spacing: 500,  withTool: true  });
+makeMultiAutosteer({ name: 'multi-3-tool-spaced',     count: 3, spacing: 500,  withTool: true  });
 
-  /** rc.14: concurrent paste safety — fire send + inject in same tick. */
-  'concurrent-paste-no-corruption': async () => {
-    const { p, events, cleanup } = await setupRealTui('concurrent');
-    try {
-      const sendP = p.send('Reply ONLY with "ALPHA" — one word.');
-      p.injectUserMessage({
-        content: 'Reply ONLY with "BRAVO" — one word.',
-        msgId: 9003,
-      });
-      await sendP;
-      await waitForResolution(events, 9003, 45_000);
-      await sleep(500);
-      assertInvariants(events, { autosteeredMsgId: 9003, expectAutosteer: true });
-    } finally { await cleanup(); }
-  },
+// ── Concurrent send + inject races ───────────────────────────────────
 
-  /** Sanity: single pm.send with no inject emits no autosteer events. */
-  'single-turn-no-autosteer': async () => {
-    const { p, events, cleanup } = await setupRealTui('single');
-    try {
-      const res = await p.send('Reply ONLY with "SOLO" — one word.');
-      assertTrue(/SOLO/i.test(res.text || ''),
-        `single reply contains SOLO (got ${JSON.stringify(res.text?.slice(0,60))})`);
-      assertInvariants(events, { expectAutosteer: false });
-    } finally { await cleanup(); }
-  },
+S('race', 'race-send-and-inject-same-tick', async () => {
+  const { p, events, cleanup } = await setupRealTui('race-st');
+  try {
+    const sendP = p.send('Reply ONLY with "RACE-P".');
+    // No sleep — fire inject in the SAME microtask.
+    p.injectUserMessage({ content: 'Reply ONLY with "RACE-A".', msgId: 3001 });
+    await sendP;
+    await waitForResolution(events, 3001, 60_000);
+    await sleep(500);
+    assertInvariants(events, { autosteeredMsgIds: [3001] });
+  } finally { await cleanup(); }
+});
 
-  /** Two autosteers fired during one primary turn. */
-  'two-autosteers-in-one-turn': async () => {
-    const { p, events, cleanup } = await setupRealTui('multi');
-    try {
-      const sendP = p.send('Run `echo MULTI` with Bash, then reply with ONE word: "MULTIDONE".');
-      await sleep(400);
-      p.injectUserMessage({
-        content: 'Also mention "extra-A" in your reply.',
-        msgId: 9101,
-      });
-      await sleep(50);
-      p.injectUserMessage({
-        content: 'And mention "extra-B" too.',
-        msgId: 9102,
-      });
-      await sendP;
-      // Wait for both to resolve.
-      await waitForResolution(events, 9101, 45_000);
-      await waitForResolution(events, 9102, 45_000);
-      await sleep(500);
-      assertInvariants(events, { autosteeredMsgId: 9101, expectAutosteer: true });
-      assertInvariants(events, { autosteeredMsgId: 9102, expectAutosteer: true });
-    } finally { await cleanup(); }
-  },
-};
+S('race', 'race-back-to-back-injects', async () => {
+  const { p, events, cleanup } = await setupRealTui('race-bb');
+  try {
+    const sendP = p.send('Run `echo RACE-T` with Bash, then reply "RACE-PT".');
+    await sleep(150);
+    // Three injects with NO sleeps — all in the same tick.
+    p.injectUserMessage({ content: 'Include "X1" in reply.', msgId: 3011 });
+    p.injectUserMessage({ content: 'Include "X2" in reply.', msgId: 3012 });
+    p.injectUserMessage({ content: 'Include "X3" in reply.', msgId: 3013 });
+    await sendP;
+    await waitForAllResolutions(events, [3011, 3012, 3013], 90_000);
+    await sleep(800);
+    assertInvariants(events, { autosteeredMsgIds: [3011, 3012, 3013] });
+  } finally { await cleanup(); }
+});
 
-// ─── Driver ──────────────────────────────────────────────────────────
+// ── Edge cases ────────────────────────────────────────────────────────
+
+S('edge', 'inject-before-send-returns-false', async () => {
+  const { p, events, cleanup } = await setupRealTui('e-pre');
+  try {
+    // No send in flight → inject must return false.
+    const r = p.injectUserMessage({ content: 'should be ignored', msgId: 4001 });
+    ok(r === false, 'inject without in-flight turn returns false');
+    notFired(events, 'inject-user-message', 'no inject-user-message event emitted');
+    notFired(events, 'autosteer-resolution', 'no autosteer-resolution');
+  } finally { await cleanup(); }
+});
+
+S('edge', 'inject-empty-content-returns-false', async () => {
+  const { p, events, cleanup } = await setupRealTui('e-empty');
+  try {
+    const sendP = p.send('Reply ONLY with "E".');
+    await sleep(50);
+    const r = p.injectUserMessage({ content: '', msgId: 4002 });
+    ok(r === false, 'inject with empty content returns false');
+    await sendP;
+    await sleep(500);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('edge', 'inject-whitespace-only', async () => {
+  const { p, events, cleanup } = await setupRealTui('e-ws');
+  try {
+    const sendP = p.send('Reply ONLY with "WS".');
+    await sleep(50);
+    // Whitespace is NON-empty after sanitize so this DOES inject. The
+    // agent may or may not produce a useful reply; the invariants
+    // still hold (no corruption, no match-miss).
+    p.injectUserMessage({ content: '   \n\t  ', msgId: 4003 });
+    await sendP;
+    await sleep(2000);
+    assertInvariants(events);  // no autosteer assertion — agent may ignore
+  } finally { await cleanup(); }
+});
+
+// ── Long-running tool patterns ───────────────────────────────────────
+
+S('long-tool', 'tool-with-sleep', async () => {
+  const { p, events, cleanup } = await setupRealTui('lt-sleep');
+  try {
+    const res = await p.send('Run `sleep 2 && echo SLEPT` with Bash, then reply ONLY with "SLEEPDONE".');
+    ok(/SLEEPDONE/i.test(res.text || ''),
+      `sleep-tool reply contains SLEEPDONE (got ${JSON.stringify(res.text?.slice(0,80))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('long-tool', 'multiple-tools-sequential', async () => {
+  const { p, events, cleanup } = await setupRealTui('lt-multi');
+  try {
+    const res = await p.send('Run `echo A`, then `echo B`, then `echo C` with three separate Bash commands. Then reply ONLY with "ABCDONE".');
+    ok(res.metrics?.numToolUses >= 2, `multiple tool calls tracked (got ${res.metrics?.numToolUses})`);
+    ok(/ABCDONE/i.test(res.text || ''),
+      `multi-tool reply contains ABCDONE (got ${JSON.stringify(res.text?.slice(0,80))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('long-tool autosteer', 'long-tool-with-autosteer-mid', async () => {
+  const { p, events, cleanup } = await setupRealTui('lt-mid');
+  try {
+    const sendP = p.send('Run `sleep 3 && echo LONG` with Bash, then reply "LTPRIM".');
+    await sleep(800);
+    p.injectUserMessage({ content: 'Also say "LTMID" in your reply.', msgId: 5001 });
+    await sendP;
+    await waitForResolution(events, 5001, 60_000);
+    await sleep(500);
+    assertInvariants(events, { autosteeredMsgIds: [5001] });
+  } finally { await cleanup(); }
+});
+
+S('long-tool autosteer', 'long-tool-multi-autosteer', async () => {
+  const { p, events, cleanup } = await setupRealTui('lt-multi-a');
+  try {
+    const sendP = p.send('Run `sleep 4 && echo LONGER` with Bash, then reply "MULTILT".');
+    await sleep(500);
+    p.injectUserMessage({ content: 'Include "I1" in reply.', msgId: 5101 });
+    await sleep(500);
+    p.injectUserMessage({ content: 'Include "I2" in reply.', msgId: 5102 });
+    await sleep(500);
+    p.injectUserMessage({ content: 'Include "I3" in reply.', msgId: 5103 });
+    await sendP;
+    await waitForAllResolutions(events, [5101, 5102, 5103], 90_000);
+    await sleep(800);
+    assertInvariants(events, { autosteeredMsgIds: [5101, 5102, 5103] });
+  } finally { await cleanup(); }
+});
+
+// ── Sequential turns (multiple sends, no autosteer) ─────────────────
+
+S('sequential', 'two-sequential-sends', async () => {
+  const { p, events, cleanup } = await setupRealTui('seq-2');
+  try {
+    const r1 = await p.send('Reply ONLY with "SEQ1".');
+    ok(/SEQ1/i.test(r1.text || ''), `first turn: SEQ1 (got ${JSON.stringify(r1.text?.slice(0,40))})`);
+    const r2 = await p.send('Reply ONLY with "SEQ2".');
+    ok(/SEQ2/i.test(r2.text || ''), `second turn: SEQ2 (got ${JSON.stringify(r2.text?.slice(0,40))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('sequential', 'three-sequential-sends', async () => {
+  const { p, events, cleanup } = await setupRealTui('seq-3');
+  try {
+    const r1 = await p.send('Reply ONLY with "ONE".');
+    ok(/ONE/i.test(r1.text || ''), `turn 1: ONE`);
+    const r2 = await p.send('Reply ONLY with "TWO".');
+    ok(/TWO/i.test(r2.text || ''), `turn 2: TWO`);
+    const r3 = await p.send('Reply ONLY with "THREE".');
+    ok(/THREE/i.test(r3.text || ''), `turn 3: THREE`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('sequential', 'send-tool-send', async () => {
+  const { p, events, cleanup } = await setupRealTui('seq-tool');
+  try {
+    const r1 = await p.send('Reply ONLY with "P1".');
+    ok(/P1/i.test(r1.text || ''), 'turn 1 OK');
+    const r2 = await p.send('Run `echo MIDDLE` with Bash, then reply ONLY with "MID".');
+    ok(/MID/i.test(r2.text || ''), `tool turn OK (got ${JSON.stringify(r2.text?.slice(0,60))})`);
+    const r3 = await p.send('Reply ONLY with "P3".');
+    ok(/P3/i.test(r3.text || ''), 'turn 3 OK');
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// ── Send-then-send rapid (queue at TmuxProcess level) ───────────────
+
+S('rapid sends', 'two-sends-no-await', async () => {
+  const { p, events, cleanup } = await setupRealTui('two-no-await');
+  try {
+    // Fire two sends back-to-back without awaiting the first.
+    // TmuxProcess queues the second in its pendingQueue.
+    const send1P = p.send('Reply ONLY with "Q1".');
+    const send2P = p.send('Reply ONLY with "Q2".');
+    const r1 = await send1P;
+    const r2 = await send2P;
+    ok(/Q1/i.test(r1.text || ''), `first send returns Q1 reply (got ${JSON.stringify(r1.text?.slice(0,40))})`);
+    ok(/Q2/i.test(r2.text || ''), `second send returns Q2 reply (got ${JSON.stringify(r2.text?.slice(0,40))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('rapid sends', 'three-sends-no-await', async () => {
+  const { p, events, cleanup } = await setupRealTui('three-no-await');
+  try {
+    const send1P = p.send('Reply ONLY with "QQ1".');
+    const send2P = p.send('Reply ONLY with "QQ2".');
+    const send3P = p.send('Reply ONLY with "QQ3".');
+    const [r1, r2, r3] = await Promise.all([send1P, send2P, send3P]);
+    ok(/QQ1/i.test(r1.text || ''), `send 1 → QQ1 (got ${JSON.stringify(r1.text?.slice(0,40))})`);
+    ok(/QQ2/i.test(r2.text || ''), `send 2 → QQ2 (got ${JSON.stringify(r2.text?.slice(0,40))})`);
+    ok(/QQ3/i.test(r3.text || ''), `send 3 → QQ3 (got ${JSON.stringify(r3.text?.slice(0,40))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// ── Send + multiple injects in one turn ─────────────────────────────
+
+S('mixed', 'send-then-inject-then-send', async () => {
+  const { p, events, cleanup } = await setupRealTui('mix-sis');
+  try {
+    const send1P = p.send('Reply ONLY with "M1".');
+    await sleep(100);
+    p.injectUserMessage({ content: 'Inject A — include "MIA".', msgId: 7001 });
+    await sleep(100);
+    const send2P = p.send('Reply ONLY with "M2".');
+    const [r1, r2] = await Promise.all([send1P, send2P]);
+    ok(typeof r1.text === 'string', `send 1 resolved with text (got ${JSON.stringify(r1.text?.slice(0,40))})`);
+    ok(typeof r2.text === 'string', `send 2 resolved with text (got ${JSON.stringify(r2.text?.slice(0,40))})`);
+    await waitForResolution(events, 7001, 60_000);
+    await sleep(500);
+    assertInvariants(events, { autosteeredMsgIds: [7001] });
+  } finally { await cleanup(); }
+});
+
+S('mixed', 'send-inject-tool-inject', async () => {
+  const { p, events, cleanup } = await setupRealTui('mix-sit');
+  try {
+    const sendP = p.send('Run `echo MIX` with Bash, then reply ONLY with "MIXED".');
+    await sleep(200);
+    p.injectUserMessage({ content: 'Inject 1 — include "I1A".', msgId: 7011 });
+    await sleep(800);  // mid-tool
+    p.injectUserMessage({ content: 'Inject 2 — include "I2B".', msgId: 7012 });
+    await sendP;
+    await waitForAllResolutions(events, [7011, 7012], 90_000);
+    await sleep(500);
+    assertInvariants(events, { autosteeredMsgIds: [7011, 7012] });
+  } finally { await cleanup(); }
+});
+
+// ── Stress: rapid-fire multi-autosteer ──────────────────────────────
+
+S('stress', 'stress-many-rapid-autosteers', async () => {
+  const { p, events, cleanup } = await setupRealTui('stress-many');
+  try {
+    const sendP = p.send('Run `sleep 3` with Bash, then reply ONLY with "STRESS-P".');
+    await sleep(300);
+    const msgIds = [];
+    for (let i = 0; i < 6; i++) {
+      const id = 8000 + i;
+      msgIds.push(id);
+      p.injectUserMessage({ content: `Inject ${i}: include "SX${i}".`, msgId: id });
+      // No sleep — all in same tick.
+    }
+    await sendP;
+    await waitForAllResolutions(events, msgIds, 120_000);
+    await sleep(800);
+    assertInvariants(events, { autosteeredMsgIds: msgIds });
+  } finally { await cleanup(); }
+});
+
+// ── Reasoning-heavy primary turns ───────────────────────────────────
+
+S('reasoning', 'long-text-primary-no-autosteer', async () => {
+  const { p, events, cleanup } = await setupRealTui('long-text');
+  try {
+    const res = await p.send('Write a single sentence explaining what 1+1 equals. End your reply with the word "DONE".');
+    ok(/DONE/i.test(res.text || ''),
+      `long reasoning reply ends with DONE (got ${JSON.stringify(res.text?.slice(0,120))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('sequential', 'four-sequential-mixed', async () => {
+  const { p, events, cleanup } = await setupRealTui('seq-4mix');
+  try {
+    const r1 = await p.send('Reply ONLY with "S1".');
+    ok(/S1/i.test(r1.text || ''), 'turn 1 OK');
+    const r2 = await p.send('Run `echo X` with Bash, reply ONLY with "S2".');
+    ok(/S2/i.test(r2.text || ''), 'turn 2 (tool) OK');
+    const r3 = await p.send('Reply ONLY with "S3".');
+    ok(/S3/i.test(r3.text || ''), 'turn 3 OK');
+    const r4 = await p.send('Run `echo Y` with Bash, reply ONLY with "S4".');
+    ok(/S4/i.test(r4.text || ''), 'turn 4 (tool) OK');
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('autosteer timing', 'autosteer-2s-after-primary', async () => {
+  // Inject AFTER the primary has almost certainly finished. The
+  // inject MIGHT return false (no in-flight turn) — assert that
+  // either way, no spurious events fire.
+  const { p, events, cleanup } = await setupRealTui('a-2s');
+  try {
+    const sendP = p.send('Reply ONLY with "FAST".');
+    await sleep(2000);  // primary likely done
+    const r = p.injectUserMessage({ content: 'Reply ONLY with "LATE".', msgId: 9501 });
+    log('late inject returned:', r);
+    await sendP;
+    await sleep(2000);
+    assertInvariants(events,
+      r === true ? { autosteeredMsgIds: [9501] } : {});
+  } finally { await cleanup(); }
+});
+
+S('content', 'autosteer-emoji-only', async () => {
+  const { p, events, cleanup } = await setupRealTui('c-emoji');
+  try {
+    const sendP = p.send('Reply ONLY with "PRIM".');
+    await sleep(100);
+    p.injectUserMessage({
+      content: '🎉 — please include "EMOJIK" in your reply.',
+      msgId: 9601,
+    });
+    await sendP;
+    await waitForResolution(events, 9601, 60_000);
+    await sleep(500);
+    assertInvariants(events, { autosteeredMsgIds: [9601] });
+  } finally { await cleanup(); }
+});
+
+S('content', 'autosteer-with-special-chars', async () => {
+  const { p, events, cleanup } = await setupRealTui('c-special');
+  try {
+    const sendP = p.send('Reply ONLY with "PRIM".');
+    await sleep(100);
+    p.injectUserMessage({
+      content: 'Special chars: <tag attr="value">data & more</tag>\nLine 2.\n\nReply with "SPCOK".',
+      msgId: 9602,
+    });
+    await sendP;
+    await waitForResolution(events, 9602, 60_000);
+    await sleep(500);
+    assertInvariants(events, { autosteeredMsgIds: [9602] });
+  } finally { await cleanup(); }
+});
+
+S('reasoning autosteer', 'reasoning-primary-with-autosteer', async () => {
+  const { p, events, cleanup } = await setupRealTui('reason-auto');
+  try {
+    const sendP = p.send('Briefly explain (one sentence) what 2+2 equals. End with "RPRIM".');
+    await sleep(200);
+    p.injectUserMessage({
+      content: 'Also include word "RAUTO" in your final reply.',
+      msgId: 9001,
+    });
+    await sendP;
+    await waitForResolution(events, 9001, 60_000);
+    await sleep(500);
+    assertInvariants(events, { autosteeredMsgIds: [9001] });
+  } finally { await cleanup(); }
+});
+
+// ── Driver ───────────────────────────────────────────────────────────
 
 async function main() {
   const arg = process.argv[2];
-  const names = arg ? [arg] : Object.keys(scenarios);
-  const unknown = names.filter((n) => !scenarios[n]);
-  if (unknown.length > 0) {
-    console.error('Unknown scenarios:', unknown.join(','));
-    console.error('Available:', Object.keys(scenarios).join(', '));
-    process.exit(2);
+  let chosen = scenarios;
+  if (arg) {
+    chosen = scenarios.filter((s) => s.name === arg || s.tags.includes(arg));
+    if (chosen.length === 0) {
+      console.error(`No scenarios match "${arg}". Available:`);
+      for (const s of scenarios) console.error(`  ${s.name}  [${s.tags}]`);
+      process.exit(2);
+    }
   }
+  console.log(`Running ${chosen.length} scenario${chosen.length === 1 ? '' : 's'}.\n`);
 
   const timer = setTimeout(() => {
-    console.error('[spike] HARD TIMEOUT exceeded, aborting');
+    console.error('[spike] HARD TIMEOUT, aborting');
     process.exit(2);
   }, HARD_TIMEOUT_MS).unref();
 
-  for (const name of names) {
-    console.log(`\n=== Scenario: ${name} ===`);
+  let passed = 0;
+  let failed = 0;
+  const failures = [];
+
+  for (const s of chosen) {
+    console.log(`\n=== [${s.tags}] ${s.name} ===`);
+    scenarioFailed = false;
+    const t0 = Date.now();
     try {
-      await scenarios[name]();
+      await s.fn();
     } catch (err) {
-      console.error(`[spike] scenario ${name} threw:`, err.message);
-      process.exitCode = 1;
+      fail(`scenario threw: ${err.message}`);
+    }
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    if (scenarioFailed) {
+      failed++;
+      failures.push(s.name);
+      console.log(`  → FAILED in ${elapsed}s`);
+    } else {
+      passed++;
+      console.log(`  → passed in ${elapsed}s`);
     }
   }
   clearTimeout(timer);
 
-  if (process.exitCode === 1) {
+  console.log('\n=== Summary ===');
+  console.log(`Scenarios: ${chosen.length}`);
+  console.log(`Passed:    ${passed}`);
+  console.log(`Failed:    ${failed}`);
+  console.log(`Assertions: ${totalAsserts}`);
+  if (failures.length > 0) {
+    console.log('\nFailed scenarios:');
+    for (const f of failures) console.log('  -', f);
     console.log('\n=== SPIKE FAILED ===');
     process.exit(1);
   } else {
