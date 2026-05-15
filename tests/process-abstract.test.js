@@ -3,7 +3,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  Process, UnsupportedOperationError, NotImplementedYetError,
+  Process, UnsupportedOperationError,
 } = require('../lib/process/process');
 
 describe('Process — abstract base', () => {
@@ -135,17 +135,6 @@ describe('UnsupportedOperationError', () => {
   });
 });
 
-describe('NotImplementedYetError', () => {
-  test('shape', () => {
-    const err = new NotImplementedYetError('bar', 'tmux', 'Phase 3');
-    assert.equal(err.name, 'NotImplementedYetError');
-    assert.equal(err.code, 'NOT_IMPLEMENTED_YET');
-    assert.equal(err.method, 'bar');
-    assert.equal(err.backend, 'tmux');
-    assert.equal(err.phase, 'Phase 3');
-    assert.match(err.message, /bar.*not yet implemented.*tmux.*Phase 3/);
-  });
-});
 
 describe('Process — subclass override sets backend', () => {
   class TestBackend extends Process {

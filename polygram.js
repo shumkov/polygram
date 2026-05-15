@@ -40,6 +40,10 @@ const { filterAttachments } = require('./lib/attachments');
 const { ProcessManager } = require('./lib/process-manager');
 const { createProcessFactory } = require('./lib/process/factory');
 const { extractAssistantText } = require('./lib/process/sdk-process');
+const { createTmuxRunner } = require('./lib/tmux/tmux-runner');
+const { sweepTmuxOrphans } = require('./lib/tmux/orphan-sweep');
+const { normalizeTuiToolInput } = require('./lib/tmux/tui-tool-input');
+const { PollScheduler } = require('./lib/tmux/poll-scheduler');
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
 // (pm.injectUserMessage) replaces the buffer + PostToolBatch detour.
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
@@ -1119,29 +1123,34 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // subsequent fires. Cleared on compact-boundary so the next
       // cycle (if it crosses again) will fire fresh.
       if (chatCtxHint === true && !contextHintShown.has(sessionKey)) {
-        const entry = pm.get(sessionKey);
-        const q = entry?.query;
-        if (q && typeof q.getContextUsage === 'function') {
-          const threshold = chatConfig.contextHintThreshold != null
-            ? chatConfig.contextHintThreshold
-            : (config.bot?.contextHintThreshold != null
-              ? config.bot.contextHintThreshold
-              : undefined);
-          q.getContextUsage().then((usage) => {
-            const text = maybeContextFullHint(usage, threshold != null ? { threshold } : undefined);
-            if (!text) return;
-            // Mark BEFORE the send so concurrent turns don't all
-            // fire the hint while the first one's still in flight.
-            contextHintShown.add(sessionKey);
-            return tg(bot, 'sendMessage', {
-              chat_id: chatId,
-              text,
-              ...(threadId ? { message_thread_id: threadId } : {}),
-            }, { source: 'context-full-hint', botName: BOT_NAME });
-          }).catch((err) => {
-            console.error(`[${label}] context-hint failed: ${err.message}`);
-          });
-        }
+        // 0.10.0: route through pm.getContextUsage(sessionKey) instead
+        // of poking entry.query directly. The pm-level call delegates
+        // to Process.getContextUsage(), which is implemented by BOTH
+        // SdkProcess (via Query.getContextUsage) and TmuxProcess (via
+        // JSONL message.usage snapshots). Either backend returns the
+        // same shape; either throws Unsupported when no data yet.
+        const threshold = chatConfig.contextHintThreshold != null
+          ? chatConfig.contextHintThreshold
+          : (config.bot?.contextHintThreshold != null
+            ? config.bot.contextHintThreshold
+            : undefined);
+        pm.getContextUsage(sessionKey).then((usage) => {
+          const text = maybeContextFullHint(usage, threshold != null ? { threshold } : undefined);
+          if (!text) return;
+          // Mark BEFORE the send so concurrent turns don't all fire
+          // the hint while the first one's still in flight.
+          contextHintShown.add(sessionKey);
+          return tg(bot, 'sendMessage', {
+            chat_id: chatId,
+            text,
+            ...(threadId ? { message_thread_id: threadId } : {}),
+          }, { source: 'context-full-hint', botName: BOT_NAME });
+        }).catch((err) => {
+          // UnsupportedOperation = backend doesn't have usage data
+          // (yet) — silent no-op, not an error. Other errors surface.
+          if (err?.code === 'UNSUPPORTED_OPERATION') return;
+          console.error(`[${label}] context-hint failed: ${err.message}`);
+        });
       }
     }
 
@@ -1866,6 +1875,20 @@ async function main() {
     console.log(`[orphan-guard] prior=${pidClaim.priorPid ?? '?'} action=${pidClaim.priorAction}`);
   }
 
+  // 0.10.0: after claimPidFile kills the orphan daemon, sweep any
+  // `polygram-<bot>-*` tmux sessions it left behind. Tmux sessions
+  // outlive their parent process — without this, the new daemon's
+  // TmuxProcess.start() hits EEXIST on session spawn for any chat
+  // routed to pm:'tmux'. See lib/tmux/orphan-sweep.js for rationale.
+  try {
+    const sweep = await sweepTmuxOrphans({ botName: BOT_NAME, logger: console });
+    if (sweep.swept.length > 0) {
+      console.log(`[orphan-sweep] killed ${sweep.swept.length} stale tmux session(s)`);
+    }
+  } catch (err) {
+    console.warn?.(`[orphan-sweep] failed (non-fatal): ${err.message}`);
+  }
+
   try {
     db = dbClient.open(DB_PATH);
     console.log(`[db] opened ${DB_PATH}`);
@@ -2000,12 +2023,48 @@ async function main() {
   // subclass per-chat based on config.chats[X].pm. Lifecycle events
   // (init / close / stream-chunk / result / tool-use / etc.) emit
   // from each Process; the pm forwards to sdkCallbacks.
+  // tmux backend runner — one per daemon, shared across all TmuxProcess
+  // instances. Construction is cheap (no system call until first
+  // spawn/send). Only used if any chat in config has pm:'tmux'.
+  const tmuxRunner = createTmuxRunner({ logger: console });
+  // O1 optimization: shared poll-tick scheduler. N TmuxProcess
+  // instances share ONE setInterval instead of spawning N independent
+  // setTimeout chains. Idle when no chats are in flight (zero timers
+  // running). Configurable via config.bot.tmuxPollIntervalMs.
+  const tmuxPollIntervalMs = config.bot?.tmuxPollIntervalMs || 250;
+  const pollScheduler = new PollScheduler({ intervalMs: tmuxPollIntervalMs });
   const processFactory = createProcessFactory({
     config,
     spawnFn: buildSdkOptions,
     db,
     logger: console,
+    tmuxRunner,
+    botName: BOT_NAME,
+    pollScheduler,
   });
+  // 0.10.0: route tmux backend's in-pane approval prompts through the
+  // SAME canUseTool plumbing that SDK chats use. TmuxProcess emits
+  // 'approval-required' with a respond() closure when it detects the
+  // TUI's "Do you want to do this?" prompt; we call makeCanUseTool
+  // (admin-chat card, chat_tool_decisions persistence, timeout race —
+  // all reused from SDK) and feed its decision back to the TUI.
+  sdkCallbacks.onApprovalRequired = async (sessionKey, payload) => {
+    const { toolName, toolInput, id, respond } = payload || {};
+    if (typeof respond !== 'function') return;
+    try {
+      const canUseTool = makeCanUseTool(sessionKey);
+      const input = normalizeTuiToolInput(toolName, toolInput);
+      const decision = await canUseTool(toolName, input, { toolUseID: id });
+      const verdict = decision?.behavior === 'allow' ? 'allow' : 'deny';
+      await respond(verdict, decision?.message);
+    } catch (err) {
+      console.error(`[approval-required] ${sessionKey} ${toolName} → ${err.message}`);
+      // Fail-closed: deny with the error as feedback.
+      try { await respond('deny', `approval-flow error: ${err.message}`); }
+      catch { /* swallow */ }
+    }
+  };
+
   pm = new ProcessManager({
     processFactory,
     db,
@@ -2343,14 +2402,16 @@ async function main() {
       if (o.text && savedSessionId) {
         try {
           const entry = await pm.getOrSpawn(o.session_key, buildSpawnContext(o.session_key));
-          if (!entry?.inputController?.push) {
-            throw new Error('input controller not ready post-spawn');
+          // 0.10.0 P0.4: route through Process.fireUserMessage so both
+          // SDK and tmux backends work. Pre-0.10.0-P0.4 reached into
+          // entry.inputController.push directly — broken on tmux.
+          if (!entry || typeof entry.fireUserMessage !== 'function') {
+            throw new Error('Process.fireUserMessage not available');
           }
-          entry.inputController.push({
-            type: 'user',
-            message: { role: 'user', content: o.text },
-            parent_tool_use_id: null,
-          });
+          const ok = entry.fireUserMessage(o.text);
+          if (!ok) {
+            throw new Error('fireUserMessage refused (closed or empty content)');
+          }
           logEvent('compact-replay', {
             chat_id: o.chat_id,
             thread_id: o.thread_id,

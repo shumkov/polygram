@@ -1,0 +1,206 @@
+'use strict';
+
+/**
+ * Approval-flow tests for TmuxProcess. When a chat is spawned without
+ * --permission-mode acceptEdits, claude TUI pauses on risky tools and
+ * shows a "Do you want to do this?" prompt. TmuxProcess detects this
+ * via capture-pane, fires approval-required, and waits for the
+ * consumer to call respond('allow'|'deny'|'always-allow').
+ */
+
+const { test, describe } = require('node:test');
+const assert = require('node:assert/strict');
+const { TmuxProcess } = require('../lib/process/tmux-process');
+
+const APPROVAL_CAPTURE = [
+  '⏺ Bash(rm /tmp/foo.txt)',
+  '  ⎿  Do you want to do this?',
+  '       1. Yes',
+  '       2. Yes, allow always for similar commands',
+  '       3. No, and tell Claude what to do differently',
+  '',
+  '❯ ',
+].join('\n');
+
+const READY_CAPTURE = 'welcome\n? for shortcuts';
+
+function makeFakeRunner({ captureSequence } = {}) {
+  const calls = [];
+  let idx = 0;
+  return {
+    _calls: calls,
+    spawn: async () => { calls.push({ kind: 'spawn' }); },
+    sendControl: async (n, k) => { calls.push({ kind: 'sendControl', name: n, key: k }); },
+    pasteText: async (n, t) => {
+      calls.push({ kind: 'pasteText', name: n, text: t });
+      return { sanitized: t, oneLine: t, stripped: 0 };
+    },
+    captureWide: async () => {
+      const v = captureSequence?.[Math.min(idx, captureSequence.length - 1)] ?? READY_CAPTURE;
+      idx++;
+      return v;
+    },
+    capturePane: async () => READY_CAPTURE,
+    sessionExists: async () => true,
+    killSession: async (n) => { calls.push({ kind: 'killSession', name: n }); },
+    listPolygramSessions: async () => [],
+    setPaneReadOnly: async () => {},
+    sessionName: (b, c, t) => `polygram-${b}-${c}-${t || 'main'}`,
+    debugLogPath: (b, c, t) => `/tmp/${b}-${c}-${t || 'main'}.log`,
+  };
+}
+
+const SILENT = { warn: () => {}, error: () => {}, debug: () => {}, log: () => {}, info: () => {} };
+
+function makeProc(runner) {
+  return new TmuxProcess({
+    sessionKey: 'chat:100', chatId: '100', threadId: null, label: 'test',
+    runner, botName: 'shumabit', logger: SILENT,
+    pollMs: 1, quiesceMs: 5, readyTimeoutMs: 500, turnTimeoutMs: 500,
+  });
+}
+
+describe('TmuxProcess approval — detection', () => {
+  test('SECURITY: assistant message containing "Do you want to proceed?" alone does NOT fire approval-required', async () => {
+    // Without the menu structure (numbered options), this is just
+    // text claude generated — must not trigger a fake approval card.
+    const fakeAssistantText = [
+      '⏺ Read(/etc/passwd)',  // a prior tool use lingering in scrollback
+      '',
+      '...',
+      '',
+      'Do you want to proceed? Let me know if you have any other questions.',
+      '? for shortcuts',
+    ].join('\n');
+    const runner = makeFakeRunner({
+      captureSequence: [READY_CAPTURE, fakeAssistantText, READY_CAPTURE],
+    });
+    const p = makeProc(runner);
+    p.tmuxName = 'polygram-test';
+    let fired = false;
+    p.on('approval-required', () => { fired = true; });
+    const turnPromise = p._awaitTurnComplete({ timeoutMs: 200 }).catch(() => null);
+    await turnPromise;
+    assert.equal(fired, false, 'approval-required must NOT fire for assistant-rendered question');
+  });
+
+  test('emits approval-required when capture-pane shows the prompt', async () => {
+    const runner = makeFakeRunner({
+      captureSequence: [READY_CAPTURE, APPROVAL_CAPTURE],
+    });
+    const p = makeProc(runner);
+    p.tmuxName = 'polygram-test';
+    const fired = new Promise((resolve) => p.once('approval-required', resolve));
+    // Drive the poll loop directly. _awaitTurnComplete catches the
+    // approval pattern and surfaces the event before deciding on
+    // ready/streaming state.
+    const turnPromise = p._awaitTurnComplete({ timeoutMs: 1000 }).catch(() => null);
+    const ev = await Promise.race([
+      fired,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('not emitted')), 500)),
+    ]);
+    assert.equal(ev.toolName, 'Bash');
+    assert.match(ev.toolInput, /rm \/tmp\/foo\.txt/);
+    assert.equal(ev.backend, 'tmux');
+    assert.equal(typeof ev.respond, 'function');
+    // Settle the lingering turn poll. Respond to release it.
+    await ev.respond('allow');
+    await turnPromise;
+  });
+
+  test('duplicate approval captures do not re-fire the event (dedup)', async () => {
+    const runner = makeFakeRunner({
+      captureSequence: [
+        READY_CAPTURE,
+        APPROVAL_CAPTURE,
+        APPROVAL_CAPTURE,
+        APPROVAL_CAPTURE,
+        READY_CAPTURE,
+      ],
+    });
+    const p = makeProc(runner);
+    p.tmuxName = 'polygram-test';
+    const fires = [];
+    p.on('approval-required', (ev) => fires.push(ev));
+    const turnPromise = p._awaitTurnComplete({ timeoutMs: 1000 }).catch(() => null);
+    // Give the loop time to see the prompt + dedup repeats.
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(fires.length, 1, `expected 1 emit, got ${fires.length}`);
+    await fires[0].respond('allow');
+    await turnPromise;
+  });
+});
+
+describe('TmuxProcess approval — respond', () => {
+  test('respond("allow") pastes "1" + Enter', async () => {
+    const runner = makeFakeRunner();
+    const p = makeProc(runner);
+    p.tmuxName = 'polygram-test';
+    p._pendingApprovalId = 'approval-123';
+    const ok = await p.respondToApproval('approval-123', 'allow');
+    assert.equal(ok, true);
+    const paste = runner._calls.find((c) => c.kind === 'pasteText');
+    assert.equal(paste.text, '1');
+    const enter = runner._calls.find((c) => c.kind === 'sendControl' && c.key === 'Enter');
+    assert.ok(enter);
+    assert.equal(p._pendingApprovalId, null);
+  });
+
+  test('respond("always-allow") pastes "2" + Enter', async () => {
+    const runner = makeFakeRunner();
+    const p = makeProc(runner);
+    p.tmuxName = 'polygram-test';
+    p._pendingApprovalId = 'approval-123';
+    await p.respondToApproval('approval-123', 'always-allow');
+    const paste = runner._calls.find((c) => c.kind === 'pasteText');
+    assert.equal(paste.text, '2');
+  });
+
+  test('respond("deny") pastes "3" + Enter', async () => {
+    const runner = makeFakeRunner();
+    const p = makeProc(runner);
+    p.tmuxName = 'polygram-test';
+    p._pendingApprovalId = 'approval-123';
+    await p.respondToApproval('approval-123', 'deny');
+    const paste = runner._calls.find((c) => c.kind === 'pasteText');
+    assert.equal(paste.text, '3');
+  });
+
+  test('respond("deny", message) pastes "3" + Enter, then message + Enter (separated)', async () => {
+    // SECURITY: choice + feedback split into two pastes so a feedback
+    // string starting with a digit can't be re-parsed as a menu choice.
+    const runner = makeFakeRunner();
+    const p = makeProc(runner);
+    p.tmuxName = 'polygram-test';
+    p._pendingApprovalId = 'approval-123';
+    await p.respondToApproval('approval-123', 'deny', 'use Glob instead');
+    const pastes = runner._calls.filter((c) => c.kind === 'pasteText').map((c) => c.text);
+    assert.deepEqual(pastes, ['3', 'use Glob instead']);
+    const enters = runner._calls.filter((c) => c.kind === 'sendControl' && c.key === 'Enter');
+    assert.equal(enters.length, 2, 'two Enters: one after choice, one after feedback');
+  });
+
+  test('respond with mismatched id is a no-op (stale prompt)', async () => {
+    const runner = makeFakeRunner();
+    const p = makeProc(runner);
+    p.tmuxName = 'polygram-test';
+    p._pendingApprovalId = 'approval-NEW';
+    const ok = await p.respondToApproval('approval-STALE', 'allow');
+    assert.equal(ok, false);
+    assert.equal(runner._calls.length, 0);  // no paste, no enter
+    assert.equal(p._pendingApprovalId, 'approval-NEW');
+  });
+
+  test('paste failure surfaces as approval-fail event, returns false', async () => {
+    const runner = makeFakeRunner();
+    runner.pasteText = async () => { throw new Error('paste boom'); };
+    const p = makeProc(runner);
+    p.tmuxName = 'polygram-test';
+    p._pendingApprovalId = 'approval-123';
+    const fired = new Promise((resolve) => p.once('approval-fail', resolve));
+    const ok = await p.respondToApproval('approval-123', 'allow');
+    assert.equal(ok, false);
+    const ev = await fired;
+    assert.match(ev.err, /paste boom/);
+  });
+});

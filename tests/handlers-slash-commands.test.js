@@ -13,16 +13,24 @@ function fixture(overrides = {}) {
     pairings: [],
   };
 
+  // 0.10.0 P0.2/P0.3 fix: slash-commands routes through Process
+  // abstraction (pm.getContextUsage + entry.fireUserMessage) instead
+  // of poking entry.query / entry.inputController directly. Fixture
+  // mirrors the new contract.
   const pmEntry = overrides.pmEntry === undefined
     ? {
-        query: { getContextUsage: async () => ({ remaining: 9999 }) },
-        inputController: { push: (m) => calls.pmCalls.push({ kind: 'push', m }) },
+        fireUserMessage: (text) => {
+          calls.pmCalls.push({ kind: 'push', m: { type: 'user', message: { role: 'user', content: text } } });
+          return true;
+        },
       }
     : overrides.pmEntry;
 
   const pm = {
     get: () => pmEntry,
     has: () => pmEntry != null,
+    getContextUsage: overrides.getContextUsage
+      || (async () => ({ remaining: 9999 })),
     kill: async (sk) => calls.pmCalls.push({ kind: 'kill', sk }),
     resetSession: async (sk, opts) => {
       calls.pmCalls.push({ kind: 'reset', sk, opts });
@@ -124,7 +132,7 @@ describe('slash-commands — /context', () => {
 
   test('getContextUsage throws: user-friendly error', async () => {
     const fx = fixture({
-      pmEntry: { query: { getContextUsage: async () => { throw new Error('boom'); } } },
+      getContextUsage: async () => { throw new Error('boom'); },
     });
     await fx.dispatch(fx.makeCtx({ text: '/context' }));
     assert.match(fx.calls.sendReply[0], /Couldn't fetch context info: boom/);
@@ -305,8 +313,9 @@ describe('slash-commands — /compact', () => {
   });
 
   test('without session BUT saved id: auto-spawn-resume and log compact-spawn-resumed', async () => {
+    // Post-0.10.0-P0.3: slash-commands routes through Process.fireUserMessage.
     const spawned = {
-      inputController: { push: () => {} },
+      fireUserMessage: () => true,
     };
     const fx = fixture({ pmEntry: null, savedSessionId: 'sess-abc', spawnEntry: spawned });
     await fx.dispatch(fx.makeCtx({ text: '/compact' }));
