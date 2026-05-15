@@ -51,6 +51,9 @@ describe('parseLine — empty / malformed', () => {
   });
   test('returns [] for unknown types', () => {
     assert.deepEqual(parseLine(JSON.stringify({ type: 'queue-operation' })), []);
+    // attachment with unknown attachment.type stays unparsed
+    assert.deepEqual(parseLine(JSON.stringify({ type: 'attachment', attachment: { type: 'something_else' } })), []);
+    // attachment with no attachment object stays unparsed
     assert.deepEqual(parseLine(JSON.stringify({ type: 'attachment', attachment: {} })), []);
   });
 });
@@ -193,6 +196,95 @@ describe('parseLine — usage', () => {
     });
     const events = parseLine(line);
     assert.ok(!events.some((e) => e.type === 'usage'));
+  });
+});
+
+describe('parseLine — top-level user message (autosteer queue-dequeue signal)', () => {
+  // Background: probed 2026-05-15 in a real claude TUI session. When a
+  // user pastes mid-turn and the TUI's queue dequeues the paste as a
+  // FRESH USER TURN (because the agent already emitted final text
+  // before the queue was consumed), a top-level user entry appears in
+  // JSONL with `message.content` as a string. This is the
+  // queue-becomes-new-turn signal polygram needs to detect to extract
+  // the second turn's reply.
+  //
+  // Counter-example: when content is an array containing a
+  // `tool_result` block, this is the API-shaped tool_result feedback
+  // (Claude's API convention), NOT a user prompt — must NOT emit.
+
+  test('top-level user message with string content emits user-message event', () => {
+    const line = JSON.stringify({
+      type: 'user',
+      sessionId: 'sess-1',
+      parentUuid: 'parent-1',
+      message: { role: 'user', content: 'And the capital of Germany? Just one word.' },
+      uuid: 'user-1',
+    });
+    const events = parseLine(line);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'user-message');
+    assert.equal(events[0].text, 'And the capital of Germany? Just one word.');
+  });
+
+  test('user content as tool_result array does NOT emit user-message', () => {
+    const line = JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{
+          tool_use_id: 'toolu_abc',
+          type: 'tool_result',
+          content: 'VALUE_B',
+          is_error: false,
+        }],
+      },
+      toolUseResult: { stdout: 'VALUE_B', stderr: '', interrupted: false },
+      sourceToolAssistantUUID: 'asst-1',
+    });
+    assert.deepEqual(parseLine(line), []);
+  });
+
+  test('user with empty string content does NOT emit', () => {
+    const line = JSON.stringify({
+      type: 'user',
+      message: { role: 'user', content: '' },
+    });
+    assert.deepEqual(parseLine(line), []);
+  });
+});
+
+describe('parseLine — attachment.queued_command (autosteer fold signal)', () => {
+  // Background: when a paste DOES fold into the in-flight turn
+  // (because there's still active generation ahead — typically a
+  // pending tool result), the TUI emits an `attachment` JSONL entry
+  // with `attachment.type === "queued_command"` and the queued prompt.
+  // This is the fold-confirmed signal — polygram should NOT extract a
+  // second reply because the current turn's response already
+  // incorporates the autosteered content.
+
+  test('attachment.queued_command emits queue-folded with prompt', () => {
+    const line = JSON.stringify({
+      type: 'attachment',
+      parentUuid: 'parent-1',
+      attachment: {
+        type: 'queued_command',
+        prompt: "Also run 'echo VALUE_B' and include that in your answer.",
+        commandMode: 'prompt',
+      },
+      uuid: 'attch-1',
+    });
+    const events = parseLine(line);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'queue-folded');
+    assert.equal(events[0].prompt, "Also run 'echo VALUE_B' and include that in your answer.");
+  });
+
+  test('attachment with missing prompt does NOT emit', () => {
+    const line = JSON.stringify({
+      type: 'attachment',
+      attachment: { type: 'queued_command' },
+    });
+    assert.deepEqual(parseLine(line), []);
   });
 });
 

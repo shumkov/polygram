@@ -526,4 +526,221 @@ describe('TmuxProcess — JSONL session-log path', () => {
       await p.kill('done');
     } finally { env.cleanup(); }
   });
+
+  // ─── autosteer fold-vs-queue extra-turn extraction (rc.7) ───────────
+  //
+  // Empirically validated 2026-05-15 against a real claude TUI session:
+  //   - Pasting mid-turn triggers a {type:queue-operation,operation:enqueue,
+  //     content:...} JSONL entry.
+  //   - The TUI consumes that queued paste in ONE of TWO ways:
+  //
+  //     A) FOLD — when the agent is still actively generating
+  //        (typically a pending tool result is about to land), the
+  //        queued prompt is consumed as {type:attachment,
+  //        attachment:{type:queued_command, prompt:...}} INSIDE the
+  //        current turn. The agent's reply now addresses both messages
+  //        — one Telegram reply suffices.
+  //
+  //     B) NEW TURN — when the agent already emitted its final text
+  //        (short turn, no in-flight tool), the queued prompt is
+  //        dequeued as a top-level {type:user, message:{content:"..."}}
+  //        JSONL entry and the model runs a fresh turn for it. The
+  //        primary turn's reply addresses only the first message;
+  //        polygram MUST extract the second turn's reply or it's lost.
+  //
+  // The bug Ivan reported on shumorobot 2026-05-15: turn 2 reply went
+  // to /dev/null because TmuxProcess.send() returns after turn 1's
+  // result and stops watching. These tests pin the rc.7 fix: track
+  // pending autosteers, detect fold-vs-new-turn, emit
+  // 'extra-turn-reply' { msgId, text } for the NEW TURN case.
+
+  test('autosteer FOLD path: queue-folded event clears the pending autosteer; no extra-turn-reply emitted', async () => {
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = 'fffffff1-1111-2222-3333-fffffffffff1';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      const autosteeredContent = 'and this https://discogs/release/abc';
+      const autosteeredMsgId = 658;
+      let extraReplyEvents = 0;
+      p.on('extra-turn-reply', () => { extraReplyEvents++; });
+
+      // Mirror production order: send() starts (turn becomes inFlight),
+      // THEN the autosteer arrives while turn is processing. Calling
+      // injectUserMessage before send() would early-return because the
+      // process isn't inFlight yet — and no autosteer would register.
+      const sendP = p.send('download https://youtube/foo');
+      await sleep(20);
+      const okInject = p.injectUserMessage({ content: autosteeredContent, msgId: autosteeredMsgId });
+      assert.equal(okInject, true, 'injectUserMessage must succeed when turn is in flight');
+
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      // Turn 1: agent uses a tool, then the queue gets folded as an
+      // attachment.queued_command (FOLD signal).
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: {
+          content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls' } }],
+          stop_reason: 'tool_use',
+        },
+      }) + '\n');
+      await sleep(20);
+      // FOLD signal — the autosteered prompt is absorbed.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'attachment',
+        attachment: { type: 'queued_command', prompt: autosteeredContent, commandMode: 'prompt' },
+      }) + '\n');
+      await sleep(20);
+      // Final assistant text addresses both
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: {
+          content: [{ type: 'text', text: 'Both done.' }],
+          stop_reason: 'end_turn',
+        },
+      }) + '\n');
+
+      const res = await sendP;
+      assert.equal(res.error, null);
+      // Note: the tool_use stop_reason in the first JSONL line resolves
+      // the turn race early; we don't assert on the final text since
+      // it's not the test's goal. (Existing "tool_use" test in this
+      // file documents the same partial-text behavior.) The point of
+      // THIS test is that the queue-folded event cleared the pending
+      // autosteer so no spurious extra-turn-reply fires.
+
+      // Give a beat in case any spurious extra-turn-reply tries to fire
+      await sleep(80);
+      assert.equal(extraReplyEvents, 0,
+        'FOLD path must NOT emit extra-turn-reply — the primary reply already covers both messages');
+      // Sanity: the pending autosteer is also cleared (defends against
+      // a later top-level user message with the same content
+      // incorrectly triggering extra-turn extraction).
+      assert.equal(p._pendingAutosteers.length, 0,
+        'queue-folded should remove the matching pending autosteer');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
+  test('autosteer NEW TURN path: dequeued user-message triggers second-turn extraction; emits extra-turn-reply with correct msgId', async () => {
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = 'fffffff2-1111-2222-3333-fffffffffff2';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      const autosteeredContent = 'and this https://discogs/release/abc';
+      const autosteeredMsgId = 658;
+      const extraReplies = [];
+      p.on('extra-turn-reply', (ev) => extraReplies.push(ev));
+
+      const sendP = p.send('download https://youtube/foo');
+      await sleep(20);
+      // Now (turn 1 inFlight) the autosteer arrives — production flow
+      assert.equal(
+        p.injectUserMessage({ content: autosteeredContent, msgId: autosteeredMsgId }),
+        true, 'injectUserMessage must succeed when turn is in flight',
+      );
+
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      // Turn 1: short — model emits final text immediately, no tool.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: {
+          content: [{ type: 'text', text: 'Already done — Midnight Picnic.mp3' }],
+          stop_reason: 'end_turn',
+        },
+      }) + '\n');
+
+      const res = await sendP;
+      assert.equal(res.error, null);
+      assert.ok(res.text.includes('Midnight Picnic'),
+        'primary turn reply should be turn 1 text alone');
+
+      // Now turn 2 happens: TUI dequeues the autosteered paste as a
+      // fresh top-level user message, then the model replies.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'user',
+        sessionId,
+        message: { role: 'user', content: autosteeredContent },
+      }) + '\n');
+      await sleep(20);
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: {
+          content: [{ type: 'text', text: 'Also already done — Neon Affair 4 tracks.' }],
+          stop_reason: 'end_turn',
+        },
+      }) + '\n');
+
+      // Give the tail + handler time to process
+      await sleep(80);
+
+      assert.equal(extraReplies.length, 1,
+        'NEW TURN path must emit exactly one extra-turn-reply');
+      assert.equal(extraReplies[0].msgId, autosteeredMsgId,
+        'extra-turn-reply must carry the autosteered msgId so polygram routes the reply correctly');
+      assert.ok(extraReplies[0].text.includes('Neon Affair'),
+        'extra-turn-reply text must be the second turn\'s assistant reply');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
+  test('user-message that does NOT match a pending autosteer is ignored (no spurious extra-turn-reply)', async () => {
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = 'fffffff3-1111-2222-3333-fffffffffff3';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      // No injectUserMessage call → no pending autosteers.
+      let extras = 0;
+      p.on('extra-turn-reply', () => { extras++; });
+
+      const sendP = p.send('first');
+      await sleep(20);
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: { content: [{ type: 'text', text: 'one' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      await sendP;
+
+      // Spurious top-level user message — must NOT trigger extra-turn-reply
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'user',
+        sessionId,
+        message: { role: 'user', content: 'a totally unrelated message' },
+      }) + '\n');
+      await sleep(40);
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: { content: [{ type: 'text', text: 'two' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      await sleep(50);
+
+      assert.equal(extras, 0,
+        'top-level user message without a matching pending autosteer must not emit extra-turn-reply');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
 });

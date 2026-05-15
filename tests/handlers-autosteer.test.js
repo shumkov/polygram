@@ -144,7 +144,12 @@ describe('tryAutosteer — full dispatch', () => {
     });
     assert.equal(r.autosteered, true);
     assert.equal(r.priority, 'next');
-    assert.deepEqual(m.pmCalls[0], ['injectUserMessage', 'k', { content: 'follow-up', priority: 'next' }]);
+    // rc.7: msgId is forwarded to pm.injectUserMessage so the tmux
+    // backend can route an extra-turn reply back to the autosteered
+    // Telegram message_id when the TUI dequeues the paste as a fresh
+    // user turn. SDK backend ignores msgId — harmless extra field.
+    assert.deepEqual(m.pmCalls[0],
+      ['injectUserMessage', 'k', { content: 'follow-up', priority: 'next', msgId: 555 }]);
     assert.equal(m.refs[0].key, 'k');
     assert.equal(m.refs[0].ref.msgId, 555);
     const evt = m.events.find((e) => e.kind === 'autosteer');
