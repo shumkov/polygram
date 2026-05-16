@@ -583,6 +583,45 @@ S('mixed', 'send-inject-tool-inject', async () => {
   } finally { await cleanup(); }
 });
 
+// ── L8: production trace 2026-05-16 — send/send/autosteer, turn 2 empty ─
+
+/** L8: shumorobot production 2026-05-16 09:24. Ivan sent three
+ *  messages ~2 s apart on a freshly-spawned session:
+ *    msg 731 "Hi"  → pm.send turn 1 (triggered the spawn)
+ *    msg 732 "Hey" → pm.send turn 2 (queued — session not yet
+ *                    inFlight when it arrived, so NOT autosteered)
+ *    msg 733 "How" → autosteer (session inFlight by now)
+ *  Only turn 1 produced a reply ("Hey! What's up?"). Turn 2
+ *  returned empty → polygram fired telegram-empty-response-fallback
+ *  ("No response generated. Please try again."). The JSONL
+ *  recorded ONLY msg 731's turn — 732's paste never became a turn.
+ *
+ *  This reproduces the message PATTERN (send, send, inject) with
+ *  ~2 s gaps. The production wrinkle of "all three land during the
+ *  ~11 s fresh-session spawn" is approximated here by the gaps —
+ *  setupRealTui already finished start(), so this isolates whether
+ *  the send/send/inject ordering alone is enough to empty turn 2. */
+S('L8', 'send-send-autosteer-turn2-not-empty', async () => {
+  const { p, events, cleanup } = await setupRealTui('l8');
+  try {
+    const send1P = p.send('Reply ONLY with the literal word "L8ONE".');
+    await sleep(2000);
+    const send2P = p.send('Reply ONLY with the literal word "L8TWO".');
+    await sleep(2000);
+    p.injectUserMessage({ content: 'Reply ONLY with the literal word "L8THREE".', msgId: 98001 });
+    const [r1, r2] = await Promise.all([send1P, send2P]);
+
+    ok(typeof r1.text === 'string' && r1.text.length > 0,
+      `turn 1 non-empty (got ${JSON.stringify(r1.text?.slice(0,60))})`);
+    // The production bug: turn 2 came back empty.
+    ok(typeof r2.text === 'string' && r2.text.length > 0,
+      `turn 2 MUST be non-empty — production 2026-05-16 returned '' here (got ${JSON.stringify(r2.text?.slice(0,60))})`);
+    await waitForResolution(events, 98001, 60_000);
+    await sleep(500);
+    assertInvariants(events, { autosteeredMsgIds: [98001] });
+  } finally { await cleanup(); }
+});
+
 // ── Stress: rapid-fire multi-autosteer ──────────────────────────────
 
 S('stress', 'stress-many-rapid-autosteers', async () => {
