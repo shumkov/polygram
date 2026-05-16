@@ -133,6 +133,84 @@ describe('ProcessManager — getOrSpawn', () => {
   });
 });
 
+describe('ProcessManager — getOrSpawn concurrent spawn (production 2026-05-16)', () => {
+  // Production bug, shumorobot 2026-05-16 09:24: Ivan sent three
+  // messages ~2s apart on a freshly-spawned tmux session. getOrSpawn
+  // registers the proc in this.procs BEFORE awaiting start(); a
+  // second message arriving during the ~11s spawn got the
+  // still-spawning proc and called send() on it — pasting a turn
+  // into a TUI that was not ready. The paste was silently dropped,
+  // and the turn returned empty → "No response generated. Please
+  // try again." The JSONL recorded only the first message's turn.
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  test('second getOrSpawn during an in-flight spawn waits for start() to complete', async () => {
+    let releaseStart;
+    const startGate = new Promise((r) => { releaseStart = r; });
+    let startCompleted = false;
+
+    class SlowStartProc extends MockProcess {
+      async start(opts) {
+        this._startSpy.push(opts);
+        await startGate;
+        startCompleted = true;
+      }
+    }
+    const pm = new ProcessManager({
+      processFactory: (sk) => new SlowStartProc({ sessionKey: sk }),
+    });
+
+    const call1 = pm.getOrSpawn('sk');   // triggers the spawn
+    const call2 = pm.getOrSpawn('sk');   // arrives DURING the spawn
+
+    let call2Resolved = false;
+    call2.then(() => { call2Resolved = true; }, () => {});
+
+    // Let microtasks + timers settle. On the buggy code call2
+    // returns `existing` immediately; on the fix it awaits start().
+    await sleep(20);
+    assert.equal(call2Resolved, false,
+      'getOrSpawn during an in-flight spawn must NOT resolve before start() completes');
+
+    releaseStart();
+    const [p1, p2] = await Promise.all([call1, call2]);
+    assert.equal(p1, p2, 'both callers receive the same proc');
+    assert.equal(startCompleted, true,
+      'start() must have completed before getOrSpawn returned the proc');
+  });
+
+  test('start() is called exactly once under concurrent getOrSpawn', async () => {
+    let releaseStart;
+    const startGate = new Promise((r) => { releaseStart = r; });
+    let startCalls = 0;
+
+    class SlowStartProc extends MockProcess {
+      async start(opts) {
+        startCalls += 1;
+        this._startSpy.push(opts);
+        await startGate;
+      }
+    }
+    let factoryCalls = 0;
+    const pm = new ProcessManager({
+      processFactory: (sk) => { factoryCalls += 1; return new SlowStartProc({ sessionKey: sk }); },
+    });
+
+    const calls = [
+      pm.getOrSpawn('sk'),
+      pm.getOrSpawn('sk'),
+      pm.getOrSpawn('sk'),
+    ];
+    await sleep(20);
+    releaseStart();
+    await Promise.all(calls);
+
+    assert.equal(factoryCalls, 1, 'factory called once for the same sessionKey');
+    assert.equal(startCalls, 1, 'start() called once for the same sessionKey');
+  });
+});
+
 describe('ProcessManager — weighted LRU eviction', () => {
   test('SDK cost=1, default budget=10 → 10 fit', async () => {
     const pm = new ProcessManager({ processFactory: mockFactory({ cost: 1 }) });
