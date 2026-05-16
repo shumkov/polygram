@@ -1,5 +1,13 @@
 'use strict';
 
+// TmuxProcess.start() verifies the pinned claude binary exists
+// (lib/claude-bin.js); the real binary isn't present in CI. Point
+// the override at the node executable — always present. The fake
+// runner never actually execs it.
+if (!process.env.POLYGRAM_CLAUDE_BIN) {
+  process.env.POLYGRAM_CLAUDE_BIN = process.execPath;
+}
+
 /**
  * Integration test: pm:'tmux' chat routes through ProcessManager →
  * factory → TmuxProcess end-to-end against a stubbed TmuxRunner that
