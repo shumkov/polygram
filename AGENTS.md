@@ -36,8 +36,29 @@ needed because the TUI's behaviour, not polygram's logic, drifted.
 
 The version polygram has been validated against is recorded in the
 TmuxProcess source — search for `CLAUDE_CLI_PINNED_VERSION` in
-`lib/process/tmux-process.js`. Production daemon startup verifies
-the installed CLI matches before opening any tmux session.
+`lib/process/tmux-process.js`.
+
+### How the pin is enforced (hard pin, since 0.10.0-rc.19)
+
+Polygram does **not** spawn the bare `claude` on `$PATH`. The claude
+CLI installs each version as a standalone binary at
+`~/.local/share/claude/versions/<version>` and points
+`~/.local/bin/claude` (a symlink) at the active one — the CLI's
+auto-updater re-points that symlink whenever a new version lands.
+A `$PATH` spawn therefore silently drifts (shumorobot 2026-05-16:
+the CLI auto-updated 2.1.142 → 2.1.143 between deploys).
+
+`TmuxProcess.start()` resolves the **absolute versioned path** via
+`lib/claude-bin.js` (`resolvePinnedClaudeBin`) and spawns that. The
+versioned binary is immutable — the updater only adds new files, it
+never overwrites an existing one — so the pin holds across CLI
+auto-updates. If the pinned binary is missing, `start()` throws
+`CLAUDE_BIN_MISSING` with an actionable message (run
+`claude install <version>`); SDK-backed chats are unaffected.
+
+Override the resolved path with `POLYGRAM_CLAUDE_BIN` (non-standard
+installs, CI, tests). Daemon boot logs the absolute binary the tmux
+backend will use.
 
 ### Upgrade procedure (separate, deliberate process)
 
@@ -89,23 +110,15 @@ The discipline above turns "the CLI just updated and prod broke"
 (reactive, painful) into "we bumped the pin after running 50
 scenarios; here's the release-note diff" (proactive, auditable).
 
-### Open work: hard binary pin (TODO before 0.10.0 final)
+### Hard binary pin — DONE (0.10.0-rc.19)
 
-The current pin is a `--version` string check at daemon boot —
-better than nothing, but the CLI binary can be auto-updated under
-us between checks. The remaining task is to ensure polygram spawns
-a SPECIFIC binary (not just whatever's first on PATH).
+Polygram spawns the absolute versioned binary (see "How the pin is
+enforced" above). A system-wide `claude update` no longer affects
+the running daemon — the updater adds a new `versions/<v>` file but
+polygram keeps spawning the pinned path.
 
-See [`docs/0.10.0-claude-binary-pinning.md`](./docs/0.10.0-claude-binary-pinning.md)
-for the research plan. Tracks options:
-- bundle the binary in the polygram repo
-- `npm-install @anthropic-ai/claude-code@<version>` as a polygram
-  dep and spawn from `node_modules/.bin/claude`
-- a polygram-managed binary cache at `~/.polygram/claude-cache/`
-
-Acceptance: polygram cannot accidentally run against an unpinned
-claude version; a system-wide `claude update` does NOT affect the
-running daemon.
+Background + the options considered:
+[`docs/0.10.0-claude-binary-pinning.md`](./docs/0.10.0-claude-binary-pinning.md).
 
 ## Test layers
 
