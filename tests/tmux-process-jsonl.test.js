@@ -12,6 +12,14 @@
 
 'use strict';
 
+// TmuxProcess.start() verifies the pinned claude binary exists
+// (lib/claude-bin.js); the real binary isn't present in CI. Point
+// the override at the node executable — always present. The fake
+// runner never actually execs it.
+if (!process.env.POLYGRAM_CLAUDE_BIN) {
+  process.env.POLYGRAM_CLAUDE_BIN = process.execPath;
+}
+
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');

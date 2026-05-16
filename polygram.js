@@ -2045,32 +2045,26 @@ async function main() {
   // instances. Construction is cheap (no system call until first
   // spawn/send). Only used if any chat in config has pm:'tmux'.
   const tmuxRunner = createTmuxRunner({ logger: console });
-  // Verify the installed claude CLI matches polygram's pinned
-  // version. Mismatch = potential TUI-format drift (see AGENTS.md).
-  // Non-fatal warning — production may be mid-upgrade — but the
-  // event lands in stdout so log aggregation catches it and the
-  // operator can decide.
-  (async () => {
-    try {
-      const { CLAUDE_CLI_PINNED_VERSION } = require('./lib/process/tmux-process');
-      const child = require('child_process');
-      const { promisify } = require('util');
-      const exec = promisify(child.execFile);
-      const { stdout } = await exec('claude', ['--version']);
-      const m = stdout.match(/(\d+\.\d+\.\d+)/);
-      const installed = m ? m[1] : '(parse failed)';
-      if (installed !== CLAUDE_CLI_PINNED_VERSION) {
-        console.warn(
-          `[polygram] WARNING: installed claude CLI v${installed} does not match polygram's pinned v${CLAUDE_CLI_PINNED_VERSION}. `
-          + 'Tmux backend behaviour may drift. See AGENTS.md "Pinned claude CLI version" for the upgrade procedure.',
-        );
-      } else {
-        console.log(`[polygram] claude CLI v${installed} matches pin`);
-      }
-    } catch (err) {
-      console.warn(`[polygram] could not verify claude CLI version: ${err.message}`);
+  // Verify the pinned claude CLI binary is present. The tmux
+  // backend spawns this exact binary by absolute path (see
+  // lib/claude-bin.js + TmuxProcess.start) — it never resolves
+  // `claude` through $PATH, so the CLI auto-updater can't drift
+  // it. This boot check is informational: it tells the operator
+  // up-front which binary the tmux backend will use, and warns
+  // (non-fatal — SDK-backed chats don't need it) if it's missing.
+  // A missing binary still hard-fails per-chat at TmuxProcess.start.
+  {
+    const { CLAUDE_CLI_PINNED_VERSION } = require('./lib/process/tmux-process');
+    const { verifyPinnedClaudeBin } = require('./lib/claude-bin');
+    const binCheck = verifyPinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION);
+    if (binCheck.ok) {
+      console.log(
+        `[polygram] tmux backend pinned to claude CLI v${CLAUDE_CLI_PINNED_VERSION}: ${binCheck.path}`,
+      );
+    } else {
+      console.warn(`[polygram] WARNING: ${binCheck.reason}`);
     }
-  })();
+  }
   // O1 optimization: shared poll-tick scheduler. N TmuxProcess
   // instances share ONE setInterval instead of spawning N independent
   // setTimeout chains. Idle when no chats are in flight (zero timers

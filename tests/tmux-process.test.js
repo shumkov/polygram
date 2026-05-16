@@ -1,5 +1,13 @@
 'use strict';
 
+// TmuxProcess.start() verifies the pinned claude binary exists
+// (lib/claude-bin.js). The real binary isn't present in CI, so
+// point the override at the node executable — always present and
+// executable. The fake runner never actually execs it.
+if (!process.env.POLYGRAM_CLAUDE_BIN) {
+  process.env.POLYGRAM_CLAUDE_BIN = process.execPath;
+}
+
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const { TmuxProcess } = require('../lib/process/tmux-process');
@@ -90,7 +98,8 @@ describe('TmuxProcess.start', () => {
     const spawn = runner._calls.find((c) => c.kind === 'spawn');
     assert.equal(spawn.name, 'polygram-shumabit-100-main');
     assert.equal(spawn.cwd, '/work');
-    assert.equal(spawn.command, 'claude');
+    // Pin: spawn uses the absolute pinned-binary path, not bare 'claude'.
+    assert.equal(spawn.command, process.env.POLYGRAM_CLAUDE_BIN);
     assert.ok(spawn.args.includes('--model'));
     assert.ok(spawn.args.includes('sonnet'));
     assert.ok(spawn.args.includes('--effort'));
