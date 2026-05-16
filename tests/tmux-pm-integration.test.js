@@ -30,7 +30,7 @@ const { createProcessFactory } = require('../lib/process/factory');
 const SILENT = { warn: () => {}, error: () => {}, info: () => {}, debug: () => {}, log: () => {} };
 
 // Simulated TUI lifecycle: ready → user pastes → streaming → ready w/ reply.
-function makeFakeTmuxRunner({ replyText = 'hello back!' } = {}) {
+function makeFakeTmuxRunner({ replyText = 'hello back!', onPaste = null } = {}) {
   const calls = [];
   // capture sequence per spawn lifecycle:
   //   1. start.waitForReady → ready hint
@@ -50,6 +50,7 @@ function makeFakeTmuxRunner({ replyText = 'hello back!' } = {}) {
     },
     pasteText: async (name, text) => {
       calls.push({ kind: 'pasteText', name, text });
+      if (typeof onPaste === 'function') onPaste(text);
       return { sanitized: text, oneLine: text, stripped: 0 };
     },
     captureWide: async () => {
@@ -94,8 +95,44 @@ function makeCallbacks() {
 
 describe('pm:tmux integration', () => {
   test('end-to-end: factory→TmuxProcess→send→kill', async () => {
+    // 0.10.0 Phase 4 §6: a turn needs JSONL to succeed (capture-pane
+    // never delivers text). Use an isolated HOME so the synthetic
+    // per-session JSONL is writable; the fake runner writes the
+    // turn's user-message + assistant reply when the prompt is pasted.
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'pgr-pmint-'));
+    const prevHome = process.env.HOME;
+    process.env.HOME = tmpHome;
+    try {
     const config = { chats: { 100: { pm: 'tmux', model: 'sonnet', effort: 'high', cwd: '/work' } } };
-    const runner = makeFakeTmuxRunner();
+    const procRef = {};
+    const runner = makeFakeTmuxRunner({
+      onPaste: (text) => {
+        const token = (String(text).match(/pgm-corr-[0-9a-f]+/) || [])[0] || null;
+        setImmediate(() => {
+          const p = procRef.proc;
+          if (!p || !p._sessionLogPath) return;
+          try {
+            fs.mkdirSync(path.dirname(p._sessionLogPath), { recursive: true });
+            fs.appendFileSync(p._sessionLogPath, JSON.stringify({
+              type: 'user', sessionId: p.claudeSessionId,
+              message: {
+                role: 'user',
+                content: token
+                  ? `<polygram-info corr-id="${token}"></polygram-info>\n\nprompt`
+                  : 'prompt',
+              },
+            }) + '\n');
+            fs.appendFileSync(p._sessionLogPath, JSON.stringify({
+              type: 'assistant', sessionId: p.claudeSessionId,
+              message: { content: [{ type: 'text', text: 'hello back!' }], stop_reason: 'end_turn' },
+            }) + '\n');
+          } catch { /* swallow */ }
+        });
+      },
+    });
     const callbacks = makeCallbacks();
     const factory = createProcessFactory({
       config,
@@ -121,6 +158,7 @@ describe('pm:tmux integration', () => {
         p.quiesceMs = 3;
         p.readyTimeoutMs = 500;
         p.turnTimeoutMs = 500;
+        p.pasteConfirmMs = 50;
       }
       return p;
     };
@@ -133,6 +171,7 @@ describe('pm:tmux integration', () => {
       chatConfig: config.chats[100],
       existingSessionId: null,
     });
+    procRef.proc = proc;   // the fake runner's onPaste writes JSONL here
     assert.equal(proc.backend, 'tmux');
     assert.equal(proc.cost, 3);
     assert.ok(runner._calls.some((c) => c.kind === 'spawn'));
@@ -149,6 +188,10 @@ describe('pm:tmux integration', () => {
     await pm.shutdown();
     // Underlying tmux session killed
     assert.ok(runner._calls.some((c) => c.kind === 'killSession'));
+    } finally {
+      process.env.HOME = prevHome;
+      try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
   });
 
   test('weighted LRU: tmux (cost=3) co-exists with budget=10', async () => {

@@ -1296,6 +1296,52 @@ describe('TmuxProcess — JSONL session-log path', () => {
     } finally { env.cleanup(); }
   });
 
+  test('Phase 4 §7 — a stale autosteer (never correlated) is swept at turn completion', async () => {
+    // An autosteer paste the TUI never correlated — no enqueue,
+    // remove, dequeue, or user-message — is dead. The stale-turn
+    // sweep fails it loud at the next turn completion so it cannot
+    // leak in the ledger (and its reaction state cannot dangle).
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = '5eee7777-1111-2222-3333-5eee77775eee';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+      const matchMisses = [];
+      p.on('autosteer-match-miss', (ev) => matchMisses.push(ev));
+
+      const sendP = p.send('primary');
+      await sleep(20);
+      const primTok = pastedTokens(runner)[0];
+      // An autosteer the TUI never acts on.
+      assert.equal(p.injectUserMessage({ content: 'lost', msgId: 999 }), true);
+      const autoTurn = p._ledger.find((t) => t.kind === 'autosteer');
+      assert.ok(autoTurn && autoTurn.state === 'pasted', 'autosteer turn parked in the ledger');
+      // Backdate it well past the staleness grace window.
+      autoTurn.startedAt -= 10 * 60_000;
+
+      // Complete the primary turn → _finishTurn → stale-turn sweep.
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, userLine(sessionId, primTok));
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: { content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      await sendP;
+      await sleep(40);
+
+      const stale = matchMisses.find((m) => m.phase === 'stale-sweep' && m.msgId === 999);
+      assert.ok(stale, 'the stale autosteer emitted a stale-sweep diagnostic');
+      assert.ok(!p._ledger.some((t) => t === autoTurn),
+        'the stale autosteer was pruned from the ledger');
+      assert.equal(autoTurn.state, 'failed', 'the stale autosteer is marked failed');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
   test('Phase 2 B1b — two primary turns route by token; replies never cross-attribute', async () => {
     // Tokens are injective: turn A and turn B each get their own
     // reply even when delivered back-to-back. No substring collision,

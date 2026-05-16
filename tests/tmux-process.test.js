@@ -290,15 +290,21 @@ describe('TmuxProcess.start', () => {
 // ─── send() ─────────────────────────────────────────────────────────
 
 describe('TmuxProcess.send', () => {
-  test('happy path: paste + Enter, capture diff, returns text + sessionId + duration', async () => {
+  test('Phase 4 §6 — capture-pane completion with no JSONL fails loud, never returns pane text', async () => {
+    // 0.10.0 Phase 4 §6: capture-pane is a LIVENESS signal only — it
+    // never delivers reply text. A turn the capture-pane race judged
+    // complete but for which no JSONL text exists fails loud with an
+    // explicit error, NEVER with the pane diff (which was the
+    // echoed-input and banner-as-reply failure class). The genuine
+    // JSONL-driven success path is covered by tmux-process-jsonl.
     let captureCount = 0;
     const runner = makeFakeRunner({
       captureWide: async () => {
         captureCount++;
         if (captureCount === 1) return '? for shortcuts'; // ready check for start
-        if (captureCount === 2) return 'PRELUDE\n? for shortcuts'; // captureAtStart
-        if (captureCount === 3) return 'PRELUDE\n? for shortcuts\nhi there!\n? for shortcuts'; // first quiesce
-        return 'PRELUDE\n? for shortcuts\nhi there!\n? for shortcuts'; // stays quiesced
+        // The pane shows what LOOKS like a reply. Pre-§6 the
+        // capture-pane diff returned this as result.text.
+        return 'PRELUDE\n? for shortcuts\nhi there!\n? for shortcuts';
       },
     });
     const p = makeTmuxProcess(runner);
@@ -307,14 +313,12 @@ describe('TmuxProcess.send', () => {
       existingSessionId: 'sess-final',
     });
     const res = await p.send('hello');
-    assert.equal(res.error, null);
-    assert.ok(res.text.includes('hi there!'));
-    assert.equal(res.sessionId, 'sess-final');
-    assert.equal(res.metrics.resultSubtype, 'success');
-    assert.equal(res.metrics.numAssistantMessages, 1);
-    // 0.10.0 Phase 2: the pasted prompt now carries an embedded
-    // correlation token in its <polygram-info> block, so the pasted
-    // text CONTAINS 'hello' rather than equalling it.
+    // No JSONL was written → the turn fails loud.
+    assert.equal(res.metrics.resultSubtype, 'TMUX_NO_JSONL_TEXT');
+    assert.equal(res.text, '');
+    assert.ok(!String(res.text).includes('hi there!'),
+      'pane text must NEVER leak into the reply');
+    // The prompt was still pasted, with an embedded correlation token.
     const paste = runner._calls.find((c) => c.kind === 'pasteText' && c.text.includes('hello'));
     assert.ok(paste);
     assert.match(paste.text, /<polygram-info corr-id="pgm-corr-[0-9a-f]+"/,
@@ -377,10 +381,11 @@ describe('TmuxProcess.send', () => {
     const r1 = p.send('first');
     const r2 = p.send('second');
     const [res1, res2] = await Promise.all([r1, r2]);
-    assert.equal(res1.error, null);
-    assert.equal(res2.error, null);
-    // Both pastes happened, in order. Each carries an embedded
-    // correlation token, so check containment, not equality.
+    // §6: both turns are capture-only (no JSONL) so both fail loud —
+    // but the SERIALIZATION invariant still holds: turn 2 ran only
+    // after turn 1, and both pastes happened in arrival order.
+    assert.equal(res1.metrics.resultSubtype, 'TMUX_NO_JSONL_TEXT');
+    assert.equal(res2.metrics.resultSubtype, 'TMUX_NO_JSONL_TEXT');
     const pastes = runner._calls.filter((c) => c.kind === 'pasteText');
     assert.equal(pastes.length, 2);
     assert.ok(pastes[0].text.includes('first'));
