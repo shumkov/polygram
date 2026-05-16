@@ -108,6 +108,35 @@ function jsonlPath(homeDir, cwd, sessionId) {
 
 async function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// ─── 0.10.0 Phase 2 helpers — correlation token + turn ledger ────────
+//
+// Every TmuxProcess paste now embeds a pgm-corr-<hex> token in its
+// <polygram-info> block; the JSONL `user-message` reproduces it; the
+// turn ledger routes by exact token lookup. Hand-written JSONL
+// fixtures must therefore include a `user-message` line per turn.
+
+/** Correlation tokens embedded in the prompts pasted so far, in order.
+ *  Read AFTER `await sleep(...)` so the fire-and-forget paste landed. */
+function pastedTokens(runner) {
+  return runner._calls
+    .filter((c) => c.kind === 'pasteText')
+    .map((c) => (String(c.text).match(/pgm-corr-[0-9a-f]+/) || [])[0])
+    .filter(Boolean);
+}
+
+/** A top-level JSONL `user` line. With `token`, it carries that token
+ *  in a <polygram-info> block (the real round-trip shape). With
+ *  token=null it is token-less — exercising the orphan-primary
+ *  fallback in _routeUserMessage. */
+function userLine(sessionId, token, label = 'prompt') {
+  const content = token
+    ? `<polygram-info corr-id="${token}"></polygram-info>\n\n${label}`
+    : label;
+  return `${JSON.stringify({
+    type: 'user', sessionId, message: { role: 'user', content },
+  })}\n`;
+}
+
 describe('TmuxProcess — JSONL session-log path', () => {
 
   test('start() with no existingSessionId pre-allocates UUID + passes --session-id', async () => {
@@ -161,8 +190,10 @@ describe('TmuxProcess — JSONL session-log path', () => {
       // Let send() install its turnResultP listener
       await sleep(20);
 
-      // Write JSONL lines: assistant chunk then result.
+      // Write JSONL lines: the turn's user-message (so the ledger
+      // attributes it), then an assistant chunk, then the result.
       const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, userLine(sessionId, null));
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
         sessionId,
@@ -204,6 +235,7 @@ describe('TmuxProcess — JSONL session-log path', () => {
       await sleep(20);
 
       const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, userLine(sessionId, null));
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
         sessionId,
@@ -260,6 +292,7 @@ describe('TmuxProcess — JSONL session-log path', () => {
       await sleep(20);
 
       const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, userLine(sessionId, null));
       // Step 1: intermediate tool_use — must NOT resolve pm.send.
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
@@ -306,6 +339,7 @@ describe('TmuxProcess — JSONL session-log path', () => {
         const sendP = p.send('terse');
         await sleep(20);
         const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+        fs.appendFileSync(logPath, userLine(sessionId, null));
         fs.appendFileSync(logPath, JSON.stringify({
           type: 'assistant',
           sessionId,
@@ -351,6 +385,7 @@ describe('TmuxProcess — JSONL session-log path', () => {
       const sendP = p.send('think, then answer');
       await sleep(20);
       const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, userLine(sessionId, null));
 
       // Line 1 — the thinking segment of the FINAL message. Carries
       // stop_reason=end_turn but NO text block.
@@ -450,6 +485,7 @@ describe('TmuxProcess — JSONL session-log path', () => {
       const sendP = p.send('hi');
       await sleep(20);
       const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, userLine(sessionId, null));
       // assistant text, no stop_reason
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
@@ -565,6 +601,7 @@ describe('TmuxProcess — JSONL session-log path', () => {
       await sleep(20);
 
       const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, userLine(sessionId, null));
       // Pre-steer assistant text lands.
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant', sessionId,
@@ -724,6 +761,7 @@ describe('TmuxProcess — JSONL session-log path', () => {
       await sleep(20);
 
       const logPath = jsonlPath(env.cwd, env.cwd, requestedSessionId);
+      fs.appendFileSync(logPath, userLine(requestedSessionId, null));
       // claude reports a different sessionId in the result event (e.g. fork)
       const reassignedSessionId = 'eeeeeeee-1111-2222-3333-ffffffffffff';
       fs.appendFileSync(logPath, JSON.stringify({
@@ -767,7 +805,12 @@ describe('TmuxProcess — JSONL session-log path', () => {
   // pending autosteers, detect fold-vs-new-turn, emit
   // 'extra-turn-reply' { msgId, text } for the NEW TURN case.
 
-  test('autosteer FOLD path: queue-folded event clears the pending autosteer; no extra-turn-reply emitted', async () => {
+  test('autosteer FOLD: autosteer user-message arrives while the primary streams → folds, no extra-turn-reply', async () => {
+    // Phase 2: a fold is recorded, not reconstructed. The autosteer's
+    // own user-message carries its correlation token; when it lands
+    // while the primary turn is still in the active group, the two
+    // turns share one reply — autosteer-resolution(via:fold) fires,
+    // and NO separate extra-turn-reply: the primary's reply covers it.
     const env = setupTempCwd();
     try {
       const runner = makeRunner();
@@ -778,82 +821,56 @@ describe('TmuxProcess — JSONL session-log path', () => {
         chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
       });
 
-      const autosteeredContent = 'and this https://discogs/release/abc';
       const autosteeredMsgId = 658;
+      const resolutions = [];
       let extraReplyEvents = 0;
+      p.on('autosteer-resolution', (ev) => resolutions.push(ev));
       p.on('extra-turn-reply', () => { extraReplyEvents++; });
 
-      // Mirror production order: send() starts (turn becomes inFlight),
-      // THEN the autosteer arrives while turn is processing. Calling
-      // injectUserMessage before send() would early-return because the
-      // process isn't inFlight yet — and no autosteer would register.
       const sendP = p.send('download https://youtube/foo');
       await sleep(20);
-      const okInject = p.injectUserMessage({ content: autosteeredContent, msgId: autosteeredMsgId });
+      const okInject = p.injectUserMessage({
+        content: 'and this https://discogs/release/abc', msgId: autosteeredMsgId,
+      });
       assert.equal(okInject, true, 'injectUserMessage must succeed when turn is in flight');
+      await sleep(20);
+      const [primTok, autoTok] = pastedTokens(runner);
 
       const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
-      // Turn 1: agent uses a tool, then the queue gets folded as an
-      // attachment.queued_command (FOLD signal).
+      // Primary's user-message — the primary turn joins the active group.
+      fs.appendFileSync(logPath, userLine(sessionId, primTok));
+      await sleep(20);
+      // Autosteer's user-message lands WHILE the primary is still in
+      // the group → it FOLDS into the primary's turn.
+      fs.appendFileSync(logPath, userLine(sessionId, autoTok, 'autosteer'));
+      await sleep(20);
+      // One combined reply addresses both messages.
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
         sessionId,
-        message: {
-          content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls' } }],
-          stop_reason: 'tool_use',
-        },
-      }) + '\n');
-      await sleep(20);
-      // FOLD signal — the autosteered prompt is absorbed.
-      fs.appendFileSync(logPath, JSON.stringify({
-        type: 'attachment',
-        attachment: { type: 'queued_command', prompt: autosteeredContent, commandMode: 'prompt' },
-      }) + '\n');
-      await sleep(20);
-      // Final assistant text addresses both
-      fs.appendFileSync(logPath, JSON.stringify({
-        type: 'assistant',
-        sessionId,
-        message: {
-          content: [{ type: 'text', text: 'Both done.' }],
-          stop_reason: 'end_turn',
-        },
+        message: { content: [{ type: 'text', text: 'Both done.' }], stop_reason: 'end_turn' },
       }) + '\n');
 
       const res = await sendP;
       assert.equal(res.error, null);
-      // Note: the tool_use stop_reason in the first JSONL line resolves
-      // the turn race early; we don't assert on the final text since
-      // it's not the test's goal. (Existing "tool_use" test in this
-      // file documents the same partial-text behavior.) The point of
-      // THIS test is that the queue-folded event cleared the pending
-      // autosteer so no spurious extra-turn-reply fires.
-
-      // Give a beat in case any spurious extra-turn-reply tries to fire
-      await sleep(80);
+      assert.match(res.text, /Both done/);
+      await sleep(60);
       assert.equal(extraReplyEvents, 0,
-        'FOLD path must NOT emit extra-turn-reply — the primary reply already covers both messages');
-      // Sanity: the pending autosteer is also cleared (defends against
-      // a later top-level user message with the same content
-      // incorrectly triggering extra-turn extraction).
-      assert.equal(p._pendingAutosteers.length, 0,
-        'queue-folded should remove the matching pending autosteer');
+        'FOLD path must NOT emit extra-turn-reply — the primary reply already covers both');
+      const foldRes = resolutions.find((r) => r.msgId === autosteeredMsgId);
+      assert.ok(foldRes && foldRes.via === 'fold',
+        `autosteer ${autosteeredMsgId} must resolve via fold (got ${JSON.stringify(foldRes)})`);
       await p.kill('done');
     } finally { env.cleanup(); }
   });
 
-  test('rc.11.1 REGRESSION: autosteer NEW TURN works for multi-line content (pasteText \\n → / oneLine transform)', async () => {
-    // Pre-rc.11.1: _pendingAutosteers stored content AS-IS (with \n).
-    // But TmuxRunner.pasteText() normalises \r?\n → ' / ' before
-    // pasting into the TUI, and the JSONL queue-operation/user
-    // entries record the post-paste oneLine form. Match-by-content
-    // always failed for multi-line prompts → NEW-TURN extra-turn-
-    // started/reply never fired → the second-turn reply leaked
-    // through autonomous-wakeup-message instead of being routed
-    // back to the autosteered msgId. Ivan caught this on
-    // shumorobot 2026-05-15 — every polygram prompt is multi-line
-    // (the <polygram-info> wrapper has newlines), so this was a
-    // 100%-broken path in production.
+  test('autosteer NEW-TURN: multi-line autosteer content routes by token (not by content matching)', async () => {
+    // Pre-Phase-2 this path matched the autosteer by CONTENT — and the
+    // pasteText \n → ' / ' transform broke the match for every
+    // multi-line prompt (which every polygram inbound is). Phase 2
+    // routes by the embedded correlation token, so the autosteer's
+    // content shape is irrelevant: a multi-line autosteer is matched
+    // exactly like any other.
     const env = setupTempCwd();
     try {
       const runner = makeRunner();
@@ -864,25 +881,28 @@ describe('TmuxProcess — JSONL session-log path', () => {
         chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
       });
 
-      // Multi-line autosteer content — what real polygram prompts
-      // look like (wrapped with <polygram-info>...</polygram-info>).
-      const multiLineContent = '<polygram-info>line1\nline2\nline3</polygram-info>\n\n<channel>foo</channel>';
       const autosteeredMsgId = 686;
       const extraReplies = [];
       p.on('extra-turn-reply', (ev) => extraReplies.push(ev));
 
       const sendP = p.send('primary turn');
       await sleep(20);
-      // Inject the multi-line autosteer. Internally, pasteText would
-      // transform \n → ' / ' before sending to the TUI; the JSONL
-      // queue-operation/user records the oneLine form too.
+      // Multi-line autosteer content — what real polygram prompts look
+      // like. The \n → ' / ' transform no longer matters: routing is
+      // by token, not content.
       assert.equal(
-        p.injectUserMessage({ content: multiLineContent, msgId: autosteeredMsgId }),
+        p.injectUserMessage({
+          content: '<polygram-info>line1\nline2</polygram-info>\n\n<channel>foo</channel>',
+          msgId: autosteeredMsgId,
+        }),
         true,
       );
+      await sleep(20);
+      const [primTok, autoTok] = pastedTokens(runner);
 
       const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
       // Primary turn 1 completes (short, no tools).
+      fs.appendFileSync(logPath, userLine(sessionId, primTok));
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
         sessionId,
@@ -890,15 +910,8 @@ describe('TmuxProcess — JSONL session-log path', () => {
       }) + '\n');
       await sendP;
 
-      // TUI dequeues the autosteer as a NEW user turn. The content
-      // is the ONELINE form (' / ' separators), matching what
-      // pasteText put into the TUI.
-      const oneLineForm = multiLineContent.replace(/\r?\n/g, ' / ');
-      fs.appendFileSync(logPath, JSON.stringify({
-        type: 'user',
-        sessionId,
-        message: { role: 'user', content: oneLineForm },
-      }) + '\n');
+      // TUI dequeues the autosteer as a NEW user turn — primary done.
+      fs.appendFileSync(logPath, userLine(sessionId, autoTok, 'autosteer'));
       await sleep(20);
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
@@ -908,14 +921,14 @@ describe('TmuxProcess — JSONL session-log path', () => {
       await sleep(80);
 
       assert.equal(extraReplies.length, 1,
-        'rc.11.1: extra-turn-reply MUST fire for multi-line autosteer (was 0/100% broken pre-rc.11.1)');
+        'extra-turn-reply MUST fire for the NEW-TURN autosteer');
       assert.equal(extraReplies[0].msgId, autosteeredMsgId);
       assert.match(extraReplies[0].text, /extra-reply content/);
       await p.kill('done');
     } finally { env.cleanup(); }
   });
 
-  test('autosteer NEW TURN path: dequeued user-message triggers second-turn extraction; emits extra-turn-reply with correct msgId', async () => {
+  test('autosteer NEW-TURN: dequeued autosteer user-message → extra-turn-started + extra-turn-reply with correct msgId', async () => {
     const env = setupTempCwd();
     try {
       const runner = makeRunner();
@@ -926,7 +939,6 @@ describe('TmuxProcess — JSONL session-log path', () => {
         chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
       });
 
-      const autosteeredContent = 'and this https://discogs/release/abc';
       const autosteeredMsgId = 658;
       const extraReplies = [];
       const extraStarts = [];
@@ -935,14 +947,16 @@ describe('TmuxProcess — JSONL session-log path', () => {
 
       const sendP = p.send('download https://youtube/foo');
       await sleep(20);
-      // Now (turn 1 inFlight) the autosteer arrives — production flow
       assert.equal(
-        p.injectUserMessage({ content: autosteeredContent, msgId: autosteeredMsgId }),
+        p.injectUserMessage({ content: 'and this https://discogs/release/abc', msgId: autosteeredMsgId }),
         true, 'injectUserMessage must succeed when turn is in flight',
       );
+      await sleep(20);
+      const [primTok, autoTok] = pastedTokens(runner);
 
       const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
       // Turn 1: short — model emits final text immediately, no tool.
+      fs.appendFileSync(logPath, userLine(sessionId, primTok));
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
         sessionId,
@@ -957,13 +971,9 @@ describe('TmuxProcess — JSONL session-log path', () => {
       assert.ok(res.text.includes('Midnight Picnic'),
         'primary turn reply should be turn 1 text alone');
 
-      // Now turn 2 happens: TUI dequeues the autosteered paste as a
-      // fresh top-level user message, then the model replies.
-      fs.appendFileSync(logPath, JSON.stringify({
-        type: 'user',
-        sessionId,
-        message: { role: 'user', content: autosteeredContent },
-      }) + '\n');
+      // Turn 2: the TUI dequeues the autosteer as a fresh user turn
+      // (primary already done → NEW-TURN, not fold).
+      fs.appendFileSync(logPath, userLine(sessionId, autoTok, 'autosteer'));
       await sleep(20);
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
@@ -973,44 +983,33 @@ describe('TmuxProcess — JSONL session-log path', () => {
           stop_reason: 'end_turn',
         },
       }) + '\n');
-
-      // Give the tail + handler time to process
       await sleep(80);
 
       assert.equal(extraReplies.length, 1,
-        'NEW TURN path must emit exactly one extra-turn-reply');
+        'NEW-TURN path must emit exactly one extra-turn-reply');
       assert.equal(extraReplies[0].msgId, autosteeredMsgId,
-        'extra-turn-reply must carry the autosteered msgId so polygram routes the reply correctly');
+        'extra-turn-reply must carry the autosteered msgId');
       assert.ok(extraReplies[0].text.includes('Neon Affair'),
         'extra-turn-reply text must be the second turn\'s assistant reply');
-      // rc.9: extra-turn-started fires the MOMENT the queue-dequeue
-      // user message is seen — gives polygram a hook to re-engage
-      // typing indicator + ✍ reaction during turn 2 (was getting
-      // cleared by clearAutosteeredReactions when primary turn 1
-      // succeeded, leaving a silent gap in shumorobot Ivan flagged).
       assert.equal(extraStarts.length, 1,
-        'NEW TURN path must emit exactly one extra-turn-started');
+        'NEW-TURN path must emit exactly one extra-turn-started');
       assert.equal(extraStarts[0].msgId, autosteeredMsgId,
         'extra-turn-started must carry the autosteered msgId');
       await p.kill('done');
     } finally { env.cleanup(); }
   });
 
-  test('rc.12.1 REGRESSION: _extraTurnState drains BEFORE _turnState when both coexist (concurrent extra-turn + new primary)', async () => {
-    // Captured live on shumorobot 2026-05-15 19:32:31-19:32:51:
-    //   1) msg 691 IN → primary turn 1
-    //   2) msg 692 IN (during turn 1) → autosteered, ✍
-    //   3) turn 1 ends short → TUI dequeues msg 692 as turn 2 →
-    //      extra-turn-started fires, _extraTurnState set for msg 692.
-    //   4) msg 694 IN → polygram pm.send → _turnState set for turn 3
-    //      (TUI queues it behind turn 2's still-running work).
-    //   5) JSONL emits msg 692's turn 2 assistant chunks + result.
-    //      PRE-rc.12.1: _turnState (msg 694) was checked first →
-    //      chunks/result mis-attributed → msg 692's extra-turn
-    //      never flushed → typing loop leaked.
-    //   POST-rc.12.1: _extraTurnState drains first → msg 692's
-    //   reply flushes via extra-turn-reply (correctly addressed
-    //   to msgId 692) → _turnState then handles msg 694 cleanly.
+  test('concurrent extra-turn + new primary: token routing keeps msg 692 and msg 694 replies separate', async () => {
+    // Captured live on shumorobot 2026-05-15 (the rc.12.1 trace):
+    //   1) msg 691 → primary turn 1
+    //   2) msg 692 (during turn 1) → autosteered
+    //   3) turn 1 ends short → TUI dequeues msg 692 as a NEW turn
+    //   4) msg 694 → a fresh primary pm.send
+    //   5) msg 692's turn-2 reply AND msg 694's turn-3 reply both
+    //      stream in — and must not cross-attribute.
+    // Pre-Phase-2 this depended on a fragile accumulator-priority
+    // swap. Now each turn's user-message carries its own token, so
+    // routing is unambiguous regardless of interleaving.
     const env = setupTempCwd();
     try {
       const runner = makeRunner();
@@ -1021,21 +1020,23 @@ describe('TmuxProcess — JSONL session-log path', () => {
         chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
       });
 
-      const autoContent = 'autosteered turn 2 content';
       const autoMsgId = 692;
-      const newMsgId = 694;
       const extraReplies = [];
       p.on('extra-turn-reply', (ev) => extraReplies.push(ev));
 
-      // Primary turn 1 (msg 691) — happens fast, completes.
+      // Primary turn 1 + a mid-turn autosteer for msg 692.
       const turn1P = p.send('primary turn 1');
       await sleep(20);
-      // Mid-turn-1 autosteer arrives for msg 692.
       assert.equal(
-        p.injectUserMessage({ content: autoContent, msgId: autoMsgId }),
+        p.injectUserMessage({ content: 'autosteered turn 2 content', msgId: autoMsgId }),
         true,
       );
+      await sleep(20);
+      const [tok1, tokAuto] = pastedTokens(runner);
+
       const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      // Turn 1 completes.
+      fs.appendFileSync(logPath, userLine(sessionId, tok1));
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
         sessionId,
@@ -1043,29 +1044,24 @@ describe('TmuxProcess — JSONL session-log path', () => {
       }) + '\n');
       await turn1P;
 
-      // TUI dequeues msg 692 as turn 2 → extra-turn-started.
-      fs.appendFileSync(logPath, JSON.stringify({
-        type: 'user',
-        sessionId,
-        message: { role: 'user', content: autoContent },
-      }) + '\n');
+      // TUI dequeues msg 692 as a NEW turn (primary done → new-turn).
+      fs.appendFileSync(logPath, userLine(sessionId, tokAuto, 'auto692'));
       await sleep(30);
 
-      // Now msg 694's primary turn starts BEFORE msg 692's turn 2
-      // assistant chunks arrive — this is the race condition shape.
+      // msg 694's fresh primary pm.send starts.
       const turn3P = p.send('primary turn 3 (msg 694)');
       await sleep(20);
+      const tok3 = pastedTokens(runner)[2];
 
-      // JSONL: msg 692's turn 2 assistant chunks + result arrive now.
-      // PRE-rc.12.1, these would be mis-attributed to msg 694's
-      // _turnState. POST-rc.12.1, they flow to _extraTurnState.
+      // msg 692's turn-2 reply lands FIRST (flushes the auto692 group).
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
         sessionId,
         message: { content: [{ type: 'text', text: 'turn2-extra-reply' }], stop_reason: 'end_turn' },
       }) + '\n');
       await sleep(40);
-      // Now msg 694's turn assistant chunks arrive.
+      // Then msg 694's own user-message + reply.
+      fs.appendFileSync(logPath, userLine(sessionId, tok3));
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
         sessionId,
@@ -1074,20 +1070,19 @@ describe('TmuxProcess — JSONL session-log path', () => {
 
       const turn3Result = await turn3P;
 
-      // rc.12.1 invariants:
       assert.equal(extraReplies.length, 1,
-        'extra-turn-reply MUST fire for msg 692 even though msg 694\'s _turnState was also active');
+        'exactly one extra-turn-reply, for msg 692');
       assert.equal(extraReplies[0].msgId, autoMsgId,
-        'the extra-turn-reply must carry msgId=692, NOT msg 694');
+        'the extra-turn-reply must carry msgId=692, never msg 694');
       assert.match(extraReplies[0].text, /turn2-extra-reply/,
-        'msg 692\'s reply text must NOT be mis-attributed to msg 694\'s _turnState');
+        'msg 692 reply must NOT be cross-attributed to msg 694');
       assert.match(turn3Result.text, /turn3-reply/,
-        'msg 694\'s primary turn must receive its own reply text, NOT msg 692\'s');
+        'msg 694 primary turn receives its own reply, never msg 692\'s');
       await p.kill('done');
     } finally { env.cleanup(); }
   });
 
-  test('user-message that does NOT match a pending autosteer is ignored (no spurious extra-turn-reply)', async () => {
+  test('user-message with no recognised token is ignored (no spurious extra-turn-reply)', async () => {
     const env = setupTempCwd();
     try {
       const runner = makeRunner();
@@ -1098,13 +1093,14 @@ describe('TmuxProcess — JSONL session-log path', () => {
         chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
       });
 
-      // No injectUserMessage call → no pending autosteers.
       let extras = 0;
       p.on('extra-turn-reply', () => { extras++; });
 
       const sendP = p.send('first');
       await sleep(20);
+      const [tok1] = pastedTokens(runner);
       const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, userLine(sessionId, tok1));
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
         sessionId,
@@ -1112,12 +1108,9 @@ describe('TmuxProcess — JSONL session-log path', () => {
       }) + '\n');
       await sendP;
 
-      // Spurious top-level user message — must NOT trigger extra-turn-reply
-      fs.appendFileSync(logPath, JSON.stringify({
-        type: 'user',
-        sessionId,
-        message: { role: 'user', content: 'a totally unrelated message' },
-      }) + '\n');
+      // A token-less user-message with no pasted primary awaiting it
+      // → no match → ignored. (Primary done & pruned from the ledger.)
+      fs.appendFileSync(logPath, userLine(sessionId, null, 'a totally unrelated message'));
       await sleep(40);
       fs.appendFileSync(logPath, JSON.stringify({
         type: 'assistant',
@@ -1127,7 +1120,116 @@ describe('TmuxProcess — JSONL session-log path', () => {
       await sleep(50);
 
       assert.equal(extras, 0,
-        'top-level user message without a matching pending autosteer must not emit extra-turn-reply');
+        'an unrecognised user-message must not emit extra-turn-reply');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
+  // ─── Phase 2 B1 — concatenation immunity ───────────────────────────
+
+  test('Phase 2 B1 — concatenated user-message carrying TWO tokens folds N turns cleanly (no duplicate, no cross-attribution)', async () => {
+    // The TUI can concatenate two pastes landing close together into
+    // ONE user-message. Pre-Phase-2 the substring matcher then popped
+    // the wrong pending and fanned the shared text out per msgId —
+    // duplicate + cross-attributed replies. With tokens, a
+    // user-message containing N tokens is an EXPLICIT, unambiguous
+    // fold of N turns: the primary's reply covers them all, once.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = 'b1b1b1b1-1111-2222-3333-b1b1b1b1b1b1';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      const resolutions = [];
+      let extraReplyEvents = 0;
+      p.on('autosteer-resolution', (ev) => resolutions.push(ev));
+      p.on('extra-turn-reply', () => { extraReplyEvents++; });
+
+      const sendP = p.send('primary message');
+      await sleep(20);
+      assert.equal(p.injectUserMessage({ content: 'autosteer message', msgId: 777 }), true);
+      await sleep(20);
+      const [primTok, autoTok] = pastedTokens(runner);
+
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      // ONE user-message line carrying BOTH tokens — the concatenated
+      // paste. The boundary between the two messages is GONE, but the
+      // two tokens still say exactly which two turns the TUI merged.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'user',
+        sessionId,
+        message: {
+          role: 'user',
+          content: `<polygram-info corr-id="${primTok}"></polygram-info> / `
+            + `<polygram-info corr-id="${autoTok}"></polygram-info> / merged`,
+        },
+      }) + '\n');
+      await sleep(20);
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: { content: [{ type: 'text', text: 'one shared reply' }], stop_reason: 'end_turn' },
+      }) + '\n');
+
+      const res = await sendP;
+      assert.match(res.text, /one shared reply/,
+        'the primary turn receives the shared reply');
+      await sleep(60);
+      assert.equal(extraReplyEvents, 0,
+        'a fold delivers NO extra-turn-reply — the primary reply covers the folded autosteer');
+      const r777 = resolutions.find((r) => r.msgId === 777);
+      assert.ok(r777 && r777.via === 'fold',
+        `the concatenated autosteer resolves via fold (got ${JSON.stringify(r777)})`);
+      assert.equal(resolutions.filter((r) => r.msgId === 777).length, 1,
+        'autosteer 777 resolves EXACTLY once — no duplicate');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
+  test('Phase 2 B1b — two primary turns route by token; replies never cross-attribute', async () => {
+    // Tokens are injective: turn A and turn B each get their own
+    // reply even when delivered back-to-back. No substring collision,
+    // no accumulator desync.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = 'b1b2b1b2-1111-2222-3333-b1b2b1b2b1b2';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+
+      const r1P = p.send('turn A');
+      await sleep(20);
+      const tokA = pastedTokens(runner)[0];
+      fs.appendFileSync(logPath, userLine(sessionId, tokA));
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: { content: [{ type: 'text', text: 'reply-A' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      const r1 = await r1P;
+
+      const r2P = p.send('turn B');
+      await sleep(20);
+      const tokB = pastedTokens(runner)[1];
+      assert.notEqual(tokA, tokB, 'each turn mints a unique token');
+      fs.appendFileSync(logPath, userLine(sessionId, tokB));
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: { content: [{ type: 'text', text: 'reply-B' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      const r2 = await r2P;
+
+      assert.match(r1.text, /reply-A/, 'turn A receives reply-A');
+      assert.match(r2.text, /reply-B/, 'turn B receives reply-B');
+      assert.ok(!r1.text.includes('reply-B'), 'turn A reply must not contain turn B text');
+      assert.ok(!r2.text.includes('reply-A'), 'turn B reply must not contain turn A text');
       await p.kill('done');
     } finally { env.cleanup(); }
   });

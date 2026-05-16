@@ -311,8 +311,13 @@ describe('TmuxProcess.send', () => {
     assert.equal(res.sessionId, 'sess-final');
     assert.equal(res.metrics.resultSubtype, 'success');
     assert.equal(res.metrics.numAssistantMessages, 1);
-    const paste = runner._calls.find((c) => c.kind === 'pasteText' && c.text === 'hello');
+    // 0.10.0 Phase 2: the pasted prompt now carries an embedded
+    // correlation token in its <polygram-info> block, so the pasted
+    // text CONTAINS 'hello' rather than equalling it.
+    const paste = runner._calls.find((c) => c.kind === 'pasteText' && c.text.includes('hello'));
     assert.ok(paste);
+    assert.match(paste.text, /<polygram-info corr-id="pgm-corr-[0-9a-f]+"/,
+      'paste embeds a correlation token');
     const enter = runner._calls.find((c) => c.kind === 'sendControl' && c.key === 'Enter');
     assert.ok(enter);
   });
@@ -373,9 +378,12 @@ describe('TmuxProcess.send', () => {
     const [res1, res2] = await Promise.all([r1, r2]);
     assert.equal(res1.error, null);
     assert.equal(res2.error, null);
-    // Both pastes happened, in order
+    // Both pastes happened, in order. Each carries an embedded
+    // correlation token, so check containment, not equality.
     const pastes = runner._calls.filter((c) => c.kind === 'pasteText');
-    assert.deepEqual(pastes.map((p) => p.text), ['first', 'second']);
+    assert.equal(pastes.length, 2);
+    assert.ok(pastes[0].text.includes('first'));
+    assert.ok(pastes[1].text.includes('second'));
   });
 });
 
@@ -478,7 +486,13 @@ describe('TmuxProcess HOT-PATH (R1-F1: no-throw)', () => {
   test('drainQueue returns count, never throws, fires queue-drop', () => {
     const runner = makeFakeRunner();
     const p = makeTmuxProcess(runner);
-    p.pendingQueue.push({ reject: () => {} }, { reject: () => {} });
+    // 0.10.0 Phase 2: drainQueue rejects QUEUED primary turns — Turn
+    // records carry a `state`. Only 'queued' turns are drained (the
+    // running head settles via its own _runTurn flow).
+    p.pendingQueue.push(
+      { state: 'queued', reject: () => {} },
+      { state: 'queued', reject: () => {} },
+    );
     const fired = [];
     p.on('queue-drop', (c) => fired.push(c));
     const count = p.drainQueue('FOO');
@@ -490,7 +504,7 @@ describe('TmuxProcess HOT-PATH (R1-F1: no-throw)', () => {
   test('drainQueue with throwing reject does not bubble', () => {
     const runner = makeFakeRunner();
     const p = makeTmuxProcess(runner);
-    p.pendingQueue.push({ reject: () => { throw new Error('reject boom'); } });
+    p.pendingQueue.push({ state: 'queued', reject: () => { throw new Error('reject boom'); } });
     // No throw expected
     const n = p.drainQueue();
     assert.equal(n, 1);
@@ -532,7 +546,8 @@ describe('TmuxProcess HOT-PATH (R1-F1: no-throw)', () => {
     // Allow microtask drain — paste call must land
     await new Promise((r) => setImmediate(r));
     await new Promise((r) => setImmediate(r));
-    assert.ok(runner._calls.find((c) => c.kind === 'pasteText' && c.text === 'autosteer text'));
+    // Phase 2: the autosteer paste carries an embedded correlation token.
+    assert.ok(runner._calls.find((c) => c.kind === 'pasteText' && c.text.includes('autosteer text')));
   });
 
   test('injectUserMessage paste error surfaces via inject-fail event, not throw', async () => {
@@ -581,7 +596,7 @@ describe('TmuxProcess.kill', () => {
     const p = makeTmuxProcess(runner);
     p.tmuxName = 'x';
     let drained = null;
-    p.pendingQueue.push({ reject: (e) => { drained = e; } });
+    p.pendingQueue.push({ state: 'queued', reject: (e) => { drained = e; } });
     // close event parity: first arg is integer code (matches SDK);
     // second arg is optional metadata.
     const closed = new Promise((resolve) => {

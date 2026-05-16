@@ -76,13 +76,16 @@ function makeFakeTmuxRunner({ onPasteMatchedReply = null } = {}) {
       // exercise the prompt-sanitized event path.
       const sanitized = String(text).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
       const stripped = text.length - sanitized.length;
-      // Prime captures based on sanitized prompt match.
-      const idx = queuedReplies.findIndex((r) => r.prompt === sanitized);
+      // Prime captures based on the sanitized prompt. 0.10.0 Phase 2:
+      // the pasted text now carries an embedded <polygram-info>
+      // correlation token, so the scripted prompt is a SUBSTRING of
+      // what was pasted — match by containment.
+      const idx = queuedReplies.findIndex((r) => sanitized.includes(r.prompt));
       if (idx !== -1) {
         const [reply] = queuedReplies.splice(idx, 1);
         primeCaptureForReply(reply.text);
         if (typeof onPasteMatchedReply === 'function') {
-          try { onPasteMatchedReply(reply); } catch { /* swallow */ }
+          try { onPasteMatchedReply(reply, sanitized); } catch { /* swallow */ }
         }
       }
       return { sanitized, oneLine: sanitized, stripped };
@@ -239,13 +242,30 @@ function makeTmuxBackend({ sessionKey = 'chat:100', chatId = '100', threadId = n
   // backend-realistic input (cost computation, stop_reason, usage
   // metrics all populate exactly like a real claude turn).
   const runner = makeFakeTmuxRunner({
-    onPasteMatchedReply: (reply) => {
+    onPasteMatchedReply: (reply, pastedText) => {
+      // 0.10.0 Phase 2: extract the correlation token embedded in the
+      // pasted prompt so the synthetic JSONL reproduces the real
+      // round-trip — a `user-message` carrying the token, then the
+      // assistant reply. The turn ledger routes by that token.
+      const token = (String(pastedText || '').match(/pgm-corr-[0-9a-f]+/) || [])[0] || null;
       // proc may not yet have _sessionLogPath if start() hasn't run.
       // Defer to next tick so start()'s _armSessionLogTail runs first.
       setImmediate(() => {
         if (!proc._sessionLogPath) return;
         try {
           fs.mkdirSync(path.dirname(proc._sessionLogPath), { recursive: true });
+          // The turn's user-message — carries the token so the ledger
+          // attributes the reply that follows.
+          fs.appendFileSync(proc._sessionLogPath, JSON.stringify({
+            type: 'user',
+            sessionId: proc.claudeSessionId,
+            message: {
+              role: 'user',
+              content: token
+                ? `<polygram-info corr-id="${token}"></polygram-info>\n\nprompt`
+                : 'prompt',
+            },
+          }) + '\n');
           fs.appendFileSync(proc._sessionLogPath, JSON.stringify({
             type: 'assistant',
             sessionId: proc.claudeSessionId,
@@ -307,7 +327,9 @@ function makeTmuxBackend({ sessionKey = 'chat:100', chatId = '100', threadId = n
     },
 
     assertPasted(text) {
-      const found = runner._calls.some((c) => c.kind === 'pasteText' && c.text === text);
+      // Phase 2: the pasted text carries an embedded correlation
+      // token, so the prompt is a substring of what was pasted.
+      const found = runner._calls.some((c) => c.kind === 'pasteText' && c.text.includes(text));
       if (!found) {
         const pastes = runner._calls.filter((c) => c.kind === 'pasteText').map((c) => c.text);
         throw new Error(`tmux driver: expected paste of "${text}" but got ${JSON.stringify(pastes)}`);
