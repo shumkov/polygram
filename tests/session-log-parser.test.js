@@ -369,20 +369,29 @@ describe('parseLine — last-prompt', () => {
 // ─── pipeToParser ────────────────────────────────────────────────────
 
 describe('pipeToParser', () => {
-  test('emits parsed events on `event` channel', () => {
+  test('emits parsed events on `event` channel (via the stateful aggregator)', () => {
     const emitter = new EventEmitter();
     pipeToParser(emitter);
     const events = [];
     emitter.on('event', (e) => events.push(e));
+    // Assistant line WITHOUT a message.id → aggregator treats it as a
+    // standalone message, emits per-line (legacy parseLine path).
     emitter.emit('line', JSON.stringify({
       type: 'assistant',
       message: { content: [{ type: 'text', text: 'hi' }] },
     }));
-    emitter.emit('line', JSON.stringify({ type: 'queue-operation' })); // skipped
+    // 0.10.0 Phase 1: queue-operation is now PARSED, not skipped — it
+    // is the live queue-activity / fold signal the turn ledger needs.
+    emitter.emit('line', JSON.stringify({
+      type: 'queue-operation', operation: 'enqueue', content: 'queued text',
+    }));
     emitter.emit('line', JSON.stringify({ type: 'last-prompt', lastPrompt: 'q' }));
-    assert.equal(events.length, 2);
+    assert.equal(events.length, 3);
     assert.equal(events[0].type, 'assistant-chunk');
-    assert.equal(events[1].type, 'last-prompt');
+    assert.equal(events[1].type, 'queue-operation');
+    assert.equal(events[1].operation, 'enqueue');
+    assert.equal(events[1].content, 'queued text');
+    assert.equal(events[2].type, 'last-prompt');
   });
 });
 

@@ -322,6 +322,77 @@ describe('TmuxProcess — JSONL session-log path', () => {
     }
   });
 
+  test('Phase 1 — zero-concurrency empty-turn: thinking line then text line, SAME message.id, both end_turn → turn delivers the real text', async () => {
+    // Verified against real claude 2.1.142 JSONL: one logical assistant
+    // message is written across MULTIPLE JSONL lines that all share the
+    // same `message.id` and all repeat the message-level `stop_reason`.
+    // A terminal message commonly arrives as a `thinking` line followed
+    // by a `text` line — both carrying stop_reason=end_turn, same id.
+    //
+    // Pre-Phase-1, the per-line parser fired a `result` on the FIRST
+    // (thinking) line: it has stop_reason=end_turn but no text block,
+    // so the turn resolved with text='' BEFORE the real-text line was
+    // read. That is the zero-concurrency empty-turn bug — no autosteer,
+    // no burst, just a turn whose final message thinks before it speaks.
+    //
+    // Post-Phase-1, the SessionEventAggregator coalesces lines by
+    // message.id and fires `result` ONCE, on finalize, with the full
+    // text. RED before the aggregator, GREEN after.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = 'eeee0001-1111-2222-3333-eeeeeeeeeee0';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      const sendP = p.send('think, then answer');
+      await sleep(20);
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+
+      // Line 1 — the thinking segment of the FINAL message. Carries
+      // stop_reason=end_turn but NO text block.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: {
+          id: 'msg_PHASE1A',
+          content: [{ type: 'thinking', thinking: 'Let me work this out…' }],
+          stop_reason: 'end_turn',
+        },
+      }) + '\n');
+      await sleep(60);
+      // Line 2 — the text segment of the SAME message. Same id, same
+      // stop_reason, the real answer.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: {
+          id: 'msg_PHASE1A',
+          content: [{ type: 'text', text: 'REAL ANSWER 42' }],
+          stop_reason: 'end_turn',
+        },
+      }) + '\n');
+      await sleep(40);
+      // A trailing non-assistant line — claude always writes `system`
+      // lines right after a turn's final assistant message. This is
+      // what finalizes the coalesced message in steady state.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'system', sessionId, subtype: 'turn_complete',
+      }) + '\n');
+
+      const res = await sendP;
+      assert.equal(res.error, null);
+      assert.ok(res.text && res.text.length > 0,
+        `turn MUST deliver non-empty text — pre-Phase-1 the thinking line resolved it empty (got ${JSON.stringify(res.text)})`);
+      assert.match(res.text, /REAL ANSWER 42/,
+        'the delivered reply is the text segment, not the empty thinking segment');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
   test('L2 REGRESSION: last-prompt WITHOUT prior text does NOT resolve the turn (it\'s a "prompt registered" marker, not "turn done")', async () => {
     // claude v2.1.142 writes last-prompt JSONL events when a user
     // prompt is REGISTERED (before the agent replies). Pre-L2 the
