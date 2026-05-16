@@ -294,6 +294,7 @@ function makeTmuxBackend({ sessionKey = 'chat:100', chatId = '100', threadId = n
     quiesceMs: 3,
     readyTimeoutMs: 500,
     turnTimeoutMs: 1000,
+    pasteConfirmMs: 10,
   });
 
   // Restore HOME when the process is killed.

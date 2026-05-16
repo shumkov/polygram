@@ -50,6 +50,7 @@ function makeTmuxProcess(runner, opts = {}) {
     quiesceMs: 5,
     readyTimeoutMs: 500,
     turnTimeoutMs: 500,
+    pasteConfirmMs: 10,
     ...opts,
   });
 }

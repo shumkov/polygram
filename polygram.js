@@ -411,7 +411,7 @@ async function getOrSpawnForChat(sessionKey) {
   return pm.getOrSpawn(sessionKey, ctx);
 }
 
-async function sendToProcess(sessionKey, prompt, context = {}) {
+async function sendToProcess(sessionKey, prompt, context = {}, { onDispatched } = {}) {
   const entry = await getOrSpawnForChat(sessionKey);
   if (!entry) throw new Error('No process for chat');
   const chatId = getChatIdFromKey(sessionKey);
@@ -437,7 +437,13 @@ async function sendToProcess(sessionKey, prompt, context = {}) {
   // starts, which is the correct UX (and what the user already expects).
   const release = await stdinLock.acquire(sessionKey);
   try {
-    return await pm.send(sessionKey, prompt, { timeoutMs, maxTurnMs, context });
+    const turnP = pm.send(sessionKey, prompt, { timeoutMs, maxTurnMs, context });
+    // Phase 3 §4: pm.send synchronously kicks off the turn — the
+    // process is now inFlight. Signal the committed-intent latch so
+    // it can release; a concurrent handler will then correctly see
+    // the live turn and autosteer instead of racing into a 2nd send.
+    if (typeof onDispatched === 'function') onDispatched();
+    return await turnP;
   } finally {
     release();
   }
@@ -480,6 +486,15 @@ let inFlightHandlers = null;
 // until auto-compact — noisy enough that Ivan called it out.
 // Per-session lock ordering stdin writes. Module is I/O-pure.
 const stdinLock = createAsyncLock();
+
+// 0.10.0 Phase 3 §4: committed-intent latch. Serialises the
+// autosteer-vs-primary decision per session so a burst of concurrent
+// handleMessage calls cannot each independently mis-read `inFlight`
+// and all classify themselves as primary. The first to acquire it
+// for an idle session commits the primary turn and holds the latch
+// until the process is inFlight; later acquirers see the live turn
+// and autosteer.
+const intentLock = createAsyncLock();
 
 // Typing indicator is imported from lib/typing-indicator — it adds a
 // per-chat circuit breaker with exponential backoff so a chat that
@@ -971,9 +986,39 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // standard emoji per core.telegram.org/bots/api#availablereactions).
   // 🛞 is NOT on it (400: REACTION_INVALID). ✍ ("writing/noting")
   // is on the list and conveys "incorporating this".
-  const steered = autosteer.tryAutosteer({
-    sessionKey, chatConfig, chatId, msg, prompt,
-  });
+  // 0.10.0 Phase 3 §4: committed-intent latch. The autosteer-vs-
+  // primary decision AND the turn dispatch happen inside one
+  // per-session critical section. tryAutosteer's `inFlight` read is
+  // now reliable: the previous primary held this latch until its
+  // pm.send made the process inFlight, so a concurrent burst can no
+  // longer mis-classify followups as primary turns.
+  const releaseIntent = await intentLock.acquire(sessionKey);
+  let steered = { autosteered: false };
+  let sendPromise = null;
+  try {
+    steered = autosteer.tryAutosteer({ sessionKey, chatConfig, chatId, msg, prompt });
+    if (!steered.autosteered) {
+      // Primary turn. Kick off the dispatch and hold the latch until
+      // pm.send has made the process inFlight (onDispatched). The
+      // turn RESULT is awaited only AFTER the latch is released — the
+      // latch covers the decision + commitment, never the whole turn
+      // (that would block every autosteer).
+      // Pass streamer + reactor as per-turn context; pm's callbacks
+      // pick them off entry.pendingQueue[0].context.
+      await new Promise((dispatched) => {
+        sendPromise = sendToProcess(sessionKey, prompt, {
+          streamer, reactor, sourceMsgId: msg.message_id,
+          // 0.7.4 (item B): fire THINKING when Claude actually starts
+          // emitting — not the moment we wrote stdin.
+          onFirstStream: () => reactor.setState('THINKING'),
+        }, { onDispatched: dispatched })
+          .catch((e) => ({ __sendError: e }))
+          .finally(dispatched);
+      });
+    }
+  } finally {
+    releaseIntent();
+  }
   if (steered.autosteered) {
     stopTyping();
     // setState('AUTOSTEERED') is terminal — bypasses throttle,
@@ -987,18 +1032,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   }
 
   try {
-    // Pass streamer + reactor as per-turn context. pm's callbacks pick
-    // them off entry.pendingQueue[0].context so concurrent pendings each
-    // get routed to their own streamer/reactor.
-    const result = await sendToProcess(sessionKey, prompt, {
-      streamer, reactor, sourceMsgId: msg.message_id,
-      // 0.7.4 (item B): fire THINKING when Claude actually starts
-      // emitting (first assistant text or tool_use). Pre-fix, onActivate
-      // (queue-head transition) flipped to THINKING the moment we wrote
-      // stdin, even though Claude could spend hundreds of ms loading.
-      // Result: long flat 🤔 with nothing happening; users assumed stall.
-      onFirstStream: () => reactor.setState('THINKING'),
-    });
+    const result = await sendPromise;
+    // sendToProcess failures are captured (not thrown) so the latch
+    // always releases; re-throw here into the existing handler.
+    if (result && result.__sendError) throw result.__sendError;
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
     // 0.7.6 (item F): persist per-turn telemetry. Stream-json result

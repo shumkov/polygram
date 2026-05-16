@@ -52,6 +52,7 @@ function makeProc(runner, sched, chatId = '100') {
     sessionKey: `chat:${chatId}`, chatId, threadId: null, label: `t-${chatId}`,
     runner, botName: 'shumabit', logger: SILENT,
     pollMs: 5, quiesceMs: 5, readyTimeoutMs: 500, turnTimeoutMs: 500,
+    pasteConfirmMs: 10,
     pollScheduler: sched,
   });
 }

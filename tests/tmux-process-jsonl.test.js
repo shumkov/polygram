@@ -82,6 +82,7 @@ function makeProc(runner, opts = {}) {
     sessionKey: 'chat:100', chatId: '100', threadId: null, label: 'test',
     runner, botName: 'shumabit', logger: SILENT,
     pollMs: 5, quiesceMs: 10, readyTimeoutMs: 500, turnTimeoutMs: 5000,
+    pasteConfirmMs: 10,   // Phase 3 §5: short paste-gate for deterministic tests
     ...opts,
   });
 }
@@ -1186,6 +1187,111 @@ describe('TmuxProcess — JSONL session-log path', () => {
         `the concatenated autosteer resolves via fold (got ${JSON.stringify(r777)})`);
       assert.equal(resolutions.filter((r) => r.msgId === 777).length, 1,
         'autosteer 777 resolves EXACTLY once — no duplicate');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
+  test('Phase 3 §5 — paste gating: the autosteer paste waits until the primary paste is JSONL-confirmed', async () => {
+    // §5 converts the 50ms post-Enter drain GUESS into a real barrier:
+    // a paste does not release the next paste until the JSONL tail
+    // confirms it landed (its token surfaced in a user-message). Two
+    // pastes therefore cannot concatenate into one TUI input.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      // High pasteConfirmMs so the gate opens ONLY via JSONL confirm,
+      // never via timeout — the test asserts the confirm path.
+      const p = makeProc(runner, { turnTimeoutMs: 4000, pasteConfirmMs: 5000 });
+      const sessionId = 'aaaa5555-1111-2222-3333-aaaaaaaaaaaa';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      const sendP = p.send('primary');
+      await sleep(40);
+      const pasted1 = pastedTokens(runner);
+      assert.equal(pasted1.length, 1, 'the primary prompt was pasted');
+
+      // Autosteer while the primary paste is unconfirmed.
+      assert.equal(p.injectUserMessage({ content: 'autosteer', msgId: 1 }), true);
+      await sleep(80);
+      assert.equal(pastedTokens(runner).length, 1,
+        'the autosteer paste is GATED — the primary paste is not yet JSONL-confirmed');
+
+      // Write the primary's user-message → confirms paste 1 → the
+      // paste gate opens for the autosteer.
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, userLine(sessionId, pasted1[0]));
+      await sleep(120);
+      assert.equal(pastedTokens(runner).length, 2,
+        'the autosteer paste proceeds once the primary paste is JSONL-confirmed');
+
+      // Finish the turn cleanly.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: { content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      await sendP;
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
+  test('queue-operation remove folds a queued autosteer into the running turn (no user-message follows)', async () => {
+    // Verified JSONL (claude 2.1.142): an autosteer pasted during a
+    // turn is `queue-operation enqueue`d, then — when the TUI folds it
+    // into the running turn — `queue-operation remove`d. NO
+    // user-message follows. The fold must be resolved from the
+    // remove, or the autosteer leaks forever (caught by the
+    // multi-3-rapid real-TUI spike).
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = 'fffd0001-1111-2222-3333-fffd0001fffd';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      const resolutions = [];
+      let extraReplyEvents = 0;
+      p.on('autosteer-resolution', (ev) => resolutions.push(ev));
+      p.on('extra-turn-reply', () => { extraReplyEvents++; });
+
+      const sendP = p.send('primary');
+      await sleep(20);
+      const primTok = pastedTokens(runner)[0];
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, userLine(sessionId, primTok));
+      await sleep(20);
+      assert.equal(p.injectUserMessage({ content: 'autosteer', msgId: 501 }), true);
+      await sleep(20);
+      const autoTok = pastedTokens(runner)[1];
+
+      // The TUI parks the autosteer, then FOLDS it into the running
+      // turn — enqueue (carries the token), then remove.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'queue-operation', sessionId, operation: 'enqueue',
+        content: `<polygram-info corr-id="${autoTok}"></polygram-info> autosteer`,
+      }) + '\n');
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'queue-operation', sessionId, operation: 'remove',
+      }) + '\n');
+      await sleep(40);
+      // The primary's single reply covers both messages.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: { content: [{ type: 'text', text: 'covered both' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      await sendP;
+      await sleep(40);
+
+      const r501 = resolutions.find((r) => r.msgId === 501);
+      assert.ok(r501 && r501.via === 'fold',
+        `the removed (folded) autosteer resolves via fold (got ${JSON.stringify(r501)})`);
+      assert.equal(extraReplyEvents, 0,
+        'a folded autosteer gets NO extra-turn-reply — the primary reply covers it');
       await p.kill('done');
     } finally { env.cleanup(); }
   });
