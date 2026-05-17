@@ -1527,4 +1527,113 @@ describe('TmuxProcess — JSONL session-log path', () => {
       await p.kill('done');
     } finally { env.cleanup(); }
   });
+
+  test('R10 — a genuinely-empty JSONL result (end_turn, no text, no tools) fails loud', async () => {
+    // A terminal assistant message that carries stop_reason=end_turn
+    // but ONLY a thinking block — no text, no tool_use — finalizes to
+    // a `result` with text='' / subtype='success'. Pre-fix _runTurn's
+    // jsonl-winner branch resolved that as { error:null, text:'' } —
+    // a SUCCESS with empty text — and polygram delivered the canned
+    // "No response generated. Please try again." apology classified
+    // as a successful turn.
+    //
+    // This is distinct from the Phase-1 thinking-then-text case (that
+    // message HAS a text segment). Here the agent genuinely produced
+    // no answer. Matching the §6 fail-loud contract (capture-won /
+    // no-JSONL also fails loud), a genuinely-empty terminal turn must
+    // resolve with a real ERROR, not a silent empty success.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = 'eeee0010-1111-2222-3333-eeeeeeeeee10';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      const sendP = p.send('a question');
+      await sleep(20);
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, userLine(sessionId, null));
+      // The terminal message: end_turn, thinking-only, NO text block.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: {
+          id: 'msg_R10_EMPTY',
+          content: [{ type: 'thinking', thinking: 'hmm…' }],
+          stop_reason: 'end_turn',
+        },
+      }) + '\n');
+      await sleep(40);
+      // Trailing non-assistant line finalizes the coalesced message.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'system', sessionId, subtype: 'turn_complete',
+      }) + '\n');
+
+      const res = await sendP;
+      assert.ok(res.error,
+        'a genuinely-empty terminal turn must fail loud with a real error, '
+        + 'not resolve as { error:null, text:\'\' } (a silent empty success)');
+      assert.equal(res.text, '', 'no text is fabricated for an empty turn');
+      assert.equal(res.metrics.resultSubtype, 'TMUX_EMPTY_JSONL_RESULT',
+        'the failure carries an explicit, queryable subtype');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
+  test('R10 — an empty result is still a SUCCESS when the turn used a tool (tool-only completion)', async () => {
+    // The R10 fail-loud must NOT misfire on a legitimate tool-only
+    // turn: the agent ran a tool, produced side effects the user saw,
+    // and ended without a closing text block. polygram already treats
+    // that as a graceful tool-only completion (numToolUses>0 branch).
+    // Empty text + tools is fine; empty text + NO tools is the R10 bug.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = 'eeee0011-1111-2222-3333-eeeeeeeeee11';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      const sendP = p.send('run the tool');
+      await sleep(20);
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, userLine(sessionId, null));
+      // A tool_use message (non-terminal), then a terminal message
+      // with NO text block — a real tool-only completion.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: {
+          id: 'msg_R10_TOOL_A',
+          content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls' } }],
+          stop_reason: 'tool_use',
+        },
+      }) + '\n');
+      await sleep(40);
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: {
+          id: 'msg_R10_TOOL_B',
+          content: [{ type: 'thinking', thinking: 'done' }],
+          stop_reason: 'end_turn',
+        },
+      }) + '\n');
+      await sleep(40);
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'system', sessionId, subtype: 'turn_complete',
+      }) + '\n');
+
+      const res = await sendP;
+      assert.equal(res.error, null,
+        'a tool-only completion (empty text but a tool ran) is NOT the R10 '
+        + 'bug — it must still resolve as a success');
+      assert.ok(res.metrics.numToolUses >= 1,
+        'the tool use is counted — polygram\'s tool-only-completion branch keys on it');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
 });
