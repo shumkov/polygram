@@ -142,11 +142,17 @@ async function waitForAllResolutions(events, msgIds, timeoutMs = 90_000) {
   }
 }
 
-function assertInvariants(events, { autosteeredMsgIds = [] } = {}) {
+function assertInvariants(events, { autosteeredMsgIds = [], corruptionOnly = false } = {}) {
   notFired(events, 'autosteer-match-miss',
     'INV-1: no content-match miss (rc.14 paste atomicity)');
   notFired(events, 'autonomous-assistant-message',
     'INV-2: no autonomous-wakeup leak');
+  // corruptionOnly: the scenario DID inject an autosteer, but the
+  // agent's response to it is genuinely unpredictable (e.g. a
+  // whitespace-only inject). A resolution firing is then NOT
+  // spurious — only the corruption invariants (INV-1/INV-2) are
+  // guaranteed. Asserting INV-3 'no resolution' here would be wrong.
+  if (corruptionOnly) return;
   if (autosteeredMsgIds.length === 0) {
     notFired(events, 'autosteer-resolution', 'INV-3: no spurious resolution');
     notFired(events, 'extra-turn-started', 'INV-3: no spurious extra-turn-started');
@@ -413,13 +419,16 @@ S('edge', 'inject-whitespace-only', async () => {
   try {
     const sendP = p.send('Reply ONLY with "WS".');
     await sleep(50);
-    // Whitespace is NON-empty after sanitize so this DOES inject. The
-    // agent may or may not produce a useful reply; the invariants
-    // still hold (no corruption, no match-miss).
+    // Whitespace is NON-empty after sanitize so this DOES inject —
+    // an autosteer-resolution legitimately fires. The agent's reply
+    // to a whitespace-only message is unpredictable, so only the
+    // corruption invariants are guaranteed (no match-miss, no
+    // autonomous-wakeup leak). corruptionOnly skips the
+    // resolution/extra-turn assertions that don't apply here.
     p.injectUserMessage({ content: '   \n\t  ', msgId: 4003 });
     await sendP;
     await sleep(2000);
-    assertInvariants(events);  // no autosteer assertion — agent may ignore
+    assertInvariants(events, { corruptionOnly: true });
   } finally { await cleanup(); }
 });
 
