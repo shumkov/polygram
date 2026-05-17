@@ -1398,6 +1398,112 @@ describe('TmuxProcess — JSONL session-log path', () => {
     } finally { env.cleanup(); }
   });
 
+  test('R11 — a NEW-TURN autosteer routed during the _finishTurn window is NOT retired by the primary', async () => {
+    // Review finding R11: `_finishTurn`'s R1 block retires every
+    // `_activeGroup` turn when a primary turn ends. Its "no-op on
+    // success — turns is empty" assumption is FALSE when a NEW-TURN
+    // autosteer's dequeued `user-message` lands in the window between
+    // the primary's `result` (which `_flushActiveGroup` used to reset
+    // the group) and the primary's `_runTurn` reaching `_finishTurn`.
+    //
+    // `_routeUserMessage` pushes that fresh autosteer turn into a NEW
+    // `_activeGroup` (no primary in it). The R1 block then marks it
+    // `failed` and resets the group — so the autosteer's assistant
+    // chunks arrive with an empty `_activeGroup` and leak via
+    // `autonomous-assistant-message` instead of threading back as
+    // `extra-turn-reply`.
+    //
+    // The repro is deterministic: the primary's terminal `assistant`
+    // line and the autosteer's `user-message` line are written in ONE
+    // appendFileSync, so a single tail read processes both lines
+    // synchronously — the autosteer `user-message` finalizes the
+    // primary's buffered assistant message (emits `result` →
+    // `_flushActiveGroup` settles `resultPromise`), then the SAME
+    // batch routes the autosteer into `_activeGroup` — all before the
+    // microtask that resumes `_runTurn`'s race and calls
+    // `_finishTurn`. So `_finishTurn` runs with the fresh NEW-TURN
+    // autosteer sitting in `_activeGroup` — exactly the R11 race.
+    //
+    // RED before the owning-primary guard (autosteer retired →
+    // autonomous leak, no extra-turn-reply); GREEN after.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = 'aaaa0011-1111-2222-3333-aaaa0011aaaa';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+      const autosteeredMsgId = 9001;
+      const extraReplies = [];
+      const autonomous = [];
+      p.on('extra-turn-reply', (ev) => extraReplies.push(ev));
+      p.on('autonomous-assistant-message', (ev) => autonomous.push(ev));
+
+      const sendP = p.send('primary question');
+      await sleep(20);
+      assert.equal(
+        p.injectUserMessage({ content: 'autosteer follow-up', msgId: autosteeredMsgId }),
+        true, 'injectUserMessage must succeed when the turn is in flight',
+      );
+      await sleep(20);
+      const [primTok, autoTok] = pastedTokens(runner);
+
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      // The primary's user-message — starts the primary's active group.
+      fs.appendFileSync(logPath, userLine(sessionId, primTok));
+      await sleep(40);
+
+      // ONE write carrying BOTH: the primary's terminal assistant line
+      // AND the autosteer's dequeued user-message. A single tail read
+      // processes them back-to-back synchronously — the autosteer
+      // user-message finalizes the primary's assistant message
+      // (→ result → _flushActiveGroup) and is then routed into a fresh
+      // _activeGroup, all before _runTurn's race resumes _finishTurn.
+      fs.appendFileSync(logPath,
+        JSON.stringify({
+          type: 'assistant', sessionId,
+          message: {
+            id: 'msg_R11_PRIMARY',
+            content: [{ type: 'text', text: 'PRIMARY-ANSWER' }],
+            stop_reason: 'end_turn',
+          },
+        }) + '\n'
+        + userLine(sessionId, autoTok, 'autosteer') );
+
+      const res = await sendP;
+      assert.equal(res.error, null);
+      assert.match(res.text, /PRIMARY-ANSWER/,
+        'primary turn delivers its own reply');
+
+      // The autosteer's NEW turn now streams its reply.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: {
+          id: 'msg_R11_AUTO',
+          content: [{ type: 'text', text: 'AUTOSTEER-ANSWER' }],
+          stop_reason: 'end_turn',
+        },
+      }) + '\n');
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'system', sessionId, subtype: 'turn_complete',
+      }) + '\n');
+      await sleep(120);
+
+      assert.equal(autonomous.length, 0,
+        'the NEW-TURN autosteer reply must NOT leak as an autonomous-assistant-message '
+        + '(R11: _finishTurn retired the fresh autosteer group)');
+      assert.equal(extraReplies.length, 1,
+        'the NEW-TURN autosteer must deliver exactly one extra-turn-reply');
+      assert.equal(extraReplies[0].msgId, autosteeredMsgId,
+        'extra-turn-reply must carry the autosteered msgId');
+      assert.match(extraReplies[0].text, /AUTOSTEER-ANSWER/,
+        'extra-turn-reply carries the autosteer turn\'s own reply text');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
   test('R2 — a primary paste routed through the TUI queue does not desync the enqueue FIFO', async () => {
     // Review finding R2: a primary turn's paste that the TUI queues
     // (queue-operation enqueue→dequeue) was not tracked in
