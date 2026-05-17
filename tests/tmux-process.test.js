@@ -612,6 +612,33 @@ describe('TmuxProcess HOT-PATH (R1-F1: no-throw)', () => {
     assert.match(ev.err, /paste boom/);
   });
 
+  test('R8 — inject-fail carries the msgId + fails the ledger turn promptly', async () => {
+    // The inject-fail event must carry the autosteered msgId so the
+    // wired onInjectFail handler can clear the ✍ on the exact message.
+    // The ledger turn must also be marked failed immediately — not
+    // left `pasted` for the stale-sweep to catch turnTimeoutMs later.
+    const runner = makeFakeRunner({
+      pasteText: async () => { throw new Error('tmux: no server running'); },
+    });
+    const p = makeTmuxProcess(runner);
+    p.tmuxName = 'x';
+    p.inFlight = true;
+    const fired = new Promise((resolve) => p.once('inject-fail', resolve));
+    const ok = p.injectUserMessage({ content: 'follow-up', msgId: 658 });
+    assert.equal(ok, true);
+    const ev = await fired;
+    assert.equal(ev.msgId, 658,
+      'inject-fail must carry the autosteered msgId for prompt ✍ clearing');
+    assert.equal(ev.backend, 'tmux');
+    assert.ok(ev.turnId, 'inject-fail carries the ledger turnId');
+    // The autosteer turn is marked failed at once, not stranded as
+    // `pasted` until the stale-sweep.
+    const turn = p._ledger.find((t) => t.turnId === ev.turnId);
+    assert.ok(turn, 'the failed autosteer turn is still resolvable in the ledger');
+    assert.equal(turn.state, 'failed',
+      'a failed paste fails the ledger turn immediately, not turnTimeoutMs later');
+  });
+
   test('steer delegates to injectUserMessage with priority:now', () => {
     const runner = makeFakeRunner();
     const p = makeTmuxProcess(runner);

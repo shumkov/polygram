@@ -448,6 +448,53 @@ describe('typing-indicator lifecycle — interval cleanup', () => {
   });
 });
 
+describe('R8 — onInjectFail surfaces a failed autosteer paste promptly', () => {
+  test('onInjectFail is part of the callback table', () => {
+    const { deps } = baseDeps();
+    const cbs = createSdkCallbacks(deps);
+    assert.equal(typeof cbs.onInjectFail, 'function',
+      'onInjectFail must exist — a failed autosteer paste (inject-fail '
+      + 'event) was previously silent until the stale-sweep caught it '
+      + 'turnTimeoutMs later');
+  });
+
+  test('onInjectFail logs telemetry + clears the ✍ on the failed msgId', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    // injectUserMessage's paste rejected — the autosteer never landed.
+    cbs.onInjectFail('12345:24', {
+      err: 'tmux paste-buffer: no server running',
+      msgId: 658,
+      backend: 'tmux',
+    });
+
+    // Telemetry: the failure must be recorded, not swallowed.
+    const ev = h.events.find((e) => e.kind === 'inject-fail');
+    assert.ok(ev, 'inject-fail must be logged so a failed paste is diagnosable');
+    assert.equal(ev.detail.msg_id, 658);
+    assert.match(ev.detail.error, /no server running/);
+
+    // The ✍ reaction (applied by autosteeredRefs.add when the message
+    // was classified as an autosteer) must be cleared — otherwise it
+    // lingers on a message whose paste never reached the TUI.
+    const clear = h.tgCalls.find((c) => c.method === 'setMessageReaction'
+      && c.params.message_id === 658
+      && Array.isArray(c.params.reaction) && c.params.reaction.length === 0);
+    assert.ok(clear, 'a failed inject must clear the ✍ on its msgId promptly, '
+      + 'not leave it stuck until the stale-sweep fires');
+  });
+
+  test('onInjectFail without a msgId still logs (does not throw)', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    assert.doesNotThrow(() => cbs.onInjectFail('12345:24', {
+      err: 'paste failed', backend: 'tmux',
+    }));
+    const ev = h.events.find((e) => e.kind === 'inject-fail');
+    assert.ok(ev, 'inject-fail is logged even when no msgId is available');
+  });
+});
+
 describe('cross-session isolation — autosteer for one chat doesn\'t affect another', () => {
   test('two parallel extra-turns on different sessions track independently', () => {
     const h = baseDeps({
