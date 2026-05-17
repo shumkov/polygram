@@ -391,6 +391,48 @@ describe('TmuxProcess.send', () => {
     assert.ok(pastes[0].text.includes('first'));
     assert.ok(pastes[1].text.includes('second'));
   });
+
+  test('R7 — a wedged captureWide does not hang the turn forever', async () => {
+    // _awaitTurnComplete's poll loop re-checks its deadline only
+    // BETWEEN captureWide calls. If a single `tmux capture-pane`
+    // subprocess wedges (its promise never resolves), the loop is
+    // parked on the await — the deadline check never runs again, the
+    // JSONL race never settles either, and send() hangs forever,
+    // starving the whole turn queue.
+    //
+    // The fix: an absolute setTimeout-based reject wrapping the
+    // _runTurn race, so a turn ALWAYS settles within its timeout no
+    // matter what the capture subprocess does.
+    let captures = 0;
+    const runner = makeFakeRunner({
+      captureWide: async () => {
+        captures += 1;
+        if (captures === 1) return '? for shortcuts'; // start ready-check
+        // Every subsequent capture-pane subprocess wedges — the
+        // promise never resolves and never rejects.
+        return new Promise(() => {});
+      },
+    });
+    const p = makeTmuxProcess(runner, { turnTimeoutMs: 60, pollMs: 5 });
+    await p.start({ model: 'sonnet', effort: 'high' });
+
+    // send() MUST settle well within an assertion deadline generous
+    // relative to turnTimeoutMs. Pre-fix this race never settles and
+    // the test hangs until the node:test runner kills it.
+    const settled = await Promise.race([
+      p.send('hello').then((r) => ({ kind: 'settled', r })),
+      new Promise((resolve) => setTimeout(
+        () => resolve({ kind: 'hung' }), 2000)),
+    ]);
+
+    assert.equal(settled.kind, 'settled',
+      'send() must settle within the timeout even when capture-pane wedges — '
+      + 'pre-fix the poll loop parks on the await and the turn hangs forever');
+    assert.ok(settled.r.error,
+      'a wedged-capture turn settles as an error result, not a silent success');
+    assert.equal(settled.r.text, '',
+      'no reply text is fabricated for a turn that never completed');
+  });
 });
 
 // ─── interrupts / slash commands ────────────────────────────────────
