@@ -272,6 +272,88 @@ describe('TmuxProcess.start', () => {
     }
   });
 
+  // ─── R-spawn-leak: start() must kill the session it created when a
+  // post-spawn step (readiness, init) fails ─────────────────────────
+  //
+  // Production incident (shumorobot 2026-05-17 22:03, topic :3): the
+  // first spawn's TUI never signalled ready → start() threw
+  // TMUX_READY_TIMEOUT but left the tmux session alive. Every retry
+  // then ran `tmux new-session -s <same-name>` → "duplicate session"
+  // → permanent wedge until a human killed the orphan. A transient
+  // first-spawn failure became a PERMANENT wedge for that topic.
+  test('R-spawn-leak: readiness failure after spawn kills the orphan tmux session', async () => {
+    const runner = makeFakeRunner({
+      // spawn succeeds → the tmux session NAME now exists.
+      captureWide: async () => 'no ready hint — TUI never signalled ready',
+    });
+    const p = makeTmuxProcess(runner, { readyTimeoutMs: 30 });
+    await assert.rejects(
+      p.start({ model: 'sonnet', effort: 'high' }),
+      /TUI did not signal ready/,
+    );
+    // The session start() created must be torn down so a retry gets a
+    // clean name — otherwise `tmux new-session` fails "duplicate
+    // session" forever.
+    const killed = runner._calls.find(
+      (c) => c.kind === 'killSession' && c.name === p.tmuxName,
+    );
+    assert.ok(killed, 'start() must killSession the orphan after a post-spawn failure');
+  });
+
+  test('R-spawn-leak: any post-spawn throw (not just readiness) kills the orphan', async () => {
+    // A non-readiness failure after spawn (here: _waitForReady itself
+    // throwing a non-timeout error) must still tear the session down.
+    const runner = makeFakeRunner({
+      captureWide: async () => { throw new Error('capture-pane wedged'); },
+    });
+    const p = makeTmuxProcess(runner, { readyTimeoutMs: 30 });
+    await assert.rejects(p.start({ model: 'sonnet', effort: 'high' }));
+    const killed = runner._calls.find(
+      (c) => c.kind === 'killSession' && c.name === p.tmuxName,
+    );
+    assert.ok(killed, 'start() must killSession after ANY post-spawn failure');
+  });
+
+  test('R-spawn-leak: a retry after a failed start spawns cleanly (no duplicate-session wedge)', async () => {
+    let attempt = 0;
+    const runner = makeFakeRunner({
+      // First spawn's TUI hangs; after the failed start kills the
+      // orphan, the second spawn's TUI signals ready normally.
+      captureWide: async () => (attempt === 0 ? 'still starting' : '? for shortcuts'),
+    });
+    const p = makeTmuxProcess(runner, { readyTimeoutMs: 30 });
+    await assert.rejects(p.start({ model: 'sonnet', effort: 'high' }));
+    attempt = 1;
+    // The retry must succeed — start() reuses tmuxName, so if the
+    // orphan from attempt 0 were still alive a real `tmux new-session`
+    // would reject "duplicate session". The fake runner's spawn never
+    // rejects, but the killSession from attempt 0 is the contract that
+    // makes a real retry clean.
+    await p.start({ model: 'sonnet', effort: 'high' });
+  });
+
+  test('R-spawn-leak: when `tmux new-session` itself fails, NO spurious killSession is attempted', async () => {
+    // The session was never created — there is nothing to kill, and a
+    // spurious `tmux kill-session` on a non-existent name is noise.
+    // Distinguish "spawn() itself failed" from "spawn ok, later step
+    // failed".
+    const runner = makeFakeRunner({
+      spawn: async () => {
+        throw Object.assign(new Error('tmux spawn failed: duplicate session: foo'), {
+          code: 'TMUX_SPAWN_FAILED', name: 'x',
+        });
+      },
+      captureWide: async () => '? for shortcuts',
+    });
+    const p = makeTmuxProcess(runner);
+    await assert.rejects(
+      p.start({ model: 'sonnet', effort: 'high' }),
+      /tmux spawn failed/,
+    );
+    const killed = runner._calls.find((c) => c.kind === 'killSession');
+    assert.equal(killed, undefined, 'no killSession when the session was never created');
+  });
+
   test('concurrent start() awaits the same spawn (R2-F7)', async () => {
     let spawnCount = 0;
     const runner = makeFakeRunner({
