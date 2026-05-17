@@ -24,7 +24,9 @@ const fs = require('fs');
 const path = require('path');
 const processGuard = require('./lib/process-guard');
 const dbClient = require('./lib/db');
-const { migrateJsonToDb, getClaudeSessionId } = require('./lib/db/sessions');
+const {
+  migrateJsonToDb, getClaudeSessionId, resolveSessionForSpawn,
+} = require('./lib/db/sessions');
 const { buildPrompt } = require('./lib/prompt');
 const { filterAttachments } = require('./lib/attachments');
 // 0.9.0: SDK ProcessManager is the only pm. CLI pm
@@ -38,7 +40,7 @@ const { filterAttachments } = require('./lib/attachments');
 // per-session mechanics. The pre-0.10.0 monolithic ProcessManagerSdk
 // is deleted; SdkProcess inherits its per-entry guts.
 const { ProcessManager } = require('./lib/process-manager');
-const { createProcessFactory } = require('./lib/process/factory');
+const { createProcessFactory, pickBackend } = require('./lib/process/factory');
 const { extractAssistantText } = require('./lib/process/sdk-process');
 const { createTmuxRunner } = require('./lib/tmux/tmux-runner');
 const { sweepTmuxOrphans } = require('./lib/tmux/orphan-sweep');
@@ -396,12 +398,56 @@ function buildSpawnContext(sessionKey) {
   const chatConfig = config.chats[chatId];
   if (!chatConfig) return null;
   const threadId = sessionKey.includes(':') ? sessionKey.split(':')[1] : null;
+
+  // S2: a stored session is valid ONLY for the config it was spawned
+  // under. agent / cwd / pm_backend are spawn-identity — baked into
+  // the process at spawn time, never mutable on a live session.
+  // Resolve them the same way the backends do (topic override merged
+  // over chat-level) and compare to the stored `sessions` row. On
+  // drift, resolveSessionForSpawn drops the stale row and returns
+  // existingSessionId:null → the spawn starts fresh under the correct
+  // config instead of `--resume`-ing a stale one. This self-heals the
+  // pre-per-topic-config rows (e.g. shumorobot's Music topic :3,
+  // stored agent=shumabit / cwd=$HOME / sdk vs the current
+  // music-curation:music-curator / .../Music/rekordbox / tmux).
+  // model/effort are NOT compared — they apply live via setModel /
+  // applyFlagSettings with no respawn.
+  //
+  // The drift check runs only at COLD spawn (no warm process). A warm
+  // process already runs under its spawn-time config; getOrSpawn
+  // returns it without using this context, so dropping its row here
+  // would be premature — defer to the next cold spawn.
+  const isColdSpawn = !pm || !pm.has(sessionKey) || pm.get(sessionKey)?.closed;
+  let existingSessionId;
+  if (isColdSpawn) {
+    const topicConfig = getTopicConfig(chatConfig, threadId || null);
+    const resolved = {
+      agent: topicConfig.agent || chatConfig.agent || null,
+      cwd: topicConfig.cwd || chatConfig.cwd || null,
+      backend: pickBackend({ config, chatId, threadId: threadId || null }),
+    };
+    const r = resolveSessionForSpawn(db, sessionKey, resolved);
+    existingSessionId = r.existingSessionId;
+    if (r.drift) {
+      logEvent('session-config-drift', {
+        chat_id: chatId,
+        thread_id: threadId || null,
+        session_key: sessionKey,
+        fields: r.drift.fields,
+        before: r.drift.before,
+        after: r.drift.after,
+      });
+    }
+  } else {
+    existingSessionId = getClaudeSessionId(db, sessionKey);
+  }
+
   return {
     chatConfig,
     chatId,
     threadId: threadId || null,
     label: getSessionLabel(chatConfig, threadId),
-    existingSessionId: getClaudeSessionId(db, sessionKey),
+    existingSessionId,
   };
 }
 

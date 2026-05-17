@@ -10,7 +10,9 @@ const path = require('path');
 const os = require('os');
 
 const { open } = require('../lib/db');
-const { migrateJsonToDb, getClaudeSessionId } = require('../lib/db/sessions');
+const {
+  migrateJsonToDb, getClaudeSessionId, resolveSessionForSpawn,
+} = require('../lib/db/sessions');
 
 let db;
 let dbPath;
@@ -207,5 +209,141 @@ describe('getClaudeSessionId', () => {
   test('returns claude_session_id when present', () => {
     db.upsertSession({ session_key: '123', chat_id: '123', claude_session_id: 'abc' });
     assert.equal(getClaudeSessionId(db, '123'), 'abc');
+  });
+});
+
+// ─── S2: session-config drift detection ──────────────────────────────
+//
+// A stored session row is valid ONLY for the config it was created
+// under. agent / cwd / pm_backend are spawn-identity — baked into the
+// process at spawn time, never mutable on a live session. If the
+// chat/topic config has drifted from the stored row, polygram must
+// DROP the session and spawn fresh, never `--resume` into a stale
+// config. shumorobot 2026-05-17 22:03, topic :3: the stored row was
+// agent=shumabit / cwd=$HOME / sdk (pre per-topic config); the Music
+// topic now resolves to agent=music-curation:music-curator /
+// cwd=.../Music/rekordbox / tmux. A `--resume` into that mismatch
+// left the TUI never signalling ready.
+describe('resolveSessionForSpawn (S2 drift)', () => {
+  beforeEach(() => freshEnv());
+  afterEach(() => cleanup());
+
+  const resolved = {
+    agent: 'music-curation:music-curator',
+    cwd: '/Users/ivanshumkov/Music/rekordbox',
+    backend: 'tmux',
+  };
+
+  test('no stored row → fresh spawn, no drift', () => {
+    const r = resolveSessionForSpawn(db, 'chat:new', resolved);
+    assert.equal(r.existingSessionId, null);
+    assert.equal(r.drift, null);
+  });
+
+  test('matching row → resumes (existingSessionId returned, no drift)', () => {
+    db.upsertSession({
+      session_key: 'chat:3', chat_id: 'chat', thread_id: '3',
+      claude_session_id: 'sess-match',
+      agent: 'music-curation:music-curator',
+      cwd: '/Users/ivanshumkov/Music/rekordbox',
+      pm_backend: 'tmux',
+    });
+    const r = resolveSessionForSpawn(db, 'chat:3', resolved);
+    assert.equal(r.existingSessionId, 'sess-match');
+    assert.equal(r.drift, null);
+  });
+
+  test('agent drift → drops the session, fresh spawn, drift reported', () => {
+    db.upsertSession({
+      session_key: 'chat:3', chat_id: 'chat', thread_id: '3',
+      claude_session_id: 'sess-stale',
+      agent: 'shumabit',                              // ← differs
+      cwd: '/Users/ivanshumkov/Music/rekordbox',
+      pm_backend: 'tmux',
+    });
+    const r = resolveSessionForSpawn(db, 'chat:3', resolved);
+    assert.equal(r.existingSessionId, null, 'must NOT resume a stale-agent session');
+    assert.ok(r.drift, 'drift must be reported');
+    assert.ok(r.drift.fields.includes('agent'), 'agent listed as drifted field');
+    assert.equal(r.drift.before.agent, 'shumabit');
+    assert.equal(r.drift.after.agent, 'music-curation:music-curator');
+    // The stale row must be gone so a fresh claude_session_id is minted.
+    assert.equal(db.getSession('chat:3'), undefined);
+  });
+
+  test('cwd drift → drops the session, fresh spawn', () => {
+    db.upsertSession({
+      session_key: 'chat:3', chat_id: 'chat', thread_id: '3',
+      claude_session_id: 'sess-stale',
+      agent: 'music-curation:music-curator',
+      cwd: '/Users/ivanshumkov',                      // ← differs
+      pm_backend: 'tmux',
+    });
+    const r = resolveSessionForSpawn(db, 'chat:3', resolved);
+    assert.equal(r.existingSessionId, null);
+    assert.ok(r.drift.fields.includes('cwd'));
+    assert.equal(db.getSession('chat:3'), undefined);
+  });
+
+  test('backend drift (sdk→tmux) → drops the session, fresh spawn', () => {
+    db.upsertSession({
+      session_key: 'chat:3', chat_id: 'chat', thread_id: '3',
+      claude_session_id: 'sess-stale',
+      agent: 'music-curation:music-curator',
+      cwd: '/Users/ivanshumkov/Music/rekordbox',
+      pm_backend: 'sdk',                              // ← differs
+    });
+    const r = resolveSessionForSpawn(db, 'chat:3', resolved);
+    assert.equal(r.existingSessionId, null);
+    assert.ok(r.drift.fields.includes('pm_backend'));
+    assert.equal(db.getSession('chat:3'), undefined);
+  });
+
+  test('model/effort difference does NOT invalidate (applied live, not spawn-identity)', () => {
+    // /model and /effort are pushed into a live session via
+    // setModel / applyFlagSettings — no respawn. Including them here
+    // would destructively drop context on every model switch.
+    db.upsertSession({
+      session_key: 'chat:3', chat_id: 'chat', thread_id: '3',
+      claude_session_id: 'sess-keep',
+      agent: 'music-curation:music-curator',
+      cwd: '/Users/ivanshumkov/Music/rekordbox',
+      model: 'opus', effort: 'low',
+      pm_backend: 'tmux',
+    });
+    const r = resolveSessionForSpawn(db, 'chat:3', {
+      ...resolved, model: 'sonnet', effort: 'high',
+    });
+    assert.equal(r.existingSessionId, 'sess-keep', 'model/effort drift must NOT drop the session');
+    assert.equal(r.drift, null);
+  });
+
+  test('the actual stale shumorobot :3 row self-heals', () => {
+    // Reproduce the exact production row (from ~/.polygram/shumorobot.db
+    // sessions table): agent=shumabit, cwd=$HOME, pm_backend=sdk.
+    db.upsertSession({
+      session_key: '-1003807211164:3',
+      chat_id: '-1003807211164', thread_id: '3',
+      claude_session_id: 'ec13e620-4975-4bff-a5d3-451f9d2dd390',
+      agent: 'shumabit',
+      cwd: '/Users/ivanshumkov',
+      model: 'sonnet', effort: 'high',
+      pm_backend: 'sdk',
+    });
+    // The Music topic's resolved config today.
+    const r = resolveSessionForSpawn(db, '-1003807211164:3', {
+      agent: 'music-curation:music-curator',
+      cwd: '/Users/ivanshumkov/Music/rekordbox',
+      backend: 'tmux',
+    });
+    assert.equal(r.existingSessionId, null, 'stale :3 row must NOT be resumed');
+    assert.deepEqual(r.drift.fields.sort(), ['agent', 'cwd', 'pm_backend']);
+    assert.equal(db.getSession('-1003807211164:3'), undefined, ':3 row self-heals (dropped)');
+  });
+
+  test('null db → fresh spawn, no throw', () => {
+    const r = resolveSessionForSpawn(null, 'chat:3', resolved);
+    assert.equal(r.existingSessionId, null);
+    assert.equal(r.drift, null);
   });
 });
