@@ -1342,6 +1342,148 @@ describe('TmuxProcess — JSONL session-log path', () => {
     } finally { env.cleanup(); }
   });
 
+  test('R1 — a primary turn timeout retires its folded autosteers (no active-group leak)', async () => {
+    // Review finding R1: when a primary turn ends WITHOUT a terminal
+    // result (timeout/error), autosteers folded into its active group
+    // were left `streaming` forever — leaking, and keeping
+    // `_activeGroup` non-empty so the next autonomous assistant
+    // message was swallowed instead of emitted. RED before the
+    // _finishTurn group-retire; GREEN after.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 400 });
+      const sessionId = 'aaaa0001-1111-2222-3333-aaaa0001aaaa';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+      const autonomous = [];
+      p.on('autonomous-assistant-message', (ev) => autonomous.push(ev));
+
+      const sendP = p.send('primary');
+      await sleep(20);
+      const primTok = pastedTokens(runner)[0];
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      fs.appendFileSync(logPath, userLine(sessionId, primTok));
+      await sleep(20);
+      assert.equal(p.injectUserMessage({ content: 'autosteer', msgId: 5 }), true);
+      await sleep(30);
+      const autoTok = pastedTokens(runner)[1];
+      // The TUI folds the autosteer into the running turn.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'queue-operation', sessionId, operation: 'enqueue',
+        content: `<polygram-info corr-id="${autoTok}"></polygram-info> a`,
+      }) + '\n');
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'queue-operation', sessionId, operation: 'remove',
+      }) + '\n');
+      await sleep(20);
+      // NO terminal result is ever written → the primary turn times out.
+      const res = await sendP;
+      assert.equal(res.metrics.resultSubtype, 'TMUX_TURN_TIMEOUT');
+      assert.equal(p._activeGroup.turns.length, 0,
+        'the active group is retired after a primary turn ends unflushed');
+
+      // A subsequent autonomous assistant message must surface — not
+      // be swallowed into a stranded group.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: { content: [{ type: 'text', text: 'autonomous ping' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      await sleep(60);
+      assert.ok(autonomous.some((e) => /autonomous ping/.test(e.text || '')),
+        'an autonomous assistant message after the timeout is emitted, not swallowed');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
+  test('R2 — a primary paste routed through the TUI queue does not desync the enqueue FIFO', async () => {
+    // Review finding R2: a primary turn's paste that the TUI queues
+    // (queue-operation enqueue→dequeue) was not tracked in
+    // `_enqueuedTurns` (an autosteer-only filter), so the positional
+    // `dequeue` shift popped the autosteer instead — and the later
+    // `remove` then folded nothing. RED before tracking all queued
+    // turns; GREEN after.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000 });
+      const sessionId = 'aaaa0002-1111-2222-3333-aaaa0002aaaa';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+      const resolutions = [];
+      p.on('autosteer-resolution', (ev) => resolutions.push(ev));
+
+      const sendP = p.send('primary');
+      await sleep(20);
+      const primTok = pastedTokens(runner)[0];
+      assert.equal(p.injectUserMessage({ content: 'autosteer', msgId: 42 }), true);
+      await sleep(30);
+      const autoTok = pastedTokens(runner)[1];
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      const qop = (operation, token) => JSON.stringify({
+        type: 'queue-operation', sessionId, operation,
+        ...(token ? { content: `<polygram-info corr-id="${token}"></polygram-info> x` } : {}),
+      }) + '\n';
+      // The primary paste itself was queued, then the autosteer.
+      fs.appendFileSync(logPath, qop('enqueue', primTok));
+      fs.appendFileSync(logPath, qop('enqueue', autoTok));
+      // The primary is released to run...
+      fs.appendFileSync(logPath, qop('dequeue', null));
+      fs.appendFileSync(logPath, userLine(sessionId, primTok));
+      // ...then the autosteer is folded into it.
+      fs.appendFileSync(logPath, qop('remove', null));
+      await sleep(30);
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: { content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' },
+      }) + '\n');
+      await sendP;
+      await sleep(40);
+
+      const r42 = resolutions.find((r) => r.msgId === 42);
+      assert.ok(r42 && r42.via === 'fold',
+        `autosteer 42 must still fold despite the primary paste being queued (got ${JSON.stringify(r42)})`);
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
+  test('R5 — kill() releases pending paste-confirm waiters', async () => {
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 3000, pasteConfirmMs: 60_000 });
+      const sessionId = 'aaaa0005-1111-2222-3333-aaaa0005aaaa';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+      p.send('primary').catch(() => {});
+      await sleep(30);
+      // The primary paste registered a confirm waiter (no JSONL
+      // user-message written → it would otherwise wait pasteConfirmMs).
+      assert.ok(p._pasteConfirms.size >= 1, 'a paste-confirm waiter is pending');
+      await p.kill('done');
+      assert.equal(p._pasteConfirms.size, 0, 'kill() drained the paste-confirm waiters');
+    } finally { env.cleanup(); }
+  });
+
+  test('R6 — _extractTokens matches the exact 24-hex token shape', () => {
+    const env = setupTempCwd();
+    try {
+      const p = makeProc(makeRunner());
+      const tok = `pgm-corr-${'a1b2c3d4e5f6'.repeat(2)}`; // pgm-corr- + 24 hex
+      // A token immediately followed by adjacent hex still extracts
+      // EXACTLY the 24-char token, not an over-match.
+      assert.deepEqual(p._extractTokens(`${tok}deadbeef`), [tok]);
+      assert.deepEqual(p._extractTokens(`<polygram-info corr-id="${tok}">`), [tok]);
+      assert.deepEqual(p._extractTokens('no token here'), []);
+    } finally { env.cleanup(); }
+  });
+
   test('Phase 2 B1b — two primary turns route by token; replies never cross-attribute', async () => {
     // Tokens are injective: turn A and turn B each get their own
     // reply even when delivered back-to-back. No substring collision,
