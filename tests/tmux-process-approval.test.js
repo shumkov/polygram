@@ -57,6 +57,48 @@ const APPROVAL_CAPTURE_INLINE_CURSOR = [
   ' Esc to cancel · Tab to amend',
 ].join('\n');
 
+// Production TUI rendering observed on shumorobot 2026-05-18 (Music
+// topic wedged 7+ min): a Write tool's approval prompt. The verb is
+// "create", NOT one of proceed/do this/continue — the pre-fix
+// APPROVAL_PROMPT_RE verb whitelist missed it, so polygram never
+// surfaced the card and the turn hung silently
+// (THINKING→TOOL→STALL→TIMEOUT). The verb varies per tool; the
+// numbered menu is the stable, security-bearing structure.
+const APPROVAL_CAPTURE_CREATE = [
+  '⏺ Write(CLAUDE.md)',
+  '  ⎿  Waiting…',
+  '',
+  '────────────────────────────────────────────────────────────',
+  ' Create file',
+  '',
+  '   CLAUDE.md',
+  '',
+  ' Do you want to create CLAUDE.md?',
+  ' ❯ 1. Yes',
+  '   2. Yes, allow all edits during this session',
+  '   3. No',
+  '',
+  ' Esc to cancel · Tab to amend',
+].join('\n');
+
+// Another verb variant — an Edit tool's approval prompt ("make this
+// edit"). Same structural shape; exercises the broadened regex
+// against a different verb phrase.
+const APPROVAL_CAPTURE_EDIT = [
+  '⏺ Edit(lib/config.js)',
+  '  ⎿  Waiting…',
+  '',
+  '────────────────────────────────────────────────────────────',
+  ' Edit file',
+  '',
+  ' Do you want to make this edit?',
+  ' ❯ 1. Yes',
+  '   2. Yes, allow all edits during this session',
+  '   3. No',
+  '',
+  ' Esc to cancel · Tab to amend',
+].join('\n');
+
 const READY_CAPTURE = 'welcome\n? for shortcuts';
 
 function makeFakeRunner({ captureSequence } = {}) {
@@ -168,6 +210,53 @@ describe('TmuxProcess approval — detection', () => {
     ]);
     assert.equal(ev.toolName, 'Bash');
     assert.match(ev.toolInput, /bin\/dl/);
+    assert.equal(ev.backend, 'tmux');
+    await ev.respond('allow');
+    await turnPromise;
+  });
+
+  test('emits approval-required for a Write prompt — verb "create" (2026-05-18 incident)', async () => {
+    // REGRESSION: APPROVAL_PROMPT_RE matched only the verbs
+    // proceed|do this|continue. The real TUI varies the verb per tool
+    // — Write → "Do you want to create CLAUDE.md?". The whitelist
+    // missed it, so polygram never fired approval-required: the Music
+    // topic hung 7+ min (reactor THINKING→TOOL→STALL→TIMEOUT) with no
+    // way for the user to approve. The fix matches the STRUCTURE — a
+    // "Do you want to …?" question + the numbered menu — not a verb.
+    const runner = makeFakeRunner({
+      captureSequence: [READY_CAPTURE, APPROVAL_CAPTURE_CREATE],
+    });
+    const p = makeProc(runner);
+    p.tmuxName = 'polygram-test';
+    const fired = new Promise((resolve) => p.once('approval-required', resolve));
+    const turnPromise = p._awaitTurnComplete({ timeoutMs: 1000 }).catch(() => null);
+    const ev = await Promise.race([
+      fired,
+      new Promise((_, rej) => setTimeout(
+        () => rej(new Error('approval-required not emitted — the "create" verb was not matched')), 500)),
+    ]);
+    assert.equal(ev.toolName, 'Write');
+    assert.match(ev.toolInput, /CLAUDE\.md/);
+    assert.equal(ev.backend, 'tmux');
+    await ev.respond('allow');
+    await turnPromise;
+  });
+
+  test('emits approval-required for an Edit prompt — verb "make this edit"', async () => {
+    const runner = makeFakeRunner({
+      captureSequence: [READY_CAPTURE, APPROVAL_CAPTURE_EDIT],
+    });
+    const p = makeProc(runner);
+    p.tmuxName = 'polygram-test';
+    const fired = new Promise((resolve) => p.once('approval-required', resolve));
+    const turnPromise = p._awaitTurnComplete({ timeoutMs: 1000 }).catch(() => null);
+    const ev = await Promise.race([
+      fired,
+      new Promise((_, rej) => setTimeout(
+        () => rej(new Error('approval-required not emitted — the "make this edit" verb was not matched')), 500)),
+    ]);
+    assert.equal(ev.toolName, 'Edit');
+    assert.match(ev.toolInput, /config\.js/);
     assert.equal(ev.backend, 'tmux');
     await ev.respond('allow');
     await turnPromise;
