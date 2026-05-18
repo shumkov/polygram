@@ -305,15 +305,20 @@ describe('runner.pasteAndEnter — rc.13.1 paste+Enter atomic lock', () => {
     for (const tag of Object.keys(groups)) {
       const { firstIdx, lastIdx } = groups[tag];
       const span = lastIdx - firstIdx + 1;
-      // For each pasteAndEnter we expect 3 tmux commands:
-      // set-buffer, paste-buffer (with -d), send-keys (Enter).
-      // (delete-buffer error path doesn't run on success.)
-      assert.equal(span, 3,
-        `commands for buffer ${tag} must be contiguous (3 ops in a row); got span=${span}, ops=${JSON.stringify(orderedOps)}`);
-      // Verify the order within the group: set-buffer → paste-buffer → send-keys
+      // For each pasteAndEnter we expect 4 tmux commands:
+      // set-buffer, paste-buffer (with -d), send-keys (Enter), and
+      // the 2026-05-18 submit-confirm capture-pane. (The slowRun's
+      // empty capture-pane stdout doesn't match SUBMIT_STUCK_RE, so
+      // exactly one capture and no retry Enter — but the atomic-lock
+      // contiguity invariant this test pins is unchanged.)
+      assert.equal(span, 4,
+        `commands for buffer ${tag} must be contiguous (4 ops in a row); got span=${span}, ops=${JSON.stringify(orderedOps)}`);
+      // Verify the order within the group: set-buffer → paste-buffer
+      // → send-keys → capture-pane (submit confirm).
       assert.equal(orderedOps[firstIdx].op, 'set-buffer');
       assert.equal(orderedOps[firstIdx + 1].op, 'paste-buffer');
       assert.equal(orderedOps[firstIdx + 2].op, 'send-keys');
+      assert.equal(orderedOps[firstIdx + 3].op, 'capture-pane');
     }
   });
 
@@ -353,6 +358,104 @@ describe('runner.pasteAndEnter — rc.13.1 paste+Enter atomic lock', () => {
     // And the Enter actually fired.
     const enter = mockRun.calls.find((c) => c.args[0] === 'send-keys' && c.args.includes('Enter'));
     assert.ok(enter, 'send-keys Enter must fire as part of pasteAndEnter');
+  });
+});
+
+describe('runner.pasteAndEnter — large-paste submit confirmation (2026-05-18 incident)', () => {
+  // Production bug: a ~1.2KB polygram prompt is collapsed by the
+  // claude TUI into a `[Pasted text #1]` bracketed-paste block. A
+  // single Enter sent after the fixed 80ms drain does NOT submit it —
+  // the Enter is absorbed while the TUI is still ingesting the block,
+  // and the prompt sits unsubmitted in the input box. The turn never
+  // starts; polygram shows a fake THINKING state.
+  //
+  // The fix: after Enter, capture-pane and CONFIRM the input box is
+  // no longer holding the paste; if it is, re-send Enter (bounded
+  // retries). If still stuck after all retries, throw — pasteAndEnter
+  // must NOT return success for an unsubmitted prompt.
+
+  // A fake runFn modelling the stuck-paste TUI: capture-pane shows the
+  // paste sitting in the input box (`❯ [Pasted text #1]…`) until the
+  // Nth Enter, after which it shows a submitted/idle input box.
+  function makeStuckTuiRun({ submitsAfterEnters }) {
+    const calls = [];
+    let enterCount = 0;
+    const run = async (cmd, args) => {
+      calls.push({ cmd, args });
+      const op = args[0];
+      if (op === 'send-keys' && args.includes('Enter')) enterCount += 1;
+      if (op === 'capture-pane') {
+        const submitted = enterCount >= submitsAfterEnters;
+        return {
+          stdout: submitted
+            ? 'PRELUDE\n────────\n❯ \n────────\n  ⏵⏵ accept edits on'
+            : 'PRELUDE\n────────\n❯ [Pasted text #1]<polygram-info>…\n────────\n  paste again to expand',
+          stderr: '',
+        };
+      }
+      return { stdout: '', stderr: '' };
+    };
+    run.calls = calls;
+    run.enterCount = () => enterCount;
+    return run;
+  }
+
+  test('a stuck large paste is re-submitted: extra Enter sent until the input box clears', async () => {
+    // The paste submits only on the 2nd Enter (the real-TUI behaviour
+    // the probe observed). pasteAndEnter must detect the stuck input
+    // box after the 1st Enter and re-send.
+    const run = makeStuckTuiRun({ submitsAfterEnters: 2 });
+    const runner = createTmuxRunner({
+      runFn: run,
+      // Fast timings so the test doesn't wait real drains.
+      submitConfirm: { retries: 4, pollMs: 5, drainMs: 5 },
+    });
+    const result = await runner.pasteAndEnter('sess', 'a-large-prompt');
+    assert.equal(typeof result.sanitized, 'string',
+      'pasteAndEnter still returns the pasteText result shape');
+    const enters = run.calls.filter(
+      (c) => c.args[0] === 'send-keys' && c.args.includes('Enter')).length;
+    assert.equal(enters, 2,
+      'a stuck paste must get a 2nd Enter — exactly 2 fired here (submits on the 2nd)');
+    const captures = run.calls.filter((c) => c.args[0] === 'capture-pane').length;
+    assert.ok(captures >= 1,
+      'pasteAndEnter capture-confirms the submit landed');
+  });
+
+  test('a single-Enter submit needs no retry — exactly one Enter', async () => {
+    // The common case: the paste submits on the first Enter. No
+    // extra Enter, no wasted retries.
+    const run = makeStuckTuiRun({ submitsAfterEnters: 1 });
+    const runner = createTmuxRunner({
+      runFn: run,
+      submitConfirm: { retries: 4, pollMs: 5, drainMs: 5 },
+    });
+    await runner.pasteAndEnter('sess', 'small');
+    const enters = run.calls.filter(
+      (c) => c.args[0] === 'send-keys' && c.args.includes('Enter')).length;
+    assert.equal(enters, 1,
+      'a paste that submits on the first Enter gets exactly one Enter');
+  });
+
+  test('a paste that never submits FAILS LOUD after bounded retries', async () => {
+    // If the input box never clears, pasteAndEnter must throw — it
+    // must NOT return success, or polygram shows a fake THINKING
+    // state for a prompt the agent never received.
+    const run = makeStuckTuiRun({ submitsAfterEnters: 999 }); // never
+    const runner = createTmuxRunner({
+      runFn: run,
+      submitConfirm: { retries: 3, pollMs: 5, drainMs: 5 },
+    });
+    await assert.rejects(
+      () => runner.pasteAndEnter('sess', 'wedged-prompt'),
+      /TMUX_SUBMIT_FAILED|submit/i,
+      'pasteAndEnter must throw when the prompt never submits',
+    );
+    // It tried: 1 initial Enter + the bounded retries.
+    const enters = run.calls.filter(
+      (c) => c.args[0] === 'send-keys' && c.args.includes('Enter')).length;
+    assert.ok(enters >= 2,
+      `must have re-sent Enter on the bounded retries (got ${enters} Enters)`);
   });
 });
 
