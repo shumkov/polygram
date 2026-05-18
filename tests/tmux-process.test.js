@@ -529,6 +529,70 @@ describe('TmuxProcess control', () => {
     assert.ok(c);
   });
 
+  test('Bug 1 — hasBackgroundShell detects the TUI "N shell" indicator', async () => {
+    // Production incident 2026-05-18: the agent left a detached
+    // background shell running; the TUI bottom shows the indicator
+    // (`N shell · ↓ to manage` / `N shell still running`). polygram's
+    // Stop was blind to it. hasBackgroundShell() reads the pane and
+    // reports whether a background shell is running.
+    //
+    // Idle pane — no background shell.
+    const idle = makeTmuxProcess(makeFakeRunner({
+      captureWide: async () => 'PRELUDE\n  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    }));
+    idle.tmuxName = 'x';
+    assert.equal(await idle.hasBackgroundShell(), false,
+      'an idle pane has no background shell');
+
+    // Pane with the manage-hint form of the indicator.
+    const manage = makeTmuxProcess(makeFakeRunner({
+      captureWide: async () => '  ⏵⏵ bypass permissions on · 1 shell · ↓ to manage',
+    }));
+    manage.tmuxName = 'x';
+    assert.equal(await manage.hasBackgroundShell(), true,
+      'the "N shell · ↓ to manage" indicator is detected');
+
+    // Pane with the status-line form ("N shell still running").
+    const running = makeTmuxProcess(makeFakeRunner({
+      captureWide: async () => '✻ Baked for 5s · 2 shells still running',
+    }));
+    running.tmuxName = 'x';
+    assert.equal(await running.hasBackgroundShell(), true,
+      'the "N shell still running" status indicator is detected');
+  });
+
+  test('Bug 1 — killBackgroundShells opens /bashes, stops the shell, closes the panel', async () => {
+    // The kill sequence verified against the real claude TUI 2.1.142
+    // background-task panel: /bashes + Enter opens "Shell details"
+    // (legend "Esc/Enter/Space to close · x to stop"); `x` stops the
+    // shell; Esc closes the panel.
+    let captures = 0;
+    const runner = makeFakeRunner({
+      captureWide: async () => {
+        captures += 1;
+        // First capture: shell running. After the kill: cleared.
+        return captures === 1
+          ? '  ⏵⏵ bypass permissions on · 1 shell · ↓ to manage'
+          : '  ⏵⏵ bypass permissions on (shift+tab to cycle)';
+      },
+    });
+    const p = makeTmuxProcess(runner);
+    p.tmuxName = 'x';
+    const killed = await p.killBackgroundShells();
+    assert.equal(killed, true, 'killBackgroundShells reports the shell was stopped');
+
+    // /bashes was pasted to open the background-task panel.
+    const bashes = runner._calls.find(
+      (c) => c.kind === 'pasteText' && c.text === '/bashes');
+    assert.ok(bashes, '/bashes is pasted to open the panel');
+    // Enter (open panel), x (stop shell), Escape (close panel).
+    const keys = runner._calls
+      .filter((c) => c.kind === 'sendControl').map((c) => c.key);
+    assert.ok(keys.includes('Enter'), 'Enter opens the panel');
+    assert.ok(keys.includes('x'), 'x stops the running shell');
+    assert.ok(keys.includes('Escape'), 'Escape closes the panel');
+  });
+
   test('setModel pastes /model <name>', async () => {
     const runner = makeFakeRunner();
     const p = makeTmuxProcess(runner);

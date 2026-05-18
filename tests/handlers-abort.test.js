@@ -115,6 +115,54 @@ describe('handleAbortIfRequested — abort path', () => {
     assert.equal(m.aborted.length, 0, 'markSessionAborted skipped when nothing active');
   });
 
+  test('Bug 1 — no live turn but a background shell running → kills it + truthful ack', async () => {
+    // Production incident 2026-05-18: the agent left a detached
+    // background shell running after the turn ended. polygram's Stop
+    // was turn-scoped — it saw no in-flight turn and replied "Nothing
+    // to stop", which was false: the background shell WAS running.
+    let killed = false;
+    const m = makeDeps({
+      pm: {
+        has: () => true,
+        get: () => ({
+          inFlight: false,            // no in-flight TURN
+          hasBackgroundShell: async () => true,
+          killBackgroundShells: async () => { killed = true; return true; },
+        }),
+        interrupt: async () => {},
+        drainQueue: () => 0,
+      },
+    });
+    const fn = createHandleAbort(m.deps);
+    await fn(makeMsg('stop'), '12345', {}, 'stop');
+    assert.equal(killed, true, 'the background shell is stopped');
+    assert.equal(m.tgCalls[0].params.text, 'Stopped the background task.',
+      'the ack is truthful — NOT the misleading "Nothing to stop."');
+    const evt = m.events.find((e) => e.kind === 'abort-requested');
+    assert.equal(evt.detail.had_active, false);
+    assert.equal(evt.detail.killed_background_shell, true,
+      'the event records that a background shell was stopped');
+  });
+
+  test('Bug 1 — no live turn and no background shell → still "Nothing to stop."', async () => {
+    const m = makeDeps({
+      pm: {
+        has: () => true,
+        get: () => ({
+          inFlight: false,
+          hasBackgroundShell: async () => false,
+          killBackgroundShells: async () => { throw new Error('must not be called'); },
+        }),
+        interrupt: async () => {},
+        drainQueue: () => 0,
+      },
+    });
+    const fn = createHandleAbort(m.deps);
+    await fn(makeMsg('stop'), '12345', {}, 'stop');
+    assert.equal(m.tgCalls[0].params.text, 'Nothing to stop.',
+      'with neither a turn nor a background shell, the ack is unchanged');
+  });
+
   test('logs abort-requested event with had_active flag', async () => {
     const m = makeDeps();
     const fn = createHandleAbort(m.deps);
