@@ -354,6 +354,122 @@ describe('TmuxProcess.start', () => {
     assert.equal(killed, undefined, 'no killSession when the session was never created');
   });
 
+  // ─── B6: _waitForReady must banner-gate a slow custom-agent spawn ──
+  //
+  // Production incident (shumorobot 2026-05-18, Music topic, TWICE):
+  // the Music topic spawns a TUI with a custom agent
+  // (`music-curation:music-curator`) that loads several MCP servers
+  // and is SLOW to settle. The claude TUI renders `? for shortcuts`
+  // at the BOTTOM of its still-visible startup banner immediately,
+  // before the agent/MCP servers have finished initialising.
+  //
+  // `_waitForReady` matched `READY_HINTS_RE` and returned at once —
+  // so `start()` resolved, `send()` pasted the prompt into a TUI that
+  // was still starting up, and the submitted Enter was dropped. The
+  // prompt sat unsubmitted; the turn never began.
+  //
+  // `_awaitTurnComplete` already applies `TUI_BANNER_RE` as an "L1"
+  // gate (a ready hint under a visible banner is a startup artifact,
+  // not turn completion). `_waitForReady` did NOT — that asymmetry is
+  // the bug. The fix makes `_waitForReady` ignore the ready hint
+  // while the banner box-drawing chars are still on the pane bottom.
+  //
+  // B5 added a submit-confirm retry to `pasteAndEnter`, but its probe
+  // spawned a no-agent (fast) TUI and never reproduced a paste into a
+  // mid-startup slow-agent TUI. B5 fixed the wrong layer.
+  describe('B6 — _waitForReady banner-gate (slow custom-agent startup)', () => {
+    // The startup banner exactly as the claude TUI renders it: the
+    // box-drawing logo, then a few startup lines, then the ready hint
+    // ALREADY present at the bottom — the production trace shape.
+    const STARTUP_BANNER = [
+      ' ▐▛███▜▌   Claude Code v2.1.142',
+      '▝▜█████▛▘  Sonnet 4.6 · Claude Max',
+      '  ▘▘ ▝▝    @music-curation:music-curator · ~/Music/rekordbox',
+      '',
+      ' Debug mode enabled',
+      ' Logging to: …/tmux-claude--1003807211164-3.log',
+      '',
+      '────────────────────────────────────────',
+      '❯                                       ',
+      '────────────────────────────────────────',
+      '  ? for shortcuts',
+    ].join('\n');
+
+    // The same pane AFTER the banner has scrolled out of view — a
+    // genuinely settled, ready TUI: no box-drawing chars near the
+    // bottom, ready hint present.
+    const SETTLED_PANE = [
+      'Some earlier agent output that pushed the banner into',
+      'scrollback far above the visible pane bottom.',
+      '',
+      '────────────────────────────────────────',
+      '❯                                       ',
+      '────────────────────────────────────────',
+      '  ? for shortcuts',
+    ].join('\n');
+
+    test('does NOT resolve while the startup banner is still on the pane', async () => {
+      // capture-pane returns banner+ready for the first 4 polls (the
+      // slow custom-agent still starting up), then the settled pane.
+      // The bug: _waitForReady resolves on poll 1 because the ready
+      // hint is present. The fix: it must keep polling until the
+      // banner is gone, i.e. resolve only once SETTLED_PANE appears.
+      let poll = 0;
+      const captures = [];
+      const runner = makeFakeRunner({
+        captureWide: async () => {
+          poll += 1;
+          const buf = poll <= 4 ? STARTUP_BANNER : SETTLED_PANE;
+          captures.push(buf);
+          return buf;
+        },
+      });
+      const p = makeTmuxProcess(runner, { readyTimeoutMs: 2000 });
+      await p.start({ model: 'sonnet', effort: 'low' });
+
+      // start() resolved → _waitForReady returned. It must have only
+      // returned AFTER the banner left the pane: the LAST capture it
+      // observed must be the settled (banner-free) pane, never a
+      // banner-laden one. If _waitForReady resolved on poll 1 (the
+      // bug), poll === 1 and it never reached SETTLED_PANE.
+      assert.ok(poll >= 5,
+        `_waitForReady must keep polling past the banner; resolved after ${poll} poll(s)`);
+      assert.equal(captures[captures.length - 1], SETTLED_PANE,
+        '_waitForReady must only return once the banner has left the pane');
+    });
+
+    test('still resolves promptly for a banner-free ready pane (no regression)', async () => {
+      // A fast (no-agent) spawn: the banner is already gone by the
+      // first poll. The banner gate must not delay this case — a
+      // banner-free ready hint resolves `_waitForReady` immediately,
+      // exactly as the pre-B6 code did. The gate only ever WITHHOLDS
+      // readiness while the banner is present; it never adds latency
+      // to an already-settled pane.
+      let poll = 0;
+      const runner = makeFakeRunner({
+        captureWide: async () => { poll += 1; return SETTLED_PANE; },
+      });
+      const p = makeTmuxProcess(runner, { readyTimeoutMs: 2000 });
+      await p.start({ model: 'sonnet', effort: 'low' });
+      assert.equal(poll, 1,
+        `a banner-free ready pane must resolve on the first poll; took ${poll}`);
+    });
+
+    test('TMUX_READY_TIMEOUT still fires if the banner never clears', async () => {
+      // A genuinely wedged slow spawn — the banner never leaves. The
+      // gate must not mask a real hang: _waitForReady must still time
+      // out rather than wait forever for a banner that never goes.
+      const runner = makeFakeRunner({
+        captureWide: async () => STARTUP_BANNER,
+      });
+      const p = makeTmuxProcess(runner, { readyTimeoutMs: 60 });
+      await assert.rejects(
+        p.start({ model: 'sonnet', effort: 'low' }),
+        (err) => err.code === 'TMUX_READY_TIMEOUT',
+      );
+    });
+  });
+
   test('concurrent start() awaits the same spawn (R2-F7)', async () => {
     let spawnCount = 0;
     const runner = makeFakeRunner({
