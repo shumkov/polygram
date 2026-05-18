@@ -132,3 +132,84 @@ describe('polygram.js success-path ordering (rc.10)', () => {
       'success-path markReplied() must come AFTER the rc.10 deferred clears, finalising the inbound row\'s status as the very last side-effect');
   });
 });
+
+describe('Bug 2 — every streamed-reply success exit clears the reactor', () => {
+  // Production incident 2026-05-18: a primary turn with folded
+  // autosteers completed (result_subtype:success, error:null — DB
+  // confirmed) and the combined reply WAS delivered, but the
+  // primary's reactor stayed stuck at 🥱 STALL — no `reactor-state …
+  // clear` event ever fired.
+  //
+  // Root cause: handleMessage's streamed-reply success branches
+  // (streamer.finalize() finalEditOk, and the streamed-redeliver
+  // overflow/edit-failed branch) each end with `markReplied(); return;`
+  // — returning BEFORE the rc.10 deferred `reactor.clear()` at the
+  // bottom of the handler. A turn that streamed its reply therefore
+  // NEVER cleared the reactor. Normally a streaming turn keeps
+  // calling setState (re-arming STALL so it never fires); this turn
+  // went quiet mid-turn (background-shell hunting) → STALL fired at
+  // 45s → then the streamed-final return skipped the clear.
+  // `reactor.stop()` in the finally only kills timers — it does NOT
+  // remove the visible emoji.
+  //
+  // The fix: each streamed-success early-return must clear the
+  // reactor (and autosteered ✍) before returning, mirroring the
+  // rc.10 deferred-clear block. Structural test — handleMessage is
+  // not unit-testable (too many closure-captured deps); we read the
+  // source and assert every streamed-success `return` is preceded by
+  // a `reactor.clear()` since the branch's `sendInlineReactions()`.
+  const src = require('fs').readFileSync(
+    require('path').join(__dirname, '..', 'polygram.js'), 'utf8');
+  const lines = src.split('\n');
+
+  // The streamed-reply success branches each end with this trailing
+  // pair. Find every `markReplied();` immediately followed by
+  // `return;` that is inside the streamed block (after a
+  // `streamer.finalize` / `streamer.discard` site).
+  function streamedSuccessReturns() {
+    const out = [];
+    for (let i = 0; i < lines.length; i += 1) {
+      if (!/^\s*markReplied\(\);\s*$/.test(lines[i])) continue;
+      if (!/^\s*return;\s*$/.test(lines[i + 1] || '')) continue;
+      // Is this a STREAMED-branch return? The streamed branches log a
+      // "| streamed" / "streamed-redeliver" console line just above.
+      const ctx = lines.slice(Math.max(0, i - 6), i).join('\n');
+      if (/streamed/.test(ctx)) out.push(i + 1); // 1-indexed
+    }
+    return out;
+  }
+
+  test('the streamed-finalize and streamed-redeliver branches both exist', () => {
+    const returns = streamedSuccessReturns();
+    assert.ok(returns.length >= 2,
+      `expected >=2 streamed-success early returns (finalEditOk + `
+      + `streamed-redeliver), found ${returns.length}`);
+  });
+
+  test('each streamed-success early return is preceded by reactor.clear()', () => {
+    const returns = streamedSuccessReturns();
+    for (const lineNo of returns) {
+      // Walk back from the `markReplied();` line to the branch's
+      // `sendInlineReactions()` call (the common tail of every
+      // streamed-success branch) and require a `reactor.clear()`
+      // somewhere between them.
+      let start = -1;
+      for (let i = lineNo - 1; i >= 0 && i > lineNo - 30; i -= 1) {
+        if (/sendInlineReactions\(\)/.test(lines[i])) { start = i; break; }
+      }
+      assert.ok(start >= 0,
+        `streamed-success return at line ${lineNo} should have a `
+        + `sendInlineReactions() in its tail`);
+      const block = lines.slice(start, lineNo).join('\n');
+      assert.match(block, /reactor\.clear\(\)/,
+        `Bug 2: the streamed-success branch ending at line ${lineNo} `
+        + `MUST call reactor.clear() before its markReplied(); return; — `
+        + `otherwise a turn that streamed its reply leaves the reactor `
+        + `stuck (the 2026-05-18 STALL incident).`);
+      assert.match(block, /clearAutosteeredReactions\(/,
+        `Bug 2: the streamed-success branch ending at line ${lineNo} `
+        + `must also clear autosteered ✍ reactions before returning, `
+        + `mirroring the rc.10 deferred-clear block.`);
+    }
+  });
+});

@@ -1379,6 +1379,16 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           await sendInlineStickers();
           await sendInlineReactions();
           await cleanupArchivedBubbles();
+          // Bug 2 (incident 2026-05-18): this streamed-success branch
+          // returns BEFORE the rc.10 deferred-clear block at the
+          // bottom of the handler — so a turn that streamed its reply
+          // never cleared the reactor. If the turn went quiet
+          // mid-stream long enough to trip STALL (🥱), the emoji
+          // stuck. reactor.stop() in the finally only kills timers,
+          // not the visible reaction. Clear here, mirroring the
+          // rc.10 block — AFTER delivery so there's no visual gap.
+          reactor.clear().catch(() => {});
+          clearAutosteeredReactions(sessionKey).catch(() => {});
           console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
           markReplied();
           return;
@@ -1426,6 +1436,18 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         await sendInlineStickers();
           await sendInlineReactions();
         await cleanupArchivedBubbles();
+        // Bug 2 (incident 2026-05-18): same gap as the finalEditOk
+        // branch above — this streamed-redeliver path returns before
+        // the rc.10 deferred-clear block, so the reactor would stay
+        // stuck. Clear it (and autosteered ✍) here, after delivery —
+        // but ONLY on a clean delivery. When r.failed.length>0 the
+        // ERROR state (😨) was set above as the "look here" signal
+        // for the partial-delivery failure; clearing it would wipe
+        // that signal, so leave the reactor as-is in that case.
+        if (r.failed.length === 0) {
+          reactor.clear().catch(() => {});
+        }
+        clearAutosteeredReactions(sessionKey).catch(() => {});
         console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed-redeliver(${reason}, ${chunks.length} chunks${r.failed.length ? `, ${r.failed.length} failed` : ''}) | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
         markReplied();
         return;
