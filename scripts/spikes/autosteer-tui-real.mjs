@@ -880,6 +880,56 @@ S('reasoning autosteer', 'reasoning-primary-with-autosteer', async () => {
   } finally { await cleanup(); }
 });
 
+// ── Bug 3: mid-turn interrupt/abort against a live tmux turn ─────────
+//
+// Verifies the abort path's `had_active` predicate (pm.get(sk).inFlight)
+// and pm.interrupt() (→ TmuxProcess.interrupt → C-c) actually work for
+// an in-flight tmux turn — the production incident 2026-05-18 could
+// not answer this because Stop landed 44s AFTER the turn ended.
+S('abort', 'interrupt-mid-turn', async () => {
+  const { p, events, cleanup } = await setupRealTui('abort-mid', { turnTimeoutMs: 120_000 });
+  try {
+    let appliedFired = false;
+    p.on('interrupt-applied', () => { appliedFired = true; });
+
+    // A genuinely long turn. Phrased as a plain timing request so the
+    // agent actually runs it rather than refusing it as suspicious.
+    // (`sleep N` the bare CLI is blocked in this env; a python timer
+    // is not — and counting to 40 takes a real, observable ~40s+.)
+    const startedAt = Date.now();
+    const sendP = p.send(
+      'I need to measure something. Please use Bash to run python3 and '
+      + 'have it print the numbers 1 through 40, sleeping one second '
+      + 'between each. After it finishes, reply ONLY with "SLEPT40".',
+    );
+
+    // Let the turn genuinely get in-flight (spawn already done; give
+    // the paste + the tool launch a few seconds to land).
+    await sleep(8000);
+
+    // The abort path's predicate: an in-flight tmux turn MUST read
+    // inFlight===true, or `had_active` is false and Stop no-ops.
+    ok(p.inFlight === true,
+      'a live tmux turn reads inFlight===true (had_active would see it)');
+
+    // The interrupt itself — pm.interrupt() routes here.
+    const interrupted = await p.interrupt();
+    ok(interrupted === true, 'interrupt() returns true (C-c sent to the TUI)');
+    ok(appliedFired === true, 'interrupt-applied event fired');
+
+    // The turn must now END well before its natural ~40s completion.
+    // If the interrupt did nothing the python sleep runs the full 40s.
+    const res = await sendP;
+    const elapsed = Date.now() - startedAt;
+    ok(elapsed < 30_000,
+      `interrupted turn ends early — ${(elapsed / 1000).toFixed(1)}s elapsed `
+      + '(a non-interrupted python sleep(40) would take ~40s+)');
+    ok(!/SLEPT40/.test(res.text || ''),
+      'the interrupted turn did NOT run to the post-sleep "SLEPT40" reply '
+      + `(got ${JSON.stringify((res.text || '').slice(0, 80))})`);
+  } finally { await cleanup(); }
+});
+
 // ── Driver ───────────────────────────────────────────────────────────
 
 async function main() {

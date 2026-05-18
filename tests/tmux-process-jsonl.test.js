@@ -1504,6 +1504,74 @@ describe('TmuxProcess — JSONL session-log path', () => {
     } finally { env.cleanup(); }
   });
 
+  test('Bug 3 — interrupt() ends a live tool turn promptly, not at turnTimeoutMs', async () => {
+    // Production incident 2026-05-18: a folded tmux turn that used
+    // tools and was interrupted did NOT settle promptly. `interrupt()`
+    // sends C-c (kills the agent's work) but an interrupted tool turn
+    // writes NO terminal JSONL `result` — and once `_runTurn` has seen
+    // a tool-use it re-awaits the JSONL `result` alone, so the turn
+    // would hang until the absolute `turnTimeoutMs` (the queue
+    // starves, the reactor lingers).
+    //
+    // The fix: `interrupt()` settles the running turn's interrupt
+    // signal so `_runTurn`'s race ends NOW. The turn resolves with an
+    // explicit `interrupted` subtype.
+    //
+    // RED before the fix: send() does not resolve within an assertion
+    // deadline well below turnTimeoutMs — the test hangs. GREEN after:
+    // send() resolves in milliseconds with resultSubtype 'interrupted'.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      // Generous turnTimeoutMs so a hang is unambiguously a hang, not
+      // a timeout the test mistook for a prompt settle.
+      const p = makeProc(runner, { turnTimeoutMs: 30_000 });
+      const sessionId = 'bbbb0003-1111-2222-3333-bbbb0003bbbb';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      const sendP = p.send('run a long tool');
+      await sleep(20);
+      const primTok = pastedTokens(runner)[0];
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+      // The turn's user-message + a tool_use line (NON-terminal, so
+      // the turn keeps running) — sets `toolUsedThisTurn`. No terminal
+      // `result` is EVER written: the interrupted tool turn produces
+      // none, exactly as the real CLI behaves.
+      fs.appendFileSync(logPath, userLine(sessionId, primTok));
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: {
+          id: 'msg_BUG3',
+          content: [{ type: 'tool_use', name: 'Bash', input: { command: 'long' } }],
+          stop_reason: 'tool_use',
+        },
+      }) + '\n');
+      await sleep(60);
+
+      // Interrupt mid-turn — the abort path's pm.interrupt() lands here.
+      const interrupted = await p.interrupt();
+      assert.equal(interrupted, true, 'interrupt() sends C-c and returns true');
+
+      // send() MUST resolve well within an assertion deadline far
+      // below turnTimeoutMs (30s). Pre-fix it hangs to the 30s
+      // deadline; the 3s race below would then report the hang.
+      const settled = await Promise.race([
+        sendP.then((r) => ({ kind: 'settled', r })),
+        new Promise((resolve) => setTimeout(
+          () => resolve({ kind: 'hung' }), 3000)),
+      ]);
+      assert.equal(settled.kind, 'settled',
+        'send() must resolve promptly after interrupt() — pre-fix an '
+        + 'interrupted tool turn hangs until turnTimeoutMs');
+      assert.equal(settled.r.metrics.resultSubtype, 'interrupted',
+        'the interrupted turn carries an explicit `interrupted` subtype');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
   test('R2 — a primary paste routed through the TUI queue does not desync the enqueue FIFO', async () => {
     // Review finding R2: a primary turn's paste that the TUI queues
     // (queue-operation enqueue→dequeue) was not tracked in
