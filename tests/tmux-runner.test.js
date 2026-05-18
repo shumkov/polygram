@@ -1,7 +1,8 @@
 'use strict';
 
-const { test, describe, beforeEach } = require('node:test');
+const { test, describe, beforeEach, mock } = require('node:test');
 const assert = require('node:assert/strict');
+const childProcess = require('child_process');
 const {
   createTmuxRunner, sessionName, debugLogPath, sanitize, MULTILINE_SEPARATOR,
 } = require('../lib/tmux/tmux-runner');
@@ -575,5 +576,41 @@ describe('runner.listPolygramSessions', () => {
     mockRun.stub('tmux list-sessions', { error: 'no server running' });
     const runner = createTmuxRunner({ runFn: mockRun });
     assert.deepEqual(await runner.listPolygramSessions(), []);
+  });
+});
+
+// ── execFile bounding — leftover R7 ─────────────────────────────────
+//
+// Every real tmux invocation goes through the module-internal `run()`
+// → childProcess.execFile. Without a timeout a wedged tmux subprocess
+// hangs the await forever and stalls the turn (R7). This exercises
+// the REAL `run()` (default runFn) by spying on childProcess.execFile.
+
+describe('run() execFile bounding (R7: a wedged tmux call must not hang)', () => {
+  test('every tmux invocation carries a default timeout + SIGKILL killSignal', async () => {
+    const captured = [];
+    mock.method(childProcess, 'execFile', (file, args, options, cb) => {
+      captured.push({ file, args, options });
+      cb(null, '', '');           // resolve immediately — we only inspect options
+      return {};
+    });
+    try {
+      // Default runner → real run() → real childProcess.execFile (spied).
+      const runner = createTmuxRunner();
+      await runner.capturePane('polygram-x');
+      await runner.sendControl('polygram-x', 'Enter');
+    } finally {
+      mock.restoreAll();
+    }
+    assert.ok(captured.length >= 2, 'execFile was invoked for the tmux calls');
+    for (const c of captured) {
+      const label = `${c.file} ${c.args[0]}`;
+      assert.equal(c.options.timeout, 10_000,
+        `${label}: must carry a 10s timeout — without it a wedged tmux subprocess hangs the turn forever (R7)`);
+      assert.equal(c.options.killSignal, 'SIGKILL',
+        `${label}: killSignal must be SIGKILL so a wedged process that ignores SIGTERM is still reaped`);
+      assert.equal(c.options.encoding, 'utf8',
+        `${label}: encoding stays utf8 — the bounding change must not regress decoding`);
+    }
   });
 });
