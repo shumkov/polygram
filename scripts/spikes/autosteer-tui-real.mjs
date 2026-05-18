@@ -79,7 +79,7 @@ async function killTmuxSession(name) {
 
 async function setupRealTui(label, opts = {}) {
   const runner = createTmuxRunner({ logger: console });
-  const cwd = path.resolve(process.cwd());
+  const cwd = opts.cwd ? path.resolve(opts.cwd) : path.resolve(process.cwd());
 
   const p = new TmuxProcess({
     sessionKey: `spike:${label}`,
@@ -89,7 +89,10 @@ async function setupRealTui(label, opts = {}) {
     runner,
     botName: 'spike',
     logger: SILENT,
-    readyTimeoutMs: 60_000,
+    // B6: a slow custom-agent spawn (MCP servers loading) can take
+    // well over a minute. Allow callers to widen the readiness budget
+    // so a slow-startup scenario is not capped by the 60 s default.
+    readyTimeoutMs: opts.readyTimeoutMs ?? 60_000,
     turnTimeoutMs: opts.turnTimeoutMs ?? 120_000,
   });
 
@@ -106,10 +109,19 @@ async function setupRealTui(label, opts = {}) {
   const tmuxName = runner.sessionName('spike', 'spike', label);
   await killTmuxSession(tmuxName);
 
+  // B6 coverage gap: every prior scenario spawned the TUI with NO
+  // agent (`model: sonnet, effort: low`) — a no-agent TUI starts fast.
+  // The production Music topic spawns with a CUSTOM agent
+  // (`music-curation:music-curator`) that loads several MCP servers
+  // and is SLOW to settle. The paste-into-a-not-yet-ready-TUI bug only
+  // reproduces on a slow startup, so `setupRealTui` must be able to
+  // spawn WITH an agent. `opts.agent` is threaded into chatConfig
+  // exactly as a per-chat/topic config would feed `start()`.
   await p.start({
     chatConfig: {
       model: 'sonnet', effort: 'low', cwd,
       permissionMode: 'bypassPermissions',
+      ...(opts.agent ? { agent: opts.agent } : {}),
     },
   });
 
@@ -284,6 +296,78 @@ S('baseline', 'baseline-large-prompt', async () => {
       `large-prompt turn completed promptly — ${(elapsed / 1000).toFixed(1)}s `
       + '(pre-fix it ran to the ~120s turn timeout because the paste '
       + 'never submitted)');
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('baseline slow-agent', 'slow-agent-large-prompt', async () => {
+  // B6 (shumorobot 2026-05-18, Music topic, TWICE) — CLOSES THE
+  // COVERAGE GAP B5 missed. Every prior scenario — `baseline-large-
+  // prompt` included — spawns the TUI with NO agent
+  // (`model: sonnet, effort: low`). A no-agent TUI starts FAST: by the
+  // time `send()` pastes, the TUI is genuinely settled. B5's
+  // submit-confirm fix was verified only against that fast path.
+  //
+  // The production Music topic spawns with a CUSTOM agent
+  // (`music-curation:music-curator`) that pulls in several MCP
+  // servers and is SLOW to become ready. The claude TUI renders
+  // `? for shortcuts` at the BOTTOM of its still-visible startup
+  // banner immediately — so `_waitForReady` (pre-B6) matched the hint
+  // and let `start()` resolve while the TUI was still starting up.
+  // The first `send()` then pasted into a not-yet-ready TUI and the
+  // submitted Enter was dropped: the prompt sat unsubmitted, the turn
+  // never began. That is the real B6 bug — readiness detection, NOT
+  // `pasteAndEnter`.
+  //
+  // This scenario spawns WITH the production agent + cwd, then
+  // IMMEDIATELY sends a large production-shaped prompt — the exact
+  // condition that wedged the Music topic. It asserts the turn
+  // actually started and completed (the paste submitted).
+  //
+  // Determinism note: like `baseline-large-prompt`, a real-TUI
+  // scenario cannot be a guaranteed deterministic RED — the timing
+  // window (banner still up vs gone) varies run to run. The
+  // DETERMINISTIC red→green proof for B6 is the unit suite
+  // (tests/tmux-process.test.js, the `B6 — _waitForReady banner-gate`
+  // group: a fake runner returns banner+ready for N polls then a
+  // settled pane). THIS scenario is the integration guard that
+  // exercises the previously-uncovered slow-custom-agent startup path
+  // end-to-end.
+  //
+  // The production agent is `music-curation:music-curator`, resolved
+  // via the rekordbox project's `.claude/settings.json`
+  // (`extraKnownMarketplaces.rekordbox-local`), so the spawn cwd must
+  // be ~/Music/rekordbox for the agent + its plugin to load. If that
+  // setup is unavailable the spawn fails fast with a clear error
+  // rather than silently testing nothing.
+  const agent = 'music-curation:music-curator';
+  const cwd = `${process.env.HOME}/Music/rekordbox`;
+  log(`slow-agent-large-prompt: spawning with agent=${agent} cwd=${cwd}`);
+  const { p, events, cleanup } = await setupRealTui('slow-agent', {
+    agent,
+    cwd,
+    // A custom-agent + MCP-server cold start can run well past 60 s.
+    readyTimeoutMs: 180_000,
+    turnTimeoutMs: 180_000,
+  });
+  try {
+    const prompt = buildLargePrompt(
+      'Acknowledge this message with a short friendly reply.',
+      { bulk: 'Some additional context for you to consider. '.repeat(40) });
+    log(`slow-agent-large-prompt: ${prompt.length} bytes`);
+    const startedAt = Date.now();
+    const res = await p.send(prompt);
+    const elapsed = Date.now() - startedAt;
+    ok((res.text || '').trim().length > 0,
+      `slow-agent large prompt produced a real reply — got `
+      + `${JSON.stringify(res.text?.slice(0, 80))} (pre-B6: '' — the `
+      + 'paste landed in a mid-startup TUI, the Enter was dropped, the '
+      + 'turn never started)');
+    ok(!res.error,
+      `slow-agent large-prompt turn has no error (got ${JSON.stringify(res.error)})`);
+    ok(elapsed < 120_000,
+      `slow-agent large-prompt turn completed — ${(elapsed / 1000).toFixed(1)}s `
+      + '(pre-B6 it ran to the turn timeout: the paste never submitted)');
     assertInvariants(events);
   } finally { await cleanup(); }
 });
