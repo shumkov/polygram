@@ -33,6 +33,36 @@ import path from 'node:path';
 const require = createRequire(import.meta.url);
 const { TmuxProcess } = require('../../lib/process/tmux-process.js');
 const { createTmuxRunner } = require('../../lib/tmux/tmux-runner.js');
+const { buildPrompt } = require('../../lib/prompt.js');
+
+// 2026-05-18 incident coverage: real polygram prompts are ~1-3 KB —
+// the `<polygram-info>` wrapper + `<channel>` + `<untrusted-input>`
+// (+ a `<reply_to>` block when the user replies to a message).
+// Every other spike scenario sends 20-80-char prompts, so none ever
+// exercised the bracketed-paste `[Pasted text #1]` path where the
+// paste-without-submit bug lived. This builds a production-realistic
+// wrapped prompt around a given instruction so a scenario can paste
+// the same multi-KB shape polygram sends in production. `bulk` is
+// extra realistic context (a longer user message + a reply-to quote)
+// — a real user sending a paragraph with a quoted reply lands here.
+function buildLargePrompt(instruction, { bulk = '' } = {}) {
+  return buildPrompt({
+    msg: {
+      chat: { id: -1003807211164 },
+      message_id: 789,
+      from: { first_name: 'Ivan', id: 68861949 },
+      date: Math.floor(Date.now() / 1000),
+      message_thread_id: 3,
+      text: bulk ? `${instruction}\n\n${bulk}` : instruction,
+    },
+    topicName: 'Music',
+    replyTo: bulk
+      ? { text: 'An earlier message in this conversation that the new '
+          + 'message is replying to — quoted back into the prompt, as '
+          + 'polygram does for every reply.' }
+      : null,
+  });
+}
 
 const execFileP = promisify(execFile);
 const HARD_TIMEOUT_MS = 60 * 60_000;  // 60 minutes hard cap
@@ -196,6 +226,64 @@ S('baseline', 'baseline-short-text', async () => {
     }));
     ok(/BASELINE/i.test(res.text || ''),
       `baseline reply contains BASELINE (got ${JSON.stringify(res.text?.slice(0,60))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('baseline', 'baseline-large-prompt', async () => {
+  // 2026-05-18 incident — CLOSES THE COVERAGE GAP. Every other spike
+  // scenario sends 20-80-char prompts, so none ever pasted a
+  // production-realistic multi-KB prompt — and the paste-without-
+  // submit bug lived exactly in the bracketed-paste "[Pasted text #1]"
+  // path that only a large paste exercises.
+  //
+  // This scenario pastes a ~3 KB prompt with the real polygram
+  // wrapper shape (`<polygram-info>` + `<channel>` +
+  // `<untrusted-input>` + `<reply_to>`) through the full
+  // TmuxProcess.send → _runTurn → pasteAndEnter path, and asserts the
+  // turn actually STARTED and COMPLETED (real reply, no error, well
+  // under the turn timeout).
+  //
+  // Note on determinism: the underlying bug is a TIMING race (a fast
+  // Enter vs the TUI ingesting the bracketed-paste block) — it does
+  // NOT reproduce every run on a real TUI. The DETERMINISTIC red→green
+  // proof for the submit-confirm fix is the unit suite
+  // (tests/tmux-runner.test.js, the stuck-TUI fake runner). THIS
+  // scenario is the integration guard: it exercises the previously-
+  // uncovered large-paste path end-to-end and catches any SYSTEMATIC
+  // regression where multi-KB prompts stop submitting.
+  //
+  // The assertion is on SUBMISSION, not agent obedience: the
+  // instruction sits inside <untrusted-input> (correctly treated as
+  // data), so the exact reply text is not pinned — only that a turn
+  // ran. Pre-fix failure mode: empty reply + ~120 s turn timeout.
+  const { p, events, cleanup } = await setupRealTui('b-large');
+  try {
+    // ~3 KB — a realistic paragraph-length message + a quoted reply.
+    // The bigger the bracketed-paste block, the longer the TUI takes
+    // to ingest it, so a too-fast single Enter reliably fails to
+    // submit (the incident's mechanism).
+    const prompt = buildLargePrompt(
+      'Acknowledge this message with a short friendly reply.',
+      { bulk: 'Some additional context for you to consider. '.repeat(40) });
+    log(`baseline-large-prompt: ${prompt.length} bytes`);
+    if (prompt.length < 2000) {
+      fail(`large prompt should be ~3 KB (got ${prompt.length} bytes) — `
+        + 'the wrapper must mirror a realistic production prompt');
+    }
+    const startedAt = Date.now();
+    const res = await p.send(prompt);
+    const elapsed = Date.now() - startedAt;
+    ok((res.text || '').trim().length > 0,
+      `large (~${prompt.length}B) prompt produced a real reply — got `
+      + `${JSON.stringify(res.text?.slice(0, 80))} (pre-fix: '' — the `
+      + 'paste sat unsubmitted, the turn never started)');
+    ok(!res.error,
+      `large-prompt turn has no error (got ${JSON.stringify(res.error)})`);
+    ok(elapsed < 60_000,
+      `large-prompt turn completed promptly — ${(elapsed / 1000).toFixed(1)}s `
+      + '(pre-fix it ran to the ~120s turn timeout because the paste '
+      + 'never submitted)');
     assertInvariants(events);
   } finally { await cleanup(); }
 });
