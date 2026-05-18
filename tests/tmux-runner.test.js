@@ -305,20 +305,17 @@ describe('runner.pasteAndEnter — rc.13.1 paste+Enter atomic lock', () => {
     for (const tag of Object.keys(groups)) {
       const { firstIdx, lastIdx } = groups[tag];
       const span = lastIdx - firstIdx + 1;
-      // For each pasteAndEnter we expect 4 tmux commands:
-      // set-buffer, paste-buffer (with -d), send-keys (Enter), and
-      // the 2026-05-18 submit-confirm capture-pane. (The slowRun's
-      // empty capture-pane stdout doesn't match SUBMIT_STUCK_RE, so
-      // exactly one capture and no retry Enter — but the atomic-lock
-      // contiguity invariant this test pins is unchanged.)
-      assert.equal(span, 4,
-        `commands for buffer ${tag} must be contiguous (4 ops in a row); got span=${span}, ops=${JSON.stringify(orderedOps)}`);
-      // Verify the order within the group: set-buffer → paste-buffer
-      // → send-keys → capture-pane (submit confirm).
+      // For each pasteAndEnter we expect 3 tmux commands:
+      // set-buffer, paste-buffer (with -d), send-keys (Enter).
+      // (These calls pass no confirmSubmit option, so the 2026-05-18
+      // submit-confirm capture-pane does not run — this test pins the
+      // atomic-lock contiguity invariant, unchanged by that fix.)
+      assert.equal(span, 3,
+        `commands for buffer ${tag} must be contiguous (3 ops in a row); got span=${span}, ops=${JSON.stringify(orderedOps)}`);
+      // Verify the order within the group: set-buffer → paste-buffer → send-keys
       assert.equal(orderedOps[firstIdx].op, 'set-buffer');
       assert.equal(orderedOps[firstIdx + 1].op, 'paste-buffer');
       assert.equal(orderedOps[firstIdx + 2].op, 'send-keys');
-      assert.equal(orderedOps[firstIdx + 3].op, 'capture-pane');
     }
   });
 
@@ -410,15 +407,16 @@ describe('runner.pasteAndEnter — large-paste submit confirmation (2026-05-18 i
 
   test('a stuck large paste is re-submitted: extra Enter sent until the input box clears', async () => {
     // The paste submits only on the 2nd Enter (the real-TUI behaviour
-    // the probe observed). pasteAndEnter must detect the stuck input
-    // box after the 1st Enter and re-send.
+    // the probe observed). pasteAndEnter({confirmSubmit:true}) must
+    // detect the stuck input box after the 1st Enter and re-send.
     const run = makeStuckTuiRun({ submitsAfterEnters: 2 });
     const runner = createTmuxRunner({
       runFn: run,
       // Fast timings so the test doesn't wait real drains.
       submitConfirm: { retries: 4, pollMs: 5, drainMs: 5 },
     });
-    const result = await runner.pasteAndEnter('sess', 'a-large-prompt');
+    const result = await runner.pasteAndEnter('sess', 'a-large-prompt',
+      { confirmSubmit: true });
     assert.equal(typeof result.sanitized, 'string',
       'pasteAndEnter still returns the pasteText result shape');
     const enters = run.calls.filter(
@@ -438,7 +436,7 @@ describe('runner.pasteAndEnter — large-paste submit confirmation (2026-05-18 i
       runFn: run,
       submitConfirm: { retries: 4, pollMs: 5, drainMs: 5 },
     });
-    await runner.pasteAndEnter('sess', 'small');
+    await runner.pasteAndEnter('sess', 'small', { confirmSubmit: true });
     const enters = run.calls.filter(
       (c) => c.args[0] === 'send-keys' && c.args.includes('Enter')).length;
     assert.equal(enters, 1,
@@ -455,7 +453,7 @@ describe('runner.pasteAndEnter — large-paste submit confirmation (2026-05-18 i
       submitConfirm: { retries: 3, pollMs: 5, drainMs: 5 },
     });
     await assert.rejects(
-      () => runner.pasteAndEnter('sess', 'wedged-prompt'),
+      () => runner.pasteAndEnter('sess', 'wedged-prompt', { confirmSubmit: true }),
       /TMUX_SUBMIT_FAILED|submit/i,
       'pasteAndEnter must throw when the prompt never submits',
     );
@@ -464,6 +462,29 @@ describe('runner.pasteAndEnter — large-paste submit confirmation (2026-05-18 i
       (c) => c.args[0] === 'send-keys' && c.args.includes('Enter')).length;
     assert.ok(enters >= 2,
       `must have re-sent Enter on the bounded retries (got ${enters} Enters)`);
+  });
+
+  test('without confirmSubmit (the autosteer path) — no capture-pane, no retry', async () => {
+    // An autosteer paste goes into a BUSY mid-turn TUI: the TUI parks
+    // it in its own input queue, so the input box legitimately holds
+    // the paste — that is NOT a failed submit. pasteAndEnter must NOT
+    // capture-confirm or re-send Enter there (re-sending Enter into a
+    // streaming TUI corrupts the queue). Default confirmSubmit:false.
+    const run = makeStuckTuiRun({ submitsAfterEnters: 999 }); // "stuck"
+    const runner = createTmuxRunner({
+      runFn: run,
+      submitConfirm: { retries: 4, pollMs: 5, drainMs: 5 },
+    });
+    // No throw even though the fake pane always looks "stuck" —
+    // because confirmSubmit defaults to false.
+    await runner.pasteAndEnter('sess', 'autosteer-text');
+    const enters = run.calls.filter(
+      (c) => c.args[0] === 'send-keys' && c.args.includes('Enter')).length;
+    assert.equal(enters, 1,
+      'autosteer paste (no confirmSubmit) gets exactly ONE Enter — no retry');
+    const captures = run.calls.filter((c) => c.args[0] === 'capture-pane').length;
+    assert.equal(captures, 0,
+      'autosteer paste (no confirmSubmit) does NOT capture-pane to confirm');
   });
 });
 
