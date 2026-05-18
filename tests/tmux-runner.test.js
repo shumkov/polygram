@@ -377,6 +377,9 @@ describe('runner.pasteAndEnter — large-paste submit confirmation (2026-05-18 i
   // A fake runFn modelling the stuck-paste TUI: capture-pane shows the
   // paste sitting in the input box (`❯ [Pasted text #1]…`) until the
   // Nth Enter, after which it shows a submitted/idle input box.
+  // The claude TUI draws its input box bracketed by long horizontal
+  // rules; the detector keys on a `❯` line adjacent to such a rule.
+  const RULE = '─'.repeat(40);
   function makeStuckTuiRun({ submitsAfterEnters }) {
     const calls = [];
     let enterCount = 0;
@@ -386,10 +389,15 @@ describe('runner.pasteAndEnter — large-paste submit confirmation (2026-05-18 i
       if (op === 'send-keys' && args.includes('Enter')) enterCount += 1;
       if (op === 'capture-pane') {
         const submitted = enterCount >= submitsAfterEnters;
+        // `submitted` pane: an EMPTY input box between the rules, AND
+        // a `❯`-prefixed echo of the just-submitted prompt up in the
+        // conversation area (the false-positive shape the detector
+        // must NOT trip on). `stuck` pane: the paste sits IN the
+        // input box (between the rules).
         return {
           stdout: submitted
-            ? 'PRELUDE\n────────\n❯ \n────────\n  ⏵⏵ accept edits on'
-            : 'PRELUDE\n────────\n❯ [Pasted text #1]<polygram-info>…\n────────\n  paste again to expand',
+            ? `❯ <polygram-info>submitted prompt echo…\n\n✶ Working…\n${RULE}\n❯ \n${RULE}\n  ⏵⏵ accept edits on`
+            : `PRELUDE\n${RULE}\n❯ [Pasted text #1]<polygram-info>…\n${RULE}\n  paste again to expand`,
           stderr: '',
         };
       }
