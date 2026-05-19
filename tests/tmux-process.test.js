@@ -612,6 +612,177 @@ describe('TmuxProcess.start', () => {
     });
   });
 
+  // ─── B8: _waitForReady must ALSO gate on debug-log quiescence ──────
+  //
+  // Production root cause (shumorobot, the Music topic, 5+ times):
+  // B6's quiescence gate keys on `capture-pane` byte-stability. But
+  // the real production debug log for a slow-MCP startup shows the
+  // claude pane is BYTE-STABLE the entire ~33 s MCP cold-start —
+  // `plugin:serena:serena` took 27.5 s to connect, peekaboo 9.3 s —
+  // because the REPL mounts and paints its ready hint immediately,
+  // then MCP servers load entirely OFF-SCREEN. B6 reads "stable =
+  // ready", `start()` resolves mid-MCP-load, the first paste lands in
+  // a TUI that is not yet interactive, and the submitted Enter is
+  // dropped. `isolateUserConfig` (rc.26) sidesteps this for the Music
+  // topic by removing its MCP servers, but the gate is still wrong
+  // for ANY non-isolated topic that legitimately loads MCP servers.
+  //
+  // The pane is fooled; the claude `--debug-file` log is NOT. During
+  // MCP startup that log is ACTIVELY written (`MCP server "X":
+  // connecting…` / `…connected in NNNNms`); a genuinely-ready idle
+  // TUI's debug log is quiet. B8 extends `_waitForReady` to ALSO
+  // require the debug log to have had no new bytes for
+  // `readyDebugQuietMs` before declaring ready.
+  //
+  // These tests model the B6-FOOLING shape: `captureWide` returns a
+  // byte-stable pane WITH a ready hint from the very first poll, while
+  // the `--debug-file` log gets fresh lines appended for the first N
+  // polls then goes quiet. Against the B6-only `_waitForReady` they
+  // FAIL — it resolves early on poll 1 because pane-stable+hint is
+  // satisfied immediately. After the B8 fix they PASS — the gate
+  // waits out the debug-log writes.
+  describe('B8 — _waitForReady debug-log quiescence gate (slow-MCP startup)', () => {
+    // A byte-stable settled pane WITH the ready hint — identical every
+    // poll. This is exactly what B6's pane-stability check sees as
+    // "ready" the instant it has two polls, even mid-MCP-load.
+    const STABLE_READY_PANE = [
+      ' ▐▛███▜▌   Claude Code v2.1.142',
+      '▝▜█████▛▘  Sonnet 4.6 · Claude Max',
+      '  ▘▘ ▝▝    @music-curation:music-curator · ~/Music/rekordbox',
+      '────────────────────────────────────────',
+      '❯                                       ',
+      '────────────────────────────────────────',
+      '  ? for shortcuts',
+    ].join('\n');
+
+    // A minimal in-memory append-only file. `_waitForReady` probes the
+    // debug log via a synchronous `fs.statSync(...).size` (the test
+    // seam is `opts.fs`), so the fake only needs `statSync`. An empty
+    // file ENOENTs — modelling claude not having created the log yet.
+    // `append()` lets the test drive debug-log writes by hand.
+    function makeFakeDebugFile() {
+      let content = '';
+      const fakeFs = {
+        statSync() {
+          if (content === '') {
+            const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e;
+          }
+          return { size: Buffer.byteLength(content) };
+        },
+      };
+      return {
+        fs: fakeFs,
+        append(line) { content += `${line}\n`; },
+      };
+    }
+
+    // The number of consecutive polls during which the fake debug log
+    // is still being written (MCP servers connecting). Chosen well
+    // above what the B6-only gate would tolerate: B6-only resolves
+    // `quiesceMs` after the SECOND poll (the first byte-stable poll) —
+    // here that is poll ~7 — so a writing window of 20 polls cleanly
+    // separates "resolved early (B6 bug)" from "waited it out (B8)".
+    const WRITING_POLLS = 20;
+
+    test('does NOT resolve while the --debug-file log is still being written', async () => {
+      // The B6-FOOLING shape: `captureWide` returns a byte-stable pane
+      // WITH the ready hint from the very first poll — so B6's
+      // pane-stability gate is satisfied on poll 2 and (pre-B8) would
+      // resolve `quiesceMs` later. But the `--debug-file` log gets a
+      // fresh MCP-startup line appended on every poll for the first
+      // WRITING_POLLS polls. B8 must keep waiting through all of them.
+      let poll = 0;
+      let resolvedAtPoll = null;
+      const debug = makeFakeDebugFile();
+      const runner = makeFakeRunner({
+        captureWide: async () => {
+          poll += 1;
+          if (poll <= WRITING_POLLS) {
+            debug.append(
+              `2026-05-19T12:10:${poll}.000Z [DEBUG] MCP server `
+              + `"plugin:serena:serena": connecting (poll ${poll})`);
+          }
+          return STABLE_READY_PANE;
+        },
+      });
+      const p = makeTmuxProcess(runner, {
+        readyTimeoutMs: 8000,
+        readyDebugQuietMs: 30,   // tiny quiet window for a fast test
+        fs: debug.fs,
+      });
+      p.once('init', () => { resolvedAtPoll = poll; });
+      await p.start({ model: 'sonnet', effort: 'low' });
+
+      // The bug (B6-only): _waitForReady resolves on poll ~7 — the
+      // pane is stable + hinted, the debug log is ignored entirely.
+      // The fix: it must keep polling until the debug log has been
+      // quiet for `readyDebugQuietMs`, which cannot happen before the
+      // WRITING_POLLS writing polls are done.
+      assert.ok(resolvedAtPoll > WRITING_POLLS,
+        `_waitForReady resolved at poll ${resolvedAtPoll} — it must wait `
+        + `past the ${WRITING_POLLS} polls where the --debug-file log is `
+        + 'still being written (the MCP cold-start), not resolve on the '
+        + 'byte-stable pane alone (B6-only resolves on poll ~7)');
+    });
+
+    test('DOES resolve once the --debug-file log goes quiet', async () => {
+      // Same byte-stable ready pane; the debug log is written for the
+      // first 3 polls then silent. _waitForReady must resolve — proves
+      // the gate is not an unbounded wait, it releases on quiescence.
+      let poll = 0;
+      const debug = makeFakeDebugFile();
+      const runner = makeFakeRunner({
+        captureWide: async () => {
+          poll += 1;
+          if (poll <= 3) {
+            debug.append(
+              `2026-05-19T12:10:${40 + poll}.000Z [DEBUG] MCP server `
+              + `"peekaboo": connecting (poll ${poll})`);
+          }
+          return STABLE_READY_PANE;
+        },
+      });
+      const p = makeTmuxProcess(runner, {
+        readyTimeoutMs: 4000,
+        readyDebugQuietMs: 30,
+        fs: debug.fs,
+      });
+      // start() resolving without throwing is the assertion: the gate
+      // released once the debug log fell quiet after poll 3.
+      await p.start({ model: 'sonnet', effort: 'low' });
+      assert.ok(poll > 3,
+        `must have polled past the 3 debug-writing polls; polled ${poll}`);
+    });
+
+    test('a debug log that NEVER goes quiet still hits TMUX_READY_TIMEOUT', async () => {
+      // A genuinely wedged slow spawn — the debug log is written on
+      // EVERY poll forever (MCP startup never completing / a crash
+      // loop). The gate must not mask a real hang: _waitForReady must
+      // still time out, never resolve.
+      let poll = 0;
+      const debug = makeFakeDebugFile();
+      const runner = makeFakeRunner({
+        captureWide: async () => {
+          poll += 1;
+          debug.append(
+            `2026-05-19T12:10:${poll}.000Z [DEBUG] MCP server still connecting`);
+          return STABLE_READY_PANE;
+        },
+      });
+      const p = makeTmuxProcess(runner, {
+        readyTimeoutMs: 120,
+        readyDebugQuietMs: 1000,   // longer than the whole timeout
+        fs: debug.fs,
+      });
+      await assert.rejects(
+        p.start({ model: 'sonnet', effort: 'low' }),
+        (err) => err.code === 'TMUX_READY_TIMEOUT',
+        'a debug log written on every poll means MCP startup never '
+        + 'finished — _waitForReady must time out, not resolve',
+      );
+    });
+  });
+
   test('concurrent start() awaits the same spawn (R2-F7)', async () => {
     let spawnCount = 0;
     const runner = makeFakeRunner({
