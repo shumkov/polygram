@@ -259,6 +259,85 @@ describe('TmuxProcess.start', () => {
     assert.ok(spawn.args.includes('shumabit-finance'));
   });
 
+  // ─── isolateUserConfig (slow-MCP-startup fix) ─────────────────────
+  //
+  // The Music topic's `music-curation:music-curator` agent inherits the
+  // user-level `~/.claude/settings.json` MCP servers — serena (~27.5 s
+  // to connect), peekaboo (~9 s), context7. During that ~45 s startup
+  // the claude TUI accepts a pasted prompt but does NOT process the
+  // submitted Enter, so polygram's paste never submits and the turn
+  // fails. `isolateUserConfig: true` makes start() pass
+  // `--strict-mcp-config` (zero MCP servers loaded) and
+  // `--setting-sources project,local` (drops user-level config; the
+  // project's own .claude/settings.json still loads), so the TUI is
+  // ready in seconds. Default OFF — no other topic is affected.
+
+  test('isolateUserConfig: true appends --strict-mcp-config and --setting-sources project,local', async () => {
+    const runner = makeFakeRunner({ captureWide: async () => '? for shortcuts' });
+    const p = makeTmuxProcess(runner);
+    await p.start({
+      model: 'sonnet', effort: 'high',
+      chatConfig: { isolateUserConfig: true },
+    });
+    const spawn = runner._calls.find((c) => c.kind === 'spawn');
+    assert.ok(spawn.args.includes('--strict-mcp-config'),
+      'isolateUserConfig must pass --strict-mcp-config so no MCP server loads');
+    const ssIdx = spawn.args.indexOf('--setting-sources');
+    assert.ok(ssIdx >= 0, 'isolateUserConfig must pass --setting-sources');
+    assert.equal(spawn.args[ssIdx + 1], 'project,local',
+      'must load only project+local settings, dropping user-level config');
+  });
+
+  test('isolateUserConfig unset: no --strict-mcp-config / --setting-sources (default-off regression guard)', async () => {
+    const runner = makeFakeRunner({ captureWide: async () => '? for shortcuts' });
+    const p = makeTmuxProcess(runner);
+    await p.start({ model: 'sonnet', effort: 'high', chatConfig: {} });
+    const spawn = runner._calls.find((c) => c.kind === 'spawn');
+    assert.ok(!spawn.args.includes('--strict-mcp-config'),
+      'default spawn must NOT isolate MCP config — General/other topics unaffected');
+    assert.ok(!spawn.args.includes('--setting-sources'),
+      'default spawn must NOT restrict setting-sources');
+  });
+
+  test('isolateUserConfig: topic-level override turns it on for one topic only', async () => {
+    // Mirrors the production shape: Music topic (thread "3") opts in
+    // via its topic entry while the chat as a whole does not.
+    const runner = makeFakeRunner({ captureWide: async () => '? for shortcuts' });
+    const p = makeTmuxProcess(runner);
+    await p.start({
+      threadId: '3',
+      chatConfig: {
+        model: 'sonnet', effort: 'high',
+        topics: {
+          3: { name: 'Music', isolateUserConfig: true },
+        },
+      },
+    });
+    const spawn = runner._calls.find((c) => c.kind === 'spawn');
+    assert.ok(spawn.args.includes('--strict-mcp-config'),
+      'topic-level isolateUserConfig must take effect');
+    assert.equal(spawn.args[spawn.args.indexOf('--setting-sources') + 1], 'project,local');
+  });
+
+  test('isolateUserConfig: a sibling topic without the flag is NOT isolated', async () => {
+    const runner = makeFakeRunner({ captureWide: async () => '? for shortcuts' });
+    const p = makeTmuxProcess(runner);
+    await p.start({
+      threadId: '5',
+      chatConfig: {
+        model: 'sonnet', effort: 'high',
+        topics: {
+          3: { name: 'Music', isolateUserConfig: true },
+          5: { name: 'Orchestra' },
+        },
+      },
+    });
+    const spawn = runner._calls.find((c) => c.kind === 'spawn');
+    assert.ok(!spawn.args.includes('--strict-mcp-config'),
+      'topic 5 did not opt in — must not inherit topic 3 isolation');
+    assert.ok(!spawn.args.includes('--setting-sources'));
+  });
+
   test('waitForReady recognises "? for shortcuts"', async () => {
     let calls = 0;
     const runner = makeFakeRunner({
