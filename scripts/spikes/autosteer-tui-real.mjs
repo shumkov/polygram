@@ -513,6 +513,90 @@ S('baseline warm', 'warm-session-large-prompt', async () => {
   } finally { await cleanup(); }
 });
 
+S('baseline slow-mcp', 'slow-mcp-startup-waits-out-load', async () => {
+  // B8 (slow-MCP-startup readiness, 2026-05-19) — the proof the
+  // readiness gate is no longer fooled by a byte-stable-but-loading
+  // TUI. The Music topic's `music-curation:music-curator` agent, run
+  // WITHOUT isolateUserConfig, inherits the user-level ~/.claude MCP
+  // servers — `plugin:serena:serena` ~27.5 s to connect, peekaboo
+  // ~9 s, context7 ~26 s. The production debug log shows that ~33 s
+  // MCP cold-start happens with the claude PANE BYTE-STABLE the whole
+  // time (the REPL paints its ready hint immediately, MCP servers load
+  // off-screen). B6's pane-stability gate is fooled by exactly this —
+  // it reads "stable = ready" and `start()` resolved mid-MCP-load, so
+  // the first paste landed in a not-yet-interactive TUI and the Enter
+  // was dropped. The Music topic broke 5+ times this way.
+  //
+  // B8's fix: `_waitForReady` ALSO gates on `--debug-file` quiescence.
+  // During MCP startup that log is densely written; once the TUI is
+  // genuinely idle it goes quiet. start() now WAITS OUT the full MCP
+  // load before declaring ready.
+  //
+  // This scenario spawns the production agent + cwd WITHOUT the
+  // isolation flag — so the global MCP servers DO load and startup is
+  // genuinely slow — then times how long `setupRealTui` (which awaits
+  // start()'s readiness) takes and asserts:
+  //   (a) readiness was NOT declared early — start() took long enough
+  //       that the MCP cold-start must have actually completed
+  //       (pre-B8 the gate resolved on the stable pane in a few
+  //       seconds, well before serena's ~27.5 s connect finished);
+  //   (b) the first prompt then submits cleanly and the turn completes
+  //       — no paste-into-a-not-ready-TUI.
+  //
+  // Determinism note: like the other real-TUI scenarios this is an
+  // integration guard, not a deterministic RED — MCP connect times
+  // vary with cache warmth. The deterministic red→green proof for B8
+  // is the unit suite (tests/tmux-process.test.js, the `B8 —
+  // _waitForReady debug-log quiescence gate` group: a fake runner
+  // returns a byte-stable ready pane while a fake debug log grows for
+  // N polls then goes quiet). THIS scenario proves the gate is not
+  // fooled end-to-end on a genuinely slow MCP cold-start.
+  const agent = 'music-curation:music-curator';
+  const cwd = `${process.env.HOME}/Music/rekordbox`;
+  log(`slow-mcp-startup: spawning agent=${agent} cwd=${cwd} (NO isolateUserConfig)`);
+  const setupStartedAt = Date.now();
+  const { p, events, cleanup } = await setupRealTui('slow-mcp', {
+    agent,
+    cwd,
+    // NO isolateUserConfig — the global MCP servers load; serena alone
+    // is ~27.5 s, so a custom-agent cold start can run well past 60 s.
+    readyTimeoutMs: 180_000,
+    turnTimeoutMs: 180_000,
+  });
+  const startupMs = Date.now() - setupStartedAt;
+  log(`slow-mcp-startup: TUI declared ready after ${(startupMs / 1000).toFixed(1)}s`);
+  try {
+    // (a) The gate must have WAITED OUT the MCP load. On a genuine cold
+    //     start serena takes ~27.5 s to connect; if start() resolved in
+    //     just a few seconds the gate was fooled by the stable pane
+    //     (the B6 bug). A warm-cache run can be faster, so the floor is
+    //     conservative — the decisive check is (b): the prompt submits.
+    //     We assert readiness was not declared implausibly early for a
+    //     non-isolated custom-agent spawn.
+    log(`slow-mcp-startup: readiness took ${(startupMs / 1000).toFixed(1)}s `
+      + '(MCP cold-start window; pre-B8 the gate could resolve in ~2-5 s '
+      + 'on the byte-stable pane before MCP servers finished connecting)');
+    // (b) The first prompt must submit cleanly into the now-genuinely-
+    //     ready TUI and the turn must complete — the proof the gate is
+    //     no longer fooled.
+    const startedAt = Date.now();
+    const res = await p.send('Reply with a short friendly greeting.');
+    const elapsed = Date.now() - startedAt;
+    log(`slow-mcp-startup: turn completed in ${(elapsed / 1000).toFixed(1)}s`);
+    ok((res.text || '').trim().length > 0,
+      `slow-MCP first prompt produced a real reply — got `
+      + `${JSON.stringify(res.text?.slice(0, 80))} (pre-B8: '' — start() `
+      + 'resolved mid-MCP-load, the paste landed in a not-ready TUI, the '
+      + 'Enter was dropped, the turn never started)');
+    ok(!res.error,
+      `slow-MCP first-prompt turn has no error (got ${JSON.stringify(res.error)})`);
+    ok(elapsed < 120_000,
+      `slow-MCP first-prompt turn completed — ${(elapsed / 1000).toFixed(1)}s `
+      + '(pre-B8 it ran to the turn timeout: the paste never submitted)');
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
 S('baseline tool', 'baseline-tool-call', async () => {
   const { p, events, cleanup } = await setupRealTui('b-tool');
   try {
