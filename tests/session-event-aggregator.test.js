@@ -237,11 +237,18 @@ describe('SessionEventAggregator — user-message + correlation metadata', () =>
     assert.equal(events[0].promptId, 'prompt-9');
   });
 
-  test('user content as a tool_result array does NOT emit user-message', () => {
+  test('user content as a tool_result array emits tool-result, never user-message', () => {
+    // B10: array-content user lines carry `tool_result` blocks (tool
+    // feedback). They emit `tool-result` (so the turn ledger can clear
+    // an outstanding `Agent`/subagent call) and NEVER `user-message`.
     const events = run([
-      userLine([{ type: 'tool_result', tool_use_id: 'x', content: 'V' }]),
+      userLine([{ type: 'tool_result', tool_use_id: 'x', content: 'V', is_error: false }]),
     ]);
-    assert.deepEqual(events, []);
+    assert.deepEqual(events, [
+      { type: 'tool-result', toolUseId: 'x', isError: false },
+    ]);
+    assert.ok(!events.some((e) => e.type === 'user-message'),
+      'tool_result feedback must never be mistaken for a user prompt');
   });
 
   test('last-prompt forwarded; missing lastPrompt field tolerated', () => {

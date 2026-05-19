@@ -294,7 +294,12 @@ describe('parseLine — top-level user message (autosteer queue-dequeue signal)'
     assert.equal(events[0].text, 'And the capital of Germany? Just one word.');
   });
 
-  test('user content as tool_result array does NOT emit user-message', () => {
+  test('user content as tool_result array emits tool-result, never user-message', () => {
+    // B10: a user line with array content carries API-shaped
+    // `tool_result` blocks (tool feedback), NOT a user prompt. It must
+    // never emit `user-message`. It DOES emit a `tool-result` event so
+    // the turn ledger can clear an outstanding `Agent`/subagent call —
+    // a subagent returning to the main agent surfaces exactly here.
     const line = JSON.stringify({
       type: 'user',
       message: {
@@ -309,7 +314,12 @@ describe('parseLine — top-level user message (autosteer queue-dequeue signal)'
       toolUseResult: { stdout: 'VALUE_B', stderr: '', interrupted: false },
       sourceToolAssistantUUID: 'asst-1',
     });
-    assert.deepEqual(parseLine(line), []);
+    const events = parseLine(line);
+    assert.deepEqual(events, [
+      { type: 'tool-result', toolUseId: 'toolu_abc', isError: false },
+    ]);
+    assert.ok(!events.some((e) => e.type === 'user-message'),
+      'tool_result array content must never be mistaken for a user prompt');
   });
 
   test('user with empty string content does NOT emit', () => {

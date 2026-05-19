@@ -101,7 +101,7 @@ async function setupRealTui(label, opts = {}) {
     'extra-turn-started', 'extra-turn-reply',
     'autosteer-resolution', 'autosteer-match-miss',
     'autonomous-assistant-message', 'inject-user-message',
-    'result', 'tool-use',
+    'result', 'tool-use', 'subagent-wait',
   ]) {
     p.on(name, (payload) => events.push({ name, payload, t: Date.now() }));
   }
@@ -509,6 +509,78 @@ S('baseline warm', 'warm-session-large-prompt', async () => {
       `warm-session large-prompt turn completed promptly — `
       + `${(elapsed / 1000).toFixed(1)}s (pre-B7 it failed loud after the `
       + 'grace window — "turn produced no JSONL reply text")');
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('baseline subagent', 'subagent-keeps-turn-alive', async () => {
+  // B10 (shumorobot 2026-05-20, Music topic, 03:01) — CLOSES THE
+  // SUBAGENT COVERAGE GAP. The Music agent delegated work to a
+  // subagent via claude's `Agent` tool. The main agent emitted only
+  // the `Agent` tool_use (~7 s in) then went quiescent for MINUTES
+  // while the subagent ran in its OWN sidechain context. polygram's
+  // capture-pane completion detector read the quiescent MAIN pane as
+  // "turn done"; the main agent had produced no reply text yet, so the
+  // §6 fail-loud threw `turn produced no JSONL reply text within grace
+  // window` ~grace-window in — closing a turn that was genuinely in
+  // flight. The real reply arrived minutes later, out of band, with a
+  // stuck error reaction.
+  //
+  // The fix: an outstanding `Agent` tool_use (a tool_use with no
+  // matching tool_result yet) means a subagent is running — the turn
+  // is in flight, exactly like a long foreground `Bash`. While one is
+  // outstanding the main pane's capture-pane quiescence must NOT trip
+  // the §6 fail-loud; the turn completes only when the subagent
+  // returns and the main agent emits its real terminal reply.
+  //
+  // This scenario sends a prompt that makes the agent delegate to a
+  // subagent via the `Agent` tool and asserts the turn waits out the
+  // subagent and delivers the real reply — no §6 fail-loud, no early
+  // ERROR. The DETERMINISTIC red→green proof is the unit suite
+  // (tests/tmux-process-jsonl.test.js, the `B10` group: a hand-written
+  // JSONL fixture where capture-pane wins before the `Agent` line is
+  // tailed). THIS scenario is the integration guard that the real
+  // claude `Agent` tool exposes the outstanding-tool_use signal the
+  // fix keys on.
+  const { p, events, cleanup } = await setupRealTui('subagent', {
+    // A subagent run takes a while — widen the turn budget.
+    turnTimeoutMs: 240_000,
+  });
+  try {
+    // An explicit delegation instruction: the agent spawns a subagent
+    // via the `Agent` (Task) tool, which runs in its own sidechain
+    // while the main pane goes quiescent.
+    const prompt = 'Use a subagent (the Agent/Task tool) to compute '
+      + 'the sum of the integers from 1 to 100. Spawn the subagent for '
+      + 'this — do not compute it yourself. When the subagent returns, '
+      + 'reply ONLY with the final number it found.';
+    log('subagent-keeps-turn-alive: sending delegation prompt');
+    const startedAt = Date.now();
+    const res = await p.send(prompt);
+    const elapsed = Date.now() - startedAt;
+    log('subagent res:', JSON.stringify({
+      text: res.text?.slice(0, 80),
+      error: res.error,
+      resolvedVia: res.metrics?.resolvedVia,
+      resultSubtype: res.metrics?.resultSubtype,
+      elapsedMs: elapsed,
+    }));
+    // The turn must NOT have failed loud while the subagent ran.
+    ok(!res.error,
+      `subagent turn has no error (got ${JSON.stringify(res.error)}) — `
+      + 'pre-B10 the §6 fail-loud closed the turn ~grace-window in');
+    ok(res.metrics?.resultSubtype !== 'TMUX_NO_JSONL_TEXT',
+      `subagent turn did not trip the §6 fail-loud (resultSubtype `
+      + `${JSON.stringify(res.metrics?.resultSubtype)})`);
+    ok((res.text || '').trim().length > 0,
+      `subagent turn produced a real reply (got `
+      + `${JSON.stringify(res.text?.slice(0, 80))})`);
+    // The agent did delegate — at least one `Agent` tool-use fired.
+    const agentToolUses = events.filter(
+      (e) => e.name === 'tool-use' && e.payload === 'Agent');
+    ok(agentToolUses.length >= 1,
+      `the agent delegated via the Agent tool `
+      + `(${agentToolUses.length} Agent tool-use event(s))`);
     assertInvariants(events);
   } finally { await cleanup(); }
 });

@@ -1811,3 +1811,198 @@ describe('TmuxProcess — JSONL session-log path', () => {
     } finally { env.cleanup(); }
   });
 });
+
+describe('TmuxProcess B10 — subagent (Agent tool) keeps the turn alive', () => {
+  // Production incident, shumorobot Music topic, 2026-05-20 03:01.
+  // The Music agent delegated work to a subagent via claude's `Agent`
+  // tool. The main agent emitted only the `Agent` tool_use (~5-7 s in)
+  // then went quiescent for MINUTES while the subagent ran in its own
+  // sidechain. capture-pane read the quiescent MAIN pane as "turn
+  // done"; no JSONL reply text existed yet (only the `Agent` call), so
+  // the §6 fail-loud threw `turn produced no JSONL reply text within
+  // grace window` ~grace-window in — closing a turn that was genuinely
+  // in flight. The real reply arrived minutes later, out of band.
+  //
+  // The fix: an outstanding `Agent` tool_use (no matching tool_result)
+  // means a subagent is running — the turn is in flight. While one is
+  // outstanding, capture-pane quiescence of the MAIN pane must not trip
+  // the §6 fail-loud; the turn completes only when the subagent
+  // returns and the main agent emits its real terminal reply.
+
+  test('capture-pane wins before the Agent line is tailed → subagent re-check '
+    + 'waits out the subagent instead of §6 fail-loud', async () => {
+    // The exact production race: capture-pane judges the MAIN pane
+    // quiescent (toolUsedThisTurn still false — the `Agent` tool_use
+    // line has not been tailed yet) → the §6 branch. DURING the late
+    // grace the `Agent` tool_use line lands; `outstandingSubagents`
+    // populates. Pre-fix: §6 throws after the grace window. Post-fix:
+    // the subagent re-check waits for the JSONL terminal `result`.
+    //
+    // RED before the fix: res.error matches /no JSONL reply text/ and
+    // resultSubtype is TMUX_NO_JSONL_TEXT.
+    // GREEN after: res.error is null, the turn carries the real reply.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, {
+        // Generous turn timeout so a wait is unambiguously the
+        // subagent re-check, not a timeout. Short late-grace so the
+        // test is fast — the `Agent` line lands inside it.
+        turnTimeoutMs: 30_000, lateGraceMs: 300,
+      });
+      const sessionId = 'b10b0001-1111-2222-3333-b10b0001b10b';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      const sendP = p.send('use a subagent to download the previews');
+      await sleep(20);
+      const primTok = pastedTokens(runner)[0];
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+
+      // The turn's user-message — the turn has STARTED.
+      fs.appendFileSync(logPath, userLine(sessionId, primTok));
+      await sleep(20);
+
+      // The main pane goes quiescent (the agent is about to delegate).
+      // capture-pane reads it as "done" — `toolUsedThisTurn` is still
+      // false because no `tool-use` event has been processed yet.
+      runner._markIdle();
+
+      // Capture-pane wins and the §6 branch opens its late-grace
+      // window. WITHIN that window the `Agent` tool_use line lands —
+      // exactly the production race (the tool_use line is written
+      // ~7 s in, after the pane already looked idle).
+      await sleep(120);
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: {
+          id: 'msg_B10_AGENT',
+          content: [{
+            type: 'tool_use', name: 'Agent',
+            id: 'toolu_B10subagent01',
+            input: { description: 'download previews' },
+          }],
+          stop_reason: 'tool_use',
+        },
+      }) + '\n');
+
+      // The subagent runs for "minutes" — model it with a wait far
+      // longer than the late-grace (300 ms). Pre-fix the §6 fail-loud
+      // would already have thrown by now.
+      await sleep(900);
+
+      // The subagent returns: its tool_result lands (matched by
+      // tool_use_id), then the main agent emits its real terminal
+      // reply.
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'user', sessionId,
+        message: {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'toolu_B10subagent01',
+            content: [{ type: 'text', text: 'subagent done' }],
+          }],
+        },
+      }) + '\n');
+      await sleep(40);
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: {
+          id: 'msg_B10_REPLY',
+          content: [{ type: 'text', text: 'All three previews downloaded.' }],
+          stop_reason: 'end_turn',
+        },
+      }) + '\n');
+      // A trailing non-assistant line finalizes the buffered terminal
+      // message in the JSONL aggregator (real claude writes `message.id`
+      // on every line, so a message coalesces until the next line).
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'system', sessionId, subtype: 'turn_complete',
+      }) + '\n');
+
+      const res = await sendP;
+      assert.equal(res.error, null,
+        'B10: the turn must NOT fail while the subagent runs — pre-fix '
+        + 'the §6 fail-loud threw `no JSONL reply text` ~grace-window in');
+      assert.match(res.text, /All three previews downloaded\./,
+        'the turn completes with the main agent\'s real terminal reply, '
+        + 'delivered after the subagent returned');
+      assert.notEqual(res.metrics.resultSubtype, 'TMUX_NO_JSONL_TEXT',
+        'the §6 fail-loud must not fire for an in-flight subagent turn');
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+
+  test('Agent line tailed before capture wins → toolUsedThisTurn re-race '
+    + 'already keeps the turn alive (no §6, no subagent re-check needed)', async () => {
+    // The other ordering: the `Agent` tool_use line is tailed BEFORE
+    // capture-pane wins, so `toolUsedThisTurn` is already true and the
+    // existing capture-won/tool-ran re-race waits for the JSONL
+    // `result`. This pins that the common ordering is also safe and
+    // that the fix does not regress it.
+    const env = setupTempCwd();
+    try {
+      const runner = makeRunner();
+      const p = makeProc(runner, { turnTimeoutMs: 30_000, lateGraceMs: 300 });
+      const sessionId = 'b10b0002-1111-2222-3333-b10b0002b10b';
+      await p.start({
+        existingSessionId: sessionId,
+        chatConfig: { model: 'sonnet', effort: 'low', cwd: env.cwd },
+      });
+
+      const sendP = p.send('use a subagent');
+      await sleep(20);
+      const primTok = pastedTokens(runner)[0];
+      const logPath = jsonlPath(env.cwd, env.cwd, sessionId);
+
+      fs.appendFileSync(logPath, userLine(sessionId, primTok));
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: {
+          id: 'msg_B10b_AGENT',
+          content: [{
+            type: 'tool_use', name: 'Agent',
+            id: 'toolu_B10b_sub01', input: { description: 'work' },
+          }],
+          stop_reason: 'tool_use',
+        },
+      }) + '\n');
+      // Let the `Agent` line be tailed (sets toolUsedThisTurn), THEN
+      // the main pane goes quiescent.
+      await sleep(80);
+      runner._markIdle();
+      await sleep(900);   // subagent runs well past the late-grace
+
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'user', sessionId,
+        message: {
+          role: 'user',
+          content: [{
+            type: 'tool_result', tool_use_id: 'toolu_B10b_sub01',
+            content: 'ok',
+          }],
+        },
+      }) + '\n');
+      await sleep(40);
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'assistant', sessionId,
+        message: {
+          id: 'msg_B10b_REPLY',
+          content: [{ type: 'text', text: 'Subagent finished the work.' }],
+          stop_reason: 'end_turn',
+        },
+      }) + '\n');
+      fs.appendFileSync(logPath, JSON.stringify({
+        type: 'system', sessionId, subtype: 'turn_complete',
+      }) + '\n');
+
+      const res = await sendP;
+      assert.equal(res.error, null, 'turn must not fail while the subagent runs');
+      assert.match(res.text, /Subagent finished the work\./);
+      await p.kill('done');
+    } finally { env.cleanup(); }
+  });
+});
