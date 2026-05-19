@@ -37,8 +37,21 @@ function makeFakeRunner(overrides = {}) {
   return stubs;
 }
 
+// B7: a primary paste's submit is confirmed by its correlation token
+// surfacing in a JSONL `user-message`. A REAL claude TUI emits that
+// `user-message` whenever an Enter actually submits a pasted prompt —
+// so the realistic default fake TUI must do the same, otherwise every
+// `send()` would (correctly) fail TMUX_SUBMIT_FAILED waiting for a
+// `user-message` that never comes. `autoSubmitOnEnter` (default true)
+// wraps the runner's primary-paste Enter so the first Enter after a
+// token-bearing PRIMARY paste feeds the tokened `user-message` into
+// the process — modelling a TUI that submits. Autosteer pastes (which
+// the TUI legitimately parks) are NOT auto-submitted. Tests that
+// specifically exercise NON-submission (the B7 group) pass
+// `autoSubmitOnEnter:false`.
 function makeTmuxProcess(runner, opts = {}) {
-  return new TmuxProcess({
+  const { autoSubmitOnEnter = true, submitConfirmMs, ...rest } = opts;
+  const p = new TmuxProcess({
     sessionKey: 'chat:100',
     chatId: '100',
     threadId: null,
@@ -51,8 +64,32 @@ function makeTmuxProcess(runner, opts = {}) {
     readyTimeoutMs: 500,
     turnTimeoutMs: 500,
     pasteConfirmMs: 10,
-    ...opts,
+    // Keep the submit-confirm window tiny in tests so a genuinely
+    // non-submitting fake paste fails fast (ms) instead of burning the
+    // production 1500ms × retries budget — and never wedges the suite.
+    submitConfirmMs: submitConfirmMs ?? 30,
+    ...rest,
   });
+  if (autoSubmitOnEnter) {
+    // Hook `_confirmSubmitViaJsonl` — the B7 primary-turn submit
+    // confirmation. It is called ONLY for a primary turn's paste, so
+    // hooking it (rather than the autosteer-shared `_pasteAndEnter`)
+    // models exactly "the TUI submitted the primary prompt": feed the
+    // tokened `user-message` shortly after the confirm starts, so the
+    // confirm's `_awaitSubmitConfirm` waiter resolves. Tests that
+    // exercise NON-submission pass `autoSubmitOnEnter:false`.
+    const baseConfirm = p._confirmSubmitViaJsonl.bind(p);
+    p._confirmSubmitViaJsonl = (token, turn) => {
+      if (token) {
+        setTimeout(() => {
+          p._handleSessionEvent({ type: 'user-message', text:
+            `<polygram-info corr-id="${token}"></polygram-info>` });
+        }, 1);
+      }
+      return baseConfirm(token, turn);
+    };
+  }
+  return p;
 }
 
 // ─── construction ───────────────────────────────────────────────────
@@ -514,13 +551,21 @@ describe('TmuxProcess.start', () => {
 // ─── send() ─────────────────────────────────────────────────────────
 
 describe('TmuxProcess.send', () => {
-  test('Phase 4 §6 — capture-pane completion with no JSONL fails loud, never returns pane text', async () => {
+  test('Phase 4 §6 — capture-pane completion with no JSONL reply text fails loud, never returns pane text', async () => {
     // 0.10.0 Phase 4 §6: capture-pane is a LIVENESS signal only — it
     // never delivers reply text. A turn the capture-pane race judged
     // complete but for which no JSONL text exists fails loud with an
     // explicit error, NEVER with the pane diff (which was the
     // echoed-input and banner-as-reply failure class). The genuine
     // JSONL-driven success path is covered by tmux-process-jsonl.
+    //
+    // B7 fixture note: this test exercises §6's "a turn that RAN but
+    // produced no reply TEXT" case. With B7's JSONL-token submit
+    // confirmation, the proof a turn *started* is its `user-message`
+    // line — `makeTmuxProcess`'s default `autoSubmitOnEnter` feeds
+    // that `user-message` (modelling a TUI that submits), so B7's
+    // confirm passes; then the turn proceeds and fails §6-loud because
+    // NO assistant `result` text ever follows.
     let captureCount = 0;
     const runner = makeFakeRunner({
       captureWide: async () => {
@@ -537,7 +582,7 @@ describe('TmuxProcess.send', () => {
       existingSessionId: 'sess-final',
     });
     const res = await p.send('hello');
-    // No JSONL was written → the turn fails loud.
+    // The turn started (user-message) but no JSONL reply text → fails loud.
     assert.equal(res.metrics.resultSubtype, 'TMUX_NO_JSONL_TEXT');
     assert.equal(res.text, '');
     assert.ok(!String(res.text).includes('hi there!'),
@@ -944,6 +989,148 @@ describe('TmuxProcess HOT-PATH (R1-F1: no-throw)', () => {
     return fired.then((ev) => {
       assert.equal(ev.priority, 'now');
     });
+  });
+});
+
+// ─── B7: JSONL-token submit confirmation ────────────────────────────
+
+describe('TmuxProcess B7 — JSONL-token submit confirmation', () => {
+  // 2026-05-19 incident (shumorobot msg 803, 3rd recurrence): a WARM,
+  // already-idle session (a previous turn had just completed) is sent
+  // a ~1-2KB prompt. The claude TUI collapses it into a `[Pasted text
+  // #N]` placeholder. The single post-paste Enter is absorbed while
+  // the TUI is still ingesting the bracketed-paste block — the prompt
+  // sits unsubmitted in the input box, the turn never starts.
+  //
+  // B5 tried to confirm the submit by capture-pane (does the input box
+  // still hold the paste?). That FALSE-POSITIVES: the TUI hides the
+  // pasted text behind the `[Pasted text #N]` placeholder, so B5's
+  // "is the text still in the box?" check cannot find it and wrongly
+  // concludes "submitted ✓", leaving the prompt stuck.
+  //
+  // B7 fix: the ONLY reliable "the prompt reached claude" signal is the
+  // JSONL `user-message` line carrying THIS paste's correlation token.
+  // `_confirmSubmitViaJsonl(token, turn)` waits (bounded) for that
+  // tokened user-message; on a miss it re-sends Enter (bounded
+  // retries); if it never surfaces it throws TMUX_SUBMIT_FAILED. It
+  // runs as a CONCURRENT racer in `_runTurn` — NOT a blocking gate in
+  // `_pasteAndEnter` (which would hold `_pasteLock` across the confirm
+  // window and stall a folding autosteer's paste).
+
+  function enterCount(runner) {
+    return runner._calls.filter((c) => c.kind === 'sendControl' && c.key === 'Enter').length;
+  }
+
+  test('confirmed: tokened user-message arrives → resolves, no retry Enter, no capture-pane', async () => {
+    const runner = makeFakeRunner();
+    const p = makeTmuxProcess(runner, { submitConfirmMs: 200, autoSubmitOnEnter: false });
+    p.tmuxName = 'warm-sess';
+    const token = p._mintToken();
+
+    const confirmP = p._confirmSubmitViaJsonl(token);
+    // Simulate the JSONL tail: claude registered the prompt and wrote
+    // a `user-message` line carrying the token verbatim.
+    setTimeout(() => {
+      p._handleSessionEvent({ type: 'user-message', text:
+        `<polygram-info corr-id="${token}"></polygram-info>\n\nprompt` });
+    }, 10);
+
+    await confirmP; // resolves — confirmed by the token, not capture-pane
+    assert.equal(enterCount(runner), 0, 'confirm alone sends no Enter (the paste already did)');
+    assert.ok(!runner._calls.some((c) => c.kind === 'capturePane' || c.kind === 'captureWide'),
+      'B7 confirmation must NOT capture-pane — capture-pane false-positives on [Pasted text #N]');
+  });
+
+  test('warm-session [Pasted text #2] stuck: no user-message → re-sends Enter → confirmed on retry', async () => {
+    const runner = makeFakeRunner();
+    const p = makeTmuxProcess(runner, {
+      submitConfirmMs: 40, submitConfirmRetries: 4, autoSubmitOnEnter: false,
+    });
+    p.tmuxName = 'warm-sess';
+    const token = p._mintToken();
+
+    const confirmP = p._confirmSubmitViaJsonl(token);
+    // First confirm window elapses with no user-message — the prompt
+    // sits as `[Pasted text #2]`. The retry Enter lands; claude then
+    // registers the prompt and writes the tokened user-message.
+    setTimeout(() => {
+      assert.ok(enterCount(runner) >= 1,
+        'a non-submitting paste must trigger a retry Enter');
+      p._handleSessionEvent({ type: 'user-message', text:
+        `<polygram-info corr-id="${token}"></polygram-info>\n\nprompt` });
+    }, 60);
+
+    await confirmP;
+    assert.ok(enterCount(runner) >= 1,
+      'the retry Enter was sent — submission keys on the JSONL token, not the pane');
+  });
+
+  test('never submits: no user-message ever → retries exhausted → throws TMUX_SUBMIT_FAILED', async () => {
+    const runner = makeFakeRunner();
+    const p = makeTmuxProcess(runner, {
+      submitConfirmMs: 20, submitConfirmRetries: 3, autoSubmitOnEnter: false,
+    });
+    p.tmuxName = 'wedged-sess';
+    const token = p._mintToken();
+
+    // No JSONL user-message is ever fed — the prompt never submits.
+    await assert.rejects(
+      () => p._confirmSubmitViaJsonl(token),
+      (err) => {
+        assert.equal(err.code, 'TMUX_SUBMIT_FAILED',
+          'a never-submitting paste must throw TMUX_SUBMIT_FAILED, NOT false-positive success');
+        return true;
+      },
+    );
+    // submitConfirmRetries=3 → 3 retry Enters before the loud throw.
+    assert.equal(enterCount(runner), 3, 'all retry Enters were attempted before the loud throw');
+  });
+
+  test('turn already settled (result/capture won, or killed) → confirm bails, no retry Enter, no throw', async () => {
+    // The confirm runs as a concurrent racer; if the real result/
+    // capture racer settled the turn first, the submit clearly landed
+    // — the confirm must NOT then re-send Enter or throw.
+    const runner = makeFakeRunner();
+    const p = makeTmuxProcess(runner, {
+      submitConfirmMs: 20, submitConfirmRetries: 3, autoSubmitOnEnter: false,
+    });
+    p.tmuxName = 'sess';
+    const token = p._mintToken();
+    const turn = { state: 'streaming' };
+    const confirmP = p._confirmSubmitViaJsonl(token, turn);
+    // Before the first confirm window elapses, the turn settles.
+    setTimeout(() => { turn.state = 'done'; }, 5);
+    await confirmP; // resolves quietly — no throw
+    assert.equal(enterCount(runner), 0, 'a settled turn gets no retry Enter from the confirm');
+  });
+
+  test('warm-session send(): a primary paste that does not submit fails the turn loud (TMUX_SUBMIT_FAILED)', async () => {
+    // End-to-end: a WARM session (one turn already done) gets a large
+    // prompt; the fake TUI never emits the `user-message` (the paste
+    // collapsed to `[Pasted text #N]` and the Enter was absorbed).
+    // The B7 submit-confirm racer fails the turn loud — fast — instead
+    // of the turn hanging to the grace window. autoSubmitOnEnter:false
+    // models the non-submitting TUI.
+    let captureCount = 0;
+    const runner = makeFakeRunner({
+      captureWide: async () => {
+        captureCount += 1;
+        if (captureCount === 1) return '? for shortcuts'; // start ready-check
+        return 'PRELUDE\n? for shortcuts'; // idle pane, no reply
+      },
+    });
+    const p = makeTmuxProcess(runner, {
+      submitConfirmMs: 20, submitConfirmRetries: 2, turnTimeoutMs: 10_000,
+      autoSubmitOnEnter: false,
+    });
+    await p.start({ model: 'sonnet', effort: 'high', existingSessionId: 'warm' });
+    const res = await p.send('a large prompt that collapses to [Pasted text #2]');
+    assert.equal(res.metrics.resultSubtype, 'TMUX_SUBMIT_FAILED',
+      'a primary paste that never produced a user-message fails the turn loud — '
+      + 'pre-B7 the capture-pane confirm false-positived "submitted ✓"');
+    assert.equal(res.text, '', 'no text is fabricated for an unsubmitted prompt');
+    assert.ok(enterCount(runner) >= 2,
+      'the submit-confirm re-sent Enter on the non-submitting paste before failing loud');
   });
 });
 

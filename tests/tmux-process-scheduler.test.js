@@ -48,13 +48,35 @@ function makeRunner({ replies = [READY, REPLY, REPLY, REPLY] } = {}) {
 }
 
 function makeProc(runner, sched, chatId = '100') {
-  return new TmuxProcess({
+  const p = new TmuxProcess({
     sessionKey: `chat:${chatId}`, chatId, threadId: null, label: `t-${chatId}`,
     runner, botName: 'shumabit', logger: SILENT,
     pollMs: 5, quiesceMs: 5, readyTimeoutMs: 500, turnTimeoutMs: 500,
     pasteConfirmMs: 10,
+    // B7: keep the JSONL-token submit-confirm window tiny so a fake
+    // paste confirms (or fails) in ms, never burning the production
+    // 1500ms × retries budget.
+    submitConfirmMs: 30,
     pollScheduler: sched,
   });
+  // B7: a real claude TUI emits a JSONL `user-message` whenever an
+  // Enter submits a pasted prompt — that is the signal the primary
+  // turn's `_confirmSubmitViaJsonl` waits on. Hook it (called ONLY for
+  // a primary paste) to feed the tokened `user-message`, modelling a
+  // TUI that submits: the submit-confirm passes and the turn proceeds
+  // (a turn that later times out still SUBMITTED first — feeding the
+  // user-message is the faithful shape).
+  const baseConfirm = p._confirmSubmitViaJsonl.bind(p);
+  p._confirmSubmitViaJsonl = (token, turn) => {
+    if (token) {
+      setTimeout(() => {
+        p._handleSessionEvent({ type: 'user-message', text:
+          `<polygram-info corr-id="${token}"></polygram-info>` });
+      }, 1);
+    }
+    return baseConfirm(token, turn);
+  };
+  return p;
 }
 
 describe('TmuxProcess + PollScheduler integration', () => {

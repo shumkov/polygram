@@ -359,133 +359,47 @@ describe('runner.pasteAndEnter — rc.13.1 paste+Enter atomic lock', () => {
   });
 });
 
-describe('runner.pasteAndEnter — large-paste submit confirmation (2026-05-18 incident)', () => {
-  // Production bug: a ~1.2KB polygram prompt is collapsed by the
-  // claude TUI into a `[Pasted text #1]` bracketed-paste block. A
-  // single Enter sent after the fixed 80ms drain does NOT submit it —
-  // the Enter is absorbed while the TUI is still ingesting the block,
-  // and the prompt sits unsubmitted in the input box. The turn never
-  // starts; polygram shows a fake THINKING state.
+describe('runner.pasteAndEnter — submit confirmation moved to TmuxProcess (B7)', () => {
+  // B5 confirmed large-paste submission HERE by capture-pane (is the
+  // input box still holding the paste?). That false-positived: the
+  // claude TUI renders a collapsed `[Pasted text #N]` placeholder
+  // asynchronously, so a capture-pane poll catches a transient frame
+  // where the placeholder is not yet visible and B5 wrongly concluded
+  // "submitted ✓" — the 3rd recurrence (shumorobot msg 803).
   //
-  // The fix: after Enter, capture-pane and CONFIRM the input box is
-  // no longer holding the paste; if it is, re-send Enter (bounded
-  // retries). If still stuck after all retries, throw — pasteAndEnter
-  // must NOT return success for an unsubmitted prompt.
+  // B7 REMOVED the capture-pane confirm from the runner. The runner
+  // now just pastes + Enter. Submit confirmation lives in TmuxProcess,
+  // gated on the paste's correlation token surfacing in a JSONL
+  // `user-message` (see tmux-process.test.js — "B7 JSONL-token submit
+  // confirmation"). These tests pin that the runner no longer
+  // capture-panes or retries Enter.
 
-  // A fake runFn modelling the stuck-paste TUI: capture-pane shows the
-  // paste sitting in the input box (`❯ [Pasted text #1]…`) until the
-  // Nth Enter, after which it shows a submitted/idle input box.
-  // The claude TUI draws its input box bracketed by long horizontal
-  // rules; the detector keys on a `❯` line adjacent to such a rule.
-  const RULE = '─'.repeat(40);
-  function makeStuckTuiRun({ submitsAfterEnters }) {
+  test('pasteAndEnter does NOT capture-pane — just pastes + one Enter', async () => {
     const calls = [];
-    let enterCount = 0;
     const run = async (cmd, args) => {
       calls.push({ cmd, args });
-      const op = args[0];
-      if (op === 'send-keys' && args.includes('Enter')) enterCount += 1;
-      if (op === 'capture-pane') {
-        const submitted = enterCount >= submitsAfterEnters;
-        // `submitted` pane: an EMPTY input box between the rules, AND
-        // a `❯`-prefixed echo of the just-submitted prompt up in the
-        // conversation area (the false-positive shape the detector
-        // must NOT trip on). `stuck` pane: the paste sits IN the
-        // input box (between the rules).
-        return {
-          stdout: submitted
-            ? `❯ <polygram-info>submitted prompt echo…\n\n✶ Working…\n${RULE}\n❯ \n${RULE}\n  ⏵⏵ accept edits on`
-            : `PRELUDE\n${RULE}\n❯ [Pasted text #1]<polygram-info>…\n${RULE}\n  paste again to expand`,
-          stderr: '',
-        };
-      }
       return { stdout: '', stderr: '' };
     };
-    run.calls = calls;
-    run.enterCount = () => enterCount;
-    return run;
-  }
-
-  test('a stuck large paste is re-submitted: extra Enter sent until the input box clears', async () => {
-    // The paste submits only on the 2nd Enter (the real-TUI behaviour
-    // the probe observed). pasteAndEnter({confirmSubmit:true}) must
-    // detect the stuck input box after the 1st Enter and re-send.
-    const run = makeStuckTuiRun({ submitsAfterEnters: 2 });
-    const runner = createTmuxRunner({
-      runFn: run,
-      // Fast timings so the test doesn't wait real drains.
-      submitConfirm: { retries: 4, pollMs: 5, drainMs: 5 },
-    });
-    const result = await runner.pasteAndEnter('sess', 'a-large-prompt',
-      { confirmSubmit: true });
-    assert.equal(typeof result.sanitized, 'string',
-      'pasteAndEnter still returns the pasteText result shape');
-    const enters = run.calls.filter(
+    const runner = createTmuxRunner({ runFn: run });
+    await runner.pasteAndEnter('sess', 'a-large-prompt');
+    const enters = calls.filter(
       (c) => c.args[0] === 'send-keys' && c.args.includes('Enter')).length;
-    assert.equal(enters, 2,
-      'a stuck paste must get a 2nd Enter — exactly 2 fired here (submits on the 2nd)');
-    const captures = run.calls.filter((c) => c.args[0] === 'capture-pane').length;
-    assert.ok(captures >= 1,
-      'pasteAndEnter capture-confirms the submit landed');
-  });
-
-  test('a single-Enter submit needs no retry — exactly one Enter', async () => {
-    // The common case: the paste submits on the first Enter. No
-    // extra Enter, no wasted retries.
-    const run = makeStuckTuiRun({ submitsAfterEnters: 1 });
-    const runner = createTmuxRunner({
-      runFn: run,
-      submitConfirm: { retries: 4, pollMs: 5, drainMs: 5 },
-    });
-    await runner.pasteAndEnter('sess', 'small', { confirmSubmit: true });
-    const enters = run.calls.filter(
-      (c) => c.args[0] === 'send-keys' && c.args.includes('Enter')).length;
-    assert.equal(enters, 1,
-      'a paste that submits on the first Enter gets exactly one Enter');
-  });
-
-  test('a paste that never submits FAILS LOUD after bounded retries', async () => {
-    // If the input box never clears, pasteAndEnter must throw — it
-    // must NOT return success, or polygram shows a fake THINKING
-    // state for a prompt the agent never received.
-    const run = makeStuckTuiRun({ submitsAfterEnters: 999 }); // never
-    const runner = createTmuxRunner({
-      runFn: run,
-      submitConfirm: { retries: 3, pollMs: 5, drainMs: 5 },
-    });
-    await assert.rejects(
-      () => runner.pasteAndEnter('sess', 'wedged-prompt', { confirmSubmit: true }),
-      /TMUX_SUBMIT_FAILED|submit/i,
-      'pasteAndEnter must throw when the prompt never submits',
-    );
-    // It tried: 1 initial Enter + the bounded retries.
-    const enters = run.calls.filter(
-      (c) => c.args[0] === 'send-keys' && c.args.includes('Enter')).length;
-    assert.ok(enters >= 2,
-      `must have re-sent Enter on the bounded retries (got ${enters} Enters)`);
-  });
-
-  test('without confirmSubmit (the autosteer path) — no capture-pane, no retry', async () => {
-    // An autosteer paste goes into a BUSY mid-turn TUI: the TUI parks
-    // it in its own input queue, so the input box legitimately holds
-    // the paste — that is NOT a failed submit. pasteAndEnter must NOT
-    // capture-confirm or re-send Enter there (re-sending Enter into a
-    // streaming TUI corrupts the queue). Default confirmSubmit:false.
-    const run = makeStuckTuiRun({ submitsAfterEnters: 999 }); // "stuck"
-    const runner = createTmuxRunner({
-      runFn: run,
-      submitConfirm: { retries: 4, pollMs: 5, drainMs: 5 },
-    });
-    // No throw even though the fake pane always looks "stuck" —
-    // because confirmSubmit defaults to false.
-    await runner.pasteAndEnter('sess', 'autosteer-text');
-    const enters = run.calls.filter(
-      (c) => c.args[0] === 'send-keys' && c.args.includes('Enter')).length;
-    assert.equal(enters, 1,
-      'autosteer paste (no confirmSubmit) gets exactly ONE Enter — no retry');
-    const captures = run.calls.filter((c) => c.args[0] === 'capture-pane').length;
+    assert.equal(enters, 1, 'exactly one Enter — the runner never retries');
+    const captures = calls.filter((c) => c.args[0] === 'capture-pane').length;
     assert.equal(captures, 0,
-      'autosteer paste (no confirmSubmit) does NOT capture-pane to confirm');
+      'B7: the runner must NOT capture-pane to confirm a submit — that signal false-positives');
+  });
+
+  test('a confirmSubmit option, if passed, is harmlessly ignored by the runner', async () => {
+    // Defensive: TmuxProcess no longer passes confirmSubmit to the
+    // runner, but if a stale caller does, the runner ignores it
+    // rather than reviving the capture-pane confirm.
+    const calls = [];
+    const run = async (cmd, args) => { calls.push({ args }); return { stdout: '', stderr: '' }; };
+    const runner = createTmuxRunner({ runFn: run });
+    await runner.pasteAndEnter('sess', 'text', { confirmSubmit: true });
+    const captures = calls.filter((c) => c.args[0] === 'capture-pane').length;
+    assert.equal(captures, 0, 'confirmSubmit must not revive any capture-pane confirm');
   });
 });
 
