@@ -117,11 +117,19 @@ async function setupRealTui(label, opts = {}) {
   // reproduces on a slow startup, so `setupRealTui` must be able to
   // spawn WITH an agent. `opts.agent` is threaded into chatConfig
   // exactly as a per-chat/topic config would feed `start()`.
+  //
+  // `opts.isolateUserConfig` is threaded the same way — when true,
+  // start() appends --strict-mcp-config + --setting-sources
+  // project,local so the spawned TUI is cut off from the user-level
+  // ~/.claude config (no slow user-global MCP servers). The
+  // isolated-startup scenario uses it to prove the ~45 s MCP
+  // cold-start vanishes.
   await p.start({
     chatConfig: {
       model: 'sonnet', effort: 'low', cwd,
       permissionMode: 'bypassPermissions',
       ...(opts.agent ? { agent: opts.agent } : {}),
+      ...(opts.isolateUserConfig ? { isolateUserConfig: true } : {}),
     },
   });
 
@@ -368,6 +376,68 @@ S('baseline slow-agent', 'slow-agent-large-prompt', async () => {
     ok(elapsed < 120_000,
       `slow-agent large-prompt turn completed — ${(elapsed / 1000).toFixed(1)}s `
       + '(pre-B6 it ran to the turn timeout: the paste never submitted)');
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+S('baseline isolated', 'isolated-music-agent-fast-start', async () => {
+  // isolateUserConfig (slow-MCP-startup fix, 2026-05-19) — the Music
+  // topic's `music-curation:music-curator` agent inherits the
+  // user-level ~/.claude MCP servers: serena (~27.5 s to connect),
+  // peekaboo (~9 s), context7. During that ~45 s MCP cold-start the
+  // claude TUI accepts a pasted prompt but DROPS the submitted Enter,
+  // so polygram's paste never submits — the turn fails. Broke the
+  // Music topic 5+ times.
+  //
+  // The fix: spawn that topic with `isolateUserConfig: true`, which
+  // makes TmuxProcess.start() append --strict-mcp-config (zero MCP
+  // servers load) and --setting-sources project,local (drops
+  // ~/.claude/settings.json; the rekordbox project's own
+  // .claude/settings.json still loads). With no user-global MCP
+  // servers to cold-start, the TUI reaches "? for shortcuts" in a few
+  // seconds and a prompt submits cleanly.
+  //
+  // This scenario spawns WITH the production agent + cwd + the
+  // isolation flag, times how long `setupRealTui` (which awaits
+  // start()'s readiness) takes, and asserts a small prompt submits
+  // FAST. Contrast: the un-isolated `slow-agent-large-prompt`
+  // scenario above spawns the same agent WITHOUT the flag and budgets
+  // 180 s for readiness because the MCP cold-start can run that long.
+  // Running both back to back shows the startup-time delta directly.
+  const agent = 'music-curation:music-curator';
+  const cwd = `${process.env.HOME}/Music/rekordbox`;
+  log(`isolated-music-agent: spawning agent=${agent} cwd=${cwd} isolateUserConfig=true`);
+  const setupStartedAt = Date.now();
+  const { p, events, cleanup } = await setupRealTui('isolated-music', {
+    agent,
+    cwd,
+    isolateUserConfig: true,
+    // Isolated → no MCP cold-start → readiness should land well under
+    // the default 60 s. Keep a generous-but-bounded budget so a real
+    // regression (isolation not applied) still fails the scenario
+    // instead of hanging.
+    readyTimeoutMs: 90_000,
+    turnTimeoutMs: 120_000,
+  });
+  const startupMs = Date.now() - setupStartedAt;
+  log(`isolated-music-agent: TUI ready in ${(startupMs / 1000).toFixed(1)}s`);
+  try {
+    ok(startupMs < 30_000,
+      `isolated spawn reached ready in ${(startupMs / 1000).toFixed(1)}s `
+      + '(un-isolated this agent waits ~45 s on user-global MCP servers — '
+      + 'serena ~27.5 s alone; isolation drops all of them)');
+    const startedAt = Date.now();
+    const res = await p.send('Reply with a short friendly greeting.');
+    const elapsed = Date.now() - startedAt;
+    log(`isolated-music-agent: turn completed in ${(elapsed / 1000).toFixed(1)}s`);
+    ok((res.text || '').trim().length > 0,
+      `isolated small-prompt produced a real reply — got `
+      + `${JSON.stringify(res.text?.slice(0, 80))}`);
+    ok(!res.error,
+      `isolated small-prompt turn has no error (got ${JSON.stringify(res.error)})`);
+    ok(elapsed < 90_000,
+      `isolated small-prompt turn completed — ${(elapsed / 1000).toFixed(1)}s `
+      + '(the paste submitted cleanly: no mid-MCP-startup wedge)');
     assertInvariants(events);
   } finally { await cleanup(); }
 });
