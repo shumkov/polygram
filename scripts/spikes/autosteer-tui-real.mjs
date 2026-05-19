@@ -372,6 +372,77 @@ S('baseline slow-agent', 'slow-agent-large-prompt', async () => {
   } finally { await cleanup(); }
 });
 
+S('baseline warm', 'warm-session-large-prompt', async () => {
+  // B7 (shumorobot 2026-05-19, Music topic, msg 803 — the THIRD
+  // recurrence) — CLOSES THE GAP B5 AND B6 BOTH MISSED. The msg-803
+  // incident was a WARM, already-running session: a previous turn had
+  // just completed, the TUI was idle and settled — NOT a fresh spawn
+  // (so it is not B6's slow-startup case) and not a no-agent fast TUI
+  // (so it is not B5's first-cut path). polygram pasted the large
+  // prompt, the claude TUI collapsed it into a `[Pasted text #N]`
+  // placeholder, and the single post-paste Enter was absorbed
+  // mid-ingest — the prompt sat unsubmitted, the turn never started.
+  //
+  // B5's capture-pane submit-confirm false-positived here: the TUI
+  // hides the pasted text behind the `[Pasted text #N]` placeholder,
+  // so B5's "is the pasted text still in the input box?" check could
+  // not find the text and wrongly concluded "submitted ✓".
+  //
+  // B7 confirms submission via the JSONL correlation token instead:
+  // _pasteAndEnter({confirmSubmit:true}) blocks until THIS paste's
+  // token surfaces in a JSONL `user-message`, re-sending Enter on a
+  // miss and throwing TMUX_SUBMIT_FAILED if it never registers.
+  //
+  // This scenario reproduces the production shape: send one SMALL
+  // turn first, let it fully complete (the session is now WARM and
+  // idle), THEN send a ~3 KB large prompt that collapses to
+  // `[Pasted text #N]`. It asserts the warm-session large paste
+  // actually started + completed a turn.
+  //
+  // Determinism note: same as the other large-prompt scenarios — a
+  // real-TUI run cannot be a guaranteed RED (the absorb-vs-ingest
+  // window is a timing race). The DETERMINISTIC red→green proof for
+  // B7 is the unit suite (tests/tmux-process.test.js, the
+  // `B7 JSONL-token submit confirmation` group: a fake runner whose
+  // JSONL only emits the tokened `user-message` after the Nth Enter,
+  // proving the fix keys on JSONL not the pane). THIS scenario is the
+  // integration guard for the previously-uncovered warm-session
+  // large-paste path.
+  const { p, events, cleanup } = await setupRealTui('warm-large');
+  try {
+    // 1. Warm the session: a small turn that fully completes.
+    const r1 = await p.send('Reply ONLY with "WARMUP".');
+    ok(/WARMUP/i.test(r1.text || ''),
+      `warm-up turn completed (got ${JSON.stringify(r1.text?.slice(0, 40))})`);
+    log('warm-session-large-prompt: session warmed, TUI now idle');
+
+    // 2. Now send a ~3 KB prompt on the WARM, idle session — the
+    //    exact msg-803 shape (a large paste into an already-running
+    //    session, NOT a fresh spawn).
+    const prompt = buildLargePrompt(
+      'Acknowledge this message with a short friendly reply.',
+      { bulk: 'Some additional context for you to consider. '.repeat(40) });
+    log(`warm-session-large-prompt: ${prompt.length} bytes`);
+    if (prompt.length < 2000) {
+      fail(`large prompt should be ~3 KB (got ${prompt.length} bytes)`);
+    }
+    const startedAt = Date.now();
+    const res = await p.send(prompt);
+    const elapsed = Date.now() - startedAt;
+    ok((res.text || '').trim().length > 0,
+      `warm-session large (~${prompt.length}B) prompt produced a real reply — `
+      + `got ${JSON.stringify(res.text?.slice(0, 80))} (pre-B7: '' — the paste `
+      + 'sat unsubmitted as [Pasted text #N], the turn never started)');
+    ok(!res.error,
+      `warm-session large-prompt turn has no error (got ${JSON.stringify(res.error)})`);
+    ok(elapsed < 60_000,
+      `warm-session large-prompt turn completed promptly — `
+      + `${(elapsed / 1000).toFixed(1)}s (pre-B7 it failed loud after the `
+      + 'grace window — "turn produced no JSONL reply text")');
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
 S('baseline tool', 'baseline-tool-call', async () => {
   const { p, events, cleanup } = await setupRealTui('b-tool');
   try {
@@ -1122,6 +1193,17 @@ async function main() {
     process.exit(2);
   }, HARD_TIMEOUT_MS).unref();
 
+  // Event-loop keepalive. A turn that has cleared the capture-pane
+  // poll loop and is awaiting only the JSONL `resultPromise` has no
+  // REF'd handle holding the process: `LogTail`'s tick timer is
+  // `unref`'d (lib/tmux/log-tail.js) and so is the turn-deadline
+  // timer. In the real daemon the Telegram long-poll keeps the loop
+  // alive; the spike has no such anchor, so without this `setInterval`
+  // Node exits 0 mid-turn — `p.send()` never settles and the scenario
+  // prints no result. Cleared before the Summary so the process can
+  // exit cleanly once all scenarios finish.
+  const keepAlive = setInterval(() => {}, 1000);
+
   let passed = 0;
   let failed = 0;
   const failures = [];
@@ -1146,6 +1228,7 @@ async function main() {
     }
   }
   clearTimeout(timer);
+  clearInterval(keepAlive);
 
   console.log('\n=== Summary ===');
   console.log(`Scenarios: ${chosen.length}`);
