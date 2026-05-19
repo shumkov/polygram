@@ -98,7 +98,8 @@
       "cwd": "/Users/you/admin-agent",
       "requireMention": true,
       "isolateTopics": true,
-      "_comment_topics": "rc.48: each topic entry is EITHER a string (legacy: just a label) OR an object with optional fields {name, agent, cwd, model, effort, permissionMode}. Object form lets a topic override chat-level config. Per-topic permissionMode overrides chat-level — typical use: scope one topic to permissionMode:'default' (so settings.json gates apply) while the rest of the chat stays on bypassPermissions. Object form requires isolateTopics: true (each topic gets its own SDK Query); polygram emits a startup warning otherwise.",
+      "_comment_topics": "rc.48: each topic entry is EITHER a string (legacy: just a label) OR an object with optional fields {name, agent, cwd, model, effort, permissionMode, isolateUserConfig}. Object form lets a topic override chat-level config. Per-topic permissionMode overrides chat-level — typical use: scope one topic to permissionMode:'default' (so settings.json gates apply) while the rest of the chat stays on bypassPermissions. Object form requires isolateTopics: true (each topic gets its own SDK Query); polygram emits a startup warning otherwise.",
+      "_comment_isolateUserConfig": "0.10.0, tmux backend only: isolateUserConfig:true spawns the topic's claude TUI cut off from the user-level ~/.claude config — passes --strict-mcp-config (zero MCP servers load) and --setting-sources project,local (drops ~/.claude/settings.json; the spawn cwd's own .claude/settings.json still loads). Use it when a topic's agent would otherwise inherit slow user-global MCP servers whose cold-start (tens of seconds) wedges the TUI before it can accept a prompt. Settable at chat OR topic level (topic wins). Default false.",
       "topics": {
         "100": "Customer A",
         "200": {
@@ -107,7 +108,8 @@
           "cwd": "/Users/you/customer-b-projects",
           "model": "opus",
           "effort": "high",
-          "permissionMode": "default"
+          "permissionMode": "default",
+          "isolateUserConfig": true
         }
       }
     },
