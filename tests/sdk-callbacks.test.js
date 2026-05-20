@@ -79,8 +79,8 @@ describe('createSdkCallbacks — factory contract', () => {
   });
 });
 
-describe('onInit — upserts session row', () => {
-  test('persists session_id + chat config via db.upsertSession', () => {
+describe('onInit — upserts session row with TOPIC-RESOLVED spawn identity', () => {
+  test('chat-only config: persists chat-level agent/cwd/model/effort + resolved pm_backend', () => {
     const h = baseDeps();
     const cbs = createSdkCallbacks(h.deps);
     cbs.onInit('12345:24', { session_id: 'sess-abc' }, {
@@ -92,11 +92,77 @@ describe('onInit — upserts session row', () => {
       chat_id: '12345',
       thread_id: '24',
       claude_session_id: 'sess-abc',
-      agent: 'finance',
+      agent: 'finance',                       // chat-level (no topic override)
       cwd: '/u',
       model: 'sonnet',
       effort: 'high',
+      pm_backend: 'sdk',                      // no pm set → defaults via pickBackend
     });
+  });
+
+  test('topic override wins over chat-level (Music topic regression — shumorobot 2026-05-21)', () => {
+    // Production trigger: chat-level was agent=shumabit / cwd=$HOME /
+    // pm=sdk. Music topic (thread :3) had a topic-level override:
+    // agent=music-curation:music-curator, cwd=.../Music/rekordbox,
+    // pm=tmux. Pre-fix `onInit` read chat-level only, persisting the
+    // WRONG agent+cwd. Next turn → S2 drift fires (resolved topic
+    // config vs persisted chat config) → drop row → fresh sid →
+    // context lost. Every turn forever.
+    const { deps, upsertCalls } = baseDeps({
+      config: {
+        chats: {
+          '-1003807211164': {
+            agent: 'shumabit',
+            cwd: '/Users/ivanshumkov',
+            model: 'sonnet', effort: 'high',
+            pm: 'sdk',
+            topics: {
+              '3': {
+                name: 'Music',
+                agent: 'music-curation:music-curator',
+                cwd: '/Users/ivanshumkov/Music/rekordbox',
+                pm: 'tmux',
+              },
+            },
+          },
+        },
+        bot: {},
+      },
+    });
+    const cbs = createSdkCallbacks(deps);
+    cbs.onInit('-1003807211164:3', { session_id: 'sess-music' }, {
+      chatId: '-1003807211164', threadId: '3', label: 'Music',
+    });
+    assert.equal(upsertCalls.length, 1);
+    assert.deepEqual(upsertCalls[0], {
+      session_key: '-1003807211164:3',
+      chat_id: '-1003807211164',
+      thread_id: '3',
+      claude_session_id: 'sess-music',
+      agent: 'music-curation:music-curator',  // ← topic, not chat
+      cwd: '/Users/ivanshumkov/Music/rekordbox',
+      model: 'sonnet',                        // ← inherited from chat (no topic override)
+      effort: 'high',
+      pm_backend: 'tmux',                     // ← topic override
+    });
+  });
+
+  test('pm_backend is always persisted, never defaulted by upsertSession', () => {
+    // Defensive: pre-fix onInit did not pass pm_backend at all. The
+    // DB layer defaulted it to 'sdk' for every spawn — so tmux
+    // sessions were silently labelled 'sdk' in telemetry forever.
+    // Verify onInit now passes it explicitly.
+    const { deps, upsertCalls } = baseDeps({
+      config: {
+        chats: { '99': { agent: 'a', cwd: '/c', pm: 'tmux' } },
+        bot: {},
+      },
+    });
+    createSdkCallbacks(deps).onInit('99', { session_id: 's' }, {
+      chatId: '99', threadId: null, label: 't',
+    });
+    assert.equal(upsertCalls[0].pm_backend, 'tmux',
+      'pm_backend must be passed explicitly so DB layer never defaults');
   });
 });
 
