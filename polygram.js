@@ -400,18 +400,21 @@ function buildSpawnContext(sessionKey) {
   const threadId = sessionKey.includes(':') ? sessionKey.split(':')[1] : null;
 
   // S2: a stored session is valid ONLY for the config it was spawned
-  // under. agent / cwd / pm_backend are spawn-identity — baked into
-  // the process at spawn time, never mutable on a live session.
-  // Resolve them the same way the backends do (topic override merged
-  // over chat-level) and compare to the stored `sessions` row. On
-  // drift, resolveSessionForSpawn drops the stale row and returns
+  // under. agent / cwd are spawn-identity — baked into the process at
+  // spawn time, never mutable on a live session. Resolve them the
+  // same way the backends do (topic override merged over chat-level)
+  // and compare to the stored `sessions` row. On drift,
+  // resolveSessionForSpawn drops the stale row and returns
   // existingSessionId:null → the spawn starts fresh under the correct
   // config instead of `--resume`-ing a stale one. This self-heals the
   // pre-per-topic-config rows (e.g. shumorobot's Music topic :3,
-  // stored agent=shumabit / cwd=$HOME / sdk vs the current
-  // music-curation:music-curator / .../Music/rekordbox / tmux).
+  // stored agent=shumabit / cwd=$HOME vs the current
+  // music-curation:music-curator / .../Music/rekordbox).
   // model/effort are NOT compared — they apply live via setModel /
-  // applyFlagSettings with no respawn.
+  // applyFlagSettings with no respawn. pm_backend is also NOT
+  // compared (rc.32): both backends spawn the same pinned claude
+  // binary against the same on-disk JSONL, so a backend flip
+  // preserves context. See lib/db/sessions.js for full reasoning.
   //
   // The drift check runs only at COLD spawn (no warm process). A warm
   // process already runs under its spawn-time config; getOrSpawn

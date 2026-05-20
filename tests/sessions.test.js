@@ -285,18 +285,28 @@ describe('resolveSessionForSpawn (S2 drift)', () => {
     assert.equal(db.getSession('chat:3'), undefined);
   });
 
-  test('backend drift (sdk→tmux) → drops the session, fresh spawn', () => {
+  test('backend flip alone (sdk↔tmux) PRESERVES the session', () => {
+    // Migration target: pm_backend is no longer drift-invalidating.
+    // Both backends spawn the same pinned claude binary and write the
+    // same on-disk JSONL at ~/.claude/projects/<cwd>/<sid>.jsonl —
+    // claude itself doesn't know or care which Node-side wrapper
+    // invoked it. Flipping pm_backend with agent+cwd unchanged must
+    // preserve the row so the next spawn `--resume`s with full
+    // conversation context. (Pre-this-change, this drift dropped the
+    // row, costing the user every prior message in the chat across
+    // the SDK→tmux migration window.)
     db.upsertSession({
       session_key: 'chat:3', chat_id: 'chat', thread_id: '3',
-      claude_session_id: 'sess-stale',
+      claude_session_id: 'sess-keep-across-flip',
       agent: 'music-curation:music-curator',
       cwd: '/Users/ivanshumkov/Music/rekordbox',
-      pm_backend: 'sdk',                              // ← differs
+      pm_backend: 'sdk',                              // ← prior backend
     });
-    const r = resolveSessionForSpawn(db, 'chat:3', resolved);
-    assert.equal(r.existingSessionId, null);
-    assert.ok(r.drift.fields.includes('pm_backend'));
-    assert.equal(db.getSession('chat:3'), undefined);
+    const r = resolveSessionForSpawn(db, 'chat:3', resolved); // resolved.backend = 'tmux'
+    assert.equal(r.existingSessionId, 'sess-keep-across-flip',
+      'backend flip alone must preserve session id');
+    assert.equal(r.drift, null);
+    assert.ok(db.getSession('chat:3'), 'row stays in place');
   });
 
   test('model/effort difference does NOT invalidate (applied live, not spawn-identity)', () => {
@@ -318,7 +328,7 @@ describe('resolveSessionForSpawn (S2 drift)', () => {
     assert.equal(r.drift, null);
   });
 
-  test('the actual stale shumorobot :3 row self-heals', () => {
+  test('the actual stale shumorobot :3 row self-heals (agent+cwd drift; backend flip incidental)', () => {
     // Reproduce the exact production row (from ~/.polygram/shumorobot.db
     // sessions table): agent=shumabit, cwd=$HOME, pm_backend=sdk.
     db.upsertSession({
@@ -337,7 +347,11 @@ describe('resolveSessionForSpawn (S2 drift)', () => {
       backend: 'tmux',
     });
     assert.equal(r.existingSessionId, null, 'stale :3 row must NOT be resumed');
-    assert.deepEqual(r.drift.fields.sort(), ['agent', 'cwd', 'pm_backend']);
+    // Backend flip is no longer drift-invalidating (see "backend flip
+    // alone" test above) — only the real config drift (agent + cwd)
+    // appears in the drift report. The row still drops because agent
+    // AND cwd both changed.
+    assert.deepEqual(r.drift.fields.sort(), ['agent', 'cwd']);
     assert.equal(db.getSession('-1003807211164:3'), undefined, ':3 row self-heals (dropped)');
   });
 
