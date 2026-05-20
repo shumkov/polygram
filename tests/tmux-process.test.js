@@ -25,7 +25,15 @@ function makeFakeRunner(overrides = {}) {
     },
     capturePane: async (name) => '',
     captureWide: async (name) => '',
-    sessionExists: async () => true,
+    // Default: no pre-existing tmux session for this name. Tests that
+    // exercise the orphan-reconcile path (lib/process/tmux-process.js
+    // spawn-time orphan kill — shumorobot 2026-05-20 incident) override
+    // this to return true on the first call. Pre-reconcile this fake
+    // returned true unconditionally; nothing in TmuxProcess called
+    // sessionExists() at all, so the value was inert. With reconcile
+    // it now matters — false is the realistic default for a fresh
+    // test environment.
+    sessionExists: async () => false,
     killSession: async (name) => { calls.push({ kind: 'killSession', name }); },
     listPolygramSessions: async () => [],
     setPaneReadOnly: async (name) => { calls.push({ kind: 'setPaneReadOnly', name }); },
