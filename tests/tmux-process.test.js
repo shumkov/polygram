@@ -79,15 +79,16 @@ function makeTmuxProcess(runner, opts = {}) {
     ...rest,
   });
   if (autoSubmitOnEnter) {
-    // Hook `_confirmSubmitViaJsonl` — the B7 primary-turn submit
-    // confirmation. It is called ONLY for a primary turn's paste, so
-    // hooking it (rather than the autosteer-shared `_pasteAndEnter`)
-    // models exactly "the TUI submitted the primary prompt": feed the
-    // tokened `user-message` shortly after the confirm starts, so the
-    // confirm's `_awaitSubmitConfirm` waiter resolves. Tests that
-    // exercise NON-submission pass `autoSubmitOnEnter:false`.
-    const baseConfirm = p._confirmSubmitViaJsonl.bind(p);
-    p._confirmSubmitViaJsonl = (token, turn) => {
+    // Hook `_scheduleSubmitRetries` (0.10.0 Commit 2 successor to
+    // `_confirmSubmitViaJsonl`) — the primary-turn submit confirmation.
+    // It is called ONLY for a primary turn's paste, so hooking it
+    // (rather than the autosteer-shared `_pasteAndEnter`) models
+    // exactly "the TUI submitted the primary prompt": feed the tokened
+    // `user-message` shortly after the confirm starts, so the confirm's
+    // `_awaitSubmitConfirm` waiter resolves. Tests that exercise
+    // NON-submission pass `autoSubmitOnEnter:false`.
+    const baseConfirm = p._scheduleSubmitRetries.bind(p);
+    p._scheduleSubmitRetries = (token, turn) => {
       if (token) {
         setTimeout(() => {
           p._handleSessionEvent({ type: 'user-message', text:
@@ -1268,7 +1269,7 @@ describe('TmuxProcess B7 — JSONL-token submit confirmation', () => {
   //
   // B7 fix: the ONLY reliable "the prompt reached claude" signal is the
   // JSONL `user-message` line carrying THIS paste's correlation token.
-  // `_confirmSubmitViaJsonl(token, turn)` waits (bounded) for that
+  // `_scheduleSubmitRetries(token, turn)` waits (bounded) for that
   // tokened user-message; on a miss it re-sends Enter (bounded
   // retries); if it never surfaces it throws TMUX_SUBMIT_FAILED. It
   // runs as a CONCURRENT racer in `_runTurn` — NOT a blocking gate in
@@ -1285,7 +1286,7 @@ describe('TmuxProcess B7 — JSONL-token submit confirmation', () => {
     p.tmuxName = 'warm-sess';
     const token = p._mintToken();
 
-    const confirmP = p._confirmSubmitViaJsonl(token);
+    const confirmP = p._scheduleSubmitRetries(token);
     // Simulate the JSONL tail: claude registered the prompt and wrote
     // a `user-message` line carrying the token verbatim.
     setTimeout(() => {
@@ -1307,7 +1308,7 @@ describe('TmuxProcess B7 — JSONL-token submit confirmation', () => {
     p.tmuxName = 'warm-sess';
     const token = p._mintToken();
 
-    const confirmP = p._confirmSubmitViaJsonl(token);
+    const confirmP = p._scheduleSubmitRetries(token);
     // First confirm window elapses with no user-message — the prompt
     // sits as `[Pasted text #2]`. The retry Enter lands; claude then
     // registers the prompt and writes the tokened user-message.
@@ -1333,7 +1334,7 @@ describe('TmuxProcess B7 — JSONL-token submit confirmation', () => {
 
     // No JSONL user-message is ever fed — the prompt never submits.
     await assert.rejects(
-      () => p._confirmSubmitViaJsonl(token),
+      () => p._scheduleSubmitRetries(token),
       (err) => {
         assert.equal(err.code, 'TMUX_SUBMIT_FAILED',
           'a never-submitting paste must throw TMUX_SUBMIT_FAILED, NOT false-positive success');
@@ -1355,7 +1356,7 @@ describe('TmuxProcess B7 — JSONL-token submit confirmation', () => {
     p.tmuxName = 'sess';
     const token = p._mintToken();
     const turn = { state: 'streaming' };
-    const confirmP = p._confirmSubmitViaJsonl(token, turn);
+    const confirmP = p._scheduleSubmitRetries(token, turn);
     // Before the first confirm window elapses, the turn settles.
     setTimeout(() => { turn.state = 'done'; }, 5);
     await confirmP; // resolves quietly — no throw
@@ -1389,6 +1390,154 @@ describe('TmuxProcess B7 — JSONL-token submit confirmation', () => {
     assert.equal(res.text, '', 'no text is fabricated for an unsubmitted prompt');
     assert.ok(enterCount(runner) >= 2,
       'the submit-confirm re-sent Enter on the non-submitting paste before failing loud');
+  });
+
+  // ─── C1: paste-parked (0.10.0 Commit 2) ──────────────────────────
+  //
+  // The 2026-05-20 C1 trace: a primary paste lands while the TUI is
+  // busy with a prior turn. The TUI PARKS it in its input queue and
+  // writes a `queue-operation enqueue` carrying the paste's
+  // correlation token. NO `user-message` follows until the prior turn
+  // finishes and the TUI dequeues ours.
+  //
+  // Pre-Commit-2 (`_confirmSubmitViaJsonl`): the confirm couldn't tell
+  // a parked paste from an absorbed-Enter paste — it re-sent Enter 5×
+  // (each could submit a DIFFERENT queued item or double-submit) then
+  // failed loud `TMUX_SUBMIT_FAILED` on a turn that was legitimately
+  // in flight.
+  //
+  // Commit 2 (`_scheduleSubmitRetries`): the turn-phase predicate sets
+  // `turn.parked = true` on the enqueue. Once parked, the confirm
+  // stops re-sending Enter and waits (unbounded — W1 is the floor) for
+  // the eventual `user-message`.
+  describe('C1: paste-parked submit confirmation', () => {
+    test('parked-from-the-start: enqueue with our token → NO retry Enter, settles on user-message', async () => {
+      const runner = makeFakeRunner();
+      const p = makeTmuxProcess(runner, {
+        submitConfirmMs: 30, submitConfirmRetries: 4, autoSubmitOnEnter: false,
+      });
+      p.tmuxName = 'busy-sess';
+      // A live primary turn whose paste the busy TUI will park. It must
+      // be in the ledger so the predicate (driven via _handleSessionEvent)
+      // can find it by token and set `parked`.
+      const turn = p._makeTurn({ kind: 'primary', prompt: 'do X', msgIds: [1] });
+      p._ledger.push(turn);
+
+      const submitParked = [];
+      p.on('submit-parked', (ev) => submitParked.push(ev));
+
+      const confirmP = p._scheduleSubmitRetries(turn.token, turn);
+
+      // The TUI parks our paste: queue-operation enqueue carrying our
+      // token. The predicate sets turn.parked = true.
+      p._handleSessionEvent({
+        type: 'queue-operation', operation: 'enqueue',
+        content: `<polygram-info corr-id="${turn.token}"></polygram-info>\n\ndo X`,
+      });
+      assert.equal(turn.parked, true, 'enqueue with our token sets parked');
+
+      // Prior turn finishes; TUI dequeues ours and writes the user-message.
+      setTimeout(() => {
+        p._handleSessionEvent({ type: 'user-message', text:
+          `<polygram-info corr-id="${turn.token}"></polygram-info>\n\ndo X` });
+      }, 60);
+
+      await confirmP; // resolves on the user-message, not via retry/throw
+      assert.equal(enterCount(runner), 0,
+        'a PARKED paste must NOT re-send Enter — the TUI already holds it');
+      assert.ok(submitParked.length >= 1, 'submit-parked event fired for observability');
+      assert.equal(submitParked[0].token, turn.token);
+    });
+
+    test('parked-after-first-miss: one confirm window misses, THEN enqueue → stop retrying, settle on user-message', async () => {
+      const runner = makeFakeRunner();
+      const p = makeTmuxProcess(runner, {
+        submitConfirmMs: 30, submitConfirmRetries: 4, autoSubmitOnEnter: false,
+      });
+      p.tmuxName = 'busy-sess';
+      const turn = p._makeTurn({ kind: 'primary', prompt: 'do Y', msgIds: [2] });
+      p._ledger.push(turn);
+
+      const confirmP = p._scheduleSubmitRetries(turn.token, turn);
+
+      // First confirm window elapses with neither user-message nor
+      // enqueue → one retry Enter fires. THEN the enqueue lands.
+      setTimeout(() => {
+        const entersBeforePark = enterCount(runner);
+        assert.ok(entersBeforePark >= 1,
+          'the first miss (not yet parked) re-sends Enter — same as a stuck paste');
+        p._handleSessionEvent({
+          type: 'queue-operation', operation: 'enqueue',
+          content: `<polygram-info corr-id="${turn.token}"></polygram-info>\n\ndo Y`,
+        });
+        assert.equal(turn.parked, true);
+        // Capture the Enter count at park time; assert no MORE fire after.
+        p._parkEnterBaseline = enterCount(runner);
+        // Then the TUI dequeues + user-message arrives.
+        setTimeout(() => {
+          p._handleSessionEvent({ type: 'user-message', text:
+            `<polygram-info corr-id="${turn.token}"></polygram-info>\n\ndo Y` });
+        }, 50);
+      }, 45);
+
+      await confirmP;
+      assert.equal(enterCount(runner), p._parkEnterBaseline,
+        'no further retry Enter after the paste is observed parked');
+    });
+
+    test('NOT parked (different token enqueued) → still fails loud TMUX_SUBMIT_FAILED', async () => {
+      // An enqueue for a DIFFERENT turn must not mark OUR turn parked —
+      // a genuinely stuck paste must still fail loud.
+      const runner = makeFakeRunner();
+      const p = makeTmuxProcess(runner, {
+        submitConfirmMs: 15, submitConfirmRetries: 2, autoSubmitOnEnter: false,
+      });
+      p.tmuxName = 'wedged-sess';
+      const turn = p._makeTurn({ kind: 'primary', prompt: 'mine', msgIds: [3] });
+      p._ledger.push(turn);
+
+      // Some OTHER turn's paste gets parked — not ours.
+      p._handleSessionEvent({
+        type: 'queue-operation', operation: 'enqueue',
+        content: '<polygram-info corr-id="pgm-corr-aaaaaaaaaaaaaaaaaaaaaaaa"></polygram-info>',
+      });
+      assert.equal(turn.parked, false, 'an enqueue for another token must NOT park us');
+
+      await assert.rejects(
+        () => p._scheduleSubmitRetries(turn.token, turn),
+        (err) => err.code === 'TMUX_SUBMIT_FAILED',
+      );
+      assert.equal(enterCount(runner), 2,
+        'a genuinely stuck (non-parked) paste still exhausts retries and fails loud');
+    });
+
+    test('parked then turn killed before user-message → confirm resolves quietly (no leak, no throw)', async () => {
+      const runner = makeFakeRunner();
+      const p = makeTmuxProcess(runner, {
+        submitConfirmMs: 30, submitConfirmRetries: 4, autoSubmitOnEnter: false,
+      });
+      p.tmuxName = 'busy-sess';
+      const turn = p._makeTurn({ kind: 'primary', prompt: 'do Z', msgIds: [4] });
+      // Arm the interrupt promise the way _runTurn does, so the parked
+      // wait can bail when the turn is interrupted.
+      turn.interruptP = new Promise((resolve) => { turn.signalInterrupt = resolve; });
+      p._ledger.push(turn);
+
+      const confirmP = p._scheduleSubmitRetries(turn.token, turn);
+      p._handleSessionEvent({
+        type: 'queue-operation', operation: 'enqueue',
+        content: `<polygram-info corr-id="${turn.token}"></polygram-info>\n\ndo Z`,
+      });
+      assert.equal(turn.parked, true);
+
+      // The turn is interrupted before the user-message ever lands.
+      setTimeout(() => { turn.state = 'failed'; turn.signalInterrupt(); }, 40);
+
+      await confirmP; // resolves via interruptP — no hang, no throw
+      assert.equal(enterCount(runner), 0, 'parked + killed sends no Enter');
+      assert.ok(!p._submitConfirms.has(turn.token),
+        'the submit-confirm waiter is cleaned up — no leaked Map entry');
+    });
   });
 });
 
