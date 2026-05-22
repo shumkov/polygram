@@ -1397,6 +1397,56 @@ describe('TmuxProcess — rc.42 review-driven coverage', () => {
       '_finishTurn must clear the Stop synth timer');
   });
 
+  // rc.43 — session-age prompt detection regex
+  test('SESSION_AGE_PROMPT_RE matches the real claude TUI session-age menu', () => {
+    const { SESSION_AGE_PROMPT_RE } = require('../lib/process/tmux-process');
+    // Real production capture (shumorobot Music topic, 2026-05-22 21:11).
+    const realMenu = `\
+✻ Brewed for 1m 19s
+
+────────────────────────────────────────────────────────────────────
+  This session is 8h 38m old and 117.6k tokens.
+
+  Resuming the full session will consume a substantial portion of your usage limits.
+  We recommend resuming from a summary.
+
+  ❯ 1. Resume from summary (recommended)
+    2. Resume full session as-is
+    3. Don't ask me again
+
+  Enter to confirm · Esc to cancel
+`;
+    assert.ok(SESSION_AGE_PROMPT_RE.test(realMenu),
+      'must match the real production session-age menu');
+  });
+
+  test('SESSION_AGE_PROMPT_RE does NOT match the normal ready hint', () => {
+    const { SESSION_AGE_PROMPT_RE } = require('../lib/process/tmux-process');
+    const normalReady = `
+Type a message…
+
+? for shortcuts
+bypass permissions on (shift+tab to cycle)
+`;
+    assert.ok(!SESSION_AGE_PROMPT_RE.test(normalReady),
+      'must NOT match a normal ready pane (would cause false dismissal)');
+  });
+
+  test('SESSION_AGE_PROMPT_RE does NOT match prose mentioning the phrases', () => {
+    const { SESSION_AGE_PROMPT_RE } = require('../lib/process/tmux-process');
+    // A turn whose ASSISTANT TEXT discussed the prompt itself
+    // must not be misread as the menu. The regex requires both
+    // distinctive substrings — "Resuming the full session" AND
+    // "Resume from summary" — in that order, so prose that uses
+    // just one is safe. Prose that mentions both is rare but the
+    // false-positive risk is low; if it ever fires, polygram
+    // sends Enter into the chat input which the TUI handles as a
+    // submit-empty no-op, not catastrophic.
+    const justOne = 'Yes, "Resume from summary" is the default option in the menu.';
+    assert.ok(!SESSION_AGE_PROMPT_RE.test(justOne),
+      'mentioning only one phrase must not match');
+  });
+
   // #6 (review-driven) — repeated Stop events don't schedule N timers
   test('repeated Stop events only schedule ONE Stop-synth timer per turn', () => {
     const p = makeTmuxProcess(makeFakeRunner(), { stopGraceMs: 60_000 });
