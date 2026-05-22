@@ -80,6 +80,7 @@ const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/telegr
 const { createStreamer } = require('./lib/telegram/streamer');
 const { chunkMarkdownText } = require('./lib/telegram/chunk');
 const { deliverReplies } = require('./lib/telegram/deliver');
+const { sanitizeAssistantReply } = require('./lib/telegram/sanitize-reply');
 const { announce, shouldAnnounce } = require('./lib/announces');
 const { isAbortRequest } = require('./lib/abort-detector');
 const { startTyping } = require('./lib/telegram/typing');
@@ -1308,6 +1309,25 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     }
 
     const parsed = parseResponse(result.text);
+    // rc.39: intercept CLI-context canned-string leaks (`No response
+    // requested.` etc.) before they reach the streamer/deliver path.
+    // Replaces with an honest brief message; logs the substitution
+    // for forensic post-hoc analysis of how often the leak fires.
+    // See lib/telegram/sanitize-reply.js for the (narrow) allowlist
+    // and rationale — the rc.37 prompt-side hint mitigation proved
+    // insufficient, so this is the polygram-layer safety net.
+    if (parsed.text) {
+      const sanitized = sanitizeAssistantReply(parsed.text);
+      if (sanitized.replaced) {
+        logEvent('canned-reply-suppressed', {
+          chat_id: chatId,
+          msg_id: msg.message_id,
+          original: sanitized.original,
+          backend: result?.backend || null,
+        });
+        parsed.text = sanitized.text;
+      }
+    }
     const outMeta = { ...outMetaBase, sessionId: result.sessionId, costUsd: result.cost };
 
     // 0.8.0-rc.39: send any inline stickers Claude embedded with
