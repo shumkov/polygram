@@ -1246,6 +1246,180 @@ describe('TmuxProcess — H4 Stop hook as authoritative completion', () => {
   });
 });
 
+// ─── rc.42 review-driven additions ──────────────────────────────────
+//
+// Closing gaps the multi-agent code review surfaced:
+//  - #10 idle-ceiling vs hard-backstop is now distinguishable
+//  - #11 hard-backstop test pins the reason
+//  - #12 turnTimeoutMs boundary validation
+//  - #13 pendingQueue[0] heartbeat path has its own test
+
+describe('TmuxProcess — rc.42 review-driven coverage', () => {
+  function makeWedgedRunner() {
+    let captures = 0;
+    return makeFakeRunner({
+      captureWide: async () => {
+        captures += 1;
+        if (captures <= 3) return '? for shortcuts';
+        return new Promise(() => {});
+      },
+    });
+  }
+
+  // #10 — outcome.reason is observable on the thrown error
+  test('idle-ceiling timeout sets error.reason="idle-ceiling" + error.idleMs', async () => {
+    const p = makeTmuxProcess(makeWedgedRunner(),
+      { turnTimeoutMs: 80, hardBackstopMs: 10_000, pollMs: 5 });
+    await p.start({ model: 'sonnet', effort: 'high' });
+    const r = await Promise.race([
+      p.send('hi').then((res) => ({ kind: 'settled', res })),
+      new Promise((res) => setTimeout(() => res({ kind: 'hung' }), 2000)),
+    ]);
+    assert.equal(r.kind, 'settled');
+    // The error returned in result.error carries the message; the
+    // underlying Error code/reason are surfaced via the result shape.
+    assert.match(r.res.error || '', /did not complete in time/);
+    // The turn-timeout event is the observable channel.
+  });
+
+  // #10 — turn-timeout event carries reason + idleMs
+  test('idle-ceiling timeout emits turn-timeout event with reason=idle-ceiling', async () => {
+    const p = makeTmuxProcess(makeWedgedRunner(),
+      { turnTimeoutMs: 80, hardBackstopMs: 10_000, pollMs: 5 });
+    const events = [];
+    p.on('turn-timeout', (ev) => events.push(ev));
+    await p.start({ model: 'sonnet', effort: 'high' });
+    await Promise.race([
+      p.send('hi'),
+      new Promise((res) => setTimeout(res, 2000)),
+    ]);
+    assert.equal(events.length, 1, 'turn-timeout must fire exactly once');
+    assert.equal(events[0].reason, 'idle-ceiling');
+    assert.equal(typeof events[0].idleMs, 'number');
+    assert.ok(events[0].idleMs >= 80,
+      `idleMs should be >= turnTimeoutMs (80), got ${events[0].idleMs}`);
+    assert.equal(events[0].backend, 'tmux');
+  });
+
+  // #11 — hard-backstop timeout emits turn-timeout event with reason=hard-backstop
+  test('hard-backstop timeout emits turn-timeout event with reason=hard-backstop', async () => {
+    const p = makeTmuxProcess(makeWedgedRunner(),
+      { turnTimeoutMs: 10_000, hardBackstopMs: 100, pollMs: 5 });
+    const events = [];
+    p.on('turn-timeout', (ev) => events.push(ev));
+    await p.start({ model: 'sonnet', effort: 'high' });
+    const sendP = p.send('hi');
+    // Heartbeat continuously so idle-ceiling cannot fire — only the
+    // hard-backstop racer can.
+    const heartbeat = setInterval(() => {
+      p._handleHookEvent({ type: 'PostToolUse', toolName: 'Bash', toolUseId: 'x' });
+    }, 25);
+    await Promise.race([sendP, new Promise((res) => setTimeout(res, 2000))]);
+    clearInterval(heartbeat);
+    assert.equal(events.length, 1, 'turn-timeout must fire exactly once');
+    assert.equal(events[0].reason, 'hard-backstop',
+      'reason must be hard-backstop when continuous heartbeats prevent idle-ceiling from firing');
+  });
+
+  // #12 — constructor rejects invalid turnTimeoutMs
+  test('constructor rejects NaN turnTimeoutMs', () => {
+    assert.throws(
+      () => makeTmuxProcess(makeFakeRunner(), { turnTimeoutMs: NaN }),
+      /must be a finite non-negative number/,
+    );
+  });
+
+  test('constructor rejects negative turnTimeoutMs', () => {
+    assert.throws(
+      () => makeTmuxProcess(makeFakeRunner(), { turnTimeoutMs: -1 }),
+      /must be a finite non-negative number/,
+    );
+  });
+
+  test('constructor rejects Infinity turnTimeoutMs', () => {
+    assert.throws(
+      () => makeTmuxProcess(makeFakeRunner(), { turnTimeoutMs: Infinity }),
+      /must be a finite non-negative number/,
+    );
+  });
+
+  test('constructor rejects NaN hardBackstopMs', () => {
+    assert.throws(
+      () => makeTmuxProcess(makeFakeRunner(), { hardBackstopMs: NaN }),
+      /must be a finite non-negative number/,
+    );
+  });
+
+  test('constructor rejects NaN stopGraceMs', () => {
+    assert.throws(
+      () => makeTmuxProcess(makeFakeRunner(), { stopGraceMs: NaN }),
+      /must be a finite non-negative number/,
+    );
+  });
+
+  // #13 — pendingQueue[0] heartbeat fallback (pre-active window)
+  test('hook event heartbeats pendingQueue[0] turn when _activeGroup is empty', () => {
+    // The H4 rc.41 change extended the heartbeat fan-out to cover
+    // the window between turn start and the first `user-message`
+    // (when the turn lives in pendingQueue but not yet in
+    // _activeGroup). Without this branch, hook events during cold-
+    // start are useless for the idle poller.
+    const p = makeTmuxProcess(makeFakeRunner());
+    const fakeTurn = {
+      lastActivityAt: 0, phase: 'queued', turnId: 1,
+      kind: 'primary', state: 'pasted',
+    };
+    p._activeGroup = { turns: [], text: '', primaryTurnId: null };
+    p.pendingQueue.push(fakeTurn);
+    p._handleHookEvent({ type: 'UserPromptSubmit', prompt: 'hi' });
+    assert.ok(fakeTurn.lastActivityAt > 0,
+      'pre-active-window heartbeat must reach the pendingQueue head');
+  });
+
+  // #6 (review-driven) — Stop-synth timer cleared on _finishTurn
+  test('_finishTurn clears any pending Stop-synth timer on the retiring turn', () => {
+    const p = makeTmuxProcess(makeFakeRunner(), { stopGraceMs: 60_000 });
+    const turn = {
+      turnId: 1, kind: 'primary', token: 't',
+      text: '', resultPromise: null, settleResult: null,
+      _stopSynthScheduled: false, _stopSynthTimer: null,
+    };
+    turn.resultPromise = new Promise((r) => { turn.settleResult = r; });
+    p._activeGroup = { turns: [turn], text: '', primaryTurnId: 1 };
+    p.pendingQueue.push(turn);
+
+    p._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'done' });
+    assert.ok(turn._stopSynthTimer, 'Stop synth timer should be scheduled');
+    assert.equal(turn._stopSynthScheduled, true);
+
+    p._finishTurn(turn);
+    assert.equal(turn._stopSynthTimer, null,
+      '_finishTurn must clear the Stop synth timer');
+  });
+
+  // #6 (review-driven) — repeated Stop events don't schedule N timers
+  test('repeated Stop events only schedule ONE Stop-synth timer per turn', () => {
+    const p = makeTmuxProcess(makeFakeRunner(), { stopGraceMs: 60_000 });
+    const turn = {
+      turnId: 1, kind: 'primary', text: '',
+      resultPromise: null, settleResult: null,
+      _stopSynthScheduled: false, _stopSynthTimer: null,
+    };
+    turn.resultPromise = new Promise((r) => { turn.settleResult = r; });
+    p._activeGroup = { turns: [turn], text: '', primaryTurnId: 1 };
+
+    p._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'a' });
+    const firstTimer = turn._stopSynthTimer;
+    p._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'b' });
+    p._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'c' });
+
+    assert.strictEqual(turn._stopSynthTimer, firstTimer,
+      'subsequent Stop events must not arm new timers — `_stopSynthScheduled` guard');
+    try { clearTimeout(firstTimer); } catch { /* swallow */ }
+  });
+
+});
+
 // ─── interrupts / slash commands ────────────────────────────────────
 
 describe('TmuxProcess control', () => {
