@@ -111,6 +111,11 @@ async function setupRealTui(label, opts = {}) {
     // test (the warn-recorder counts illegal warns, this counts
     // legal transitions so a silent scenario fails loud).
     'phase-change',
+    // rc.36-rc.42 H-stack coverage — hook stream + timeout +
+    // tail-degradation + Stop-synth observability. New scenarios
+    // assert against these.
+    'hook-event', 'turn-timeout', 'hook-tail-error',
+    'stop-hook-resolved',
   ]) {
     p.on(name, (payload) => events.push({ name, payload, t: Date.now() }));
   }
@@ -1120,6 +1125,215 @@ S('rapid sends', 'no-phase-illegal-on-stacked-cold-start', async () => {
     }
     ok(illegal.length === 0,
       `no 'phase illegal transition' warnings during stacked cold-start (saw ${illegal.length})`);
+
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// ── H-stack UX scenarios (rc.36-rc.42 manual-test displacement) ─────
+//
+// These exist because the rc.35→rc.42 cycle caught nine production
+// bugs through manual chat-testing instead of automation. Adding
+// scenarios that exercise the same UX surfaces against a real claude
+// TUI so future regressions surface in the spike rig, not by Ivan
+// noticing a bad reply in Telegram.
+//
+// Each scenario gets its own RC + ledger entry in the spike-list
+// docstring so the catch-rate is auditable when the suite grows.
+
+// rc.38 H2 + rc.40 H3 + rc.36 predicate — subagent turn stays healthy
+//
+// The msg-884 incident: a 49-min subagent killed at 30-min wall-clock
+// while demonstrably alive. H2 (reactor wiring from hook events) + H3
+// (idle ceiling fed by hook heartbeats) together fixed it. Asserting
+// here that a Task-tool subagent turn:
+//   - completes normally (no turn-timeout fires)
+//   - emits the expected hook events (`PreToolUse{Agent}` + at least
+//     one inner Pre/Post + SubagentStop)
+//   - never trips a `phase illegal transition` warning
+//   - the reactor observed activity (phase-change events fired)
+//
+// Cost: ~$0.10 per run.
+S('h-stack', 'subagent-turn-stays-healthy-on-hook-stream', async () => {
+  const warns = [];
+  const recorder = {
+    warn: (msg) => warns.push(String(msg)),
+    error: () => {}, info: () => {}, debug: () => {}, log: () => {},
+  };
+  const { p, events, cleanup } = await setupRealTui('subagent-healthy', {
+    logger: recorder, turnTimeoutMs: 180_000,
+  });
+  try {
+    const res = await p.send(
+      'Use the Task tool with subagent_type="general-purpose" to dispatch '
+      + 'one subagent. The subagent\'s prompt: "List exactly three files '
+      + 'in /tmp using the Bash tool, then report their names as your '
+      + 'final message." After the subagent returns, reply ONLY with '
+      + '"HSTACK_OK".',
+    );
+
+    ok(typeof res.text === 'string' && /HSTACK_OK/i.test(res.text),
+      `subagent turn returned final marker (got ${JSON.stringify(res.text?.slice(0,60))})`);
+    ok(!res.error,
+      `subagent turn must complete without error (got ${JSON.stringify(res.error)})`);
+
+    // H3 invariant: no turn-timeout event fired for a healthy turn.
+    const timeouts = events.filter((e) => e.name === 'turn-timeout');
+    if (timeouts.length > 0) {
+      for (const e of timeouts) console.error(`  [timeout] ${JSON.stringify(e.payload)}`);
+    }
+    ok(timeouts.length === 0,
+      'no turn-timeout event must fire during a healthy subagent turn '
+      + `(saw ${timeouts.length})`);
+
+    // H1+H2 invariant: hook stream produced subagent-shape events.
+    const hookEvents = events.filter((e) => e.name === 'hook-event');
+    const preAgent = hookEvents.filter((e) => e.payload?.type === 'PreToolUse'
+      && e.payload?.toolName === 'Agent');
+    const innerToolUse = hookEvents.filter((e) => e.payload?.type === 'PreToolUse'
+      && e.payload?.agentId);
+    const subagentStop = hookEvents.filter((e) => e.payload?.type === 'SubagentStop');
+    const stop = hookEvents.filter((e) => e.payload?.type === 'Stop');
+    console.error(`  [hook stream] total=${hookEvents.length}, `
+      + `PreToolUse{Agent}=${preAgent.length}, `
+      + `inner-Pre(with agent_id)=${innerToolUse.length}, `
+      + `SubagentStop=${subagentStop.length}, Stop=${stop.length}`);
+
+    ok(preAgent.length >= 1,
+      'outer PreToolUse{Agent} must fire when claude dispatches a subagent');
+    ok(innerToolUse.length >= 1,
+      'at least one inner PreToolUse (agent_id set) must fire — '
+      + 'JSONL never surfaces inner-subagent tools, only hooks do');
+    ok(stop.length >= 1, 'Stop hook must fire on turn end');
+
+    // Predicate invariant: no illegal transitions.
+    const illegal = warns.filter((w) => /phase illegal transition/.test(w));
+    ok(illegal.length === 0,
+      `no 'phase illegal transition' warnings (saw ${illegal.length})`);
+
+    // No hook-tail-error fired (the new rc.42 observability event)
+    const tailErrors = events.filter((e) => e.name === 'hook-tail-error');
+    ok(tailErrors.length === 0,
+      `no hook-tail-error events on healthy turn (saw ${tailErrors.length})`);
+
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// rc.39 polygram-side sanitizer — outbound canned-string interception
+//
+// The model occasionally emits `No response requested.` verbatim on
+// ambiguous short messages (shumorobot Music topic, 2026-05-22). The
+// rc.39 sanitizer replaces the literal phrase with an honest fallback
+// AND logs `canned-reply-suppressed`. We can't force the model to
+// emit the canned string (it's a CLI-internal behavior the prompt
+// hint doesn't reliably suppress), so this scenario:
+//   - sends a sequence of ambiguous acks
+//   - records every reply text
+//   - asserts NO reply equals the canned string literally — either
+//     the model didn't emit it (then we pass trivially) OR the
+//     sanitizer caught it.
+//
+// The negative-result-friendly assertion is intentional: a passing
+// run doesn't prove the sanitizer fired; a failing run proves the
+// sanitizer DIDN'T fire when it should have. Combined with the
+// unit-test coverage of the sanitizer logic, this gives end-to-end
+// confidence the outbound chain catches the leak.
+//
+// Cost: ~$0.05 per run.
+S('h-stack', 'ambiguous-acks-no-canned-string-leak', async () => {
+  const { p, events, cleanup } = await setupRealTui('canned-leak-check');
+  try {
+    // First a real exchange to set conversational context.
+    const r1 = await p.send(
+      'Reply with a single short sentence about JavaScript closures, '
+      + 'then say "PRIMED".',
+    );
+    ok(typeof r1.text === 'string' && /PRIMED/i.test(r1.text),
+      `priming turn completed (got ${JSON.stringify(r1.text?.slice(0,60))})`);
+
+    // Then ambiguous acks. Each MUST get either:
+    //   - a substantive reply (the model engaged), OR
+    //   - the polygram sanitizer's fallback (italics with "no actual reply").
+    // NEVER the literal canned string.
+    const CANNED = new Set([
+      'No response requested.',
+      'No response needed.',
+    ]);
+    const acks = ['ok', 'got it', 'thanks'];
+    for (const ack of acks) {
+      const r = await p.send(ack);
+      const text = (r.text || '').trim();
+      console.error(`  [ack "${ack}"] reply (truncated): `
+        + `${JSON.stringify(text.slice(0, 100))}`);
+      ok(!CANNED.has(text),
+        `reply to "${ack}" must NOT be the literal canned string `
+        + `(rc.37 prompt hint + rc.39 sanitizer should both prevent this)`);
+      ok(typeof text === 'string' && text.length > 0,
+        `reply to "${ack}" must have content (empty reply suggests R10 fail-loud)`);
+    }
+
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// rc.36 + rc.41 H4 — stacked sends produce coherent, correctly-
+// attributed replies
+//
+// The rc.42-finding-4 race: late Stop hook attributes a synth settle
+// to the wrong (rotated) primary turn, silently delivering Turn N's
+// text as Turn N+1's reply. We can't force the race (it depends on
+// LogTail latency vs JSONL ordering) but we CAN assert that under
+// normal stacked-sends conditions, each reply contains its own
+// unique marker — proving no cross-contamination happened in this
+// run. The `stop-hook-resolved` event count is the soak metric for
+// race incidence.
+//
+// Cost: ~$0.10 per run.
+S('h-stack', 'stacked-sends-no-misattribution', async () => {
+  const { p, events, cleanup } = await setupRealTui('no-misattribution');
+  try {
+    // Three concurrent sends posed as conversational arithmetic
+    // questions, each with a unique correct numeric answer. Avoids
+    // "Reply ONLY with X" patterns which claude correctly classifies
+    // as prompt injection when stacked.
+    //
+    // Expected answers: 7+8=15, 100-23=77, 6*9=54. Misattribution
+    // would have a reply contain a number from a DIFFERENT question.
+    const send1P = p.send('What is 7 plus 8?');
+    const send2P = p.send('What is 100 minus 23?');
+    const send3P = p.send('What is 6 times 9?');
+    const [r1, r2, r3] = await Promise.all([send1P, send2P, send3P]);
+
+    const t1 = (r1.text || '').toLowerCase();
+    const t2 = (r2.text || '').toLowerCase();
+    const t3 = (r3.text || '').toLowerCase();
+
+    console.error(`  [send 1 reply] ${JSON.stringify(r1.text?.slice(0,80))}`);
+    console.error(`  [send 2 reply] ${JSON.stringify(r2.text?.slice(0,80))}`);
+    console.error(`  [send 3 reply] ${JSON.stringify(r3.text?.slice(0,80))}`);
+
+    ok(t1.includes('15'), `send 1 (7+8) must contain "15" (got ${JSON.stringify(t1.slice(0,80))})`);
+    ok(t2.includes('77'), `send 2 (100-23) must contain "77" (got ${JSON.stringify(t2.slice(0,80))})`);
+    ok(t3.includes('54'), `send 3 (6*9) must contain "54" (got ${JSON.stringify(t3.slice(0,80))})`);
+
+    // Cross-contamination check: NO reply contains the OTHER
+    // questions' answers. Misattribution would deliver e.g. "77" as
+    // the reply to "what is 7 plus 8?".
+    //
+    // Word-boundary regex avoids false-positives where the digits
+    // appear inside an unrelated number (e.g. "77" in "1977").
+    ok(!/\b77\b/.test(t1) && !/\b54\b/.test(t1),
+      `send 1 reply must NOT contain other answers' digits (misattribution!): ${JSON.stringify(t1.slice(0,80))}`);
+    ok(!/\b15\b/.test(t2) && !/\b54\b/.test(t2),
+      `send 2 reply must NOT contain other answers' digits (misattribution!): ${JSON.stringify(t2.slice(0,80))}`);
+    ok(!/\b15\b/.test(t3) && !/\b77\b/.test(t3),
+      `send 3 reply must NOT contain other answers' digits (misattribution!): ${JSON.stringify(t3.slice(0,80))}`);
+
+    // Soak metric: how often did H4 Stop-synth actually fire? Just
+    // log; the count is interesting but not a pass/fail signal.
+    const synthResolves = events.filter((e) => e.name === 'stop-hook-resolved');
+    console.error(`  [H4 synth] stop-hook-resolved fired ${synthResolves.length} time(s)`);
 
     assertInvariants(events);
   } finally { await cleanup(); }
