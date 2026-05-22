@@ -969,6 +969,135 @@ describe('TmuxProcess.send', () => {
   });
 });
 
+// ─── H3: idle ceiling + hard backstop replace W1 absolute deadline ──
+//
+// rc.40: the old W1 was an absolute setTimeout that killed any turn
+// running longer than turnTimeoutMs, regardless of whether the turn
+// was making progress. The msg-884 incident (49-min SoundCloud
+// subagent killed at 30 min while demonstrably alive) was the
+// motivating fail. H3 inverts: `turnTimeoutMs` is now the IDLE
+// ceiling — a turn is wedged only if NO activity (JSONL events,
+// capture-pane stream signals, OR hook events) for that long. A
+// healthy long subagent firing hooks every few seconds never trips.
+// A separate `hardBackstopMs` (default 4h) is the absolute backstop
+// against pathological infinite tool loops.
+
+describe('TmuxProcess — H3 idle ceiling + hard backstop', () => {
+  // Helper: wedge captures so only the timeout racer can fire.
+  function makeWedgedRunner() {
+    let captures = 0;
+    return makeFakeRunner({
+      captureWide: async () => {
+        captures += 1;
+        // First 3 captures complete the ready-check; subsequent ones
+        // wedge so capture-pane quiescence can never settle the turn.
+        if (captures <= 3) return '? for shortcuts';
+        return new Promise(() => {});
+      },
+    });
+  }
+
+  test('hook events heartbeat the active group turns (predicate liveness)', () => {
+    // Direct unit-level invocation — no start() needed. Tests just
+    // the _handleHookEvent → _heartbeat link.
+    const p = makeTmuxProcess(makeFakeRunner());
+    const fakeTurn = { lastActivityAt: 0, phase: 'streaming', turnId: 1 };
+    p._activeGroup = { turns: [fakeTurn], text: '', primaryTurnId: 1 };
+    const before = fakeTurn.lastActivityAt;
+    p._handleHookEvent({ type: 'PreToolUse', toolName: 'Bash' });
+    assert.ok(fakeTurn.lastActivityAt > before,
+      'hook event must heartbeat the active turn');
+    // parse-error and unknown explicitly do NOT heartbeat — they're
+    // diagnostic-only and shouldn't keep a wedged turn alive.
+    fakeTurn.lastActivityAt = 0;
+    p._handleHookEvent({ type: 'parse-error', error: 'x', raw: '...' });
+    assert.equal(fakeTurn.lastActivityAt, 0,
+      'parse-error must NOT heartbeat — it is diagnostic noise, not liveness');
+    p._handleHookEvent({ type: 'unknown', raw: {} });
+    assert.equal(fakeTurn.lastActivityAt, 0,
+      'unknown event must NOT heartbeat either');
+  });
+
+  test('idle-ceiling timeout fires when nothing heartbeats the turn', async () => {
+    // turnTimeoutMs=80 ms idle ceiling, hardBackstopMs=10 s so only
+    // the idle path can win. Capture wedged so quiesced can never
+    // settle. With the adaptive poll, detection should land inside
+    // ~250 ms.
+    const p = makeTmuxProcess(makeWedgedRunner(),
+      { turnTimeoutMs: 80, hardBackstopMs: 10_000, pollMs: 5 });
+    await p.start({ model: 'sonnet', effort: 'high' });
+    const settled = await Promise.race([
+      p.send('hello').then((r) => ({ kind: 'settled', r })),
+      new Promise((r) => setTimeout(() => r({ kind: 'hung' }), 2000)),
+    ]);
+    assert.equal(settled.kind, 'settled',
+      'idle-ceiling poller must fire even though capture-pane is wedged');
+    assert.ok(settled.r.error,
+      'idle-timed-out turn settles as an error');
+  });
+
+  test('continuous heartbeats keep the turn alive past turnTimeoutMs', async () => {
+    // turnTimeoutMs=300 ms. Inject a hook event every 25 ms — well
+    // inside the idle ceiling. Turn must NOT idle-timeout while
+    // heartbeats arrive. Stop heartbeating after 800 ms (≈2.5×
+    // the ceiling); turn THEN idle-times-out. Hard backstop is 10 s
+    // so it can't fire here.
+    const p = makeTmuxProcess(makeWedgedRunner(),
+      { turnTimeoutMs: 300, hardBackstopMs: 10_000, pollMs: 5 });
+    await p.start({ model: 'sonnet', effort: 'high' });
+    const sendP = p.send('hello');
+    let heartbeats = 0;
+    const heartbeatInterval = setInterval(() => {
+      heartbeats += 1;
+      p._handleHookEvent({ type: 'PostToolUse', toolName: 'Bash', toolUseId: 'x' });
+    }, 25);
+    setTimeout(() => clearInterval(heartbeatInterval), 800);
+    const result = await Promise.race([
+      sendP.then((r) => ({ kind: 'settled', r })),
+      new Promise((r) => setTimeout(() => r({ kind: 'hung' }), 3000)),
+    ]);
+    clearInterval(heartbeatInterval);
+    assert.equal(result.kind, 'settled',
+      'turn must eventually settle once heartbeats stop');
+    // 800 ms / 25 ms ≈ 32 expected, with generous lower bound to
+    // tolerate runtime jitter. The signal we care about is that the
+    // turn DID survive past turnTimeoutMs (300 ms) while heartbeats
+    // were active — so any heartbeats >> turnTimeoutMs/pollInterval
+    // proves the reset worked.
+    assert.ok(heartbeats >= 20,
+      `expected ≥20 heartbeats before the turn idle-timed-out, got ${heartbeats} — `
+      + 'if low, the idle poller fired DESPITE active heartbeats (H3 broken)');
+  });
+
+  test('hard-backstop fires even with continuous heartbeats', async () => {
+    // The pathological-infinite-tool-loop guard. turnTimeoutMs huge
+    // (10 s) so idle never fires; hardBackstopMs=150 ms; heartbeats
+    // every 25 ms. Turn MUST settle within ~500 ms via the backstop.
+    const p = makeTmuxProcess(makeWedgedRunner(),
+      { turnTimeoutMs: 10_000, hardBackstopMs: 150, pollMs: 5 });
+    await p.start({ model: 'sonnet', effort: 'high' });
+    const sendP = p.send('hello');
+    const heartbeatInterval = setInterval(() => {
+      p._handleHookEvent({ type: 'PostToolUse', toolName: 'Bash', toolUseId: 'y' });
+    }, 25);
+    const result = await Promise.race([
+      sendP.then((r) => ({ kind: 'settled', r })),
+      new Promise((r) => setTimeout(() => r({ kind: 'hung' }), 2000)),
+    ]);
+    clearInterval(heartbeatInterval);
+    assert.equal(result.kind, 'settled',
+      'hard-backstop must fire regardless of heartbeats');
+    assert.ok(result.r.error,
+      'backstop-timed-out turn settles as an error');
+  });
+
+  test('hardBackstopMs defaults to 4h (sanity — no production regression)', () => {
+    const p = makeTmuxProcess(makeFakeRunner());
+    assert.equal(p.hardBackstopMs, 4 * 60 * 60 * 1000,
+      'default hardBackstopMs must be 4h — generous beyond any single-turn legit runtime');
+  });
+});
+
 // ─── interrupts / slash commands ────────────────────────────────────
 
 describe('TmuxProcess control', () => {
