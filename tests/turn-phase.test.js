@@ -149,9 +149,32 @@ describe('turn-phase module — enum + helpers', () => {
     // Terminal phases are absorbing.
     assert.equal(isLegalTransition(TurnPhase.DONE, TurnPhase.STREAMING), false);
     assert.equal(isLegalTransition(TurnPhase.FAILED, TurnPhase.DONE), false);
-    // QUEUED can only go to PASTED_UNCONFIRMED or FAILED.
+    // QUEUED can advance to PASTED_UNCONFIRMED, PASTE_PARKED, or FAILED
+    // — see the QUEUED→PASTE_PARKED test below. Steady-running phases
+    // are NOT reachable directly from QUEUED.
     assert.equal(isLegalTransition(TurnPhase.QUEUED, TurnPhase.STREAMING), false);
     assert.equal(isLegalTransition(TurnPhase.QUEUED, TurnPhase.DONE), false);
+  });
+
+  // rc.35 production regression (2026-05-22): the predicate WARN
+  // `phase illegal transition: queued → paste-parked (reason
+  // jsonl:queue-operation:enqueue)` fired on every freshly-stacked
+  // Music message after a cold-start respawn. Root cause: when a
+  // paste arrives while claude TUI is still cold-starting (or busy
+  // with an in-flight turn), the JSONL emits `queue-operation:enqueue`
+  // BEFORE the corresponding `user-message`. The predicate's path
+  // for `queue-operation:enqueue` sets PASTE_PARKED directly, so the
+  // observed transition is `QUEUED → PASTE_PARKED` without ever
+  // passing through PASTED_UNCONFIRMED. This is a legitimate
+  // real-world flow (Commit 2 introduced PASTE_PARKED specifically
+  // for this enqueue-before-user-message ordering) — the predicate
+  // table just hadn't been updated to permit it. `_setPhase` applies
+  // the transition regardless of legality, so the bug manifested as
+  // log noise only until Commit 3 (rc.35) started consuming
+  // predicate fields more strictly.
+  test('isLegalTransition accepts QUEUED → PASTE_PARKED (cold-start enqueue)', () => {
+    assert.equal(isLegalTransition(TurnPhase.QUEUED, TurnPhase.PASTE_PARKED), true,
+      'queue-operation:enqueue can land before user-message when TUI is busy/cold-starting');
   });
 
   test('every phase has an entry in ALLOWED_TRANSITIONS', () => {
