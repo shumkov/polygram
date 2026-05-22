@@ -254,6 +254,131 @@ describe('onToolUse — classifies + maybe announces subagent', () => {
   });
 });
 
+// ── 0.10.0 H2 — hook events route to reactor ────────────────────────
+//
+// H2 extends `onHookEvent` (which was H1 observer-only DB persist) to
+// also call reactor.setState / reactor.heartbeat. The win is that
+// PreToolUse fires for subagent-inner tools (scoped by `agent_id`)
+// that JSONL `tool-use` never surfaces — keeps the reactor meaningful
+// on long subagent turns and kills the 🥱→😨→🤯 fear escalation.
+describe('onHookEvent — H2 reactor wiring', () => {
+  function makeRig() {
+    const h = baseDeps();
+    const states = [];
+    let heartbeats = 0;
+    const head = {
+      context: {
+        reactor: {
+          setState: (s) => states.push(s),
+          heartbeat: () => { heartbeats += 1; },
+        },
+      },
+    };
+    const entry = { pendingQueue: [head], chatId: '12345', label: 't' };
+    const cbs = createSdkCallbacks(h.deps);
+    return { h, cbs, entry, head, states, get heartbeats() { return heartbeats; } };
+  }
+
+  test('PreToolUse → reactor.setState(classifyToolName(toolName))', () => {
+    const r = makeRig();
+    r.cbs.onHookEvent('k', { type: 'PreToolUse', toolName: 'Bash' }, r.entry);
+    assert.deepEqual(r.states, ['state-for-Bash']);
+  });
+
+  test('PreToolUse for subagent-inner tool still routes (agent_id present)', () => {
+    // The whole point of H2: JSONL `tool-use` never fires for tools
+    // inside a Task subagent — but hook `PreToolUse` does, scoped by
+    // `agent_id`. The reactor doesn't care WHO ran the tool, only
+    // WHAT — so the setState fires the same way for inner tools.
+    const r = makeRig();
+    r.cbs.onHookEvent('k', {
+      type: 'PreToolUse',
+      toolName: 'WebFetch',
+      agentId: 'a-1', agentType: 'general-purpose',
+    }, r.entry);
+    assert.deepEqual(r.states, ['state-for-WebFetch']);
+  });
+
+  test('PreToolUse with no toolName is a no-op (defensive)', () => {
+    const r = makeRig();
+    r.cbs.onHookEvent('k', { type: 'PreToolUse' }, r.entry);
+    assert.deepEqual(r.states, []);
+  });
+
+  test('PostToolUse → reactor.heartbeat', () => {
+    const r = makeRig();
+    r.cbs.onHookEvent('k', { type: 'PostToolUse', toolName: 'Bash', toolUseId: 'x' }, r.entry);
+    assert.equal(r.heartbeats, 1);
+    assert.deepEqual(r.states, []);
+  });
+
+  test('SubagentStop → reactor.heartbeat', () => {
+    const r = makeRig();
+    r.cbs.onHookEvent('k', { type: 'SubagentStop', agentId: 'a-1' }, r.entry);
+    assert.equal(r.heartbeats, 1);
+  });
+
+  test('Notification → reactor.heartbeat', () => {
+    const r = makeRig();
+    r.cbs.onHookEvent('k', { type: 'Notification' }, r.entry);
+    assert.equal(r.heartbeats, 1);
+  });
+
+  test('UserPromptSubmit + Stop are intentionally NO-OPs (lifecycle owns those)', () => {
+    const r = makeRig();
+    r.cbs.onHookEvent('k', { type: 'UserPromptSubmit', prompt: 'hi' }, r.entry);
+    r.cbs.onHookEvent('k', { type: 'Stop', lastAssistantMessage: 'done' }, r.entry);
+    assert.deepEqual(r.states, []);
+    assert.equal(r.heartbeats, 0);
+  });
+
+  test('unknown / parse-error don\'t touch the reactor', () => {
+    const r = makeRig();
+    r.cbs.onHookEvent('k', { type: 'unknown', raw: { x: 1 } }, r.entry);
+    r.cbs.onHookEvent('k', { type: 'parse-error', error: 'bad', raw: '...' }, r.entry);
+    assert.deepEqual(r.states, []);
+    assert.equal(r.heartbeats, 0);
+  });
+
+  test('skips silently when there is no head pending (between turns)', () => {
+    const r = makeRig();
+    // No throw — and the DB persist (H1 side) still happens.
+    assert.doesNotThrow(() => {
+      r.cbs.onHookEvent('k', { type: 'PreToolUse', toolName: 'Bash' },
+        { pendingQueue: [] });
+    });
+    const persisted = r.h.events.filter((e) => e.kind === 'hook-event');
+    assert.equal(persisted.length, 1, 'H1 persist still runs even when reactor is absent');
+  });
+
+  test('skips silently when reactor is absent on the head context', () => {
+    const r = makeRig();
+    assert.doesNotThrow(() => {
+      r.cbs.onHookEvent('k', { type: 'PostToolUse', toolName: 'Bash' },
+        { pendingQueue: [{ context: {} }] });
+    });
+  });
+
+  test('reactor.heartbeat being non-function is tolerated (older reactor)', () => {
+    const h = baseDeps();
+    const head = { context: { reactor: { setState: () => {} } } };  // no heartbeat
+    const cbs = createSdkCallbacks(h.deps);
+    assert.doesNotThrow(() => {
+      cbs.onHookEvent('k', { type: 'PostToolUse', toolName: 'Bash' },
+        { pendingQueue: [head] });
+    });
+  });
+
+  test('H1 DB persist still runs when H2 routes to reactor (augment, not replace)', () => {
+    const r = makeRig();
+    r.cbs.onHookEvent('k', { type: 'PreToolUse', toolName: 'Bash' }, r.entry);
+    const persisted = r.h.events.filter((e) => e.kind === 'hook-event');
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0].detail.hook_type, 'PreToolUse');
+    assert.equal(persisted[0].detail.tool_name, 'Bash');
+  });
+});
+
 describe('onAssistantMessageStart — fresh bubble + heartbeat', () => {
   test('calls streamer.forceNewMessage', () => {
     const h = baseDeps();
