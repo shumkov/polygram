@@ -51,6 +51,36 @@ describe('POLYGRAM_DISPLAY_HINT — content', () => {
     assert.match(POLYGRAM_DISPLAY_HINT, /desktop/i);
   });
 
+  // rc.37 hardening (2026-05-22): the model leaked the CLI-context
+  // canned string `No response requested.` as an actual Telegram
+  // reply on ambiguous short user messages ("okay", "ok") — seen
+  // twice in the shumorobot Music topic. The rc.0 hint never named
+  // it, so the model treated the phrase as legitimate output when its
+  // reasoning short-circuited to "no response needed". Mirror the
+  // table rule's discipline: explicit imperative + verbatim phrase
+  // + a positive instruction for the trigger case.
+  test('forbids `No response requested.` verbatim (rc.37 canned-string leak)', () => {
+    assert.match(POLYGRAM_DISPLAY_HINT, /No response requested\./);
+  });
+
+  test('forbids `No response needed.` verbatim (close adjacent vector)', () => {
+    assert.match(POLYGRAM_DISPLAY_HINT, /No response needed\./);
+  });
+
+  test('uses imperative NEVER (not descriptive guidance) for canned-strings rule', () => {
+    // Same lesson as the table rule (rc.53) — descriptive wording got
+    // ignored on long agent prompts. NEVER is binding to the model.
+    assert.match(POLYGRAM_DISPLAY_HINT, /NEVER emit/);
+  });
+
+  test('gives the positive instruction for ambiguous short messages', () => {
+    // The rule must say what to do INSTEAD — otherwise the model has
+    // a forbidden output and no replacement, and may default to
+    // something equally bad.
+    assert.match(POLYGRAM_DISPLAY_HINT, /clarifying question/i);
+    assert.match(POLYGRAM_DISPLAY_HINT, /okay|got it|ack/i);
+  });
+
   test('TELEGRAM_TABLE_WIDTH_BUDGET is a positive integer', () => {
     assert.ok(Number.isInteger(TELEGRAM_TABLE_WIDTH_BUDGET));
     assert.ok(TELEGRAM_TABLE_WIDTH_BUDGET > 0);
