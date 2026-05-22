@@ -1039,34 +1039,38 @@ describe('TmuxProcess — H3 idle ceiling + hard backstop', () => {
   test('continuous heartbeats keep the turn alive past turnTimeoutMs', async () => {
     // turnTimeoutMs=300 ms. Inject a hook event every 25 ms — well
     // inside the idle ceiling. Turn must NOT idle-timeout while
-    // heartbeats arrive. Stop heartbeating after 800 ms (≈2.5×
-    // the ceiling); turn THEN idle-times-out. Hard backstop is 10 s
-    // so it can't fire here.
+    // heartbeats arrive. Stop heartbeating after 800 ms; turn THEN
+    // idle-times-out at ~800+300 = ~1100 ms. Hard backstop is 10 s.
+    const turnTimeoutMs = 300;
+    const heartbeatWindowMs = 800;
     const p = makeTmuxProcess(makeWedgedRunner(),
-      { turnTimeoutMs: 300, hardBackstopMs: 10_000, pollMs: 5 });
+      { turnTimeoutMs, hardBackstopMs: 10_000, pollMs: 5 });
     await p.start({ model: 'sonnet', effort: 'high' });
+    const startedAt = Date.now();
     const sendP = p.send('hello');
-    let heartbeats = 0;
     const heartbeatInterval = setInterval(() => {
-      heartbeats += 1;
       p._handleHookEvent({ type: 'PostToolUse', toolName: 'Bash', toolUseId: 'x' });
     }, 25);
-    setTimeout(() => clearInterval(heartbeatInterval), 800);
+    setTimeout(() => clearInterval(heartbeatInterval), heartbeatWindowMs);
     const result = await Promise.race([
       sendP.then((r) => ({ kind: 'settled', r })),
       new Promise((r) => setTimeout(() => r({ kind: 'hung' }), 3000)),
     ]);
     clearInterval(heartbeatInterval);
+    const durationMs = Date.now() - startedAt;
     assert.equal(result.kind, 'settled',
       'turn must eventually settle once heartbeats stop');
-    // 800 ms / 25 ms ≈ 32 expected, with generous lower bound to
-    // tolerate runtime jitter. The signal we care about is that the
-    // turn DID survive past turnTimeoutMs (300 ms) while heartbeats
-    // were active — so any heartbeats >> turnTimeoutMs/pollInterval
-    // proves the reset worked.
-    assert.ok(heartbeats >= 20,
-      `expected ≥20 heartbeats before the turn idle-timed-out, got ${heartbeats} — `
-      + 'if low, the idle poller fired DESPITE active heartbeats (H3 broken)');
+    // The load-bearing assertion: the turn outlived turnTimeoutMs
+    // because heartbeats kept resetting the idle clock. Without
+    // heartbeats it would idle-timeout in ~300 ms; with continuous
+    // heartbeats for `heartbeatWindowMs` it survives at least that
+    // long. Generous floor (heartbeatWindowMs - 50ms slack) to
+    // tolerate event-loop jitter on the heartbeat setInterval.
+    assert.ok(
+      durationMs >= heartbeatWindowMs - 50,
+      `turn settled at ${durationMs} ms but heartbeats ran for ${heartbeatWindowMs} ms — `
+      + 'the idle poller fired DESPITE active heartbeats (H3 broken)',
+    );
   });
 
   test('hard-backstop fires even with continuous heartbeats', async () => {
@@ -1095,6 +1099,150 @@ describe('TmuxProcess — H3 idle ceiling + hard backstop', () => {
     const p = makeTmuxProcess(makeFakeRunner());
     assert.equal(p.hardBackstopMs, 4 * 60 * 60 * 1000,
       'default hardBackstopMs must be 4h — generous beyond any single-turn legit runtime');
+  });
+});
+
+// ─── H4: Stop hook as authoritative turn-done signal ────────────────
+//
+// rc.41: Stop hook fires when claude finishes responding — same
+// semantic as the JSONL `result` event. H4 synthesizes a settle
+// from Stop after a small grace, so if JSONL `result` never arrives
+// (broken stream, stuck parser) the turn isn't stranded. JSONL wins
+// when both fire because Promise resolve is idempotent.
+
+describe('TmuxProcess — H4 Stop hook as authoritative completion', () => {
+  test('Stop hook fires settleResult after the grace if JSONL never arrives', async () => {
+    const p = makeTmuxProcess(makeFakeRunner(), { stopGraceMs: 50 });
+    // Build a primary turn with the same shape _runTurn would:
+    // resultPromise + settleResult bound, kind='primary', text=''.
+    let settledWith = null;
+    const turn = {
+      kind: 'primary', turnId: 1, text: '',
+      lastActivityAt: 0,
+      resultPromise: null, settleResult: null,
+    };
+    turn.resultPromise = new Promise((resolve) => {
+      turn.settleResult = (ev) => { settledWith = ev; resolve(ev); };
+    });
+    p._activeGroup = { turns: [turn], text: '', primaryTurnId: 1 };
+
+    p._handleHookEvent({
+      type: 'Stop',
+      stopHookActive: false,
+      lastAssistantMessage: 'done from stop hook',
+    });
+
+    // JSONL never fires. After the grace, the synth settle lands.
+    const result = await Promise.race([
+      turn.resultPromise,
+      new Promise((r) => setTimeout(() => r('hung'), 500)),
+    ]);
+    assert.notEqual(result, 'hung', 'Stop hook synth settle must fire after grace');
+    assert.equal(settledWith.text, 'done from stop hook');
+    assert.equal(settledWith.subtype, 'success');
+    assert.equal(settledWith.stopReason, 'stop_hook');
+    assert.equal(settledWith.via, 'stop-hook');
+  });
+
+  test('JSONL settles first → Stop synth becomes a no-op (idempotent)', async () => {
+    const p = makeTmuxProcess(makeFakeRunner(), { stopGraceMs: 100 });
+    let settledWith = null;
+    const turn = {
+      kind: 'primary', turnId: 1, text: 'streamed text',
+      lastActivityAt: 0,
+      resultPromise: null, settleResult: null,
+    };
+    turn.resultPromise = new Promise((resolve) => {
+      turn.settleResult = (ev) => {
+        // Only the FIRST settle wins. Subsequent calls must no-op.
+        if (settledWith) return;
+        settledWith = ev;
+        resolve(ev);
+      };
+    });
+    p._activeGroup = { turns: [turn], text: '', primaryTurnId: 1 };
+
+    p._handleHookEvent({
+      type: 'Stop',
+      lastAssistantMessage: 'hook-text',
+    });
+    // JSONL fires BEFORE the Stop grace expires — full result event.
+    setTimeout(() => {
+      turn.settleResult({
+        text: 'streamed text', subtype: 'success', stopReason: 'end_turn',
+        // No `via` field — that's the marker that this came from JSONL.
+      });
+    }, 30);
+
+    await turn.resultPromise;
+    // Wait past the Stop grace so the synth timer has a chance to fire.
+    await new Promise((r) => setTimeout(r, 150));
+
+    assert.equal(settledWith.stopReason, 'end_turn',
+      'JSONL result must win; Stop synth (`stop_hook`) must not overwrite');
+    assert.equal(settledWith.via, undefined,
+      'no `via:stop-hook` marker — JSONL settled first');
+  });
+
+  test('Stop hook with no primary turn in the active group is a no-op', () => {
+    // Stop firing between turns (between settled primary and next
+    // pending) must not throw / not try to settle a non-existent
+    // turn.
+    const p = makeTmuxProcess(makeFakeRunner());
+    p._activeGroup = { turns: [], text: '', primaryTurnId: null };
+    assert.doesNotThrow(() => {
+      p._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'done' });
+    });
+  });
+
+  test('Stop hook prefers turn.text over lastAssistantMessage when present', async () => {
+    // Streaming-fed `turn.text` should win in the synth — it carries
+    // polygram-side accumulation that may differ from claude's
+    // snapshot (formatting, partial-chunk handling). Stop's
+    // lastAssistantMessage is the fallback.
+    const p = makeTmuxProcess(makeFakeRunner(), { stopGraceMs: 30 });
+    const turn = {
+      kind: 'primary', turnId: 1, text: 'from streaming',
+      lastActivityAt: 0,
+      resultPromise: null, settleResult: null,
+    };
+    turn.resultPromise = new Promise((resolve) => {
+      turn.settleResult = (ev) => resolve(ev);
+    });
+    p._activeGroup = { turns: [turn], text: '', primaryTurnId: 1 };
+    p._handleHookEvent({
+      type: 'Stop', lastAssistantMessage: 'from hook snapshot',
+    });
+    const settled = await turn.resultPromise;
+    assert.equal(settled.text, 'from streaming',
+      'turn.text wins when present');
+  });
+
+  test('Stop hook falls back to lastAssistantMessage when turn.text is empty', async () => {
+    // Production case: a broken JSONL stream means no
+    // `assistant-chunk` events landed, so turn.text is empty. Stop's
+    // `last_assistant_message` is the only text available.
+    const p = makeTmuxProcess(makeFakeRunner(), { stopGraceMs: 30 });
+    const turn = {
+      kind: 'primary', turnId: 1, text: '',
+      lastActivityAt: 0,
+      resultPromise: null, settleResult: null,
+    };
+    turn.resultPromise = new Promise((resolve) => {
+      turn.settleResult = (ev) => resolve(ev);
+    });
+    p._activeGroup = { turns: [turn], text: '', primaryTurnId: 1 };
+    p._handleHookEvent({
+      type: 'Stop', lastAssistantMessage: 'rescued by stop hook',
+    });
+    const settled = await turn.resultPromise;
+    assert.equal(settled.text, 'rescued by stop hook',
+      'lastAssistantMessage fallback when turn.text is empty');
+  });
+
+  test('stopGraceMs defaults to 2000 ms (sanity)', () => {
+    const p = makeTmuxProcess(makeFakeRunner());
+    assert.equal(p.stopGraceMs, 2000);
   });
 });
 
