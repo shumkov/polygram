@@ -88,7 +88,11 @@ async function setupRealTui(label, opts = {}) {
     label: `spike-${label}`,
     runner,
     botName: 'spike',
-    logger: SILENT,
+    // Scenarios that need to assert on logger output (e.g. the
+    // rc.35 `phase illegal transition` regression) pass an
+    // `opts.logger` recorder. Default stays SILENT so existing
+    // scenarios get the same noise-free output as before.
+    logger: opts.logger ?? SILENT,
     // B6: a slow custom-agent spawn (MCP servers loading) can take
     // well over a minute. Allow callers to widen the readiness budget
     // so a slow-startup scenario is not capped by the 60 s default.
@@ -102,6 +106,11 @@ async function setupRealTui(label, opts = {}) {
     'autosteer-resolution', 'autosteer-match-miss',
     'autonomous-assistant-message', 'inject-user-message',
     'result', 'tool-use', 'subagent-wait',
+    // rc.35 regression coverage — `phase-change` lets a scenario
+    // verify the predicate observed the transition pattern under
+    // test (the warn-recorder counts illegal warns, this counts
+    // legal transitions so a silent scenario fails loud).
+    'phase-change',
   ]) {
     p.on(name, (payload) => events.push({ name, payload, t: Date.now() }));
   }
@@ -1023,6 +1032,95 @@ S('rapid sends', 'three-sends-no-await', async () => {
     ok(/QQ1/i.test(r1.text || ''), `send 1 → QQ1 (got ${JSON.stringify(r1.text?.slice(0,40))})`);
     ok(/QQ2/i.test(r2.text || ''), `send 2 → QQ2 (got ${JSON.stringify(r2.text?.slice(0,40))})`);
     ok(/QQ3/i.test(r3.text || ''), `send 3 → QQ3 (got ${JSON.stringify(r3.text?.slice(0,40))})`);
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// ── rc.35 regression: QUEUED → PASTE_PARKED predicate transition ────
+//
+// Production trace (2026-05-22): post-restart on rc.35, Music topic
+// stacked 4 messages. Each one after the first fired
+// `phase illegal transition: queued → paste-parked (reason
+// jsonl:queue-operation:enqueue)` because `ALLOWED_TRANSITIONS[QUEUED]`
+// didn't include `PASTE_PARKED`. Latent since Commit 2 introduced
+// the PASTE_PARKED state — but `_setPhase` applies transitions even
+// when illegal (observer-only Commit 1 spec) so the bug was log
+// noise only until Commit 3 made predicate fields load-bearing.
+//
+// `three-sends-no-await` above exercises the same paste-while-busy
+// pattern but doesn't watch the WARN channel — `setupRealTui`
+// hard-coded `logger: SILENT`. This scenario passes a recorder
+// logger and asserts the warning never fires.
+S('rapid sends', 'no-phase-illegal-on-stacked-cold-start', async () => {
+  const warns = [];
+  const recorder = {
+    warn: (msg) => warns.push(String(msg)),
+    error: () => {}, info: () => {}, debug: () => {}, log: () => {},
+  };
+  const { p, events, cleanup } = await setupRealTui('no-illegal-trans', {
+    logger: recorder,
+  });
+  try {
+    // Reproducing the production ordering: turn 1 must be slow enough
+    // that pastes 2 + 3 land in the TUI's NATIVE queue while turn 1's
+    // user-message is still in flight. The JSONL then emits
+    // `queue-operation:enqueue` for them BEFORE their `user-message`,
+    // which the predicate translates to `QUEUED → PASTE_PARKED`.
+    // Sonnet/low + short prompts is too fast — turn 1 confirms its
+    // user-message before paste 2 even arrives. A heavier first
+    // prompt + a 200 ms gap between sends 1 and 2 forces the
+    // ordering window. (The 200 ms is empirical — small enough not
+    // to mask the bug, large enough that paste 1 reliably lands at
+    // the TUI before pastes 2/3 stack behind it.)
+    // Force turn 1 into a guaranteed >5 s in-flight window by making
+    // it call Bash with a sleep — that holds the TUI busy long enough
+    // for pastes 2 and 3 to provably arrive while turn 1 is mid-tool.
+    // Without a guaranteed slow turn 1, sonnet text-only responses
+    // complete before the next paste can stack via `queue-operation:
+    // enqueue`. (Music topic in production used opus + custom agent;
+    // we don't have the plugin locally, so Bash-sleep is the
+    // deterministic substitute.)
+    const send1P = p.send(
+      'Use the Bash tool to run `sleep 6 && echo SLEPT`. After Bash '
+      + 'returns, reply ONLY with "STK1".',
+    );
+    await sleep(300);
+    const send2P = p.send('Reply ONLY with "STK2".');
+    const send3P = p.send('Reply ONLY with "STK3".');
+    const [r1, r2, r3] = await Promise.all([send1P, send2P, send3P]);
+
+    ok(typeof r1.text === 'string', `send 1 resolved (got ${JSON.stringify(r1.text?.slice(0,40))})`);
+    ok(typeof r2.text === 'string', `send 2 resolved (got ${JSON.stringify(r2.text?.slice(0,40))})`);
+    ok(typeof r3.text === 'string', `send 3 resolved (got ${JSON.stringify(r3.text?.slice(0,40))})`);
+
+    // Diagnostic: log every observed transition + count QUEUED →
+    // PASTE_PARKED firings. The scenario PASSES whether or not the
+    // transition fired — the assert below only fails on the actual
+    // bug (illegal-transition warning). Reproducing the production
+    // ordering window reliably needs the real Music topic
+    // conditions (cold-start + opus + custom-agent), which we
+    // can't fully stage here. When the transition DID fire we get
+    // strong e2e evidence; when it didn't, the unit test
+    // (tests/turn-phase.test.js — `accepts QUEUED → PASTE_PARKED`)
+    // remains the authoritative red→green proof.
+    const phaseChanges = events.filter((e) => e.name === 'phase-change');
+    const qpp = phaseChanges.filter(
+      (e) => e.payload?.prev === 'queued' && e.payload?.next === 'paste-parked');
+    console.error(`  [observed ${phaseChanges.length} phase changes, `
+      + `${qpp.length} were QUEUED → PASTE_PARKED]`);
+
+    // THE assertion that would have caught rc.35 in CI when the
+    // window does fire. Continuous-pressure regression guard against
+    // anything that makes `queue-operation:enqueue` start firing in
+    // the QUEUED phase without the transition being legal.
+    const illegal = warns.filter((w) => /phase illegal transition/.test(w));
+    if (illegal.length > 0) {
+      console.error('  [illegal transitions detail]');
+      for (const w of illegal.slice(0, 10)) console.error(`    ${w}`);
+    }
+    ok(illegal.length === 0,
+      `no 'phase illegal transition' warnings during stacked cold-start (saw ${illegal.length})`);
+
     assertInvariants(events);
   } finally { await cleanup(); }
 });
