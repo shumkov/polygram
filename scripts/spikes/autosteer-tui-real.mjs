@@ -257,7 +257,12 @@ function fail(label) {
   console.error(`  FAIL: ${label}`);
   totalAsserts++;
   scenarioFailed = true;
-  process.exitCode = 1;
+  // NOTE: do NOT set process.exitCode here. A scenario that fails attempt 1
+  // and recovers on attempt 2 (the --retry=N path) is counted as PASSED in
+  // the final aggregate (`failures` array) — but if `fail()` latches
+  // exitCode=1 on the failed attempt, the process exits 1 even though the
+  // summary prints `=== SPIKE PASS ===`. Authoritative exit code is set
+  // explicitly by the SPIKE FAILED / SPIKE PASS branches at end of main().
 }
 function ok(cond, label) { cond ? pass(label) : fail(label); return cond; }
 function notFired(events, name, label) {
@@ -2337,6 +2342,7 @@ async function main() {
     process.exit(1);
   } else {
     console.log('\n=== SPIKE PASS ===');
+    process.exit(0);          // authoritative — overrides any stale exitCode
   }
 }
 
