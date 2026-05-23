@@ -1259,12 +1259,13 @@ S('h-stack', 'subagent-turn-stays-healthy-on-hook-stream', async () => {
       'Use the Task tool with subagent_type="general-purpose" to dispatch '
       + 'one subagent. The subagent\'s prompt: "List exactly three files '
       + 'in /tmp using the Bash tool, then report their names as your '
-      + 'final message." After the subagent returns, reply ONLY with '
-      + '"HSTACK_OK".',
+      + 'final message." After the subagent returns, tell me what '
+      + 'files it found.',
     );
 
-    ok(typeof res.text === 'string' && /HSTACK_OK/i.test(res.text),
-      `subagent turn returned final marker (got ${JSON.stringify(res.text?.slice(0,60))})`);
+    // Marker-free: the hook stream is the load-bearing assertion.
+    ok(typeof res.text === 'string' && res.text.length > 0,
+      `subagent turn returned a non-empty reply (got ${JSON.stringify(res.text?.slice(0,80))})`);
     ok(!res.error,
       `subagent turn must complete without error (got ${JSON.stringify(res.error)})`);
 
@@ -1508,6 +1509,302 @@ S('h-stack', 'reactor-no-cascade-during-long-thinking', async () => {
   } finally { await cleanup(); }
 });
 
+// ── Per-tool reactor coverage — each classifyToolName bucket ────────
+//
+// `lib/telegram/reactions.js` classifies tool names to reactor states
+// via substring match:
+//   - web/fetch/browser/search → WEB (⚡)
+//   - todo/task/skill          → WRITING (✍)
+//   - read/write/edit/bash/grep/glob/notebook → CODING (👨‍💻)
+//   - everything else          → TOOL (🔥)
+//
+// One scenario per bucket exercises the mapping end-to-end with a
+// real claude TUI. If `classifyToolName` is ever broken or H2's
+// PreToolUse routing regresses, these fail loud.
+
+// CODING — Bash tool (single direct invocation, no subagent)
+S('h-stack', 'bash-tool-reactor-flips-to-CODING', async () => {
+  const { p, events, reactorStates, cleanup } = await setupRealTui(
+    'bash-coding',
+    { captureReactor: true },
+  );
+  try {
+    const res = await p.send(
+      'Use the Bash tool to run `echo BASH_CODING_OK` and tell me what it printed.',
+    );
+    ok(typeof res.text === 'string' && res.text.length > 0,
+      `turn completed (got ${JSON.stringify(res.text?.slice(0,80))})`);
+    ok(!res.error, `no error (got ${JSON.stringify(res.error)})`);
+
+    const reached = new Set(reactorStates.map((s) => s.toState));
+    console.error(`  [reactor reached] ${[...reached].join(', ')}`);
+    ok(reached.has('CODING'),
+      'reactor must reach CODING when Bash tool fires '
+      + `(saw states: ${[...reached].join(', ')})`);
+
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// WEB — WebFetch tool (network fetch)
+S('h-stack', 'webfetch-tool-reactor-flips-to-WEB', async () => {
+  const { p, events, reactorStates, cleanup } = await setupRealTui(
+    'webfetch-web',
+    { captureReactor: true, turnTimeoutMs: 180_000 },
+  );
+  try {
+    // example.com is RFC-stable, no rate limits, returns trivial HTML.
+    // The prompt is permissive — the model may choose Bash+curl
+    // instead of WebFetch in some sessions; assertion below tolerates
+    // either tool as long as the reactor reaches WEB or CODING.
+    const res = await p.send(
+      'Use the WebFetch tool to retrieve https://example.com and '
+      + 'tell me what the H1 says. Reply with just the H1 text.',
+    );
+    ok(typeof res.text === 'string' && res.text.length > 0,
+      `turn produced a reply (got ${JSON.stringify(res.text?.slice(0,80))})`);
+
+    const reached = new Set(reactorStates.map((s) => s.toState));
+    console.error(`  [reactor reached] ${[...reached].join(', ')}`);
+    // WEB is the right state for WebFetch. If the model chose Bash
+    // (e.g. curl) the reactor would hit CODING — also acceptable
+    // since the bucket-mapping itself is the unit-test concern;
+    // this scenario asserts the mapping fires at all on a network
+    // tool.
+    ok(reached.has('WEB') || reached.has('CODING'),
+      'reactor must reach WEB (WebFetch) or CODING (curl via Bash) '
+      + 'on a network-fetch turn '
+      + `(saw states: ${[...reached].join(', ')})`);
+
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// ── Multi-tool sequence — reactor transitions through several states
+//
+// Real turns rarely use one tool. A typical turn touches Bash to
+// probe state, then Read to inspect a file, then maybe Edit. The
+// reactor should reflect each transition.
+S('h-stack', 'multi-tool-sequence-reactor-transitions', async () => {
+  const { p, events, reactorStates, cleanup } = await setupRealTui(
+    'multi-tool',
+    { captureReactor: true, turnTimeoutMs: 180_000 },
+  );
+  try {
+    // All three tools map to CODING (bash + read + grep), so the
+    // reactor stays at CODING throughout but the HEARTBEATS that
+    // prevent cascade-to-fear need to keep firing across the tool
+    // boundary transitions. Assertion: no STALL/TIMEOUT, at least
+    // one CODING state recorded, and the hook stream has multiple
+    // PreToolUse events.
+    const res = await p.send(
+      'Do these three steps in order and then summarize: '
+      + '(1) use Bash to run `echo step1`, '
+      + '(2) use Bash to run `pwd`, '
+      + '(3) use Bash to run `echo step3`.',
+    );
+    ok(typeof res.text === 'string' && res.text.length > 0,
+      `turn completed (got ${JSON.stringify(res.text?.slice(0,80))})`);
+    ok(!res.error, `no error (got ${JSON.stringify(res.error)})`);
+
+    const reached = new Set(reactorStates.map((s) => s.toState));
+    console.error(`  [reactor reached] ${[...reached].join(', ')}`);
+    ok(reached.has('CODING'), 'reactor reached CODING on Bash tool work');
+    ok(!reached.has('STALL'), 'reactor did NOT escalate to STALL during multi-tool work');
+    ok(!reached.has('TIMEOUT'), 'reactor did NOT escalate to TIMEOUT');
+
+    const hookEvents = events.filter((e) => e.name === 'hook-event');
+    const preBash = hookEvents.filter((e) => e.payload?.type === 'PreToolUse'
+      && e.payload?.toolName === 'Bash');
+    ok(preBash.length >= 3,
+      `at least 3 PreToolUse{Bash} events fired (got ${preBash.length}) — `
+      + 'each tool call should produce its own hook');
+
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// ── Long-running subagent — reactor stable through extended work ────
+//
+// Tests the msg-884 incident class with a real long-running
+// subagent. The Bash sleep keeps the inner work going for 30+
+// seconds; H1's hook stream + H3's idle ceiling + H4's Stop synth
+// must all hold together. The reactor must not escalate to fear
+// even though the user-visible turn is long.
+S('h-stack', 'long-running-subagent-reactor-stable', async () => {
+  const { p, events, reactorStates, cleanup } = await setupRealTui(
+    'long-subagent',
+    { captureReactor: true, turnTimeoutMs: 180_000 },
+  );
+  try {
+    const startedAt = Date.now();
+    const res = await p.send(
+      'Use the Task tool with subagent_type="general-purpose" to dispatch '
+      + 'a subagent. The subagent\'s prompt: "Use Bash to run '
+      + '`sleep 30 && echo SLOW_DONE` and report the output." '
+      + 'After the subagent returns, tell me what it reported.',
+    );
+    const elapsedMs = Date.now() - startedAt;
+    // Marker-free: model variance can drop strict markers; the
+    // load-bearing assertion is reactor stability over LONG duration,
+    // not specific reply text.
+    ok(typeof res.text === 'string' && res.text.length > 0,
+      `long subagent turn completed with a reply (got ${JSON.stringify(res.text?.slice(0,80))})`);
+    ok(!res.error,
+      `no error on the turn (got ${JSON.stringify(res.error)})`);
+    // Tolerant of timing variance — the subagent's sleep is a
+    // deterministic lower bound but claude's pre/post overhead is
+    // model-variable. 20 s proves the subagent actually ran sleep
+    // (without it, the dispatch would finish in 1-3 s).
+    ok(elapsedMs >= 20_000,
+      `turn ran for ≥20s — got ${Math.round(elapsedMs/1000)}s — `
+      + 'proves the subagent actually slept');
+
+    const reached = new Set(reactorStates.map((s) => s.toState));
+    console.error(`  [reactor reached after ${Math.round(elapsedMs/1000)}s] ${[...reached].join(', ')}`);
+    ok(!reached.has('STALL'),
+      'reactor did NOT escalate to STALL (🥱) during 30s+ subagent work — '
+      + 'rc.45 heartbeat-from-capture-pane fix is intact');
+    ok(!reached.has('TIMEOUT'),
+      'reactor did NOT escalate to TIMEOUT (😨) during long subagent');
+
+    // No turn-timeout event (H3 idle ceiling didn't trip).
+    const timeouts = events.filter((e) => e.name === 'turn-timeout');
+    ok(timeouts.length === 0,
+      `no turn-timeout fired on healthy long subagent (saw ${timeouts.length})`);
+
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// ── Sequential subagents — multiple Task dispatches in one turn ─────
+//
+// Production-shaped: the music-curator agent often dispatches
+// multiple subagents in one turn (e.g. "verify likes" then "sync
+// playlists"). Each one must produce a hook event chain; the
+// reactor must reflect the work continuously.
+S('h-stack', 'sequential-subagents-both-observable', async () => {
+  const { p, events, reactorStates, cleanup } = await setupRealTui(
+    'seq-subagents',
+    { captureReactor: true, turnTimeoutMs: 180_000 },
+  );
+  try {
+    const res = await p.send(
+      'Run two Task subagents sequentially, both with '
+      + 'subagent_type="general-purpose": '
+      + '(1) first dispatches a subagent whose prompt is "Run `echo FIRST` '
+      + 'using Bash and report output." '
+      + '(2) after the first returns, dispatch a second subagent whose '
+      + 'prompt is "Run `echo SECOND` using Bash and report output." '
+      + 'Then tell me what both subagents reported.',
+    );
+    // Marker-free: the hook stream is the load-bearing assertion;
+    // the text reply is variable.
+    ok(typeof res.text === 'string' && res.text.length > 0,
+      `sequential-subagents turn completed (got ${JSON.stringify(res.text?.slice(0,80))})`);
+
+    // Each subagent fires outer PreToolUse{Agent} + SubagentStop.
+    const hookEvents = events.filter((e) => e.name === 'hook-event');
+    const preAgent = hookEvents.filter((e) => e.payload?.type === 'PreToolUse'
+      && e.payload?.toolName === 'Agent');
+    const subagentStop = hookEvents.filter((e) => e.payload?.type === 'SubagentStop');
+    console.error(`  [hook stream] PreToolUse{Agent}=${preAgent.length}, `
+      + `SubagentStop=${subagentStop.length}`);
+
+    ok(preAgent.length >= 2,
+      `expect ≥2 PreToolUse{Agent} (got ${preAgent.length}) — `
+      + 'both subagent dispatches must surface in the hook stream');
+    ok(subagentStop.length >= 2,
+      `expect ≥2 SubagentStop events (got ${subagentStop.length}) — '
+      + 'both subagent terminations must fire`);
+
+    // Reactor stayed sane across both subagents.
+    const reached = new Set(reactorStates.map((s) => s.toState));
+    console.error(`  [reactor reached] ${[...reached].join(', ')}`);
+    ok(!reached.has('STALL') && !reached.has('TIMEOUT'),
+      'reactor stayed out of fear states across both subagents');
+
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// ── Tool failure — turn completes, hook stream documents the gap ────
+//
+// Bash exiting non-zero is a normal claude flow (failed grep, missing
+// file, etc.). polygram's turn must complete cleanly.
+//
+// REAL CLAUDE BEHAVIOR (2.1.142, verified by this scenario):
+// when Bash exits non-zero, claude TUI fires only `PreToolUse` then
+// `Stop` — NEITHER `PostToolUse` NOR `PostToolUseFailure`. The H1
+// spike doc noted Pre-without-Post for tool INIT failures (EPERM);
+// this scenario documents that RUNTIME failures (exit≠0) do the
+// same. Two production implications:
+//
+//   1. `outstandingTools` (tracked from hook events) would leak the
+//      tool_use_id on a failed tool. Polygram relies on JSONL
+//      `tool-result` as the authoritative drain signal — the hook
+//      stream is supplementary. (The H1 spike findings doc already
+//      records this fallback.)
+//   2. The reactor doesn't get a PostToolUse heartbeat for the
+//      failure. The capture-pane heartbeat (rc.45) and the next
+//      tool's PreToolUse pick up the liveness signal — verified
+//      below by asserting reactor still reflected tool work.
+//
+// If a future claude version starts emitting PostToolUse or
+// PostToolUseFailure on exit≠0, this scenario fails loud — at which
+// point the assertion should be updated to match the new behavior.
+S('h-stack', 'tool-failure-completes-and-documents-hook-gap', async () => {
+  const { p, events, reactorStates, cleanup } = await setupRealTui(
+    'tool-fail',
+    { captureReactor: true },
+  );
+  try {
+    const res = await p.send(
+      'Use the Bash tool to run `false` (which exits with code 1). '
+      + 'Then briefly explain what happened.',
+    );
+
+    // Turn must complete cleanly — claude handles tool failure
+    // gracefully, polygram's turn settles without hanging.
+    ok(typeof res.text === 'string' && res.text.length > 0,
+      `turn completed with a reply (got ${JSON.stringify(res.text?.slice(0,80))})`);
+    ok(!res.error,
+      'turn must NOT return an error — claude handles tool failure gracefully');
+
+    const hookEvents = events.filter((e) => e.name === 'hook-event');
+    const hookSummary = hookEvents
+      .map((e) => `${e.payload?.type}${e.payload?.toolName ? '/' + e.payload.toolName : ''}`)
+      .join(', ');
+    console.error(`  [hook events] ${hookSummary}`);
+
+    // Document the observed hook-stream gap.
+    const preBash = hookEvents.filter((e) => e.payload?.type === 'PreToolUse'
+      && e.payload?.toolName === 'Bash');
+    const postOrFail = hookEvents.filter(
+      (e) => (e.payload?.type === 'PostToolUse' || e.payload?.type === 'PostToolUseFailure')
+        && e.payload?.toolName === 'Bash');
+    ok(preBash.length >= 1,
+      'PreToolUse{Bash} fired (claude attempted the tool)');
+    ok(postOrFail.length === 0,
+      'EXPECTED claude behavior: no PostToolUse / PostToolUseFailure '
+      + `on exit≠0 — got: ${hookSummary}. If this assertion changes from `
+      + 'PASS to FAIL in a future run, claude TUI behavior changed; '
+      + 'audit polygram\'s outstandingTools drain logic before declaring '
+      + 'the new behavior an improvement.');
+
+    // Reactor reached CODING on PreToolUse, never escalated.
+    const reached = new Set(reactorStates.map((s) => s.toState));
+    console.error(`  [reactor reached] ${[...reached].join(', ')}`);
+    ok(reached.has('CODING'),
+      'reactor reached CODING on PreToolUse (the only heartbeat the '
+      + 'hook stream provides for a failed tool)');
+    ok(!reached.has('STALL') && !reached.has('TIMEOUT'),
+      'reactor did NOT escalate on tool failure');
+
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
 // ── rc.38 H2 — reactor shows tool state during a subagent turn ──────
 //
 // H2's promise: when claude dispatches a subagent (Task tool), the
@@ -1529,11 +1826,17 @@ S('h-stack', 'reactor-reflects-subagent-tool-work', async () => {
       'Use the Task tool with subagent_type="general-purpose" to dispatch '
       + 'a subagent that runs `echo HELLO` using the Bash tool, then '
       + 'reports the output as its final message. After the subagent '
-      + 'returns, reply ONLY with "REACTOR_OK".',
+      + 'returns, tell me what the subagent reported.',
     );
 
-    ok(typeof res.text === 'string' && /REACTOR_OK/i.test(res.text || ''),
-      `subagent turn produced final marker (got ${JSON.stringify(res.text?.slice(0,80))})`);
+    // Marker-prompts are brittle (model variance — claude occasionally
+    // returns empty when given a strict-format requirement). The
+    // load-bearing assertion is the reactor trajectory, not the
+    // reply text. Just check the turn completed cleanly.
+    ok(typeof res.text === 'string',
+      `subagent turn produced a reply object (got ${JSON.stringify(res.text?.slice(0,80))})`);
+    ok(!res.error,
+      `no error on the turn (got ${JSON.stringify(res.error)})`);
 
     const transitions = reactorStates.map((s) => `${s.fromState || '∅'}→${s.toState}(${s.source})`);
     console.error(`  [reactor trajectory] ${transitions.join(', ')}`);
@@ -1935,7 +2238,17 @@ S('abort', 'interrupt-mid-turn', async () => {
 // ── Driver ───────────────────────────────────────────────────────────
 
 async function main() {
-  const arg = process.argv[2];
+  const args = process.argv.slice(2);
+  const arg = args.find((a) => !a.startsWith('--')) || null;
+  // Per-scenario retry budget — real claude has model variance + API
+  // hiccups that produce occasional flakes. Standalone runs of a
+  // scenario pass at ~95% rate; the batch suite hits ~85% on the
+  // first try. `--retry=N` reruns a failed scenario up to N extra
+  // times before declaring failure. Each scenario's verdict reports
+  // the attempt count when retries were used so flake-spikes are
+  // visible vs. genuine regressions.
+  const retryArg = args.find((a) => a.startsWith('--retry='));
+  const maxRetries = retryArg ? Math.max(0, parseInt(retryArg.split('=')[1], 10) || 0) : 0;
   let chosen = scenarios;
   if (arg) {
     chosen = scenarios.filter((s) => s.name === arg || s.tags.includes(arg));
@@ -1945,7 +2258,9 @@ async function main() {
       process.exit(2);
     }
   }
-  console.log(`Running ${chosen.length} scenario${chosen.length === 1 ? '' : 's'}.\n`);
+  console.log(`Running ${chosen.length} scenario${chosen.length === 1 ? '' : 's'}`
+    + (maxRetries > 0 ? `, up to ${maxRetries} retries per scenario` : '')
+    + '.\n');
 
   const timer = setTimeout(() => {
     console.error('[spike] HARD TIMEOUT, aborting');
@@ -1969,21 +2284,42 @@ async function main() {
 
   for (const s of chosen) {
     console.log(`\n=== [${s.tags}] ${s.name} ===`);
-    scenarioFailed = false;
-    const t0 = Date.now();
-    try {
-      await s.fn();
-    } catch (err) {
-      fail(`scenario threw: ${err.message}`);
+    let attemptElapsed = 0;
+    let succeededOnAttempt = -1;
+    let lastError = null;
+    // Each scenario gets `1 + maxRetries` attempts. The whole scenario
+    // is rerun (fresh setupRealTui — new tmux session, fresh claude
+    // spawn) so retry escapes per-attempt sticky state. The retry
+    // budget is conservative: real regressions still fail visibly
+    // because they fail every attempt; only true model-variance
+    // flakes recover. Process exits non-zero if any scenario
+    // exhausts its budget.
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      scenarioFailed = false;
+      const t0 = Date.now();
+      try {
+        await s.fn();
+      } catch (err) {
+        fail(`scenario threw: ${err.message}`);
+        lastError = err;
+      }
+      attemptElapsed = Date.now() - t0;
+      if (!scenarioFailed) { succeededOnAttempt = attempt; break; }
+      if (attempt < maxRetries) {
+        console.log(`  ↻ attempt ${attempt + 1} failed in ${(attemptElapsed/1000).toFixed(1)}s; retrying…`);
+      }
     }
-    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-    if (scenarioFailed) {
+    const elapsed = (attemptElapsed / 1000).toFixed(1);
+    if (succeededOnAttempt < 0) {
       failed++;
       failures.push(s.name);
-      console.log(`  → FAILED in ${elapsed}s`);
+      console.log(`  → FAILED in ${elapsed}s after ${maxRetries + 1} attempt${maxRetries ? 's' : ''}`);
     } else {
       passed++;
-      console.log(`  → passed in ${elapsed}s`);
+      const suffix = succeededOnAttempt > 0
+        ? ` (recovered on attempt ${succeededOnAttempt + 1})`
+        : '';
+      console.log(`  → passed in ${elapsed}s${suffix}`);
     }
   }
   clearTimeout(timer);
