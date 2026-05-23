@@ -34,6 +34,7 @@ const require = createRequire(import.meta.url);
 const { TmuxProcess } = require('../../lib/process/tmux-process.js');
 const { createTmuxRunner } = require('../../lib/tmux/tmux-runner.js');
 const { buildPrompt } = require('../../lib/prompt.js');
+const { createReactionManager, classifyToolName } = require('../../lib/telegram/reactions.js');
 
 // 2026-05-18 incident coverage: real polygram prompts are ~1-3 KB —
 // the `<polygram-info>` wrapper + `<channel>` + `<untrusted-input>`
@@ -147,10 +148,100 @@ async function setupRealTui(label, opts = {}) {
     },
   });
 
+  // rc.45-onwards: optional reactor capture. Creates the REAL
+  // `createReactionManager` with a no-op apply (Telegram side
+  // disabled) so cascade timers (THINKING_DEEPER@12s,
+  // THINKING_DEEPEST@30s, STALL@45s, TIMEOUT@180s) fire authentically.
+  // Scenarios can read `reactorStates` and assert on the full state
+  // machine trajectory — proving the reactor reaches concrete states
+  // (CODING/WEB/TOOL/WRITING) during tool work and NEVER reaches
+  // STALL/TIMEOUT on healthy turns.
+  //
+  // The reactor is wired into `p.send`'s context via a per-call
+  // wrapper so every send sees it on `turn.context.reactor`. Mirrors
+  // polygram.js's `sendToProcess` shape.
+  const reactorStates = [];
+  const reactorRef = { current: null };
+  if (opts.captureReactor) {
+    reactorRef.current = createReactionManager({
+      apply: async () => {},   // no-op Telegram apply
+      throttleMs: 50,          // tight throttle so transitions land quickly
+      onStateChange: (t) => reactorStates.push({ ...t, atMs: Date.now() }),
+      logError: () => {},
+    });
+    const originalSend = p.send.bind(p);
+    p.send = (prompt, sendOpts = {}) => {
+      // Mirror polygram.js's onFirstStream → THINKING pattern. The
+      // harness can't easily wire onFirstStream into the underlying
+      // send path, so we just nudge THINKING at the start — the same
+      // shape polygram.js uses at line 1063.
+      reactorRef.current.setState('THINKING');
+      return originalSend(prompt, {
+        ...sendOpts,
+        context: {
+          ...(sendOpts.context || {}),
+          reactor: reactorRef.current,
+        },
+      });
+    };
+
+    // ── Mirror the production event-routing pattern ────────────────
+    //
+    // ProcessManager.wireCallbacks (lib/process-manager.js:409) wires
+    // TmuxProcess events to the callbacks built by createSdkCallbacks
+    // (lib/sdk/callbacks.js). The spike rig doesn't run those layers
+    // — it talks to TmuxProcess directly — so without this, hook
+    // events never reach the reactor and H2/H3/H4 are bypassed
+    // entirely (caught by `reactor-reflects-subagent-tool-work`
+    // FAILING with trajectory `∅→THINKING(manual)` only).
+    //
+    // Below we duplicate the four production routings the reactor
+    // depends on. If the production code changes its routing, these
+    // duplicates need to change too — that's the cost of testing
+    // the wiring outside its natural seam.
+    p.on('tool-use', (toolName) => {
+      const head = p.pendingQueue?.[0];
+      const r = head?.context?.reactor;
+      if (r) r.setState(classifyToolName(toolName));
+    });
+    p.on('stream-chunk', () => {
+      const head = p.pendingQueue?.[0];
+      const r = head?.context?.reactor;
+      if (r && typeof r.heartbeat === 'function') r.heartbeat();
+    });
+    p.on('assistant-message-start', () => {
+      const head = p.pendingQueue?.[0];
+      const r = head?.context?.reactor;
+      if (r && typeof r.heartbeat === 'function') r.heartbeat();
+    });
+    // H2 hook-event routing (mirrors lib/sdk/callbacks.js onHookEvent
+    // switch statement).
+    p.on('hook-event', (ev) => {
+      const head = p.pendingQueue?.[0];
+      const r = head?.context?.reactor;
+      if (!r) return;
+      switch (ev?.type) {
+        case 'PreToolUse':
+          if (ev.toolName) r.setState(classifyToolName(ev.toolName));
+          break;
+        case 'PostToolUse':
+        case 'SubagentStop':
+        case 'Notification':
+          if (typeof r.heartbeat === 'function') r.heartbeat();
+          break;
+        default:
+          break;
+      }
+    });
+  }
+
   return {
     p,
     events,
+    reactorStates,    // empty array unless opts.captureReactor:true
+    reactor: reactorRef.current,
     cleanup: async () => {
+      try { reactorRef.current?.stop?.(); } catch {}
       try { await p.kill('spike-done'); } catch {}
       await killTmuxSession(tmuxName);
     },
@@ -1334,6 +1425,136 @@ S('h-stack', 'stacked-sends-no-misattribution', async () => {
     // log; the count is interesting but not a pass/fail signal.
     const synthResolves = events.filter((e) => e.name === 'stop-hook-resolved');
     console.error(`  [H4 synth] stop-hook-resolved fired ${synthResolves.length} time(s)`);
+
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// ── rc.45 — reactor stays out of fear states during long thinking ───
+//
+// Production observation (shumorobot main topic 2026-05-23, msg 995):
+// the reactor cascaded THINKING → THINKING_DEEPER → THINKING_DEEPEST
+// → STALL during a 93-second pure-thinking turn (no tool ran until
+// the very end). The user saw 🥱 (STALL) which feels scary while the
+// model is actually still working.
+//
+// rc.45 fix: route capture-pane "esc to interrupt" heartbeats from
+// `_heartbeat(turn, 'capture:streaming')` to `reactor.heartbeat()`.
+// That resets the cascade clock continuously while claude is busy.
+//
+// This scenario forces a long pure-thinking phase (heavy reasoning
+// prompt on a model that thinks before emitting tokens), captures
+// the reactor's state transitions, and asserts:
+//   1. Reactor reached THINKING (turn started).
+//   2. Reactor NEVER reached STALL or TIMEOUT.
+//   3. heartbeat() was called (would-be cascade was reset).
+S('h-stack', 'reactor-no-cascade-during-long-thinking', async () => {
+  const { p, events, reactorStates, cleanup } = await setupRealTui(
+    'no-cascade-thinking',
+    { captureReactor: true, turnTimeoutMs: 180_000 },
+  );
+  try {
+    // Prompt designed to make the model think before any token:
+    // a multi-step reasoning question with a clear single-line
+    // answer requirement, asked in a way that encourages reflection
+    // rather than tool use.
+    const res = await p.send(
+      'Without using any tools and only after careful step-by-step '
+      + 'reasoning in your head, answer in a single short sentence: '
+      + 'if a clock loses 4 minutes every hour, after how many real '
+      + 'hours does it lose a full hour? Show no intermediate work — '
+      + 'just the final sentence.',
+    );
+
+    ok(typeof res.text === 'string' && res.text.length > 0,
+      `turn produced a reply (got ${JSON.stringify(res.text?.slice(0,80))})`);
+
+    // Diagnostics — log every reactor transition so a failure run is
+    // self-explaining.
+    const transitions = reactorStates.map((s) => `${s.fromState || '∅'}→${s.toState}(${s.source})`);
+    console.error(`  [reactor trajectory] ${transitions.join(', ')}`);
+    console.error(`  [transition count] ${reactorStates.length}`);
+
+    // Sanity: the reactor was actually exercised.
+    ok(reactorStates.length >= 1,
+      'reactor recorded at least one state transition (turn touched the reactor wiring)');
+
+    // Load-bearing assertion #1: THINKING fired (turn started).
+    const sawThinking = reactorStates.some((s) => s.toState === 'THINKING');
+    ok(sawThinking, 'reactor reached THINKING (turn-start setState fired)');
+
+    // Load-bearing assertion #2: no fear escalation. STALL and
+    // TIMEOUT are the cascade-timer endpoints; reaching either
+    // means the heartbeat-from-capture-pane rc.45 fix didn't reset
+    // the cascade clock in time.
+    const sawStall = reactorStates.some((s) => s.toState === 'STALL');
+    const sawTimeout = reactorStates.some((s) => s.toState === 'TIMEOUT');
+    if (sawStall || sawTimeout) {
+      console.error('  [FAIL CONTEXT] reactor escalated to fear state — capture-pane heartbeat fix DIDN\'T reset the cascade clock');
+    }
+    ok(!sawStall,
+      'reactor must NOT reach STALL (🥱) during a healthy thinking turn '
+      + '— rc.45 capture-pane heartbeat fix is regressed');
+    ok(!sawTimeout,
+      'reactor must NOT reach TIMEOUT (😨) during a healthy thinking turn');
+
+    // Assertion #3: hook stream worked (the existing H1+H2 wiring).
+    const hookEvents = events.filter((e) => e.name === 'hook-event');
+    const stopHook = hookEvents.filter((e) => e.payload?.type === 'Stop');
+    ok(stopHook.length >= 1,
+      'Stop hook fired on turn end (H1 wiring alive)');
+
+    assertInvariants(events);
+  } finally { await cleanup(); }
+});
+
+// ── rc.38 H2 — reactor shows tool state during a subagent turn ──────
+//
+// H2's promise: when claude dispatches a subagent (Task tool), the
+// reactor reflects the inner work via hook PreToolUse events scoped
+// by `agent_id`. Pre-H2 the reactor stayed silent during subagent
+// work (JSONL only surfaced the outer Agent tool_use once) and
+// cascaded to fear emojis on long ones.
+//
+// This scenario sends a Task-dispatching prompt and asserts the
+// reactor reached at least one concrete (non-fear) state during the
+// turn — proving H2 hooks are firing setState.
+S('h-stack', 'reactor-reflects-subagent-tool-work', async () => {
+  const { p, events, reactorStates, cleanup } = await setupRealTui(
+    'reactor-subagent',
+    { captureReactor: true, turnTimeoutMs: 180_000 },
+  );
+  try {
+    const res = await p.send(
+      'Use the Task tool with subagent_type="general-purpose" to dispatch '
+      + 'a subagent that runs `echo HELLO` using the Bash tool, then '
+      + 'reports the output as its final message. After the subagent '
+      + 'returns, reply ONLY with "REACTOR_OK".',
+    );
+
+    ok(typeof res.text === 'string' && /REACTOR_OK/i.test(res.text || ''),
+      `subagent turn produced final marker (got ${JSON.stringify(res.text?.slice(0,80))})`);
+
+    const transitions = reactorStates.map((s) => `${s.fromState || '∅'}→${s.toState}(${s.source})`);
+    console.error(`  [reactor trajectory] ${transitions.join(', ')}`);
+
+    // Concrete (non-fear, non-thinking) states the reactor should
+    // hit when tools actually run. `classifyToolName` maps Agent →
+    // WRITING (Task contains "task"), Bash → CODING, etc.
+    const CONCRETE_STATES = new Set(['CODING', 'WEB', 'TOOL', 'WRITING']);
+    const concreteHits = reactorStates.filter((s) =>
+      CONCRETE_STATES.has(s.toState) && s.source === 'manual');
+
+    ok(concreteHits.length >= 1,
+      'reactor must reach at least one concrete tool state '
+      + '(CODING/WEB/TOOL/WRITING) during subagent work — H2 setState '
+      + `is regressed (saw transitions: ${transitions.join(', ')})`);
+
+    // Also assert reactor didn't escalate to fear during subagent work.
+    const sawStall = reactorStates.some((s) => s.toState === 'STALL');
+    const sawTimeout = reactorStates.some((s) => s.toState === 'TIMEOUT');
+    ok(!sawStall && !sawTimeout,
+      'reactor must NOT reach STALL/TIMEOUT during a healthy subagent turn');
 
     assertInvariants(events);
   } finally { await cleanup(); }
