@@ -1244,6 +1244,155 @@ describe('TmuxProcess — H4 Stop hook as authoritative completion', () => {
     const p = makeTmuxProcess(makeFakeRunner());
     assert.equal(p.stopGraceMs, 2000);
   });
+
+  // ─── gap-2: end-to-end Stop-synth rescue when JSONL is broken ───────
+  //
+  // The tests above pin `_handleHookEvent` + `_activeGroup` in
+  // isolation. This pins the FULL integration: `send()` → `_runTurn`
+  // → `_awaitSettle` → Stop synth → outcome `{kind:'jsonl', via:
+  // 'stop-hook'}` → PmSendResult.metrics.resolvedVia === 'stop-hook'
+  // → `stop-hook-resolved` event. The production scenario this guards
+  // against is a wedged JSONL stream (broken file tail, stuck parser,
+  // claude TUI buffering issue): without H4, the turn would hang
+  // until `turnTimeoutMs`. With H4, Stop hook rescues it within
+  // `stopGraceMs` and the caller sees a clean reply, marked.
+
+  describe('rc.41 — Stop synth rescues a JSONL-broken turn via send()', () => {
+    // A capture-pane buffer that prevents `_awaitTurnComplete` from
+    // settling via quiesce: contains the streaming hint ("esc to
+    // interrupt") so `cachedStreaming` is true → the
+    // `isReady && !isStreaming` gate stays closed forever. The
+    // `tick` keeps the buffer length changing so the per-poll
+    // optimization branch keeps running.
+    const inflightPane = (tick) => [
+      ' ▐▛███▜▌   Claude Code v2.1.142',
+      '',
+      `✻ Thinking… (${tick})`,
+      '',
+      '  esc to interrupt',
+    ].join('\n');
+
+    test('JSONL never delivers result; Stop synth completes send() with via=stop-hook', async () => {
+      // Two-phase capture-pane:
+      //   - During `_waitForReady`: settled ready pane (start succeeds)
+      //   - After `send()` begins: streaming-hint pane (quiesce locked off)
+      let started = false;
+      let pollAfterStart = 0;
+      const runner = makeFakeRunner({
+        captureWide: async () => {
+          if (!started) return '? for shortcuts';
+          pollAfterStart += 1;
+          return inflightPane(pollAfterStart);
+        },
+      });
+      const p = makeTmuxProcess(runner, {
+        readyTimeoutMs: 500,
+        // The turn must not race the absolute backstop — it must
+        // settle via Stop. Give the backstop a generous budget vs.
+        // the 30 ms stopGraceMs that does the actual settling.
+        turnTimeoutMs: 5_000,
+        hardBackstopMs: 5_000,
+        stopGraceMs: 30,
+        pollMs: 5,
+        quiesceMs: 5,
+      });
+      const stopResolvedEvents = [];
+      p.on('stop-hook-resolved', (ev) => stopResolvedEvents.push(ev));
+
+      await p.start({ model: 'sonnet', effort: 'low' });
+      started = true;
+
+      // Fire the Stop hook shortly after `send()` enters its race
+      // loop. The exact delay isn't load-bearing — we just need
+      // `_runTurn` to have armed `turn.resultPromise`, which happens
+      // synchronously inside `send()` before the first awaited paste.
+      const stopText = 'rescued via Stop synth (JSONL never came)';
+      setTimeout(() => {
+        p._handleHookEvent({
+          type: 'Stop',
+          stopHookActive: false,
+          lastAssistantMessage: stopText,
+        });
+      }, 50);
+
+      const res = await Promise.race([
+        p.send('hello'),
+        new Promise((_, rej) => setTimeout(
+          () => rej(new Error('send() hung — Stop synth did NOT rescue the turn')),
+          2_000,
+        )),
+      ]);
+
+      assert.equal(res.text, stopText,
+        'reply text must come from the Stop hook lastAssistantMessage');
+      assert.equal(res.error, null,
+        'a Stop-synth-rescued turn must succeed (error=null)');
+      assert.equal(res.metrics.resolvedVia, 'stop-hook',
+        'metrics.resolvedVia pins H4 provenance — must be "stop-hook", not "jsonl"');
+      assert.equal(res.metrics.stopReason, 'stop_hook',
+        'metrics.stopReason carries the synth marker');
+      assert.equal(res.metrics.resultSubtype, 'success');
+
+      assert.equal(stopResolvedEvents.length, 1,
+        'a Stop-synth-rescued turn must emit exactly one stop-hook-resolved event');
+      assert.equal(stopResolvedEvents[0].backend, 'tmux');
+    });
+
+    test('Stop synth preserves streamed text when both turn.text and lastAssistantMessage exist', async () => {
+      // The integration version of the unit test above (turn.text
+      // wins over hook snapshot). Drives the full path so the
+      // mapping in `_runTurn` (`text = turn.text || outcome.ev.text`)
+      // is exercised end-to-end.
+      let started = false;
+      let pollAfterStart = 0;
+      const runner = makeFakeRunner({
+        captureWide: async () => {
+          if (!started) return '? for shortcuts';
+          pollAfterStart += 1;
+          return inflightPane(pollAfterStart);
+        },
+      });
+      const p = makeTmuxProcess(runner, {
+        readyTimeoutMs: 500,
+        turnTimeoutMs: 5_000,
+        hardBackstopMs: 5_000,
+        stopGraceMs: 30,
+        pollMs: 5,
+        quiesceMs: 5,
+      });
+
+      await p.start({ model: 'sonnet', effort: 'low' });
+      started = true;
+
+      // Feed streamed text into the in-flight turn BEFORE Stop fires.
+      // The active turn becomes pendingQueue[0] as soon as send() runs.
+      const streamed = 'streamed partial reply from JSONL chunks';
+      setTimeout(() => {
+        const turn = p.pendingQueue[0];
+        if (turn) turn.text = streamed;
+        // Fire Stop a tick later so the text is in place first.
+        setTimeout(() => {
+          p._handleHookEvent({
+            type: 'Stop',
+            lastAssistantMessage: 'hook-snapshot would be wrong here',
+          });
+        }, 5);
+      }, 50);
+
+      const res = await Promise.race([
+        p.send('hi'),
+        new Promise((_, rej) => setTimeout(
+          () => rej(new Error('send() hung')), 2_000,
+        )),
+      ]);
+
+      assert.equal(res.text, streamed,
+        'turn.text from JSONL chunks must win over Stop hook lastAssistantMessage — '
+        + 'rescue must not overwrite known-good streamed text');
+      assert.equal(res.metrics.resolvedVia, 'stop-hook',
+        'rescue path still ran (no JSONL result event); resolvedVia stays "stop-hook"');
+    });
+  });
 });
 
 // ─── rc.42 review-driven additions ──────────────────────────────────
@@ -1445,6 +1594,180 @@ bypass permissions on (shift+tab to cycle)
     const justOne = 'Yes, "Resume from summary" is the default option in the menu.';
     assert.ok(!SESSION_AGE_PROMPT_RE.test(justOne),
       'mentioning only one phrase must not match');
+  });
+
+  // ─── gap-1: session-age prompt — `_waitForReady` integration ────────
+  //
+  // The regex tests above pin the detector. These pin the wiring:
+  // detector → sendControl(Enter) → emit('session-age-prompt-dismissed')
+  // → rc.44 deadline reset → readiness check survives a /compact that
+  // exceeds the initial `readyTimeoutMs`. The closest production
+  // failure was shumorobot 2026-05-22 23:30: menu auto-dismissed, but
+  // `/compact` ran for ~2 min and the (unreset) deadline killed the
+  // wait before claude finished reloading from the summary.
+
+  describe('rc.43/44 — session-age prompt _waitForReady integration', () => {
+    // The exact production-trace menu, kept distinct from the regex
+    // tests above so a regex change can't accidentally pass these
+    // wiring tests by re-matching a stale fixture.
+    const MENU = [
+      '✻ Brewed for 1m 19s',
+      '',
+      '────────────────────────────────────────────────────────────────────',
+      '  This session is 8h 38m old and 117.6k tokens.',
+      '',
+      '  Resuming the full session will consume a substantial portion of your usage limits.',
+      '  We recommend resuming from a summary.',
+      '',
+      '  ❯ 1. Resume from summary (recommended)',
+      '    2. Resume full session as-is',
+      '    3. Don\'t ask me again',
+      '',
+      '  Enter to confirm · Esc to cancel',
+    ].join('\n');
+
+    // A "compact in progress" pane — claude is reloading the summary
+    // after dismissal. NO ready hint, content changes every poll
+    // (compact tick line). Neither stable-equality nor hint-present
+    // matches → `_waitForReady` stays in the loop.
+    const compactPane = (tick) => [
+      '✻ Compacting…',
+      '',
+      `  Processing summary chunk ${tick}`,
+      '',
+    ].join('\n');
+
+    // The settled pane the TUI shows once compact finishes. Ready
+    // hint present, byte-stable between consecutive polls.
+    const SETTLED_PANE = [
+      ' ▐▛███▜▌   Claude Code v2.1.142',
+      '────────────────────────────────────────',
+      '❯                                       ',
+      '────────────────────────────────────────',
+      '  ? for shortcuts',
+    ].join('\n');
+
+    test('rc.43: menu detected → Enter sent EXACTLY ONCE → dismissal event emitted', async () => {
+      // Menu appears on poll 1 and lingers across polls 2-3 (claude
+      // slow to rerender after Enter). Polls 4+ return the settled
+      // pane. The detector fires once on poll 1, `sessionAgePromptDismissed`
+      // gates subsequent sends, and start() succeeds.
+      let poll = 0;
+      const runner = makeFakeRunner({
+        captureWide: async () => {
+          poll += 1;
+          return poll <= 3 ? MENU : SETTLED_PANE;
+        },
+      });
+      const p = makeTmuxProcess(runner, {
+        readyTimeoutMs: 500,
+        pollMs: 2,
+        quiesceMs: 2,
+      });
+      const events = [];
+      p.on('session-age-prompt-dismissed', (ev) => events.push(ev));
+      await p.start({ model: 'sonnet', effort: 'low' });
+
+      const enters = runner._calls.filter(
+        (c) => c.kind === 'sendControl' && c.key === 'Enter',
+      );
+      assert.equal(enters.length, 1,
+        'Enter must be sent exactly once even when the menu lingers across polls');
+      assert.equal(events.length, 1,
+        'session-age-prompt-dismissed must emit exactly once per wait');
+      assert.equal(events[0].backend, 'tmux');
+    });
+
+    test('no menu present → no Enter sent, no dismissal event (regression guard)', async () => {
+      // The settled pane comes up immediately — the detector must not
+      // false-positive on a normal startup or on prose that happens
+      // to mention "Resume from summary" elsewhere.
+      const runner = makeFakeRunner({
+        captureWide: async () => SETTLED_PANE,
+      });
+      const p = makeTmuxProcess(runner, {
+        readyTimeoutMs: 500,
+        pollMs: 2,
+        quiesceMs: 2,
+      });
+      const events = [];
+      p.on('session-age-prompt-dismissed', (ev) => events.push(ev));
+      await p.start({ model: 'sonnet', effort: 'low' });
+
+      const enters = runner._calls.filter(
+        (c) => c.kind === 'sendControl' && c.key === 'Enter',
+      );
+      assert.equal(enters.length, 0,
+        'no menu → no Enter ever sent during _waitForReady');
+      assert.equal(events.length, 0,
+        'no menu → no dismissal event emitted');
+    });
+
+    test('rc.44: deadline is reset at dismissal so /compact can take >readyTimeoutMs', async () => {
+      // The production-failure pin (shumorobot 2026-05-22 23:30+23:36):
+      // before rc.44, `let deadline = ...` (was `const`) → dismissal
+      // ate the original budget, /compact ran for ~2 min, deadline
+      // expired before the post-compact ready pane appeared, throwing
+      // TMUX_READY_TIMEOUT.
+      //
+      // Real wall-clock timing makes this test flaky under parallel
+      // suite load (a few-ms jitter erases tight margins). Use a
+      // VIRTUAL CLOCK (`nowFn` test seam) to drive deadline math
+      // deterministically:
+      //
+      //   - virtualNow starts at 0; readyTimeoutMs=100 ⇒ deadline=100.
+      //   - Every captureWide advances virtualNow by 1 (so the loop
+      //     progresses one virtual ms per poll).
+      //   - When the menu is detected, `sendControl('Enter', …)` JUMPS
+      //     virtualNow by 1000. This simulates /compact eating well past
+      //     the original deadline:
+      //       OLD code (const deadline = 100): the very next loop
+      //         iteration's `while (this._now() < deadline)` check is
+      //         `1001 < 100` → FALSE → throw TMUX_READY_TIMEOUT.
+      //       NEW code (rc.44 reset): deadline = 1000 + 100 = 1100,
+      //         so the loop continues and eventually quiesces on the
+      //         settled pane.
+      let virtualNow = 0;
+      let poll = 0;
+      const runner = makeFakeRunner({
+        captureWide: async () => {
+          poll += 1;
+          virtualNow += 1;
+          if (poll <= 3) return `phase-X startup banner ${poll}\n  ${'.'.repeat(poll)}`;
+          if (poll === 4) return MENU;
+          if (poll <= 7) return compactPane(poll);  // post-dismiss /compact
+          return SETTLED_PANE;
+        },
+        sendControl: async (name, key) => {
+          runner._calls.push({ kind: 'sendControl', name, key });
+          if (key === 'Enter') virtualNow += 1000;     // jump past the original deadline
+        },
+      });
+      const p = makeTmuxProcess(runner, {
+        readyTimeoutMs: 100,
+        pollMs: 1,           // real wait between polls (kept tiny — test runs fast)
+        quiesceMs: 1,        // virtual-time quiesce window
+        nowFn: () => virtualNow,
+      });
+      // `_probeDebugLogSize` returns null when stat fails → "quiet"
+      // for the entire wait. Pin the override so the test doesn't
+      // depend on the fake debugLogPath not existing on disk.
+      p._fsOverride = { statSync: () => { throw new Error('ENOENT'); } };
+
+      await p.start({ model: 'sonnet', effort: 'low' });
+
+      const enters = runner._calls.filter(
+        (c) => c.kind === 'sendControl' && c.key === 'Enter',
+      );
+      assert.equal(enters.length, 1, 'menu dismissed exactly once');
+      // Virtual time when start() returned must reflect that the loop
+      // ran PAST the original deadline. Without the rc.44 reset, the
+      // dismissal jump would have thrown before any further captures.
+      assert.ok(virtualNow > 1000,
+        `loop must have continued PAST the post-dismiss virtual-time jump; `
+        + `virtualNow=${virtualNow}. Without the rc.44 reset this would have `
+        + 'thrown TMUX_READY_TIMEOUT instead.');
+    });
   });
 
   // #6 (review-driven) — repeated Stop events don't schedule N timers
