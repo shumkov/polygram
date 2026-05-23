@@ -53,14 +53,39 @@ describe('sanitizeAssistantReply — passes legitimate text through unchanged', 
     assert.equal(r.replaced, false);
   });
 
-  test('reply that MENTIONS the canned phrase but is longer is NOT intercepted', () => {
-    // Substring guard — only EXACT full-text matches are rewritten.
-    // A real reply discussing the canned-string leak itself must
-    // survive the sanitizer.
+  test('multi-bubble combined text — canned string as a substring still gets replaced (rc.45)', () => {
+    // The rc.45 production trigger: claude split its reply into two
+    // assistant-message blocks. The first was substantive ("Nothing
+    // to stop."), the second was the canned `No response
+    // requested.`. polygram concatenates them into combined text;
+    // exact-match wouldn't fire. Substring replace does.
+    const combined = 'Nothing to stop.\n\nNo response requested.';
+    const r = sanitizeAssistantReply(combined);
+    assert.equal(r.replaced, true,
+      'combined text containing the canned phrase as a substring MUST be sanitized');
+    assert.ok(r.text.includes('Nothing to stop.'),
+      'substantive content before the canned string must survive');
+    assert.ok(!r.text.includes('No response requested.'),
+      'canned phrase must be removed from the output');
+    assert.ok(r.text.includes(SANITIZED_REPLACEMENT),
+      'replacement text must be present');
+  });
+
+  test('reply that MENTIONS the canned phrase WILL have the substring replaced (rc.45 trade-off)', () => {
+    // Substring-replace's downside: a legitimate discussion of the
+    // canned phrase has its inner mention rewritten. Cost is
+    // cosmetic — the surrounding prose survives. The exact-match
+    // approach failed in production (rc.39) because claude's
+    // multi-bubble reply made an exact match impossible; substring
+    // accepts this trade-off explicitly. Documented in the
+    // sanitize-reply.js header.
     const txt = 'The model sometimes leaks the literal string "No response requested." — that is the bug.';
     const r = sanitizeAssistantReply(txt);
-    assert.equal(r.replaced, false);
-    assert.equal(r.text, txt);
+    assert.equal(r.replaced, true);
+    assert.ok(r.text.includes('The model sometimes leaks'),
+      'surrounding prose must survive');
+    assert.ok(!r.text.includes('No response requested.'),
+      'inner canned-phrase mention IS replaced (cost of the trade-off)');
   });
 });
 
