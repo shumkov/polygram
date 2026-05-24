@@ -332,6 +332,82 @@ test('kill() tears down socket file and rejects pending turns', async () => {
   bridge.close();
 });
 
+// Review #5: bridge disconnect drains pendingTurns immediately instead of
+// leaving 10-min hardTimers running.
+test('bridge disconnect drains pendingTurns immediately (no 10min hardTimer wait)', async () => {
+  const cp = makeChannelsProcess();
+  const bridge = await startWithFakeBridge(cp);
+
+  // Pre-attach rejection assertion before triggering disconnect to avoid
+  // the unhandled-rejection trap (same pattern as kill() test below).
+  const sendP = cp.send('hello');
+  const rejectAssertion = assert.rejects(
+    sendP,
+    err => err && err.code === 'BRIDGE_DISCONNECTED' && /bridge disconnected/.test(err.message),
+  );
+  await bridge.waitFor(m => m.kind === 'user_msg');
+
+  // Simulate bridge crash by closing the fake bridge's socket end.
+  bridge.close();
+
+  // The pending turn must reject within milliseconds — NOT wait 600_000ms.
+  // Hard guard at 200ms.
+  await Promise.race([
+    rejectAssertion,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('pendingTurns NOT drained within 200ms')), 200)),
+  ]);
+
+  // pendingTurns is empty + inFlight cleared
+  assert.equal(cp.pendingTurns.size, 0);
+  assert.equal(cp.inFlight, false);
+
+  await cp.kill('test');
+});
+
+// Review #16: when toolDispatcher returns {ok:false}, the reply text MUST NOT
+// be recorded into pendingTurn.replies — otherwise send() resolves with text
+// that was never delivered to Telegram.
+test('toolDispatcher failure does NOT record reply into pending turn', async () => {
+  const cp = new ChannelsProcess({
+    sessionKey: 'sess-fail', chatId: 'chat-1', threadId: null, label: 'test-fail',
+    tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
+    toolDispatcher: async () => ({ ok: false, error: 'telegram down' }),
+    logger: quietLogger,
+    handshakeTimeoutMs: 2000,
+    turnQuietMs: 50,
+    turnTimeoutMs: 1500,
+  });
+  const bridge = await startWithFakeBridge(cp);
+
+  const sendP = cp.send('hello');
+  await bridge.waitFor(m => m.kind === 'user_msg');
+
+  bridge.send({
+    kind: 'tool', session: cp.sessionKey, tool_call_id: 'fail-1',
+    name: 'reply', args: { chat_id: 'chat-1', text: 'this-was-never-delivered' },
+  });
+  const ack = await bridge.waitFor(m => m.kind === 'tool_ack');
+  assert.equal(ack.ok, false);
+
+  // After quietMs window, send() should time out at hardTimer (1500ms) rather
+  // than resolve with the undelivered text. Wait > quietMs to confirm no false
+  // resolution.
+  await new Promise(r => setTimeout(r, 200));
+  assert.equal(cp.pendingTurns.size, 1, 'pending turn still open — no false resolution from failed delivery');
+
+  // Now deliver a successful reply so the send() resolves cleanly (test cleanup)
+  cp.toolDispatcher = async () => ({ ok: true });
+  bridge.send({
+    kind: 'tool', session: cp.sessionKey, tool_call_id: 'ok-1',
+    name: 'reply', args: { chat_id: 'chat-1', text: 'actually-delivered' },
+  });
+  const result = await sendP;
+  assert.equal(result.text, 'actually-delivered', 'only successfully-delivered text in result');
+
+  bridge.close();
+  await cp.kill('test');
+});
+
 test('two concurrent sessions have isolated sockets and routing', async () => {
   const cpA = makeChannelsProcess({ chatId: 'chat-A' });
   const cpB = makeChannelsProcess({ chatId: 'chat-B' });

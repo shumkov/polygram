@@ -117,6 +117,44 @@ test('STALL fires after stallAfterMs of no liveness', async () => {
   assert.ok(stallCall, 'stall emoji applied');
 });
 
+// Review #17: once STALL fires, a subsequent liveness event must resume
+// cycling. Previously inStall was never cleared, so 🥱 stayed frozen for the
+// rest of the turn.
+test('STALL→liveness→cycling resumes (inStall clears on liveness)', async () => {
+  const proc = makeProcess();
+  const rec = makeRecorder();
+  new HeartbeatReactor({
+    process: proc, chatId: 1, messageId: 100,
+    setReaction: rec.setReaction,
+    tickBaseMs: 30,           // ticks fast so we observe resumption
+    tickJitterMs: 0,
+    stallAfterMs: 50,
+    rng: fixedRng([0]),
+    logger: quietLogger,
+  });
+
+  proc.emit('thinking');
+  await Promise.resolve();
+
+  // Wait past stall window
+  await new Promise(r => setTimeout(r, 80));
+  const stallFired = rec.calls.some(c => c.reaction[0] === DEFAULT_STALL_EMOJI);
+  assert.ok(stallFired, 'stall emoji applied after stallAfterMs');
+
+  // Now fire a liveness event — _resetStall should clear inStall, allowing
+  // next tick to cycle again.
+  const callsBeforeResume = rec.calls.length;
+  proc.emit('tool-use', 'Bash');
+  await new Promise(r => setTimeout(r, 60));   // 2 ticks at 30ms
+
+  // After liveness + 2 ticks, at least one new working-pool reaction (NOT stall)
+  const callsAfter = rec.calls.slice(callsBeforeResume);
+  const resumedWithPoolEmoji = callsAfter.some(c =>
+    c.reaction.length === 1 && DEFAULT_WORKING_POOL.includes(c.reaction[0]),
+  );
+  assert.ok(resumedWithPoolEmoji, `cycling resumed after liveness: got calls ${JSON.stringify(callsAfter.map(c => c.reaction))}`);
+});
+
 test('liveness event resets stall timer', async () => {
   const proc = makeProcess();
   const rec = makeRecorder();
