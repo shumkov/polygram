@@ -259,13 +259,17 @@ test('perm_req emits approval-required and respondToPermission round-trips', asy
     input_preview: 'ls -la',
   });
   const ap = await approvalP;
-  assert.equal(ap.requestId, 'abcde');
+  // Canonical shape — matches TmuxProcess's emit signature so polygram's
+  // existing onApprovalRequired handler works without changes.
+  assert.equal(ap.id, 'abcde');
   assert.equal(ap.toolName, 'Bash');
-  assert.equal(ap.description, 'list dir');
-  assert.equal(ap.sessionKey, cp.sessionKey);
-  assert.equal(ap.chatId, 'chat-1');
+  assert.equal(ap.toolInput.description, 'list dir');
+  assert.equal(ap.toolInput.input_preview, 'ls -la');
+  assert.equal(ap.backend, 'channels');
+  assert.equal(typeof ap.respond, 'function');
 
-  await cp.respondToPermission('abcde', 'allow');
+  // Verdict via the canonical respond() closure
+  await ap.respond('allow', 'optional-message-ignored-for-channels');
   const verdict = await bridge.waitFor(m => m.kind === 'perm_verdict');
   assert.equal(verdict.request_id, 'abcde');
   assert.equal(verdict.behavior, 'allow');

@@ -42,6 +42,10 @@ const { filterAttachments } = require('./lib/attachments');
 const { ProcessManager } = require('./lib/process-manager');
 const { createProcessFactory, pickBackend } = require('./lib/process/factory');
 const { extractAssistantText } = require('./lib/process/sdk-process');
+// 0.11.0: channels backend tool dispatcher — adapts ChannelsProcess's reply
+// tool callback into polygram's existing chunkText + deliverReplies primitives.
+const { createChannelsToolDispatcher } = require('./lib/process/channels-tool-dispatcher');
+const { chunkText: chunkTextPlain } = require('./lib/telegram/chunk');
 const { createTmuxRunner } = require('./lib/tmux/tmux-runner');
 const { sweepTmuxOrphans } = require('./lib/tmux/orphan-sweep');
 const { normalizeTuiToolInput } = require('./lib/tmux/tui-tool-input');
@@ -2181,6 +2185,8 @@ async function main() {
   // up-front which binary the tmux backend will use, and warns
   // (non-fatal — SDK-backed chats don't need it) if it's missing.
   // A missing binary still hard-fails per-chat at TmuxProcess.start.
+  // 0.11.0: binCheck reused for channels backend wiring below.
+  let pinnedClaudeBin = null;
   {
     const { CLAUDE_CLI_PINNED_VERSION } = require('./lib/process/tmux-process');
     const { verifyPinnedClaudeBin } = require('./lib/claude-bin');
@@ -2189,6 +2195,7 @@ async function main() {
       console.log(
         `[polygram] tmux backend pinned to claude CLI v${CLAUDE_CLI_PINNED_VERSION}: ${binCheck.path}`,
       );
+      pinnedClaudeBin = binCheck.path;
     } else {
       console.warn(`[polygram] WARNING: ${binCheck.reason}`);
     }
@@ -2199,6 +2206,19 @@ async function main() {
   // running). Configurable via config.bot.tmuxPollIntervalMs.
   const tmuxPollIntervalMs = config.bot?.tmuxPollIntervalMs || 250;
   const pollScheduler = new PollScheduler({ intervalMs: tmuxPollIntervalMs });
+  // 0.11.0: channels backend wiring. Used when a chat opts in via
+  // `pm: 'channels'` config. Falls back to SDK gracefully if the pinned
+  // claude binary isn't present (see factory.js — channelsClaudeBin
+  // missing triggers a loud warn + SDK fallback).
+  const channelsToolDispatcher = createChannelsToolDispatcher({
+    bot,
+    send: tg,
+    chunkText: chunkTextPlain,
+    deliverReplies,
+    logger: console,
+  });
+  const channelsClaudeBin = pinnedClaudeBin;
+
   const processFactory = createProcessFactory({
     config,
     spawnFn: buildSdkOptions,
@@ -2207,6 +2227,9 @@ async function main() {
     tmuxRunner,
     botName: BOT_NAME,
     pollScheduler,
+    // channels backend
+    toolDispatcher: channelsToolDispatcher,
+    channelsClaudeBin,
   });
   // 0.10.0: route tmux backend's in-pane approval prompts through the
   // SAME canUseTool plumbing that SDK chats use. TmuxProcess emits
