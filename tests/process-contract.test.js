@@ -44,12 +44,11 @@ const CHANNELS_SKIPS = new Set([
   'C27',  // pendingQueue introspection (channels uses pendingTurns)
   'C25',  // cost + token-breakdown metrics (Channels protocol doesn't expose them)
   // Optional Process methods channels does not implement in 0.11.0
-  'C13',  // resetSession — not in 0.11.0 scope (defer)
   'C15',  // setModel / applyFlagSettings — channels reconfigures via respawn
   'C16',  // setPermissionMode — channels controls perms via the relay flow
   'C17',  // getContextUsage — Channels protocol doesn't expose usage
-  'C28',  // fireUserMessage — could be added (write user_msg without pending-turn),
-          // deferred until a polygram /compact-equivalent slash command needs it.
+  // C13 (resetSession) + C28 (fireUserMessage) — now implemented in
+  // ChannelsProcess per review AC7 + AC8. No longer skipped.
 ]);
 function shouldSkip(kind, scenario) {
   return kind === 'channels' && CHANNELS_SKIPS.has(scenario);
@@ -254,7 +253,7 @@ for (const kind of BACKENDS) {
 
     // ── API parity (C13–C20) ─────────────────────────────────────────
 
-    test('C13 resetSession returns shape {closed:boolean, drainedPendings:number}', { skip: shouldSkip(kind, 'C13') ? 'channels-protocol N/A' : undefined }, async () => {
+    test('C13 resetSession returns shape {closed:boolean, drainedPendings:number}', async () => {
       // NOTE: `closed` differs across backends.
       // SDK: closes the Query (closed=true) so a fresh one spawns on next send.
       // Tmux: sends /new to the TUI (closed=false; same pty kept alive).
@@ -406,7 +405,7 @@ for (const kind of BACKENDS) {
       await proc.kill('cleanup');
     });
 
-    test('C28 fireUserMessage returns true for valid content + delivers to underlying transport', { skip: shouldSkip(kind, 'C28') ? 'channels-protocol N/A' : undefined }, async () => {
+    test('C28 fireUserMessage returns true for valid content + delivers to underlying transport', async () => {
       // P0.3 / 0.10.0: both backends implement fireUserMessage as a
       // fire-and-forget user-message push regardless of inFlight state.
       // Polygram's /compact slash command depends on this working

@@ -33,6 +33,11 @@ test('construction validates required deps', () => {
     () => createChannelsToolDispatcher({ bot: fakeBot, send: () => {} }),
     /chunkText/,
   );
+  // M3: deliverReplies is required (was optional with lazy require)
+  assert.throws(
+    () => createChannelsToolDispatcher({ bot: fakeBot, send: () => {}, chunkText: fakeChunk }),
+    /deliverReplies required/,
+  );
 });
 
 test('dispatches reply text via deliverReplies', async () => {

@@ -474,6 +474,89 @@ test('toolDispatcher failure does NOT record reply into pending turn', async () 
   await cp.kill('test');
 });
 
+// P2 ADV-6: token-bucket rate limit on reply tool calls. Burst of 20 + 5/s
+// refill (defaults). After exhausting the bucket, NACK kicks in.
+test('P2 ADV-6: tool rate limit NACKs after burst exhausted', async () => {
+  const cp = new ChannelsProcess({
+    sessionKey: 'sess-rate', chatId: 'chat-1', threadId: null, label: 'rate',
+    tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
+    toolDispatcher: async () => ({ ok: true }),
+    logger: quietLogger,
+    handshakeTimeoutMs: 2000,
+    turnQuietMs: 50,
+  });
+  // Set a tiny burst + rate so the test is fast and deterministic.
+  cp.toolRateBurst = 3;
+  cp.toolRateTokens = 3;
+  cp.toolRatePerSec = 0.01;   // effectively no refill during the test
+  const bridge = await startWithFakeBridge(cp);
+
+  // 3 allowed (uses bucket), 4th NACKed
+  for (let i = 1; i <= 4; i++) {
+    bridge.send({
+      kind: 'tool', session: cp.sessionKey, tool_call_id: `rate-${i}`,
+      name: 'reply', args: { chat_id: 'chat-1', text: `msg ${i}` },
+    });
+  }
+  const acks = [];
+  for (let i = 1; i <= 4; i++) {
+    acks.push(await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === `rate-${i}`));
+  }
+  assert.equal(acks[0].ok, true);
+  assert.equal(acks[1].ok, true);
+  assert.equal(acks[2].ok, true);
+  assert.equal(acks[3].ok, false, '4th call rate-limited');
+  assert.match(acks[3].error, /rate limit/);
+
+  bridge.close();
+  await cp.kill('test');
+});
+
+// P2 AC7: fireUserMessage queues a user-shaped message into the bridge
+// without registering a pending turn (used by polygram's /compact slash).
+test('P2 AC7: fireUserMessage writes user_msg without pending-turn registration', async () => {
+  const cp = makeChannelsProcess();
+  const bridge = await startWithFakeBridge(cp);
+
+  assert.equal(cp.fireUserMessage('/compact'), true);
+  const userMsg = await bridge.waitFor(m => m.kind === 'user_msg');
+  assert.equal(userMsg.text, '/compact');
+  assert.equal(cp.pendingTurns.size, 0, 'no pending turn registered');
+  assert.equal(cp.pendingQueue.length, 0);
+
+  // Invalid inputs return false
+  assert.equal(cp.fireUserMessage(''), false);
+  assert.equal(cp.fireUserMessage(null), false);
+
+  bridge.close();
+  await cp.kill('test');
+});
+
+// P2 AC8: resetSession drains pendingTurns + clears claudeSessionId
+test('P2 AC8: resetSession drains pendings, clears session id, emits session-reset', async () => {
+  const cp = makeChannelsProcess();
+  const bridge = await startWithFakeBridge(cp);
+  const originalSid = cp.claudeSessionId;
+  assert.ok(originalSid);
+
+  const sendP = cp.send('hello');
+  const rejectAssertion = assert.rejects(sendP, err => err && err.code === 'RESET');
+  await bridge.waitFor(m => m.kind === 'user_msg');
+
+  const resetP = new Promise(resolve => cp.once('session-reset', resolve));
+  const res = await cp.resetSession({ reason: '/new' });
+  assert.equal(typeof res.closed, 'boolean');
+  assert.equal(res.closed, false);   // Channels does not close on reset; only clears state
+  assert.equal(res.drainedPendings, 1);
+  const evt = await resetP;
+  assert.equal(evt.reason, '/new');
+  assert.equal(cp.claudeSessionId, null, 'claudeSessionId cleared');
+  await rejectAssertion;
+
+  bridge.close();
+  await cp.kill('test');
+});
+
 // P1 #18: _handleStartupDialogs branches — dev-channel confirmation, trust
 // dialog, timeout. Tests use a scripted captureWide that returns different
 // pane content over time and assert sendControl('Enter') fires correctly.

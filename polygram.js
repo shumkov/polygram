@@ -44,8 +44,11 @@ const { createProcessFactory, pickBackend } = require('./lib/process/factory');
 const { extractAssistantText } = require('./lib/process/sdk-process');
 // 0.11.0: channels backend tool dispatcher — adapts ChannelsProcess's reply
 // tool callback into polygram's existing chunkText + deliverReplies primitives.
+// ADV-14: use chunkMarkdownText (fence-aware) instead of plain chunkText so
+// Claude replies containing code blocks or HTML-style tags aren't split mid-
+// element by the size cap.
 const { createChannelsToolDispatcher } = require('./lib/process/channels-tool-dispatcher');
-const { chunkText: chunkTextPlain } = require('./lib/telegram/chunk');
+const { chunkMarkdownText } = require('./lib/telegram/chunk');
 const { createTmuxRunner } = require('./lib/tmux/tmux-runner');
 const { sweepTmuxOrphans } = require('./lib/tmux/orphan-sweep');
 const { normalizeTuiToolInput } = require('./lib/tmux/tui-tool-input');
@@ -2213,7 +2216,7 @@ async function main() {
   const channelsToolDispatcher = createChannelsToolDispatcher({
     bot,
     send: tg,
-    chunkText: chunkTextPlain,
+    chunkText: chunkMarkdownText,
     deliverReplies,
     logger: console,
   });
