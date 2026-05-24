@@ -261,10 +261,14 @@ test('perm_req emits approval-required and respondToPermission round-trips', asy
   const ap = await approvalP;
   // Canonical shape — matches TmuxProcess's emit signature so polygram's
   // existing onApprovalRequired handler works without changes.
+  // P1 #13: toolInput is a STRING (normalizeTuiToolInput expects string;
+  // object → '' silent empty card). When description and input_preview
+  // differ enough, channels folds both into the string for operator visibility.
   assert.equal(ap.id, 'abcde');
   assert.equal(ap.toolName, 'Bash');
-  assert.equal(ap.toolInput.description, 'list dir');
-  assert.equal(ap.toolInput.input_preview, 'ls -la');
+  assert.equal(typeof ap.toolInput, 'string', 'toolInput is a string per TmuxProcess contract');
+  assert.match(ap.toolInput, /ls -la/, 'input_preview included');
+  assert.match(ap.toolInput, /list dir/, 'description folded in when distinct from preview');
   assert.equal(ap.backend, 'channels');
   assert.equal(typeof ap.respond, 'function');
 
@@ -465,6 +469,201 @@ test('toolDispatcher failure does NOT record reply into pending turn', async () 
   });
   const result = await sendP;
   assert.equal(result.text, 'actually-delivered', 'only successfully-delivered text in result');
+
+  bridge.close();
+  await cp.kill('test');
+});
+
+// P1 #4: reply MUST route by echoed turn_id when present so concurrent send()s
+// don't cross-attribute their replies.
+test('P1 #4: reply with echoed turn_id routes to matching pending turn (no fan-out)', async () => {
+  const cp = new ChannelsProcess({
+    sessionKey: 'sess-multi', chatId: 'chat-1', threadId: null, label: 'multi',
+    tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
+    toolDispatcher: async () => ({ ok: true }),
+    logger: quietLogger,
+    handshakeTimeoutMs: 2000,
+    turnQuietMs: 30,
+    turnTimeoutMs: 5_000,
+  });
+  const bridge = await startWithFakeBridge(cp);
+
+  // Two concurrent sends
+  const sendA = cp.send('msg A');
+  const userMsgA = await bridge.waitFor(m => m.kind === 'user_msg');
+  const sendB = cp.send('msg B');
+  const userMsgB = await bridge.waitFor(m => m.kind === 'user_msg' && m.turn_id !== userMsgA.turn_id);
+
+  assert.notEqual(userMsgA.turn_id, userMsgB.turn_id, 'distinct turn_ids');
+
+  // Reply to A with B's turn_id (would cross-attribute under the bug)
+  bridge.send({
+    kind: 'tool', session: cp.sessionKey, tool_call_id: 'r1',
+    name: 'reply',
+    args: { chat_id: 'chat-1', turn_id: userMsgA.turn_id, text: 'reply-for-A' },
+  });
+  await bridge.waitFor(m => m.kind === 'tool_ack');
+
+  const resultA = await sendA;
+  assert.equal(resultA.text, 'reply-for-A', 'send A got its own reply');
+
+  // B still pending
+  assert.equal(cp.pendingTurns.size, 1, 'B still pending after A resolved');
+
+  // Reply to B
+  bridge.send({
+    kind: 'tool', session: cp.sessionKey, tool_call_id: 'r2',
+    name: 'reply',
+    args: { chat_id: 'chat-1', turn_id: userMsgB.turn_id, text: 'reply-for-B' },
+  });
+  await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === 'r2');
+  const resultB = await sendB;
+  assert.equal(resultB.text, 'reply-for-B', 'send B got its own reply');
+
+  bridge.close();
+  await cp.kill('test');
+});
+
+// P1 #15: emit 'tool-use' event on every bridge tool message so polygram's
+// reactor chain gets per-tool icons (CALLBACK_TO_EVENT.onToolUse).
+test('P1 #15: bridge tool dispatch emits canonical tool-use event', async () => {
+  const cp = makeChannelsProcess();
+  const bridge = await startWithFakeBridge(cp);
+
+  const toolUseP = new Promise(resolve => cp.once('tool-use', resolve));
+  bridge.send({
+    kind: 'tool', session: cp.sessionKey, tool_call_id: 'tu-1',
+    name: 'reply', args: { chat_id: 'chat-1', text: 'hi' },
+  });
+  const toolName = await toolUseP;
+  assert.equal(toolName, 'reply');
+
+  bridge.close();
+  await cp.kill('test');
+});
+
+// P1 #15: emit 'autonomous-assistant-message' when a reply arrives with no
+// pending turn (e.g. ScheduleWakeup-style proactive push from Claude).
+test('P1 #15: reply with no pending turn emits autonomous-assistant-message', async () => {
+  const cp = makeChannelsProcess();
+  const bridge = await startWithFakeBridge(cp);
+
+  const autoP = new Promise(resolve => cp.once('autonomous-assistant-message', resolve));
+  bridge.send({
+    kind: 'tool', session: cp.sessionKey, tool_call_id: 'auto-1',
+    name: 'reply', args: { chat_id: 'chat-1', text: 'proactive update' },
+  });
+  await bridge.waitFor(m => m.kind === 'tool_ack');
+
+  const payload = await autoP;
+  assert.equal(payload.text, 'proactive update');
+  assert.equal(payload.backend, 'channels');
+  assert.equal(payload.sessionId, cp.claudeSessionId);
+
+  bridge.close();
+  await cp.kill('test');
+});
+
+// P1 #14: pendingQueue is populated with per-turn context so polygram's SDK
+// callback path can find streamer/reactor via entry.pendingQueue[0].context.
+test('P1 #14: send() populates pendingQueue with per-turn context', async () => {
+  const cp = makeChannelsProcess();
+  const bridge = await startWithFakeBridge(cp);
+
+  const fakeStreamer = { write: () => {} };
+  const fakeReactor = { setState: () => {} };
+  const sendP = cp.send('hi', {
+    context: { streamer: fakeStreamer, reactor: fakeReactor, sourceMsgId: 12345 },
+  });
+  await bridge.waitFor(m => m.kind === 'user_msg');
+
+  // During the turn, pendingQueue[0].context should have what callers wired
+  assert.equal(cp.pendingQueue.length, 1);
+  const ctx = cp.pendingQueue[0].context;
+  assert.equal(ctx.streamer, fakeStreamer);
+  assert.equal(ctx.reactor, fakeReactor);
+  assert.equal(ctx.sourceMsgId, 12345);
+
+  // Resolve the turn — queue should be cleared
+  bridge.send({
+    kind: 'tool', session: cp.sessionKey, tool_call_id: 'r1',
+    name: 'reply', args: { chat_id: 'chat-1', text: 'done' },
+  });
+  await sendP;
+  assert.equal(cp.pendingQueue.length, 0, 'pendingQueue cleared after turn-end');
+
+  bridge.close();
+  await cp.kill('test');
+});
+
+// P1 #7: duplicate tool_call_id re-ACKs without re-dispatching (idempotency).
+test('P1 #7: duplicate tool_call_id is re-ACKed without re-dispatching', async () => {
+  let dispatchCount = 0;
+  const cp = new ChannelsProcess({
+    sessionKey: 'sess-idemp', chatId: 'chat-1', threadId: null, label: 'idemp',
+    tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
+    toolDispatcher: async () => { dispatchCount++; return { ok: true }; },
+    logger: quietLogger,
+    handshakeTimeoutMs: 2000,
+    turnQuietMs: 50,
+  });
+  const bridge = await startWithFakeBridge(cp);
+
+  // First call — dispatched normally
+  bridge.send({
+    kind: 'tool', session: cp.sessionKey, tool_call_id: 'dup-1',
+    name: 'reply', args: { chat_id: 'chat-1', text: 'hi' },
+  });
+  const ack1 = await bridge.waitFor(m => m.kind === 'tool_ack');
+  assert.equal(ack1.ok, true);
+  assert.equal(dispatchCount, 1);
+
+  // Duplicate — should re-ACK without invoking dispatcher again
+  bridge.send({
+    kind: 'tool', session: cp.sessionKey, tool_call_id: 'dup-1',
+    name: 'reply', args: { chat_id: 'chat-1', text: 'hi' },
+  });
+  const ack2 = await bridge.waitFor(m => m.kind === 'tool_ack');
+  assert.equal(ack2.ok, true);
+  assert.equal(dispatchCount, 1, 'dispatcher NOT invoked for duplicate tool_call_id');
+
+  bridge.close();
+  await cp.kill('test');
+});
+
+// P1 #12: quiet-window cap. After maxRepliesPerTurn replies, send() resolves
+// without waiting for the quiet window — prevents chatty-Claude 10-min hang.
+test('P1 #12: send() resolves at maxRepliesPerTurn cap (no chatty-hang)', async () => {
+  const cp = new ChannelsProcess({
+    sessionKey: 'sess-chatty', chatId: 'chat-1', threadId: null, label: 'chatty',
+    tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
+    toolDispatcher: async () => ({ ok: true }),
+    logger: quietLogger,
+    handshakeTimeoutMs: 2000,
+    turnQuietMs: 100_000,            // huge — would never resolve on quiet
+    turnTimeoutMs: 5_000,
+    maxRepliesPerTurn: 3,            // small cap for the test
+  });
+  const bridge = await startWithFakeBridge(cp);
+
+  const sendP = cp.send('do many things');
+  const userMsg = await bridge.waitFor(m => m.kind === 'user_msg');
+
+  // Stream 3 reply tool calls — at the 3rd, send() should resolve IMMEDIATELY
+  // (quiet timer is 100s; cap fires first).
+  for (let i = 1; i <= 3; i++) {
+    bridge.send({
+      kind: 'tool', session: cp.sessionKey, tool_call_id: `r${i}`,
+      name: 'reply', args: { chat_id: 'chat-1', turn_id: userMsg.turn_id, text: `progress ${i}` },
+    });
+    await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === `r${i}`);
+  }
+  // sendP should resolve within ms, not 100s
+  const winner = await Promise.race([
+    sendP.then(() => 'resolved'),
+    new Promise(r => setTimeout(() => r('timeout'), 500)),
+  ]);
+  assert.equal(winner, 'resolved', 'send() resolved at cap, not via quiet window');
 
   bridge.close();
   await cp.kill('test');
