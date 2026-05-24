@@ -1801,6 +1801,139 @@ bypass permissions on (shift+tab to cycle)
         'no menu → no dismissal event emitted');
     });
 
+    // ─── rc.48: /compact progress extends the deadline as long as ──
+    //          progress is observable. Production 2026-05-24 post-
+    //          rc.47 deploy: rc.44's one-shot reset gave compact a
+    //          fresh 120 s, but an even older session needed >120 s
+    //          and timed out anyway. The new logic extends the
+    //          deadline EACH POLL that observes a signature change
+    //          (elapsed time, progress bar, percentage), while a
+    //          genuinely-stalled compact is still bounded by the
+    //          existing deadline.
+
+    test('COMPACT_PROGRESS_RE matches the real /compact progress UI', () => {
+      const { COMPACT_PROGRESS_RE } = require('../lib/process/tmux-process');
+      // Real production capture (shumorobot HOME, 2026-05-24 09:50ish).
+      const realCompact = `
+✶ Compacting conversation… (1m 58s)
+  ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱ 73%
+`;
+      assert.ok(COMPACT_PROGRESS_RE.test(realCompact),
+        'must match the real production compact progress UI');
+    });
+
+    test('COMPACT_PROGRESS_RE signature CHANGES as compact advances', () => {
+      const { COMPACT_PROGRESS_RE } = require('../lib/process/tmux-process');
+      const sig1 = ('✶ Compacting conversation… (1m 30s)\n  ▰▱▱▱ 25%')
+        .match(COMPACT_PROGRESS_RE)?.[0];
+      const sig2 = ('✶ Compacting conversation… (1m 58s)\n  ▰▰▰▱ 73%')
+        .match(COMPACT_PROGRESS_RE)?.[0];
+      assert.ok(sig1 && sig2, 'both compact frames must match');
+      assert.notEqual(sig1, sig2,
+        'signature must differ between two progress frames — '
+        + '"progress observed" detection depends on this');
+    });
+
+    test('COMPACT_PROGRESS_RE does NOT match a normal ready pane', () => {
+      const { COMPACT_PROGRESS_RE } = require('../lib/process/tmux-process');
+      const normalReady = `
+❯
+  ? for shortcuts
+  accept edits on
+`;
+      assert.ok(!COMPACT_PROGRESS_RE.test(normalReady),
+        'a normal ready pane must NOT false-positive as compact-in-progress');
+    });
+
+    test('rc.48: deadline extends while /compact is making progress', async () => {
+      // Virtual clock — same pattern as the rc.44 test, but compact
+      // takes LONGER than readyTimeoutMs even WITH a one-shot reset.
+      // Without the per-poll extension this would throw
+      // TMUX_READY_TIMEOUT (the exact pre-rc.48 production failure
+      // from 2026-05-24 post-rc.47 deploy).
+      let virtualNow = 0;
+      let poll = 0;
+      const runner = makeFakeRunner({
+        captureWide: async () => {
+          poll += 1;
+          virtualNow += 30;        // each poll = 30 virtual ms
+          // Polls 1-3: pre-compact (no menu, no compact UI, no hint).
+          if (poll <= 3) return `claude startup banner ${poll}`;
+          // Polls 4-15: compact in progress — progress (poll number
+          // serves as the changing signature: percentage advances
+          // each tick). 12 polls × 30ms = 360ms of compact, well
+          // past readyTimeoutMs=100ms. Without rc.48 this would
+          // throw TMUX_READY_TIMEOUT.
+          if (poll <= 15) {
+            const pct = Math.floor((poll - 3) / 12 * 100);
+            return `✶ Compacting conversation… (${poll}s)\n  ▰▰▰ ${pct}%`;
+          }
+          // Post-compact: settled ready pane.
+          return ' ▐▛███▜▌   Claude Code v2.1.142\n  ? for shortcuts';
+        },
+      });
+      const p = makeTmuxProcess(runner, {
+        readyTimeoutMs: 100,
+        pollMs: 1,
+        quiesceMs: 1,
+        nowFn: () => virtualNow,
+      });
+      p._fsOverride = { statSync: () => { throw new Error('ENOENT'); } };
+
+      const progressEvents = [];
+      p.on('compact-progress', (ev) => progressEvents.push(ev));
+
+      await p.start({ model: 'sonnet', effort: 'low' });
+
+      assert.ok(progressEvents.length >= 5,
+        `compact-progress events must fire on each observed advancement; `
+        + `got ${progressEvents.length} (expected ≥5 across 12 progressing polls)`);
+      assert.ok(virtualNow > 100,
+        `start() must have outlasted the initial readyTimeoutMs=100; `
+        + `virtualNow=${virtualNow}. Proves the deadline kept extending while `
+        + 'compact progressed. Without this, the production wedge would re-fire.');
+    });
+
+    test('rc.48: stalled /compact (signature frozen) still times out — wedge safety net preserved', async () => {
+      // The critical invariant: compact that GENUINELY wedges (same
+      // signature N polls in a row, no advancement) must NOT extend
+      // the deadline forever. A real wedge needs to surface as
+      // TMUX_READY_TIMEOUT so the operator gets paged.
+      let virtualNow = 0;
+      let poll = 0;
+      const runner = makeFakeRunner({
+        captureWide: async () => {
+          poll += 1;
+          virtualNow += 5;
+          if (poll === 1) return 'claude startup';
+          // Stuck at exactly the same compact frame forever. The
+          // signature must MATCH across polls so the extension
+          // doesn't fire.
+          return '✶ Compacting conversation… (1m 58s)\n  ▰▰▰ 73%';
+        },
+      });
+      const p = makeTmuxProcess(runner, {
+        readyTimeoutMs: 50,
+        pollMs: 1,
+        quiesceMs: 1,
+        nowFn: () => virtualNow,
+      });
+      p._fsOverride = { statSync: () => { throw new Error('ENOENT'); } };
+
+      const progressEvents = [];
+      p.on('compact-progress', (ev) => progressEvents.push(ev));
+
+      await assert.rejects(
+        p.start({ model: 'sonnet', effort: 'low' }),
+        (err) => err.code === 'TMUX_READY_TIMEOUT',
+        'a stalled compact (no progress) MUST still time out — '
+        + 'otherwise a real compact wedge would hang forever',
+      );
+      assert.equal(progressEvents.length, 1,
+        'compact-progress fires exactly ONCE on first sight (signature null → set), '
+        + 'then never again because the signature doesn\'t change');
+    });
+
     test('rc.44: deadline is reset at dismissal so /compact can take >readyTimeoutMs', async () => {
       // The production-failure pin (shumorobot 2026-05-22 23:30+23:36):
       // before rc.44, `let deadline = ...` (was `const`) → dismissal
