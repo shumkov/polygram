@@ -149,9 +149,11 @@ describe('turn-phase module — enum + helpers', () => {
     // Terminal phases are absorbing.
     assert.equal(isLegalTransition(TurnPhase.DONE, TurnPhase.STREAMING), false);
     assert.equal(isLegalTransition(TurnPhase.FAILED, TurnPhase.DONE), false);
-    // QUEUED can advance to PASTED_UNCONFIRMED, PASTE_PARKED, or FAILED
-    // — see the QUEUED→PASTE_PARKED test below. Steady-running phases
-    // are NOT reachable directly from QUEUED.
+    // QUEUED can advance to PASTED_UNCONFIRMED, PASTE_PARKED, SUBMITTED,
+    // or FAILED — see the QUEUED→PASTE_PARKED and QUEUED→SUBMITTED
+    // tests below for the cold-start race rationales. Steady-running
+    // phases beyond submitted (STREAMING, DONE, etc.) are NOT
+    // reachable directly from QUEUED.
     assert.equal(isLegalTransition(TurnPhase.QUEUED, TurnPhase.STREAMING), false);
     assert.equal(isLegalTransition(TurnPhase.QUEUED, TurnPhase.DONE), false);
   });
@@ -175,6 +177,24 @@ describe('turn-phase module — enum + helpers', () => {
   test('isLegalTransition accepts QUEUED → PASTE_PARKED (cold-start enqueue)', () => {
     assert.equal(isLegalTransition(TurnPhase.QUEUED, TurnPhase.PASTE_PARKED), true,
       'queue-operation:enqueue can land before user-message when TUI is busy/cold-starting');
+  });
+
+  // rc.49 (production 2026-05-24, shumorobot HOME): symmetric to the
+  // rc.35→rc.36 PASTE_PARKED fix above. Observed warning:
+  // `[Shumabit@HOME] phase illegal transition: queued → submitted
+  // (turn 3, reason jsonl:user-message)`. Root cause: the JSONL
+  // `user-message` event arrived BEFORE the `paste:returned` event
+  // (which would have first advanced QUEUED → PASTED_UNCONFIRMED).
+  // This is a known race — the TUI's JSONL emitter and the
+  // pasteAndEnter event-return ordering aren't guaranteed. As with
+  // QUEUED→PASTE_PARKED, the predicate table just hadn't been
+  // updated to permit the direct path; the actual control flow
+  // tolerates it (the eventual paste-returned still flows in).
+  // `_setPhase` warns-and-applies on illegal transitions, so the
+  // bug is observer-only — but it's noise we should silence.
+  test('isLegalTransition accepts QUEUED → SUBMITTED (user-message-before-paste-returned race)', () => {
+    assert.equal(isLegalTransition(TurnPhase.QUEUED, TurnPhase.SUBMITTED), true,
+      'jsonl:user-message can land before paste:returned when TUI submit is fast');
   });
 
   test('every phase has an entry in ALLOWED_TRANSITIONS', () => {

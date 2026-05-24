@@ -198,6 +198,70 @@ describe('send — reactions skip DB row', () => {
     const count = db.raw.prepare('SELECT COUNT(*) AS c FROM messages').get().c;
     assert.equal(count, 0);
   });
+
+  // ─── rc.49: sendChatAction must NOT create messages rows ──────────
+  //
+  // Production wedge 2026-05-24 (shumorobot rc.48 deploy day): 236
+  // pending `extra-turn-typing` rows accumulated then got marked
+  // failed on shutdown drain. The typing indicator
+  // (`lib/sdk/callbacks.js` fires `tg(bot, 'sendChatAction', …)`
+  // every 4s during a turn) was creating a fresh `messages` row per
+  // tick because `sendChatAction` was missing from
+  // METHODS_WITHOUT_MSG. Telegram returns `true` (boolean) for
+  // sendChatAction — `res?.message_id ?? 0` evaluates to 0, so
+  // markOutboundSent tried to UPDATE the row to `(chat_id, msg_id=0)`.
+  // First tick: succeeds. Every subsequent tick: UNIQUE constraint
+  // violation on (chat_id, 0). Tight loop, log spam, leaked pending
+  // rows.
+
+  test('sendChatAction does NOT insert a messages row (rc.49)', async () => {
+    // The first tick of the typing-indicator loop. Without the fix,
+    // this inserts a row + UPDATEs it to (chat_id, msg_id=0). With
+    // the fix, no row is inserted at all.
+    const bot = makeFakeBot({ result: true });   // Telegram returns boolean
+    await send({
+      bot, method: 'sendChatAction',
+      params: { chat_id: '42', action: 'typing' },
+      db, meta: { source: 'extra-turn-typing', botName: 'shumorobot' },
+      logger: silentLogger(),
+    });
+    const count = db.raw.prepare('SELECT COUNT(*) AS c FROM messages').get().c;
+    assert.equal(count, 0,
+      'sendChatAction must NOT create a messages row — it returns a '
+      + 'boolean (not a message object), so a row would carry msg_id=0 and '
+      + 'every subsequent call would UNIQUE-collide on (chat_id, 0)');
+  });
+
+  test('repeated sendChatAction calls do NOT trigger UNIQUE constraint (rc.49 production-failure pin)', async () => {
+    // The exact production failure: the typing-indicator's setInterval
+    // fires every 4 seconds during a turn. Pre-rc.49, the 2nd+ tick
+    // hit UNIQUE constraint failed: messages.chat_id, messages.msg_id
+    // and stranded a pending row each time. This test models that
+    // loop by firing N sendChatAction calls in the same chat and
+    // asserting no UNIQUE failure surfaces AND no rows are created.
+    const bot = makeFakeBot({ result: true });
+    let errorsLogged = 0;
+    const logger = {
+      log: () => {},
+      error: (msg) => {
+        if (/UNIQUE constraint failed/.test(String(msg))) errorsLogged += 1;
+      },
+    };
+    for (let i = 0; i < 5; i += 1) {
+      await send({
+        bot, method: 'sendChatAction',
+        params: { chat_id: '42', action: 'typing' },
+        db, meta: { source: 'extra-turn-typing', botName: 'shumorobot' }, logger,
+      });
+    }
+    assert.equal(errorsLogged, 0,
+      'NO UNIQUE constraint errors must surface across N typing-indicator '
+      + 'ticks in the same chat — pre-rc.49 this was 4 errors per 5 ticks '
+      + '(every tick after the first)');
+    const count = db.raw.prepare('SELECT COUNT(*) AS c FROM messages').get().c;
+    assert.equal(count, 0,
+      'NO messages rows created across N typing-indicator ticks');
+  });
 });
 
 describe('send — DB resilience', () => {
