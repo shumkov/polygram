@@ -7,10 +7,12 @@ const { ChannelsProcess } = require('../lib/process/channels-process');
 const { createProcessFactory, pickBackend } = require('../lib/process/factory');
 
 // Minimal fakes so we can construct without touching tmux / claude.
+// Method shape matches lib/tmux/tmux-runner.js exports.
 const fakeRunner = {
-  spawnSession: async () => {},
+  spawn: async () => {},
   killSession: async () => {},
-  sendKeys: async () => {},
+  sendControl: async () => {},
+  captureWide: async () => 'Listening for channel messages from: server:polygram-bridge',
 };
 const fakeDispatcher = async () => ({ ok: true });
 
