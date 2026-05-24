@@ -332,6 +332,68 @@ test('kill() tears down socket file and rejects pending turns', async () => {
   bridge.close();
 });
 
+// Review P0 #1: --mcp-config receives a FILE PATH, not inline JSON. The
+// secret-bearing JSON lives in a 0o600 tmp file. argv never carries the
+// secret (verified via the recorded spawn args).
+test('P0 #1: mcp-config written to 0o600 file, secret NOT in argv', async () => {
+  const fs = require('node:fs');
+  const cp = makeChannelsProcess();
+  const bridge = await startWithFakeBridge(cp);
+  try {
+    // mcpConfigPath was created and exists
+    assert.ok(cp.mcpConfigPath, 'mcpConfigPath set');
+    assert.ok(fs.existsSync(cp.mcpConfigPath), 'mcp-config file exists');
+    const mode = fs.statSync(cp.mcpConfigPath).mode & 0o777;
+    assert.equal(mode, 0o600, `mcp-config mode: ${mode.toString(8)}`);
+    // The runner's recorded spawn args contain the file PATH, not inline JSON
+    const spawnArgs = cp.runner.calls.spawn[0].args;
+    const mcpIdx = spawnArgs.indexOf('--mcp-config');
+    assert.ok(mcpIdx >= 0, '--mcp-config present');
+    const mcpValue = spawnArgs[mcpIdx + 1];
+    assert.equal(mcpValue, cp.mcpConfigPath, 'argv value is the file path');
+    // The argv value MUST NOT be JSON (no `{` or `mcpServers` substring)
+    assert.ok(!mcpValue.startsWith('{'), 'argv value is NOT inline JSON');
+    assert.ok(!mcpValue.includes('mcpServers'), 'argv value has no mcpServers content');
+    assert.ok(!mcpValue.includes(cp.sockSecret), 'argv value does NOT contain socket secret');
+    // The file ON DISK does contain the JSON config with the secret
+    const fileContent = fs.readFileSync(cp.mcpConfigPath, 'utf8');
+    assert.ok(fileContent.includes(cp.sockSecret), 'secret IS inside the 0o600 file');
+    assert.ok(fileContent.includes('mcpServers'), 'file is the JSON config');
+  } finally {
+    bridge.close();
+    await cp.kill('test');
+    // After kill, the file is cleaned up
+    assert.ok(!fs.existsSync(cp.mcpConfigPath), 'mcp-config file unlinked on kill');
+  }
+});
+
+// Review P0 #3: ProcessManager subscribes to 'bridge-disconnected' and kills
+// the dead instance so it leaves the procs Map (frees LRU slot, allows lazy
+// respawn on next message via getOrSpawn).
+test('P0 #3: bridge-disconnected triggers kill via ProcessManager subscriber', async () => {
+  // The ProcessManager listener calls proc.kill('bridge-disconnected'). We
+  // simulate that wiring directly here — full pm integration covered by
+  // tests/process-manager.test.js.
+  const cp = makeChannelsProcess();
+  const bridge = await startWithFakeBridge(cp);
+
+  // Simulate process-manager.js bridge-disconnect listener
+  cp.on('bridge-disconnected', () => {
+    cp.kill('bridge-disconnected').catch(() => {});
+  });
+
+  // Close the fake bridge → real channels-process sees socket close → emits
+  bridge.close();
+  // Allow the close handler to fire and the kill chain to settle
+  await new Promise(r => setTimeout(r, 50));
+
+  assert.equal(cp.closed, true, 'ChannelsProcess killed after bridge disconnect');
+  // Socket cleanup confirmed
+  const fs = require('node:fs');
+  assert.ok(!fs.existsSync(cp.sockPath), 'socket unlinked');
+  assert.ok(!fs.existsSync(cp.mcpConfigPath), 'mcp-config unlinked');
+});
+
 // Review #5: bridge disconnect drains pendingTurns immediately instead of
 // leaving 10-min hardTimers running.
 test('bridge disconnect drains pendingTurns immediately (no 10min hardTimer wait)', async () => {
