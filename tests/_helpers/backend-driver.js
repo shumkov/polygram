@@ -396,11 +396,243 @@ function makeTmuxBackend({ sessionKey = 'chat:100', chatId = '100', threadId = n
   return { process: proc, driver };
 }
 
+// ─── channels driver ─────────────────────────────────────────────────
+
+const net = require('net');
+const { ChannelsProcess } = require('../../lib/process/channels-process');
+
+const CHANNELS_READY_BANNER = 'Listening for channel messages from: server:polygram-bridge';
+
+/**
+ * Fake bridge — speaks the line-delimited JSON socket protocol
+ * ChannelsProcess expects from the real lib/process/channels-bridge.mjs.
+ * Does NOT speak MCP — we exercise the daemon-side socket layer only.
+ * Same shape as the helper in tests/channels-process-integration.test.js.
+ */
+function connectFakeChannelsBridge({ sockPath, sessionKey, secret, claudeSessionId = 'fake-claude-sid' }) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(sockPath);
+    let buf = '';
+    const inbox = [];
+    const waiters = [];
+    sock.setEncoding('utf8');
+
+    sock.on('connect', () => {
+      sock.write(JSON.stringify({ kind: 'hello', session_key: sessionKey, secret }) + '\n');
+      sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: claudeSessionId }) + '\n');
+    });
+
+    sock.on('data', chunk => {
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        let msg;
+        try { msg = JSON.parse(line); } catch { continue; }
+        inbox.push(msg);
+        for (let i = 0; i < waiters.length; i++) {
+          if (waiters[i].match(msg)) {
+            const [w] = waiters.splice(i, 1);
+            inbox.pop();   // consumed by waiter
+            w.resolve(msg);
+            break;
+          }
+        }
+      }
+    });
+
+    sock.on('error', err => {
+      // Connection closed during normal teardown — not fatal to tests.
+      if (!sock.destroyed) reject(err);
+    });
+
+    const api = {
+      sock,
+      inbox,
+      waitFor(predicate, { timeoutMs = 1500 } = {}) {
+        const idx = inbox.findIndex(predicate);
+        if (idx >= 0) return Promise.resolve(inbox.splice(idx, 1)[0]);
+        return new Promise((resolveW, rejectW) => {
+          const timer = setTimeout(() => rejectW(new Error('waitFor timeout')), timeoutMs);
+          waiters.push({
+            match: predicate,
+            resolve: msg => { clearTimeout(timer); resolveW(msg); },
+          });
+        });
+      },
+      send(obj) { sock.write(JSON.stringify(obj) + '\n'); },
+      close() { try { sock.end(); } catch {} },
+    };
+    resolve(api);
+  });
+}
+
+function makeChannelsBackend({ sessionKey = 'chat:100', chatId = '100', threadId = null } = {}) {
+  let bridge = null;          // populated by fake runner.spawn
+  let bridgeReadyP = null;
+  const dispatched = [];      // every toolDispatcher invocation, for replyTo + assertions
+
+  // Runner whose spawn() hooks the fake bridge into the proc's socket the
+  // moment proc.start() has finished _createSocketServer. Mirrors real flow:
+  // in production, runner.spawn -> claude -> claude spawns the bridge -> bridge
+  // connects back. Here we cut out claude and connect a fake bridge ourselves.
+  const runner = {
+    spawn: async () => {
+      // proc.sockPath + proc.sockSecret are set by _createSocketServer BEFORE
+      // _spawnTmuxClaude is called, so they exist here.
+      bridgeReadyP = connectFakeChannelsBridge({
+        sockPath: proc.sockPath,
+        sessionKey: proc.sessionKey,
+        secret: proc.sockSecret,
+      }).then(b => { bridge = b; return b; });
+      // Wait until handshake msg has been sent so the proc's _waitForBridgeHandshake
+      // sees session_init before the dialog poll times out.
+      await bridgeReadyP;
+    },
+    killSession: async () => {
+      if (bridge) { bridge.close(); bridge = null; }
+    },
+    sendControl: async () => {},
+    captureWide: async () => CHANNELS_READY_BANNER,
+  };
+
+  // toolDispatcher records every reply for replyTo() scripting + assertPasted.
+  // Returns ok:true by default; tests can replace via driver._setDispatcher.
+  let userDispatcher = async () => ({ ok: true });
+  const toolDispatcher = async (call) => {
+    dispatched.push(call);
+    return userDispatcher(call);
+  };
+
+  const proc = new ChannelsProcess({
+    sessionKey, chatId, threadId, label: 'channels-test',
+    tmuxRunner: runner,
+    botName: 'test',
+    claudeBin: '/usr/bin/true',     // never invoked; fake runner.spawn no-ops
+    toolDispatcher,
+    logger: SILENT,
+    handshakeTimeoutMs: 2000,
+    turnQuietMs: 30,                 // small for tests
+    turnTimeoutMs: 3_000,
+  });
+
+  // Pending reply scripts: prompt → reply text.
+  // When a user_msg matching the prompt arrives over the socket, the
+  // fake bridge sends a 'tool' message back simulating claude calling reply.
+  const replyScripts = new Map();
+
+  // Hook user_msg arrivals on the fake bridge to fire scripted replies.
+  // We need to wait until bridge is set after the first spawn() call.
+  async function ensureBridge() {
+    if (bridge) return bridge;
+    if (bridgeReadyP) return bridgeReadyP;
+    throw new Error('channels driver: bridge not yet connected (call proc.start first)');
+  }
+
+  // Poll the bridge inbox for user_msgs to script replies.
+  // Simple approach: every time the fake bridge sees a user_msg, dispatch
+  // a matching scripted reply.
+  let pollerInterval = null;
+  function startReplyPoller() {
+    if (pollerInterval) return;
+    pollerInterval = setInterval(() => {
+      if (!bridge) return;
+      // Pull any matched user_msgs from the inbox
+      for (let i = bridge.inbox.length - 1; i >= 0; i--) {
+        const msg = bridge.inbox[i];
+        if (msg.kind !== 'user_msg') continue;
+        const script = replyScripts.get(msg.text);
+        if (!script) continue;
+        bridge.inbox.splice(i, 1);
+        replyScripts.delete(msg.text);
+        // Fire scripted reply via fake bridge
+        bridge.send({
+          kind: 'tool',
+          session: proc.sessionKey,
+          tool_call_id: `script-${Date.now()}`,
+          name: 'reply',
+          args: { chat_id: chatId, text: script },
+        });
+      }
+    }, 5);
+    pollerInterval.unref?.();
+  }
+
+  // Clean up resources when proc dies
+  const origKill = proc.kill.bind(proc);
+  proc.kill = async (reason) => {
+    if (pollerInterval) { clearInterval(pollerInterval); pollerInterval = null; }
+    if (bridge) { bridge.close(); bridge = null; }
+    return origKill(reason);
+  };
+
+  const driver = {
+    kind: 'channels',
+    _proc: proc,
+    get _bridge() { return bridge; },
+
+    /** Bring backend to ready. For channels, start() is mostly a no-op —
+     *  the real work happens during proc.start() (socket + bridge handshake). */
+    async start() {
+      startReplyPoller();
+    },
+
+    /** Script a one-shot reply for a specific prompt. */
+    replyTo(prompt, text) {
+      replyScripts.set(prompt, text);
+    },
+
+    /** Verify the prompt landed on the socket as a user_msg. */
+    assertPasted(text) {
+      // Both the inbox and dispatched are checked; user_msgs may be consumed
+      // by replyTo so we keep a separate record on the bridge's data handler.
+      // Simpler: check that the prompt was sent via socket (it WAS if it
+      // didn't appear in replyScripts deletion or it's still in inbox).
+      // For the contract test pattern, replyTo is always called before send
+      // so the prompt will be matched + the reply scripted. After send
+      // resolves, we can verify the script was consumed.
+      if (replyScripts.has(text)) {
+        throw new Error(`channels driver: prompt "${text}" never reached the bridge (still in replyScripts)`);
+      }
+    },
+
+    async simulateClose() {
+      if (bridge) { bridge.close(); bridge = null; }
+      await new Promise(r => setImmediate(r));
+    },
+
+    /** Simulate claude proactively sending a reply with no preceding user_msg. */
+    async simulateAutonomousMessage(text) {
+      await ensureBridge();
+      bridge.send({
+        kind: 'tool',
+        session: proc.sessionKey,
+        tool_call_id: `auto-${Date.now()}`,
+        name: 'reply',
+        args: { chat_id: chatId, text },
+      });
+      await new Promise(r => setTimeout(r, 30));
+    },
+
+    /** Compact boundary — not surfaced through the channels protocol. */
+    async simulateCompactBoundary() {
+      throw new Error('channels backend: simulateCompactBoundary not supported (no compact event in Channels protocol)');
+    },
+
+    /** Test hook: replace the userland dispatcher to e.g. force errors. */
+    _setDispatcher(fn) { userDispatcher = fn; },
+  };
+
+  return { process: proc, driver };
+}
+
 // ─── public API ──────────────────────────────────────────────────────
 
 function makeBackend(kind, opts) {
   if (kind === 'sdk') return makeSdkBackend(opts);
   if (kind === 'tmux') return makeTmuxBackend(opts);
+  if (kind === 'channels') return makeChannelsBackend(opts);
   throw new Error(`makeBackend: unknown kind "${kind}"`);
 }
 

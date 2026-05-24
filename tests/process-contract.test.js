@@ -27,7 +27,33 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const { makeBackend } = require('./_helpers/backend-driver');
 
-const BACKENDS = ['sdk', 'tmux'];
+const BACKENDS = ['sdk', 'tmux', 'channels'];
+
+// Channels backend skips scenarios that test transport-specific features
+// the Channels protocol intentionally doesn't expose. Channels-specific
+// contract assertions live in tests/channels-process-integration.test.js.
+const CHANNELS_SKIPS = new Set([
+  // SDK/tmux-specific event shapes the Channels protocol doesn't surface
+  'C24',  // autonomous-assistant-message (channels delivers via reply tool)
+  'C26',  // compact-boundary (no compact event in Channels protocol)
+  'C21',  // prompt-sanitized event (channels accepts as-is; sanitization upstream)
+  // SDK/tmux pending-queue + injection semantics not implemented by channels
+  'C7',   // drainQueue + throwing reject (pendingTurns map shape differs)
+  'C10', 'C11', 'C23',  // injectUserMessage (channels: Process default false)
+  'C20',  // concurrent send() serialization (channels relies on upstream queue)
+  'C27',  // pendingQueue introspection (channels uses pendingTurns)
+  'C25',  // cost + token-breakdown metrics (Channels protocol doesn't expose them)
+  // Optional Process methods channels does not implement in 0.11.0
+  'C13',  // resetSession — not in 0.11.0 scope (defer)
+  'C15',  // setModel / applyFlagSettings — channels reconfigures via respawn
+  'C16',  // setPermissionMode — channels controls perms via the relay flow
+  'C17',  // getContextUsage — Channels protocol doesn't expose usage
+  'C28',  // fireUserMessage — could be added (write user_msg without pending-turn),
+          // deferred until a polygram /compact-equivalent slash command needs it.
+]);
+function shouldSkip(kind, scenario) {
+  return kind === 'channels' && CHANNELS_SKIPS.has(scenario);
+}
 
 const CHAT_CONFIG = { model: 'sonnet', effort: 'high', cwd: '/tmp' };
 
@@ -132,7 +158,7 @@ for (const kind of BACKENDS) {
       await proc.kill('cleanup');
     });
 
-    test('C7 drainQueue with throwing reject does NOT bubble', async () => {
+    test('C7 drainQueue with throwing reject does NOT bubble', { skip: shouldSkip(kind, 'C7') ? 'channels-protocol N/A' : undefined }, async () => {
       const { proc, driver } = await setupReady(kind);
       proc.pendingQueue.push({
         reject: () => { throw new Error('reject boom'); },
@@ -177,7 +203,7 @@ for (const kind of BACKENDS) {
       await proc.kill('cleanup');
     });
 
-    test('C10 injectUserMessage with valid content + live turn returns true + emits inject-user-message event', async () => {
+    test('C10 injectUserMessage with valid content + live turn returns true + emits inject-user-message event', { skip: shouldSkip(kind, 'C10') ? 'channels-protocol N/A' : undefined }, async () => {
       const { proc, driver } = await setupReady(kind);
       proc.inFlight = true;
       const fired = new Promise((resolve) => proc.once('inject-user-message', resolve));
@@ -192,7 +218,7 @@ for (const kind of BACKENDS) {
       await proc.kill('cleanup');
     });
 
-    test('C11 injectUserMessage transport failure surfaces as event, not throw', async () => {
+    test('C11 injectUserMessage transport failure surfaces as event, not throw', { skip: shouldSkip(kind, 'C11') ? 'channels-protocol N/A' : undefined }, async () => {
       const { proc, driver } = await setupReady(kind);
       proc.inFlight = true;
       // Backend-specific: poison the transport so the underlying paste/push
@@ -228,7 +254,7 @@ for (const kind of BACKENDS) {
 
     // ── API parity (C13–C20) ─────────────────────────────────────────
 
-    test('C13 resetSession returns shape {closed:boolean, drainedPendings:number}', async () => {
+    test('C13 resetSession returns shape {closed:boolean, drainedPendings:number}', { skip: shouldSkip(kind, 'C13') ? 'channels-protocol N/A' : undefined }, async () => {
       // NOTE: `closed` differs across backends.
       // SDK: closes the Query (closed=true) so a fresh one spawns on next send.
       // Tmux: sends /new to the TUI (closed=false; same pty kept alive).
@@ -253,20 +279,20 @@ for (const kind of BACKENDS) {
       await proc.kill('cleanup');
     });
 
-    test('C15 setModel + applyFlagSettings resolve without throw', async () => {
+    test('C15 setModel + applyFlagSettings resolve without throw', { skip: shouldSkip(kind, 'C15') ? 'channels-protocol N/A' : undefined }, async () => {
       const { proc, driver } = await setupReady(kind);
       await proc.setModel('haiku');
       await proc.applyFlagSettings({ effortLevel: 'low' });
       await proc.kill('cleanup');
     });
 
-    test('C16 setPermissionMode resolves without throw', async () => {
+    test('C16 setPermissionMode resolves without throw', { skip: shouldSkip(kind, 'C16') ? 'channels-protocol N/A' : undefined }, async () => {
       const { proc, driver } = await setupReady(kind);
       await proc.setPermissionMode('default');
       await proc.kill('cleanup');
     });
 
-    test('C17 getContextUsage returns SDK-shaped usage OR throws UnsupportedOperationError', async () => {
+    test('C17 getContextUsage returns SDK-shaped usage OR throws UnsupportedOperationError', { skip: shouldSkip(kind, 'C17') ? 'channels-protocol N/A' : undefined }, async () => {
       const { proc, driver } = await setupReady(kind);
       // Seed a usage snapshot on each backend so getContextUsage has
       // data to return. Without this, both backends correctly throw
@@ -320,7 +346,7 @@ for (const kind of BACKENDS) {
 
     // ── Event-emission parity (C21–C23) ──────────────────────────────
 
-    test('C21 send() with control chars in prompt fires prompt-sanitized event + strips them', async () => {
+    test('C21 send() with control chars in prompt fires prompt-sanitized event + strips them', { skip: shouldSkip(kind, 'C21') ? 'channels-protocol N/A' : undefined }, async () => {
       const { proc, driver } = await setupReady(kind);
       driver.replyTo('clean prompt', 'ok');
       // Register the listener BEFORE calling send() — SDK emits the
@@ -357,7 +383,7 @@ for (const kind of BACKENDS) {
       await proc.kill('cleanup');
     });
 
-    test('C23 injectUserMessage transport failure emits inject-fail event', async () => {
+    test('C23 injectUserMessage transport failure emits inject-fail event', { skip: shouldSkip(kind, 'C23') ? 'channels-protocol N/A' : undefined }, async () => {
       const { proc, driver } = await setupReady(kind);
       proc.inFlight = true;
       // Poison the underlying transport so the inject path's send fails.
@@ -380,7 +406,7 @@ for (const kind of BACKENDS) {
       await proc.kill('cleanup');
     });
 
-    test('C28 fireUserMessage returns true for valid content + delivers to underlying transport', async () => {
+    test('C28 fireUserMessage returns true for valid content + delivers to underlying transport', { skip: shouldSkip(kind, 'C28') ? 'channels-protocol N/A' : undefined }, async () => {
       // P0.3 / 0.10.0: both backends implement fireUserMessage as a
       // fire-and-forget user-message push regardless of inFlight state.
       // Polygram's /compact slash command depends on this working
@@ -398,7 +424,7 @@ for (const kind of BACKENDS) {
       assert.equal(proc.fireUserMessage('still trying'), false);
     });
 
-    test('C26 compact-boundary fires when claude auto-compacts mid-conversation', async () => {
+    test('C26 compact-boundary fires when claude auto-compacts mid-conversation', { skip: shouldSkip(kind, 'C26') ? 'channels-protocol N/A' : undefined }, async () => {
       const { proc, driver } = await setupReady(kind);
       const compactEvents = [];
       proc.on('compact-boundary', (ev) => compactEvents.push(ev));
@@ -409,7 +435,7 @@ for (const kind of BACKENDS) {
       await proc.kill('cleanup');
     });
 
-    test('C27 in-flight send keeps pendingQueue[0].context for streamer/reactor lookups', async () => {
+    test('C27 in-flight send keeps pendingQueue[0].context for streamer/reactor lookups', { skip: shouldSkip(kind, 'C27') ? 'channels-protocol N/A' : undefined }, async () => {
       // Polygram's onStreamChunk reads entry.pendingQueue[0].context.
       // {streamer,reactor}. The abstraction holds only if BOTH backends
       // populate pendingQueue[0] with a context-bearing pending while
@@ -429,7 +455,7 @@ for (const kind of BACKENDS) {
       await proc.kill('cleanup');
     });
 
-    test('C25 send() result populates cost + token-breakdown metrics', async () => {
+    test('C25 send() result populates cost + token-breakdown metrics', { skip: shouldSkip(kind, 'C25') ? 'channels-protocol N/A' : undefined }, async () => {
       const { proc, driver } = await setupReady(kind);
       driver.replyTo('hi', 'hello!');
       const res = await proc.send('hi');
@@ -451,7 +477,7 @@ for (const kind of BACKENDS) {
       await proc.kill('cleanup');
     });
 
-    test('C24 autonomous assistant message (no in-flight turn) fires autonomous-assistant-message event', async () => {
+    test('C24 autonomous assistant message (no in-flight turn) fires autonomous-assistant-message event', { skip: shouldSkip(kind, 'C24') ? 'channels-protocol N/A' : undefined }, async () => {
       const { proc, driver } = await setupReady(kind);
       // Make sure nothing is in flight — autonomous messages are by
       // definition unsolicited (e.g. ScheduleWakeup firing).
@@ -469,7 +495,7 @@ for (const kind of BACKENDS) {
       await proc.kill('cleanup');
     });
 
-    test('C20 concurrent send() serializes — second only fires after first resolves', async () => {
+    test('C20 concurrent send() serializes — second only fires after first resolves', { skip: shouldSkip(kind, 'C20') ? 'channels-protocol N/A' : undefined }, async () => {
       const { proc, driver } = await setupReady(kind);
       driver.replyTo('first', 'reply-1');
       driver.replyTo('second', 'reply-2');
