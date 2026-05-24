@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "phase0-bridge": {
-      "command": "node",
-      "args": ["./scripts/channels-spike/phase0-bridge.mjs"]
-    }
-  }
-}

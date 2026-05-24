@@ -615,9 +615,15 @@ function makeChannelsBackend({ sessionKey = 'chat:100', chatId = '100', threadId
       await new Promise(r => setTimeout(r, 30));
     },
 
-    /** Compact boundary — not surfaced through the channels protocol. */
+    /** Compact boundary — not surfaced through the channels protocol.
+     *  Review P3 AC9: return a sentinel instead of throwing so future cross-
+     *  backend driver-shape tests don't break. Callers can branch on
+     *  `result.supported`. */
     async simulateCompactBoundary() {
-      throw new Error('channels backend: simulateCompactBoundary not supported (no compact event in Channels protocol)');
+      return {
+        supported: false,
+        reason: 'channels-protocol-N/A: no compact event in Channels protocol',
+      };
     },
 
     /** Test hook: replace the userland dispatcher to e.g. force errors. */
