@@ -252,6 +252,136 @@ describe('createDispatcher — auto-resume gating', () => {
   });
 });
 
+// ─── rc.51: auto-resume reply goes through processAndDeliverAgentText ──
+//
+// Pre-rc.51, attemptAutoResume called deliverReplies directly with the
+// raw `result.text` from the auto-resume turn. Same latent bug class as
+// the rc.50 autonomous-wakeup fix and the rc.51 extra-turn-reply fix:
+// `[sticker:NAME]` would have shown as literal text, canned strings
+// would have leaked. The fixture above doesn't wire parseResponse +
+// sanitizeAssistantReply, so it exercises the back-compat fallback
+// path — these new tests wire them and verify the protected path.
+
+function pipelineFixture(overrides = {}) {
+  const { parseResponse: parseImpl } = require('../lib/telegram/parse');
+  const { sanitizeAssistantReply: sanitizeImpl } = require('../lib/telegram/sanitize-reply');
+  const stickerMap = { pumped: 'file_id_pumped' };
+  const parseResponse = (text) => parseImpl(text, { stickerMap, emojiToSticker: {} });
+  return fixture({ ...overrides, parseResponse, sanitizeAssistantReply: sanitizeImpl });
+}
+
+// fixture() doesn't accept parseResponse/sanitizeAssistantReply — extend it
+// for the wired path. Read the existing factory's params and add the new ones
+// by composing a wrapper.
+function fixtureWithPipeline(overrides = {}) {
+  // Re-build the fixture but pass parseResponse + sanitizeAssistantReply.
+  // The fixture() factory already accepts arbitrary createDispatcher opts
+  // via overrides — but it doesn't forward unknown keys. Instead, replicate
+  // it inline with the additional deps.
+  const calls = {
+    sendToProcess: [], tg: [], events: [], deliverReplies: [],
+    autoResumeAttempts: [], autoResumeClears: [],
+    setInboundStatus: [],
+  };
+  let handleResolver;
+  const handleMessage = overrides.handleMessage || ((sk, cid, msg, b) => {
+    return new Promise((resolve, reject) => { handleResolver = { resolve, reject }; });
+  });
+
+  const stickerMap = overrides.stickerMap || { pumped: 'file_id_pumped' };
+  const { parseResponse: parseImpl } = require('../lib/telegram/parse');
+  const { sanitizeAssistantReply } = require('../lib/telegram/sanitize-reply');
+  const parseResponse = (text) => parseImpl(text, { stickerMap, emojiToSticker: {} });
+
+  const dispatcher = createDispatcher({
+    config: { bot: { queueWarnThreshold: 3 } },
+    db: { setInboundHandlerStatus: (row) => calls.setInboundStatus.push(row) },
+    dbWrite: (fn) => { try { fn(); } catch {} },
+    tg: async (bot, method, params, meta) => {
+      calls.tg.push({ bot, method, params, meta });
+      return { ok: true, message_id: 999 };
+    },
+    botName: 'testbot',
+    logEvent: (kind, detail) => calls.events.push({ kind, detail }),
+    handleMessage,
+    sendToProcess: async (sk, prompt, ctx) => {
+      calls.sendToProcess.push({ sessionKey: sk, prompt, ctx });
+      return overrides.sendToProcessResult || { text: 'auto-resume reply text' };
+    },
+    classifyError: (err) => ({
+      kind: 'unknown',
+      userMessage: `error: ${err.message}`,
+      isTransient: false,
+      autoRecover: false,
+    }),
+    isAutoResumable: () => overrides.isAutoResumable === true,
+    abortGrace: { isRecent: () => false },
+    autoResumeTracker: {
+      isInCooldown: () => false,
+      markAttempt: (sk) => calls.autoResumeAttempts.push(sk),
+      clear: (sk) => calls.autoResumeClears.push(sk),
+    },
+    chunkMarkdownText: (text) => [text],
+    deliverReplies: async (args) => {
+      calls.deliverReplies.push(args);
+      return { sent: [1], failed: [], results: [] };
+    },
+    chunkBudget: 4096,
+    // rc.51 pipeline deps wired:
+    parseResponse,
+    sanitizeAssistantReply,
+    getIsShuttingDown: () => false,
+    logger: { log: () => {}, error: () => {} },
+  });
+
+  return { dispatcher, calls, getResolver: () => handleResolver };
+}
+
+describe('createDispatcher — rc.51 auto-resume pipeline integration', () => {
+  test('auto-resume reply with [sticker:pumped] strips tag + fires sendSticker', async () => {
+    const fx = fixtureWithPipeline({
+      isAutoResumable: true,
+      sendToProcessResult: { text: 'All recovered. [sticker:pumped]' },
+    });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(new Error('300s no activity'));
+    // Let the async chain (auto-resume → sendToProcess → pipeline → tg) settle.
+    for (let i = 0; i < 8; i++) await nextTick();
+
+    // Text bubble carries cleaned text, NOT the sticker tag.
+    const deliveryWithText = fx.calls.deliverReplies.find(
+      (d) => d.meta?.source === 'auto-resume-reply',
+    );
+    assert.ok(deliveryWithText, 'auto-resume-reply delivery must fire via pipeline');
+    assert.equal(deliveryWithText.chunks[0].trim(), 'All recovered.',
+      'sticker tag must be stripped from text bubble');
+    // sendSticker must be one of the tg calls.
+    const stickerCalls = fx.calls.tg.filter((c) => c.method === 'sendSticker');
+    assert.equal(stickerCalls.length, 1,
+      '[sticker:pumped] must fire sendSticker, not stay as literal text');
+    assert.equal(stickerCalls[0].params.sticker, 'file_id_pumped');
+  });
+
+  test('auto-resume reply with canned-string is sanitized + emits event', async () => {
+    const fx = fixtureWithPipeline({
+      isAutoResumable: true,
+      sendToProcessResult: { text: 'No response requested.' },
+    });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(new Error('300s no activity'));
+    for (let i = 0; i < 8; i++) await nextTick();
+
+    const delivery = fx.calls.deliverReplies.find((d) => d.meta?.source === 'auto-resume-reply');
+    assert.ok(delivery);
+    assert.doesNotMatch(delivery.chunks[0], /No response requested\./);
+    const canned = fx.calls.events.find((e) => e.kind === 'canned-reply-suppressed');
+    assert.ok(canned);
+    assert.equal(canned.detail.source, 'auto-resume-reply');
+  });
+});
+
 describe('createDispatcher — errorReplyText null-suppression', () => {
   test('classifyError returns null userMessage → no Telegram send', async () => {
     const fx = fixture({ userMessage: null });

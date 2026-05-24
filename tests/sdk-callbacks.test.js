@@ -646,6 +646,104 @@ describe('onAutonomousAssistantMessage — bot-initiated wakeup', () => {
     assert.equal(event.detail.pipeline, 'raw-fallback',
       'event must tag which path ran so soak can verify production runs the full path');
   });
+
+  // ─── rc.51: same pipeline coverage for onExtraTurnReply ──────────
+  //
+  // Audit during rc.50 surfaced `onExtraTurnReply` as a latent bug
+  // of the same class as `onAutonomousAssistantMessage`: agent text
+  // sent via raw `tg(bot, 'sendMessage')` without parseResponse +
+  // sanitizer. Not yet observed in production, but inevitable.
+  // rc.51 routes both paths through `processAndDeliverAgentText`.
+  //
+  // Distinction from autonomous-wakeup: extra-turn-reply HAS a
+  // target msg (the autosteered user message), so [react:EMOJI]
+  // tags CAN apply.
+
+  test('rc.51: onExtraTurnReply routes text through deliverReplies (not raw sendMessage)', async () => {
+    const h = pipelineDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onExtraTurnReply('12345:24', {
+      msgId: 999, text: 'Got it — running now.', backend: 'tmux',
+    });
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(h.deliverCalls.length, 1,
+      'deliverReplies must be used (was raw tg(sendMessage) pre-rc.51)');
+    assert.equal(h.deliverCalls[0].chunks[0], 'Got it — running now.');
+    assert.equal(h.deliverCalls[0].replyToMessageId, 999,
+      'tmux autosteered msg is the reply target — reactions CAN apply here');
+    assert.equal(h.deliverCalls[0].threadId, 24);
+    assert.equal(h.deliverCalls[0].meta.source, 'extra-turn-reply');
+    // Existing extra-turn-reply event still emitted, tagged 'full'.
+    const ev = h.events.find((e) => e.kind === 'extra-turn-reply');
+    assert.ok(ev);
+    assert.equal(ev.detail.pipeline, 'full');
+    assert.equal(ev.detail.msg_id, 999);
+  });
+
+  test('rc.51: onExtraTurnReply strips [sticker:NAME] + fires sendSticker', async () => {
+    const h = pipelineDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onExtraTurnReply('12345', {
+      msgId: 500, text: 'Tests passed. [sticker:pumped]', backend: 'tmux',
+    });
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(h.deliverCalls[0].chunks[0].trim(), 'Tests passed.');
+    const stickers = h.tgCalls.filter((c) => c.method === 'sendSticker');
+    assert.equal(stickers.length, 1);
+    assert.equal(stickers[0].params.sticker, 'file_id_pumped');
+  });
+
+  test('rc.51: onExtraTurnReply applies [react:EMOJI] to msgId (no drop — target exists)', async () => {
+    // Unlike autonomous-wakeup (no target → drop), extra-turn-reply
+    // HAS the autosteered user's msgId, so reactions get APPLIED
+    // (not dropped) to that msg.
+    const h = pipelineDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onExtraTurnReply('12345', {
+      msgId: 777, text: 'Done [react:🔥]', backend: 'tmux',
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const reactions = h.tgCalls.filter((c) => c.method === 'setMessageReaction');
+    assert.equal(reactions.length, 1, 'reaction must APPLY here (target msg exists)');
+    assert.equal(reactions[0].params.message_id, 777);
+    assert.equal(reactions[0].params.reaction[0].emoji, '🔥');
+    // No drop event (it was applied, not dropped).
+    const dropped = h.events.find((e) => e.kind === 'extra-turn-reply-reactions-dropped');
+    assert.equal(dropped, undefined);
+  });
+
+  test('rc.51: onExtraTurnReply sanitizes "No response requested." (canned-string leak protection)', async () => {
+    const h = pipelineDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onExtraTurnReply('12345', {
+      msgId: 500, text: 'No response requested.', backend: 'tmux',
+    });
+    await new Promise((r) => setImmediate(r));
+
+    assert.doesNotMatch(h.deliverCalls[0].chunks[0], /No response requested\./);
+    const cannedEvents = h.events.filter((e) => e.kind === 'canned-reply-suppressed');
+    assert.equal(cannedEvents.length, 1);
+    assert.equal(cannedEvents[0].detail.source, 'extra-turn-reply');
+  });
+
+  test('rc.51: onExtraTurnReply pipeline-missing fallback still works (back-compat)', async () => {
+    const h = baseDeps();    // NO pipeline deps
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onExtraTurnReply('12345', {
+      msgId: 500, text: 'raw fallback path', backend: 'tmux',
+    });
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(h.tgCalls.length, 1);
+    assert.equal(h.tgCalls[0].method, 'sendMessage');
+    assert.equal(h.tgCalls[0].params.text, 'raw fallback path',
+      'text sent UNPROCESSED in fallback path');
+    const ev = h.events.find((e) => e.kind === 'extra-turn-reply');
+    assert.equal(ev.detail.pipeline, 'raw-fallback');
+  });
 });
 
 describe('onCompactBoundary — surface compaction + clear hint flag', () => {

@@ -2288,6 +2288,10 @@ async function main() {
     abortGrace, autoResumeTracker,
     chunkMarkdownText, deliverReplies,
     chunkBudget: TG_CHUNK_BUDGET,
+    // rc.51: parseResponse + sanitizer for the auto-resume reply
+    // path (see attemptAutoResume in dispatcher.js). Mirrors how
+    // sdkCallbacks (rc.50) gets the same deps.
+    parseResponse, sanitizeAssistantReply,
     getIsShuttingDown: () => isShuttingDown,
     logger: console,
   }));
