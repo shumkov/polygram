@@ -164,6 +164,42 @@ describe('classify — PATTERNS coverage (one sample per kind)', () => {
       'tmux tool wedge vs polygram-pm idle must produce DIFFERENT user messages');
   });
 
+  // ─── rc.50: lruWaitTimeout ──────────────────────────────────────
+  //
+  // Production 2026-05-24 (shumorobot Music): the wedged "yes" turn
+  // held HOME tmux inFlight for 30 min. LRU can't evict inFlight
+  // procs (correct behavior — would kill a running turn). Music
+  // needed a tmux slot, parked, 5-min lruWaitMs timeout fired,
+  // bubbled up as `lru wait timed out after 300000ms`. Pre-rc.50
+  // the user got the generic `Hit a snag: …` opaque message.
+
+  test('lruWaitTimeout matches the lru-wait-timeout error message', () => {
+    const r = classify(new Error('lru wait timed out after 300000ms'));
+    assert.equal(r.kind, 'lruWaitTimeout');
+    assert.match(r.userMessage, /busy|backend slot|try resending/i,
+      'user message must explain it as a busy-slot condition, not generic timeout');
+    assert.doesNotMatch(r.userMessage, /Hit a snag/i,
+      'must NOT fall through to the unknown fallback');
+  });
+
+  test('lruWaitTimeout is NOT transient + NOT auto-recovered', () => {
+    // The right action is for the user to retry manually (or wait
+    // for an operator to raise the cap). Auto-retry would just
+    // re-park and re-timeout — no benefit, more log noise.
+    const r = classify(new Error('lru wait timed out after 300000ms'));
+    assert.equal(r.isTransient, false);
+    assert.equal(r.autoRecover, null);
+  });
+
+  test('lruWaitTimeout wins over generic `timeout` pattern (placement)', () => {
+    // The string `lru wait timed out` contains `timed out` which
+    // would otherwise match the generic `timeout` pattern. Pin the
+    // placement so the more-specific kind wins.
+    const r = classify(new Error('lru wait timed out after 300000ms'));
+    assert.equal(r.kind, 'lruWaitTimeout',
+      'must classify as lruWaitTimeout, not generic timeout — different actionability');
+  });
+
   test('tmuxToolWedge is NOT auto-recovered (no session reset)', () => {
     // A wedged tool doesn't mean the SESSION is bad. Resetting would
     // throw away the conversation history. The right action is for

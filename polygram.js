@@ -2130,6 +2130,14 @@ async function main() {
     classifyToolName, announce, shouldAnnounce, contextHintShown,
     extractAssistantText, getChatIdFromKey, getThreadIdFromKey,
     logger: console,
+    // rc.50: full reply-pipeline deps for the autonomous-wakeup path
+    // (see `onAutonomousAssistantMessage` in lib/sdk/callbacks.js).
+    // Mirrors what bot-reply-stream uses in handleMessage so
+    // [sticker:NAME] / [react:EMOJI] tags get processed and the
+    // rc.45 canned-string sanitizer fires.
+    parseResponse, sanitizeAssistantReply,
+    chunkMarkdownText, deliverReplies,
+    chunkBudget: TG_CHUNK_BUDGET,
   });
   // 0.10.0: sdkCallbacks (the polygram-side lifecycle handlers — status
   // reactor, stream chunk → bubble edit, etc.) move from the underlying

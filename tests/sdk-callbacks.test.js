@@ -435,6 +435,217 @@ describe('onAutonomousAssistantMessage — bot-initiated wakeup', () => {
     }));
     assert.equal(h.tgCalls.length, 0);
   });
+
+  // ─── rc.50: full pipeline (parseResponse + sanitize + deliver) ───
+  //
+  // Production bugs 2026-05-24 (shumorobot HOME): pre-rc.50 this
+  // handler called `tg(bot, 'sendMessage', { text: <raw> })` directly,
+  // bypassing the streamer's pipeline. Two user-visible bugs:
+  //   - `[sticker:pumped]` showed up as literal text in Telegram
+  //     because parseResponse never ran.
+  //   - `No response requested.` (CLI canned-string leak) reached
+  //     Telegram because the rc.45 sanitizer was wired into the
+  //     regular reply path only.
+  // The fix routes autonomous-wakeup text through the same pipeline
+  // as bot-reply-stream: parseResponse → sanitize → chunk →
+  // deliverReplies → send inline stickers/sticker; inline reactions
+  // logged-and-dropped (no target msg to react against).
+
+  // Helper: pipeline-wired deps that record what each stage does.
+  function pipelineDeps(overrides = {}) {
+    const h = baseDeps(overrides);
+    const stickerMap = { pumped: 'file_id_pumped', happy: 'file_id_happy' };
+    const deliverCalls = [];
+    const sanitizeCalls = [];
+    const parseCalls = [];
+
+    // Use the REAL parseResponse — that's the contract we're trying
+    // to preserve. Importing here keeps the test honest: a future
+    // change to parseResponse that breaks autonomous-wakeup will be
+    // caught by this suite.
+    const { parseResponse: parseResponseImpl } = require('../lib/telegram/parse');
+    const parseResponse = (text) => {
+      parseCalls.push(text);
+      return parseResponseImpl(text, { stickerMap, emojiToSticker: {} });
+    };
+
+    // Use the REAL sanitizer too. Same reasoning.
+    const { sanitizeAssistantReply: sanitizeImpl } = require('../lib/telegram/sanitize-reply');
+    const sanitizeAssistantReply = (text) => {
+      sanitizeCalls.push(text);
+      return sanitizeImpl(text);
+    };
+
+    // Stub deliverReplies — record what it WOULD have sent. Real
+    // delivery is over the wire; we just need to verify the
+    // pipeline routes through it with the right shape.
+    const deliverReplies = async ({ chatId, threadId, chunks, replyToMessageId, meta }) => {
+      deliverCalls.push({ chatId, threadId, chunks, replyToMessageId, meta });
+      return { sent: chunks.map((_, i) => 100 + i), failed: [], results: [] };
+    };
+
+    // Use the REAL chunker so chunking behavior is honest.
+    const { chunkMarkdownText } = require('../lib/telegram/chunk');
+
+    return {
+      ...h,
+      stickerMap,
+      deliverCalls,
+      sanitizeCalls,
+      parseCalls,
+      deps: {
+        ...h.deps,
+        parseResponse,
+        sanitizeAssistantReply,
+        chunkMarkdownText,
+        deliverReplies,
+        chunkBudget: 3500,
+      },
+    };
+  }
+
+  test('rc.50: pipeline routes plain text through deliverReplies (no raw sendMessage)', async () => {
+    const h = pipelineDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onAutonomousAssistantMessage('12345:24', {
+      message: { content: [{ type: 'text', text: 'Build finished, all green.' }] },
+    });
+    // Pipeline is async (the handler kicks off an IIFE) — let
+    // microtasks settle.
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(h.parseCalls.length, 1,
+      'parseResponse must run on autonomous text (was bypassed pre-rc.50)');
+    assert.equal(h.sanitizeCalls.length, 1,
+      'sanitizer must run on autonomous text (was bypassed pre-rc.50)');
+    assert.equal(h.deliverCalls.length, 1,
+      'deliverReplies must be used (was a raw tg(sendMessage) pre-rc.50)');
+    assert.equal(h.deliverCalls[0].chunks[0], 'Build finished, all green.');
+    assert.equal(h.deliverCalls[0].threadId, 24);
+    assert.equal(h.deliverCalls[0].replyToMessageId, null,
+      'autonomous-wakeup has no inbound msg to reply to');
+    assert.equal(h.deliverCalls[0].meta.source, 'autonomous-wakeup');
+  });
+
+  test('rc.50: [sticker:NAME] tags fire sendSticker (not literal text)', async () => {
+    // The production-failure pin (msg ids 1593 + 1312 from the
+    // shumorobot DB on 2026-05-24): autonomous-wakeup messages with
+    // `[sticker:pumped]` were stored + delivered with the literal
+    // tag visible in the chat.
+    const h = pipelineDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onAutonomousAssistantMessage('12345', {
+      message: { content: [{ type: 'text', text: 'Tests passed. [sticker:pumped]' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    // Text bubble: the sticker tag was stripped, only the prefix
+    // remains.
+    assert.equal(h.deliverCalls.length, 1);
+    assert.equal(h.deliverCalls[0].chunks[0].trim(), 'Tests passed.');
+    // Inline sticker fired via tg(sendSticker) — the actual sticker
+    // bubble Ivan should see in Telegram.
+    const stickerCalls = h.tgCalls.filter((c) => c.method === 'sendSticker');
+    assert.equal(stickerCalls.length, 1,
+      'parsed [sticker:pumped] MUST fire sendSticker, not show as literal text');
+    assert.equal(stickerCalls[0].params.sticker, 'file_id_pumped');
+    assert.equal(stickerCalls[0].meta.source, 'autonomous-wakeup-inline-sticker');
+    assert.equal(stickerCalls[0].meta.stickerName, 'pumped');
+  });
+
+  test('rc.50: solo [sticker:NAME] (whole reply) sends only the sticker', async () => {
+    // When the WHOLE autonomous text is a single sticker tag,
+    // parseResponse returns `text:'', sticker: <fileId>`. The
+    // pipeline must skip deliverReplies and send the sticker alone.
+    const h = pipelineDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onAutonomousAssistantMessage('12345', {
+      message: { content: [{ type: 'text', text: '[sticker:happy]' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(h.deliverCalls.length, 0,
+      'no text bubble — solo-sticker path');
+    const stickerCalls = h.tgCalls.filter((c) => c.method === 'sendSticker');
+    assert.equal(stickerCalls.length, 1);
+    assert.equal(stickerCalls[0].params.sticker, 'file_id_happy');
+    assert.equal(stickerCalls[0].meta.source, 'autonomous-wakeup-sticker',
+      'solo-sticker path uses a distinct source from inline-sticker for forensics');
+  });
+
+  test('rc.50: canned-string "No response requested." is sanitized + emits event', async () => {
+    // The other production leak (3 occurrences in shumorobot DB on
+    // 2026-05-24, all source='autonomous-wakeup'): the CLI-context
+    // canned string reached Telegram. rc.45 fixed this for the
+    // regular reply path; rc.50 extends the protection here.
+    const h = pipelineDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onAutonomousAssistantMessage('12345', {
+      message: { content: [{ type: 'text', text: 'No response requested.' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    // deliverReplies still fired, but with the REPLACED text, not
+    // the canned string.
+    assert.equal(h.deliverCalls.length, 1);
+    assert.doesNotMatch(h.deliverCalls[0].chunks[0], /No response requested\./,
+      'canned string must NOT reach deliverReplies — sanitizer replaces it');
+
+    // canned-reply-suppressed event surfaces the substitution so a
+    // soak can count autonomous-path leaks separately from the
+    // regular reply path.
+    const cannedEvents = h.events.filter((e) => e.kind === 'canned-reply-suppressed');
+    assert.equal(cannedEvents.length, 1,
+      'canned-reply-suppressed event must fire with source=autonomous-wakeup');
+    assert.equal(cannedEvents[0].detail.source, 'autonomous-wakeup');
+    assert.equal(cannedEvents[0].detail.original, 'No response requested.');
+  });
+
+  test('rc.50: inline [react:EMOJI] tags are dropped + logged (no target msg)', async () => {
+    // Autonomous-wakeup has no inbound msg to react against. The
+    // pipeline strips [react:EMOJI] tags via parseResponse, then
+    // logs them as dropped instead of calling setMessageReaction
+    // against a nonexistent message.
+    const h = pipelineDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onAutonomousAssistantMessage('12345', {
+      message: { content: [{ type: 'text', text: 'Done! [react:👍]' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    // No setMessageReaction call (no target msg).
+    const reactionCalls = h.tgCalls.filter((c) => c.method === 'setMessageReaction');
+    assert.equal(reactionCalls.length, 0);
+    // Dropped-reactions event for forensics.
+    const droppedEvents = h.events.filter((e) => e.kind === 'autonomous-wakeup-reactions-dropped');
+    assert.equal(droppedEvents.length, 1);
+    assert.deepEqual(droppedEvents[0].detail.dropped, ['👍']);
+  });
+
+  test('rc.50: pipeline-missing fallback path still works (back-compat for old test harnesses)', async () => {
+    // If a caller of createSdkCallbacks doesn't wire the pipeline
+    // deps (the four optional callback params: parseResponse,
+    // sanitizeAssistantReply, chunkMarkdownText, deliverReplies),
+    // the handler falls back to the pre-rc.50 raw-sendMessage path.
+    // Existing tests above (line 399-437) exercise exactly this
+    // fallback and must keep passing — assert here that the event
+    // is tagged so an operator can tell the two paths apart.
+    const h = baseDeps();    // NO pipeline deps wired
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onAutonomousAssistantMessage('12345', {
+      message: { content: [{ type: 'text', text: 'raw fallback path' }] },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(h.tgCalls.length, 1,
+      'fallback path uses a single raw tg(sendMessage)');
+    assert.equal(h.tgCalls[0].method, 'sendMessage');
+    assert.equal(h.tgCalls[0].params.text, 'raw fallback path',
+      'text is sent UNPROCESSED — no parseResponse, no sanitize');
+    const event = h.events.find((e) => e.kind === 'autonomous-wakeup-message');
+    assert.equal(event.detail.pipeline, 'raw-fallback',
+      'event must tag which path ran so soak can verify production runs the full path');
+  });
 });
 
 describe('onCompactBoundary — surface compaction + clear hint flag', () => {
