@@ -1470,6 +1470,104 @@ describe('TmuxProcess — rc.42 review-driven coverage', () => {
       'reason must be hard-backstop when continuous heartbeats prevent idle-ceiling from firing');
   });
 
+  // ─── rc.47: turn-timeout carries wedged-tool diagnostic ─────────
+  //
+  // Production wedge 2026-05-24 msg 1020: 3 PreToolUse{Bash} fired,
+  // only 2 PostToolUse came back — the 3rd Bash hung, claude waited
+  // forever, polygram killed it at 30 min, and the user got the
+  // generic "Hit a snag" message that didn't say WHICH tool wedged.
+  // The new tracking carries `lastToolName` + outstanding counts on
+  // the turn-timeout event AND in the thrown error message, so
+  // lib/error/classify.js's tmuxToolWedge kind can produce a
+  // useful user reply.
+
+  test('turn-timeout event carries lastToolName + outstanding counts', async () => {
+    const p = makeTmuxProcess(makeWedgedRunner(),
+      { turnTimeoutMs: 80, hardBackstopMs: 10_000, pollMs: 5 });
+    const events = [];
+    p.on('turn-timeout', (ev) => events.push(ev));
+    await p.start({ model: 'sonnet', effort: 'high' });
+    const sendP = p.send('hi');
+    // Drive a JSONL tool-use event so `turn.lastToolName` is set to
+    // "Bash" before the idle-ceiling fires. The wedged runner never
+    // returns a tool-result, so outstandingTools stays at 1.
+    setTimeout(() => {
+      const turn = p._activeGroup?.turns?.[0];
+      if (turn) p._handleSessionEvent({
+        type: 'tool-use', name: 'Bash', id: 'tool_wedged_1', turnTokens: [turn.token],
+      });
+    }, 20);
+    await Promise.race([sendP, new Promise((res) => setTimeout(res, 2000))]);
+    assert.equal(events.length, 1, 'turn-timeout must fire exactly once');
+    assert.equal(events[0].lastToolName, 'Bash',
+      'turn-timeout event must carry the wedged tool name (Bash) — '
+      + 'fed to lib/error/classify.js to build the user-facing reply');
+    assert.equal(events[0].outstandingToolsCount, 1,
+      'outstandingToolsCount must reflect the unreturned tool-use');
+    assert.equal(events[0].outstandingSubagentsCount, 0,
+      'outstandingSubagentsCount stays 0 — this was a non-Agent Bash wedge');
+  });
+
+  test('turn-timeout error message includes the wedged-tool diagnostic', async () => {
+    // The pre-rc.47 error message was just
+    // `TmuxProcess: turn did not complete in time` — when polygram's
+    // classifier sees that string it falls through to "Hit a snag:
+    // <reason>". rc.47 enriches the error message with the wedged
+    // tool name + outstanding count IN PARENS so the classifier's
+    // `tmuxToolWedge` pattern matches AND a future dynamic-message
+    // refinement can extract the tool name from the string.
+    const p = makeTmuxProcess(makeWedgedRunner(),
+      { turnTimeoutMs: 80, hardBackstopMs: 10_000, pollMs: 5 });
+    await p.start({ model: 'sonnet', effort: 'high' });
+    const sendP = p.send('hi');
+    setTimeout(() => {
+      const turn = p._activeGroup?.turns?.[0];
+      if (turn) p._handleSessionEvent({
+        type: 'tool-use', name: 'WebFetch', id: 'tool_wedged_x', turnTokens: [turn.token],
+      });
+    }, 20);
+    const res = await Promise.race([
+      sendP,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('hung')), 2000)),
+    ]);
+    // The result.error string carries the enriched message; classify.js
+    // pattern-matches on it. Assert both the bare phrase AND the
+    // diagnostic suffix are present.
+    assert.match(res.error || '', /TmuxProcess: turn did not complete in time/,
+      'core phrase must be preserved (matches tmuxToolWedge pattern)');
+    assert.match(res.error || '', /last tool: WebFetch/,
+      'wedged tool name must appear in the user-visible error string');
+    assert.match(res.error || '', /outstanding: 1/,
+      'outstanding count must appear so an operator reading the log can '
+      + 'tell whether it was a single tool wedge or a deep stack');
+  });
+
+  test('lastToolName tracks across multiple tool-use events (last one wins)', async () => {
+    // The wedge in production was the THIRD Bash in a row. We want
+    // the user-facing reply to name the LAST tool, not the first
+    // (the wedge is always at the end of the chain). Verify
+    // `lastToolName` overwrites on each `tool-use`.
+    const p = makeTmuxProcess(makeFakeRunner());
+    p.tmuxName = 'polygram-x';
+    const turn = p._makeTurn({ kind: 'primary', prompt: 'hi', opts: {} });
+    p._activeGroup = { turns: [turn], text: '', primaryTurnId: turn.turnId };
+    assert.equal(turn.lastToolName, null, 'starts null');
+    p._handleSessionEvent({ type: 'tool-use', name: 'Read', id: 't1', turnTokens: [turn.token] });
+    assert.equal(turn.lastToolName, 'Read');
+    p._handleSessionEvent({ type: 'tool-use', name: 'Bash', id: 't2', turnTokens: [turn.token] });
+    assert.equal(turn.lastToolName, 'Bash', 'second tool overrides first');
+    p._handleSessionEvent({ type: 'tool-use', name: 'WebFetch', id: 't3', turnTokens: [turn.token] });
+    assert.equal(turn.lastToolName, 'WebFetch', 'third tool overrides second');
+    // A `tool-result` does NOT clear lastToolName — the diagnostic
+    // value is "what was last RUNNING," and a wedged-tool timeout
+    // reads this AFTER the racer gave up, so post-result clearing
+    // would lose the signal exactly when we need it.
+    p._handleSessionEvent({ type: 'tool-result', toolUseId: 't3' });
+    assert.equal(turn.lastToolName, 'WebFetch',
+      'tool-result must NOT clear lastToolName — it stays as the most '
+      + 'recent name for diagnostic purposes');
+  });
+
   // #12 — constructor rejects invalid turnTimeoutMs
   test('constructor rejects NaN turnTimeoutMs', () => {
     assert.throws(

@@ -118,6 +118,63 @@ describe('classify — PATTERNS coverage (one sample per kind)', () => {
     assert.equal(classify(new Error('The AI service is temporarily overloaded')).kind, 'transient5xx');
   });
 
+  // ─── rc.47: tmuxToolWedge ────────────────────────────────────────
+  //
+  // Production wedge 2026-05-24 msg 1020 (shumorobot HOME, "yes"
+  // reply to "Is RB closed?"): a Bash tool's `PreToolUse` fired but
+  // no `PostToolUse` came. Polygram's H3 idle-ceiling killed the turn
+  // at 30 min and the user got the generic
+  // `Hit a snag: TmuxProcess: turn did not complete in time. Try resending.`
+  // (the "unknown" fall-through). The new `tmuxToolWedge` kind
+  // matches the enriched message `_runTurn` now throws AND the bare
+  // pre-rc.47 form (for back-compat with any in-flight error).
+
+  test('tmuxToolWedge matches enriched message with tool diagnostic', () => {
+    const r = classify(new Error(
+      'TmuxProcess: turn did not complete in time (last tool: Bash, outstanding: 1)',
+    ));
+    assert.equal(r.kind, 'tmuxToolWedge');
+    assert.match(r.userMessage, /tool didn't return|tool did not return/i,
+      'user message must name the situation, not say "Hit a snag"');
+    assert.match(r.userMessage, /Bash|shell command/i,
+      'user message should hint at Bash as the common case');
+    assert.doesNotMatch(r.userMessage, /Hit a snag/i,
+      'must NOT fall through to the generic unknown fallback');
+  });
+
+  test('tmuxToolWedge matches bare pre-rc.47 message (back-compat)', () => {
+    // Any error thrown before the rc.47 enrichment would have just
+    // the bare phrase. Still match it so an in-flight rc.46 turn that
+    // surfaces after rc.47 ships gets the better message.
+    const r = classify(new Error('TmuxProcess: turn did not complete in time'));
+    assert.equal(r.kind, 'tmuxToolWedge');
+  });
+
+  test('tmuxToolWedge wins over the generic `timeout` pattern', () => {
+    // The order in PATTERNS is significant — `tmuxToolWedge` must
+    // come BEFORE `timeout` so this specific message routes to the
+    // tool-wedge kind, not the generic idle/wall-clock timeout kind.
+    // Without the placement, polygram-pm idle timeouts and tmux
+    // tool wedges would produce the same generic message.
+    const tmux = classify(new Error('TmuxProcess: turn did not complete in time'));
+    const idle = classify(new Error('Timeout: 1800s idle with no Claude activity'));
+    assert.equal(tmux.kind, 'tmuxToolWedge');
+    assert.equal(idle.kind, 'timeout');
+    assert.notEqual(tmux.userMessage, idle.userMessage,
+      'tmux tool wedge vs polygram-pm idle must produce DIFFERENT user messages');
+  });
+
+  test('tmuxToolWedge is NOT auto-recovered (no session reset)', () => {
+    // A wedged tool doesn't mean the SESSION is bad. Resetting would
+    // throw away the conversation history. The right action is for
+    // the user to retry (possibly with a smaller scope). Same
+    // treatment as `timeout` (no autoRecover) and `transient5xx`.
+    const r = classify(new Error('TmuxProcess: turn did not complete in time (last tool: Bash, outstanding: 1)'));
+    assert.equal(r.autoRecover, null);
+    assert.equal(r.isTransient, false,
+      'wedged tool is not "transient" — pm should NOT auto-retry; user must');
+  });
+
   // 2026-05-13 production incident: shumabit Dina DM accumulated 53
   // images over 2 weeks. Session got wedged returning 400 "Could not
   // process image" on EVERY new turn (Anthropic rejecting an old image

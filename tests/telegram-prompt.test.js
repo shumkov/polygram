@@ -81,6 +81,49 @@ describe('POLYGRAM_DISPLAY_HINT — content', () => {
     assert.match(POLYGRAM_DISPLAY_HINT, /okay|got it|ack/i);
   });
 
+  // rc.47: 5-minute status-update rule. Driven by the production
+  // wedge 2026-05-24 msg 1020 (Bash tool hung 30 min, user got
+  // generic "Hit a snag" message after long silence). The hint
+  // instructs the model to emit periodic status lines during long
+  // work so (a) the user sees progress, (b) actual wedges become
+  // obvious instead of indistinguishable from "model is thinking."
+  // Polygram's 30-min idle ceiling is preserved as the safety net;
+  // this rule reduces the perceptual silence within healthy long
+  // turns and makes wedge detection (manual + future automated)
+  // tractable.
+
+  test('contains a 5-minute status-update rule for long-running work', () => {
+    assert.match(POLYGRAM_DISPLAY_HINT, /5 minute|5 min|periodic status/i,
+      'must instruct the model on periodic status updates during long work');
+  });
+
+  test('uses imperative MUST for the status-update rule', () => {
+    // Same rationale as the table rule (rc.53) and the canned-string
+    // rule (rc.37): descriptive guidance gets ignored more often than
+    // imperative MUST. Pin the imperative form so a future doc-style
+    // softening doesn't silently downgrade enforcement.
+    const statusSection = POLYGRAM_DISPLAY_HINT.split('### Long-running work')[1] || '';
+    assert.match(statusSection, /MUST/,
+      'the status-update rule must use imperative MUST (rc.53 imperative-MUST discipline)');
+  });
+
+  test('gives a concrete status-line format the model can pattern-match', () => {
+    // The forbidden form is silence. The replacement must be concrete
+    // enough that the model knows exactly what shape to emit.
+    const statusSection = POLYGRAM_DISPLAY_HINT.split('### Long-running work')[1] || '';
+    assert.match(statusSection, /Still working/,
+      'must give an example status-line opener so the model has a template');
+  });
+
+  test('mentions why (the 30-min idle ceiling) so the model understands the cost of silence', () => {
+    // The rule\'s "why" is operational, not aesthetic — polygram WILL
+    // kill a silent turn. Telling the model this turns the rule from
+    // a politeness norm into a hard UX-survival contract.
+    const statusSection = POLYGRAM_DISPLAY_HINT.split('### Long-running work')[1] || '';
+    assert.match(statusSection, /30.?min(ute)? idle ceiling|idle ceiling/i,
+      'must explain that silence has a hard backstop (polygram kills wedged turns)');
+  });
+
   test('TELEGRAM_TABLE_WIDTH_BUDGET is a positive integer', () => {
     assert.ok(Number.isInteger(TELEGRAM_TABLE_WIDTH_BUDGET));
     assert.ok(TELEGRAM_TABLE_WIDTH_BUDGET > 0);
