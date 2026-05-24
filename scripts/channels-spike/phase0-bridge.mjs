@@ -86,7 +86,13 @@ log('startup', { ok: true, pid: process.pid, node: process.version })
 
 // Push a sequence of test events to exercise the protocol. Spaced out so we can
 // observe Claude's response order and batching behavior.
-const tests = [
+// SPIKE_FAST=1 collapses the timeline for headless runs.
+const FAST = process.env.SPIKE_FAST === '1'
+const tests = FAST ? [
+  { delay:  1500, test_id: 'T1-simple',   content: 'Phase 0 test 1: please reply via the reply tool with "got T1" and pass chat_id=T1-simple.' },
+  { delay:  6000, test_id: 'T2-perm',     content: 'Phase 0 test 2: run `Bash` to `echo hello-from-T2`. We want to see a permission_request notification.' },
+  { delay: 12000, test_id: 'T3-compact',  content: 'Phase 0 test 3: Reply with a brief acknowledgement.' },
+] : [
   { delay:  3000, test_id: 'T1-simple',   content: 'Phase 0 test 1: please reply via the reply tool with "got T1" and pass chat_id=T1-simple.' },
   { delay: 10000, test_id: 'T2-perm',     content: 'Phase 0 test 2: run `Bash` to `echo hello-from-T2`. We want to see a permission_request notification.' },
   { delay: 25000, test_id: 'T3-compact',  content: 'Phase 0 test 3: After replying to this, the operator may trigger /compact. Reply with a brief acknowledgement.' },
