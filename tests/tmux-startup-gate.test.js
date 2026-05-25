@@ -234,6 +234,104 @@ test('default timeout error code applies when none supplied', async () => {
   );
 });
 
+test('rc.4: fast-fail with TMUX_SESSION_GONE when captureWide reports "can\'t find pane"', async () => {
+  // Sim: first capture shows the dev-channels banner; the trigger fires Enter;
+  // then claude exits and tmux tears down the pane → subsequent captureWide
+  // errors with "can't find pane". Should bail fast with TMUX_SESSION_GONE,
+  // NOT spin for the full deadline.
+  let calls = 0;
+  const runner = {
+    captureWide: async () => {
+      calls += 1;
+      if (calls === 1) return 'WARNING: Loading development channels — press Enter';
+      // After Enter, claude exited: pane gone
+      throw new Error("can't find pane: polygram-test-channels-abc123");
+    },
+    sendControl: async () => {},
+  };
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => runStartupGate({
+      runner,
+      tmuxName: 'polygram-test-channels-abc123',
+      triggers: [
+        { name: 'dev-channels', regex: /WARNING: Loading development channels/i, key: 'Enter' },
+      ],
+      readySignal: /never-shows-up/,
+      logger: quietLogger,
+      deadlineMs: 30_000,             // long enough that we'd KNOW if we waited it out
+      pollMs: 5,
+      settleMs: 5,
+    }),
+    (err) => {
+      assert.equal(err.code, 'TMUX_SESSION_GONE');
+      assert.match(err.message, /tmux session disappeared/);
+      assert.match(err.message, /matched: dev-channels/);
+      assert.match(err.message, /WARNING: Loading development channels/);
+      assert.equal(err.matchedTriggers[0], 'dev-channels');
+      assert.ok(err.lastPane, 'lastPane snapshot attached to error');
+      return true;
+    },
+  );
+  // Must have bailed in well under the deadline.
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 3_000, `expected fast-fail < 3s, got ${elapsed}ms`);
+});
+
+test('rc.4: deadline-timeout error includes last pane snapshot', async () => {
+  // Sim: ready signal never appears, captureWide keeps returning content.
+  // The deadline-timeout error should contain a truncated tail of the last
+  // pane content so we can see what claude was showing.
+  const runner = {
+    captureWide: async () => 'some-banner\nstill loading…\nclaude is doing something\n$',
+    sendControl: async () => {},
+  };
+  await assert.rejects(
+    () => runStartupGate({
+      runner,
+      tmuxName: 'sess',
+      triggers: [],
+      readySignal: /will-never-appear/,
+      logger: quietLogger,
+      deadlineMs: 80,
+      pollMs: 10,
+      settleMs: 10,
+    }),
+    (err) => {
+      assert.match(err.message, /Last pane content:/);
+      assert.match(err.message, /still loading/);
+      assert.ok(err.lastPane, 'lastPane attached');
+      return true;
+    },
+  );
+});
+
+test('rc.4: error message indicates when no pane was ever captured', async () => {
+  // Sim: captureWide always errors (e.g., tmux session never even existed
+  // from frame 1). lastPane stays null; error message should say so.
+  const runner = {
+    captureWide: async () => { throw new Error("can't find pane: doesntexist"); },
+    sendControl: async () => {},
+  };
+  await assert.rejects(
+    () => runStartupGate({
+      runner,
+      tmuxName: 'doesntexist',
+      triggers: [],
+      readySignal: /any/,
+      logger: quietLogger,
+      deadlineMs: 200,
+      pollMs: 5,
+      settleMs: 5,
+    }),
+    (err) => {
+      assert.equal(err.code, 'TMUX_SESSION_GONE');
+      assert.match(err.message, /no pane content ever captured/);
+      return true;
+    },
+  );
+});
+
 test('timeout message lists triggers that fired even when ready never came', async () => {
   // dev-channels fires; ready signal never matches → message should record what we hit.
   const runner = {
