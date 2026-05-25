@@ -240,6 +240,86 @@ test('P1 #9: ChannelsBridgeServer wraps listen() in restrictive umask', () => {
   );
 });
 
+// Parity audit P4 + P7 + P8 — agent / topic-precedence / --resume.
+
+async function captureSpawnArgs(constructorOpts, startOpts) {
+  const spawnedArgs = [];
+  const runner = {
+    spawn: async opts => { spawnedArgs.push(...opts.args); },
+    killSession: async () => {},
+    sendControl: async () => {},
+    captureWide: async () => 'Listening for channel messages from: server:polygram-bridge',
+  };
+  const fs = require('node:fs');
+  const net = require('node:net');
+  const p = new ChannelsProcess({
+    sessionKey: 'sess-x',
+    chatId: '1', threadId: null, label: 'parity-test',
+    tmuxRunner: runner, botName: 'b',
+    toolDispatcher: fakeDispatcher,
+    claudeBin: '/usr/bin/echo',
+    logger: { warn: () => {}, error: () => {}, log: () => {} },
+    handshakeTimeoutMs: 2000,
+    ...constructorOpts,
+  });
+  const startP = p.start(startOpts || {});
+  for (let i = 0; i < 50 && (!p.sockPath || !fs.existsSync(p.sockPath)); i++) {
+    await new Promise(r => setTimeout(r, 20));
+  }
+  const sock = net.connect(p.sockPath);
+  await new Promise(r => sock.once('connect', r));
+  sock.write(JSON.stringify({ kind: 'hello', session_key: p.sessionKey, secret: p.sockSecret }) + '\n');
+  sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: 'test-sid' }) + '\n');
+  await startP;
+  sock.end();
+  await p.kill('test');
+  return spawnedArgs;
+}
+
+test('P4 parity: --agent flag passed when chatConfig.agent set', async () => {
+  const args = await captureSpawnArgs({}, { chatConfig: { agent: 'music-curation' } });
+  const agentIdx = args.indexOf('--agent');
+  assert.ok(agentIdx >= 0, 'has --agent flag');
+  assert.equal(args[agentIdx + 1], 'music-curation');
+});
+
+test('P7 parity: topicConfig.agent overrides chatConfig.agent', async () => {
+  const args = await captureSpawnArgs({ threadId: '42' }, {
+    threadId: '42',
+    chatConfig: {
+      agent: 'fallback',
+      topics: { '42': { agent: 'topic-special' } },
+    },
+  });
+  const agentIdx = args.indexOf('--agent');
+  assert.equal(args[agentIdx + 1], 'topic-special');
+});
+
+test('P5 parity: --effort flag passed when set', async () => {
+  const args = await captureSpawnArgs({}, { chatConfig: { effort: 'high' } });
+  const effortIdx = args.indexOf('--effort');
+  assert.ok(effortIdx >= 0);
+  assert.equal(args[effortIdx + 1], 'high');
+});
+
+test('P8 parity: --resume used when existingSessionId set (NOT --session-id)', async () => {
+  const args = await captureSpawnArgs({}, { existingSessionId: 'prior-sid-from-db' });
+  // --resume should be present with the prior session id
+  const resumeIdx = args.indexOf('--resume');
+  assert.ok(resumeIdx >= 0, 'has --resume for existing session');
+  assert.equal(args[resumeIdx + 1], 'prior-sid-from-db');
+  // --session-id MUST NOT be present (would create a new session, defeating resume)
+  assert.equal(args.indexOf('--session-id'), -1,
+    '--session-id NOT present when resuming (would create new session, losing history)');
+});
+
+test('P8 parity: --session-id used when NO existingSessionId (fresh session)', async () => {
+  const args = await captureSpawnArgs({}, {});
+  // For fresh sessions, --session-id is correct (claude generates the id we pass)
+  assert.ok(args.indexOf('--session-id') >= 0, 'fresh session uses --session-id');
+  assert.equal(args.indexOf('--resume'), -1, 'no --resume on fresh');
+});
+
 // permissionMode passthrough — mirror of TmuxProcess pattern. Default mode
 // does NOT add --dangerously-skip-permissions; bypassPermissions DOES.
 test('claudeArgs include --dangerously-skip-permissions only when permissionMode=bypassPermissions', async () => {
