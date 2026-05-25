@@ -240,6 +240,59 @@ test('P1 #9: ChannelsBridgeServer wraps listen() in restrictive umask', () => {
   );
 });
 
+// permissionMode passthrough — mirror of TmuxProcess pattern. Default mode
+// does NOT add --dangerously-skip-permissions; bypassPermissions DOES.
+test('claudeArgs include --dangerously-skip-permissions only when permissionMode=bypassPermissions', async () => {
+  const net = require('node:net');
+  const fs = require('node:fs');
+
+  // Helper: start with given permissionMode, fake-bridge handshake, capture spawn args, kill.
+  async function captureSpawnArgs(permissionMode) {
+    const spawnedArgs = [];
+    const runner = {
+      spawn: async opts => { spawnedArgs.push(...opts.args); },
+      killSession: async () => {},
+      sendControl: async () => {},
+      captureWide: async () => 'Listening for channel messages from: server:polygram-bridge',
+    };
+    const p = new ChannelsProcess({
+      sessionKey: `sess-${permissionMode || 'default'}`,
+      chatId: '1', tmuxRunner: runner, botName: 'b',
+      toolDispatcher: fakeDispatcher,
+      claudeBin: '/usr/bin/echo',
+      logger: { warn: () => {}, error: () => {}, log: () => {} },
+      handshakeTimeoutMs: 2000,
+    });
+    const startP = p.start({ permissionMode });
+    for (let i = 0; i < 50 && (!p.sockPath || !fs.existsSync(p.sockPath)); i++) {
+      await new Promise(r => setTimeout(r, 20));
+    }
+    const sock = net.connect(p.sockPath);
+    await new Promise(r => sock.once('connect', r));
+    sock.write(JSON.stringify({ kind: 'hello', session_key: p.sessionKey, secret: p.sockSecret }) + '\n');
+    sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: 'test-sid' }) + '\n');
+    await startP;
+    sock.end();
+    await p.kill('test');
+    return spawnedArgs;
+  }
+
+  const defaultArgs = await captureSpawnArgs(undefined);
+  assert.ok(!defaultArgs.includes('--dangerously-skip-permissions'),
+    'default mode: no skip-permissions');
+  assert.ok(!defaultArgs.includes('--permission-mode'),
+    'default mode: no permission-mode flag');
+
+  const bypassArgs = await captureSpawnArgs('bypassPermissions');
+  assert.ok(bypassArgs.includes('--dangerously-skip-permissions'),
+    'bypassPermissions: skip-permissions flag added');
+  assert.deepEqual(
+    bypassArgs.slice(bypassArgs.indexOf('--permission-mode'), bypassArgs.indexOf('--permission-mode') + 2),
+    ['--permission-mode', 'bypassPermissions'],
+    'bypassPermissions: permission-mode flag carries the value',
+  );
+});
+
 // Review M2: claudeBin is required (factory enforces this, but the class
 // should reject missing claudeBin if env not set too).
 test('ChannelsProcess throws when claudeBin missing and env unset', () => {
