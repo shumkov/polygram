@@ -476,6 +476,31 @@ async function sendToProcess(sessionKey, prompt, context = {}, { onDispatched } 
   const chatConfig = config.chats[chatId];
   const timeoutMs = (chatConfig.timeout || config.defaults.timeout) * 1000;
   const maxTurnMs = (chatConfig.maxTurn || config.defaults?.maxTurn || 1800) * 1000;
+
+  // ChannelsProcess-only liveness heartbeat. Lazy-attached HERE (after
+  // getOrSpawnForChat) so handleMessage stays fast for slash commands and
+  // any other non-pm.send paths — earlier wiring at handleMessage:~1003
+  // forced a cold-spawn (~30s on channels) before THINKING reactor /
+  // typing indicator / autosteer decision, hiding user feedback. Now the
+  // reactor only exists when we genuinely need a turn.
+  //
+  // Gated on entry.backend === 'channels' AND context.sourceMsgId (the
+  // TG user-msg to react on). Non-msg callers (boot-replay,
+  // autonomous-wakeup re-dispatch) pass no sourceMsgId and skip the
+  // reactor entirely.
+  let heartbeatReactor = null;
+  if (entry.backend === 'channels'
+      && typeof context.heartbeatSetReaction === 'function'
+      && context.sourceMsgId != null) {
+    heartbeatReactor = new HeartbeatReactor({
+      process: entry,
+      chatId,
+      messageId: context.sourceMsgId,
+      setReaction: context.heartbeatSetReaction,
+      logger: { debug: () => {}, warn: (m) => console.warn(`[${sessionKey}] ${m}`) },
+    });
+  }
+
   // Hold the per-session lock across the FULL turn (write + result wait),
   // not just the stdin write. Claude's stream-json input mode batches any
   // user messages that arrive while a turn is in flight into the next
@@ -504,6 +529,10 @@ async function sendToProcess(sessionKey, prompt, context = {}, { onDispatched } 
     return await turnP;
   } finally {
     release();
+    // Belt-and-braces stop. The reactor auto-stops on idle/close/
+    // bridge-disconnected events from the Process, so this is idempotent
+    // — but it also covers the "send threw before any event fired" path.
+    heartbeatReactor?.stop();
   }
 }
 
@@ -1001,35 +1030,18 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       });
     },
   });
-  // ChannelsProcess-only liveness heartbeat. SDK + tmux backends have
-  // per-tool reaction visibility via the JSONL stream / SDK callbacks —
-  // the symbolic `reactor` above handles them. Channels intentionally
-  // hides mid-turn tool calls behind the bridge MCP protocol, so we
-  // substitute a time-driven cycling heartbeat on the same user message.
-  //
-  // We instantiate before pm.send fires so the reactor is bound to the
-  // Process *before* the first 'thinking' emission. getOrSpawnForChat
-  // is idempotent — the inner sendToProcess call will see the same
-  // entry. Stop is in the finally below, mirroring the symbolic reactor.
-  let heartbeatReactor = null;
-  if (pickBackend({ config, chatId, threadId: threadId || null }) === 'channels') {
-    const entry = await getOrSpawnForChat(sessionKey);
-    if (entry && typeof entry.on === 'function') {
-      heartbeatReactor = new HeartbeatReactor({
-        process: entry,
-        chatId,
-        messageId: msg.message_id,
-        setReaction: async (cid, mid, emoji) => {
-          await tg(bot, 'setMessageReaction', {
-            chat_id: cid,
-            message_id: mid,
-            reaction: emoji.length ? [{ type: 'emoji', emoji: emoji[0] }] : [],
-          }, { source: 'channels-heartbeat', botName: BOT_NAME }).catch(() => {});
-        },
-        logger: { debug: () => {}, warn: (m) => console.warn(`[${label}] ${m}`) },
-      });
-    }
-  }
+  // Channels-only heartbeat setReaction adapter. Plumbed into sendToProcess
+  // via context; sendToProcess instantiates the actual HeartbeatReactor
+  // lazily after getOrSpawnForChat returns (rc.3: see sendToProcess body
+  // for why we no longer construct here). Closure over `bot` keeps the
+  // tg() dependency local.
+  const heartbeatSetReaction = async (cid, mid, emoji) => {
+    await tg(bot, 'setMessageReaction', {
+      chat_id: cid,
+      message_id: mid,
+      reaction: emoji.length ? [{ type: 'emoji', emoji: emoji[0] }] : [],
+    }, { source: 'channels-heartbeat', botName: BOT_NAME }).catch(() => {});
+  };
 
   // rc.32: skip QUEUED (👀) entirely for first-message-in-chain. Go
   // straight to THINKING (🤔). The 👀 → 🤔 two-hop didn't add
@@ -1096,6 +1108,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       await new Promise((dispatched) => {
         sendPromise = sendToProcess(sessionKey, prompt, {
           streamer, reactor, sourceMsgId: msg.message_id,
+          heartbeatSetReaction,
           // 0.7.4 (item B): fire THINKING when Claude actually starts
           // emitting — not the moment we wrote stdin.
           onFirstStream: () => reactor.setState('THINKING'),
@@ -1115,11 +1128,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // AUTOSTEERED is terminal; stop the reactor's STALL / TIMEOUT
     // timers so they don't pin the closure for up to 30s.
     reactor.stop();
-    // Channels-only: stop the cycling-emoji heartbeat too. (When autosteer
-    // gets implemented for channels, the in-flight turn's own heartbeat
-    // will continue ticking on its primary msg-id; this msg's heartbeat
-    // stops here because its turn was folded into the primary's.)
-    heartbeatReactor?.stop();
+    // No channels-heartbeat stop here — autosteer skips sendToProcess
+    // entirely, so no HeartbeatReactor was constructed.
     markReplied();
     return;
   }
@@ -1620,10 +1630,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   } finally {
     stopTyping();
     reactor.stop();
-    // Channels-only: stop the cycling-emoji heartbeat. Idempotent — second
-    // stop is a no-op (the reactor's `stopped` flag short-circuits). Covers
-    // every exit path (success, throw, abort, timeout).
-    heartbeatReactor?.stop();
+    // HeartbeatReactor (channels-only) is stopped inside sendToProcess's
+    // own finally block — no handleMessage-level stop needed.
     // rc.38: defensive clear-on-exit for ✍ reactions. Pre-rc.38 only
     // the success path (line ~2622), the abort path (line ~2858), and
     // the tool-only-completion path (line ~2681) cleared
