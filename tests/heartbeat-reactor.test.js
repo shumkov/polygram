@@ -213,6 +213,35 @@ test('working pool members all valid (not in reserved set)', () => {
   }
 });
 
+test('bridge-disconnected stops permanently and clears reaction', async () => {
+  const proc = makeProcess();
+  const rec = makeRecorder();
+  new HeartbeatReactor({
+    process: proc, chatId: 1, messageId: 100,
+    setReaction: rec.setReaction,
+    rng: fixedRng([0]),
+    logger: quietLogger,
+  });
+
+  proc.emit('thinking');
+  await Promise.resolve();
+  assert.ok(rec.calls.length >= 1, 'reactor fired on thinking');
+  const beforeDisconnect = rec.calls.length;
+
+  proc.emit('bridge-disconnected');
+  await Promise.resolve();
+
+  // Last reaction call must have been a clear ([]).
+  const lastCall = rec.calls[rec.calls.length - 1];
+  assert.deepEqual(lastCall.reaction, [], 'reaction cleared on bridge-disconnect');
+  assert.ok(rec.calls.length > beforeDisconnect, 'an extra clear call landed');
+
+  // Subsequent thinking ignored — reactor is stopped.
+  proc.emit('thinking');
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(rec.calls.length, beforeDisconnect + 1, 'no further reactions after disconnect');
+});
+
 test('close event stops permanently — subsequent thinking ignored', async () => {
   const proc = makeProcess();
   const rec = makeRecorder();

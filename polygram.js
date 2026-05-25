@@ -44,11 +44,12 @@ const { createProcessFactory, pickBackend } = require('./lib/process/factory');
 const { extractAssistantText } = require('./lib/process/sdk-process');
 // 0.11.0: channels backend tool dispatcher — adapts ChannelsProcess's reply
 // tool callback into polygram's existing chunkText + deliverReplies primitives.
-// ADV-14: use chunkMarkdownText (fence-aware) instead of plain chunkText so
-// Claude replies containing code blocks or HTML-style tags aren't split mid-
-// element by the size cap.
+// ADV-14: chunkMarkdownText (fence-aware) is imported once below (~line 88)
+// and reused by createChannelsToolDispatcher inside main() — Claude replies
+// containing code blocks or HTML-style tags aren't split mid-element by the
+// size cap.
 const { createChannelsToolDispatcher } = require('./lib/process/channels-tool-dispatcher');
-const { chunkMarkdownText } = require('./lib/telegram/chunk');
+const { HeartbeatReactor } = require('./lib/telegram/heartbeat-reactor');
 const { createTmuxRunner } = require('./lib/tmux/tmux-runner');
 const { sweepTmuxOrphans } = require('./lib/tmux/orphan-sweep');
 const { normalizeTuiToolInput } = require('./lib/tmux/tui-tool-input');
@@ -1000,6 +1001,36 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       });
     },
   });
+  // ChannelsProcess-only liveness heartbeat. SDK + tmux backends have
+  // per-tool reaction visibility via the JSONL stream / SDK callbacks —
+  // the symbolic `reactor` above handles them. Channels intentionally
+  // hides mid-turn tool calls behind the bridge MCP protocol, so we
+  // substitute a time-driven cycling heartbeat on the same user message.
+  //
+  // We instantiate before pm.send fires so the reactor is bound to the
+  // Process *before* the first 'thinking' emission. getOrSpawnForChat
+  // is idempotent — the inner sendToProcess call will see the same
+  // entry. Stop is in the finally below, mirroring the symbolic reactor.
+  let heartbeatReactor = null;
+  if (pickBackend({ config, chatId, threadId: threadId || null }) === 'channels') {
+    const entry = await getOrSpawnForChat(sessionKey);
+    if (entry && typeof entry.on === 'function') {
+      heartbeatReactor = new HeartbeatReactor({
+        process: entry,
+        chatId,
+        messageId: msg.message_id,
+        setReaction: async (cid, mid, emoji) => {
+          await tg(bot, 'setMessageReaction', {
+            chat_id: cid,
+            message_id: mid,
+            reaction: emoji.length ? [{ type: 'emoji', emoji: emoji[0] }] : [],
+          }, { source: 'channels-heartbeat', botName: BOT_NAME }).catch(() => {});
+        },
+        logger: { debug: () => {}, warn: (m) => console.warn(`[${label}] ${m}`) },
+      });
+    }
+  }
+
   // rc.32: skip QUEUED (👀) entirely for first-message-in-chain. Go
   // straight to THINKING (🤔). The 👀 → 🤔 two-hop didn't add
   // user-readable signal — Telegram's ✓✓ already conveys "delivered",
@@ -1084,6 +1115,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // AUTOSTEERED is terminal; stop the reactor's STALL / TIMEOUT
     // timers so they don't pin the closure for up to 30s.
     reactor.stop();
+    // Channels-only: stop the cycling-emoji heartbeat too. (When autosteer
+    // gets implemented for channels, the in-flight turn's own heartbeat
+    // will continue ticking on its primary msg-id; this msg's heartbeat
+    // stops here because its turn was folded into the primary's.)
+    heartbeatReactor?.stop();
     markReplied();
     return;
   }
@@ -1584,6 +1620,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   } finally {
     stopTyping();
     reactor.stop();
+    // Channels-only: stop the cycling-emoji heartbeat. Idempotent — second
+    // stop is a no-op (the reactor's `stopped` flag short-circuits). Covers
+    // every exit path (success, throw, abort, timeout).
+    heartbeatReactor?.stop();
     // rc.38: defensive clear-on-exit for ✍ reactions. Pre-rc.38 only
     // the success path (line ~2622), the abort path (line ~2858), and
     // the tool-only-completion path (line ~2681) cleared
