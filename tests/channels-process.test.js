@@ -373,6 +373,72 @@ test('claudeArgs include --dangerously-skip-permissions only when permissionMode
   );
 });
 
+// rc.5: launch cwd MUST be the resolved topic/chat cwd, not opts.cwd ||
+// process.cwd(). Without this, claude indexes session storage by the
+// daemon's own working directory (e.g. ~/.polygram) instead of the
+// project root, and `--resume <id>` prints "No conversation found"
+// then exits clean — the exact failure mode reproduced on shumorobot
+// Music topic at 2026-05-25T22:30 (session 4837f61a-...).
+async function captureSpawnOpts(constructorOpts, startOpts) {
+  let capturedOpts = null;
+  const runner = {
+    spawn: async (opts) => { capturedOpts = opts; },
+    killSession: async () => {},
+    sendControl: async () => {},
+    captureWide: async () => 'Listening for channel messages from: server:polygram-bridge',
+  };
+  const fs = require('node:fs');
+  const net = require('node:net');
+  const p = new ChannelsProcess({
+    sessionKey: 'sess-cwd-test',
+    chatId: '1', threadId: null, label: 'cwd-test',
+    tmuxRunner: runner, botName: 'b',
+    toolDispatcher: fakeDispatcher,
+    claudeBin: '/usr/bin/echo',
+    logger: { warn: () => {}, error: () => {}, log: () => {} },
+    handshakeTimeoutMs: 2000,
+    ...constructorOpts,
+  });
+  const startP = p.start(startOpts || {});
+  for (let i = 0; i < 50 && (!p.sockPath || !fs.existsSync(p.sockPath)); i++) {
+    await new Promise(r => setTimeout(r, 20));
+  }
+  const sock = net.connect(p.sockPath);
+  await new Promise(r => sock.once('connect', r));
+  sock.write(JSON.stringify({ kind: 'hello', session_key: p.sessionKey, secret: p.sockSecret }) + '\n');
+  sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: 'test-sid' }) + '\n');
+  await startP;
+  sock.end();
+  await p.kill('test');
+  return capturedOpts;
+}
+
+test('rc.5: tmuxRunner.spawn cwd honors topicConfig.cwd', async () => {
+  const opts = await captureSpawnOpts({}, {
+    threadId: '3',
+    chatConfig: {
+      cwd: '/Users/test/home',
+      topics: { '3': { cwd: '/Users/test/Music/rekordbox' } },
+    },
+  });
+  assert.equal(opts.cwd, '/Users/test/Music/rekordbox',
+    'spawn cwd must be the topic cwd, not the chat cwd or daemon process.cwd()');
+});
+
+test('rc.5: tmuxRunner.spawn cwd honors chatConfig.cwd when no topic', async () => {
+  const opts = await captureSpawnOpts({}, {
+    chatConfig: { cwd: '/Users/test/home' },
+  });
+  assert.equal(opts.cwd, '/Users/test/home',
+    'spawn cwd falls back to chat cwd when no topic override');
+});
+
+test('rc.5: tmuxRunner.spawn cwd falls back to opts.cwd then process.cwd() when no config', async () => {
+  const opts = await captureSpawnOpts({}, { cwd: '/tmp/fallback' });
+  assert.equal(opts.cwd, '/tmp/fallback',
+    'spawn cwd falls back to opts.cwd when no topic/chat config');
+});
+
 // Review M2: claudeBin is required (factory enforces this, but the class
 // should reject missing claudeBin if env not set too).
 test('ChannelsProcess throws when claudeBin missing and env unset', () => {
