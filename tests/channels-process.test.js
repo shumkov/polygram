@@ -302,15 +302,61 @@ test('P5 parity: --effort flag passed when set', async () => {
   assert.equal(args[effortIdx + 1], 'high');
 });
 
-test('P8 parity: --resume used when existingSessionId set (NOT --session-id)', async () => {
-  const args = await captureSpawnArgs({}, { existingSessionId: 'prior-sid-from-db' });
-  // --resume should be present with the prior session id
-  const resumeIdx = args.indexOf('--resume');
-  assert.ok(resumeIdx >= 0, 'has --resume for existing session');
-  assert.equal(args[resumeIdx + 1], 'prior-sid-from-db');
-  // --session-id MUST NOT be present (would create a new session, defeating resume)
-  assert.equal(args.indexOf('--session-id'), -1,
-    '--session-id NOT present when resuming (would create new session, losing history)');
+// rc.8 ghost-session guard: --resume is only passed when the session
+// JSONL actually exists under the launch cwd. If polygram's DB has a
+// session id but claude doesn't have the file (because an early channels
+// attempt failed before claude completed any turn), drop the ghost and
+// use --session-id with a fresh uuid. Live shumorobot Music topic
+// 2026-05-26 04:04:29 reproduced this exact ghost-session stall.
+
+test('rc.8: --resume used when existingSessionId set AND session file exists on disk', async () => {
+  // Stage a fake session JSONL at the path claude indexes by cwd.
+  // resolvedCwd → ~/.claude/projects/<cwd-mangled>/<id>.jsonl
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const testCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'rc8-resume-'));
+  const sid = 'prior-sid-with-file';
+  const projectsDir = path.join(os.homedir(), '.claude', 'projects', testCwd.replace(/\//g, '-'));
+  fs.mkdirSync(projectsDir, { recursive: true });
+  const sidFile = path.join(projectsDir, `${sid}.jsonl`);
+  fs.writeFileSync(sidFile, '{"role":"user","content":"hi"}\n');
+  try {
+    const args = await captureSpawnArgs({}, {
+      existingSessionId: sid,
+      chatConfig: { cwd: testCwd },
+    });
+    const resumeIdx = args.indexOf('--resume');
+    assert.ok(resumeIdx >= 0, 'has --resume when file exists');
+    assert.equal(args[resumeIdx + 1], sid);
+    assert.equal(args.indexOf('--session-id'), -1,
+      '--session-id NOT present when --resume is in effect');
+  } finally {
+    fs.rmSync(sidFile, { force: true });
+    fs.rmdirSync(projectsDir, { recursive: true });
+    fs.rmdirSync(testCwd);
+  }
+});
+
+test('rc.8: ghost-session guard — DB id with no local file falls back to --session-id', async () => {
+  // No fixture file created — simulates the live Music-topic ghost
+  // (DB has session id from a failed prior channels attempt; claude
+  // never persisted the JSONL).
+  const args = await captureSpawnArgs({}, {
+    existingSessionId: 'ghost-sid-no-file',
+    chatConfig: { cwd: '/tmp/path-that-does-not-have-a-jsonl-fixture' },
+  });
+  assert.equal(args.indexOf('--resume'), -1,
+    'ghost session must NOT be resumed (file does not exist)');
+  assert.ok(args.indexOf('--session-id') >= 0,
+    'fresh --session-id used when ghost id is dropped');
+});
+
+test('rc.8: ghost-session guard fires even with no cwd (can\'t check → don\'t resume)', async () => {
+  const args = await captureSpawnArgs({}, { existingSessionId: 'sid-no-cwd' });
+  assert.equal(args.indexOf('--resume'), -1,
+    'no cwd → can\'t verify file → safer to NOT --resume');
+  assert.ok(args.indexOf('--session-id') >= 0);
 });
 
 test('P8 parity: --session-id used when NO existingSessionId (fresh session)', async () => {
