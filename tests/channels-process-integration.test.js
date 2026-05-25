@@ -900,3 +900,96 @@ test('two concurrent sessions have isolated sockets and routing', async () => {
   bridgeB.close();
   await cpA.kill('test'); await cpB.kill('test');
 });
+
+// ─── Step E: emit 'idle' on turn-timeout / resetSession / interrupt-grace ───
+//
+// HeartbeatReactor (lib/telegram/heartbeat-reactor.js) stops cycling only on
+// 'idle' or 'close'. ChannelsProcess used to resolve/reject pending turns on
+// turn-timeout, resetSession, and interrupt-grace-resolve WITHOUT emitting
+// 'idle' — which would leave a wired reactor cycling emoji forever (or until
+// the user typed something else). These tests pin the contract so the bug
+// can't regress.
+
+test('Step E: turn-timeout emits idle so reaction-cyclers stop', async () => {
+  const cp = new ChannelsProcess({
+    sessionKey: 'sess-idle-tt', chatId: 'chat-1', threadId: null, label: 'idle-tt',
+    tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
+    toolDispatcher: async () => ({ ok: true }),
+    logger: quietLogger,
+    handshakeTimeoutMs: 2000,
+    turnQuietMs: 50,
+    turnTimeoutMs: 200,            // tiny — fire fast
+  });
+  const bridge = await startWithFakeBridge(cp);
+
+  // Race: idle event must arrive before — or alongside — the turn-timeout reject.
+  const idleP = new Promise(resolve => cp.once('idle', () => resolve(true)));
+  const idleSawWithin = Promise.race([
+    idleP,
+    new Promise(resolve => setTimeout(() => resolve(false), 1000)),
+  ]);
+
+  const sendP = cp.send('hello');
+  const rejectAssertion = assert.rejects(sendP, err => err && err.code === 'TURN_TIMEOUT');
+  await bridge.waitFor(m => m.kind === 'user_msg');
+  // No reply ever arrives → hardTimer fires at turnTimeoutMs (200ms)
+  await rejectAssertion;
+  assert.equal(await idleSawWithin, true, 'idle was emitted on turn-timeout');
+
+  bridge.close();
+  await cp.kill('test');
+});
+
+test('Step E: resetSession emits idle so reaction-cyclers stop', async () => {
+  const cp = makeChannelsProcess();
+  const bridge = await startWithFakeBridge(cp);
+
+  const idleP = new Promise(resolve => cp.once('idle', () => resolve(true)));
+  const idleSawWithin = Promise.race([
+    idleP,
+    new Promise(resolve => setTimeout(() => resolve(false), 1000)),
+  ]);
+
+  const sendP = cp.send('hello');
+  const rejectAssertion = assert.rejects(sendP, err => err && err.code === 'RESET');
+  await bridge.waitFor(m => m.kind === 'user_msg');
+
+  await cp.resetSession({ reason: '/new' });
+  await rejectAssertion;
+  assert.equal(await idleSawWithin, true, 'idle was emitted on resetSession');
+
+  bridge.close();
+  await cp.kill('test');
+});
+
+test('Step E: interrupt grace-resolve emits idle so reaction-cyclers stop', async () => {
+  const cp = new ChannelsProcess({
+    sessionKey: 'sess-idle-int', chatId: 'chat-1', threadId: null, label: 'idle-int',
+    tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
+    toolDispatcher: async () => ({ ok: true }),
+    logger: quietLogger,
+    handshakeTimeoutMs: 2000,
+    turnQuietMs: 50,
+    turnTimeoutMs: 10_000,
+    interruptGraceMs: 100,          // tiny — fast grace fire for test
+  });
+  const bridge = await startWithFakeBridge(cp);
+
+  const idleP = new Promise(resolve => cp.once('idle', () => resolve(true)));
+  const idleSawWithin = Promise.race([
+    idleP,
+    new Promise(resolve => setTimeout(() => resolve(false), 1000)),
+  ]);
+
+  // Start a turn, then interrupt without ever supplying a reply. The grace
+  // window will synthesize an 'interrupted' resolution after interruptGraceMs.
+  const sendP = cp.send('hello');
+  await bridge.waitFor(m => m.kind === 'user_msg');
+  await cp.interrupt();
+  const result = await sendP;
+  assert.equal(result.metrics.resultSubtype, 'interrupted');
+  assert.equal(await idleSawWithin, true, 'idle was emitted on interrupt grace-resolve');
+
+  bridge.close();
+  await cp.kill('test');
+});
