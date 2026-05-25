@@ -320,6 +320,25 @@ test('P8 parity: --session-id used when NO existingSessionId (fresh session)', a
   assert.equal(args.indexOf('--resume'), -1, 'no --resume on fresh');
 });
 
+// rc.6: a second --append-system-prompt block carries the channels-mode
+// protocol contract. Without it the agent writes responses inline to its
+// TUI and polygram never sees them (every turn times out at 3min).
+test('rc.6: channels-mode spawn appends channels-protocol hint to system prompt', async () => {
+  const args = await captureSpawnArgs({}, {});
+  const appendIdxs = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--append-system-prompt') appendIdxs.push(i);
+  }
+  assert.equal(appendIdxs.length, 2,
+    'channels spawn carries TWO --append-system-prompt blocks (display hint + channels protocol)');
+  const channelsHint = args[appendIdxs[1] + 1];
+  assert.match(channelsHint, /channels mode/i, 'second hint mentions channels mode');
+  assert.match(channelsHint, /mcp__polygram-bridge__reply/, 'mentions the exact tool name');
+  assert.match(channelsHint, /HARD CONTRACT|MUST/i, 'language is unambiguous');
+  assert.match(channelsHint, /Do NOT respond conversationally|inline text will/i,
+    'explicitly tells claude not to respond inline');
+});
+
 // permissionMode passthrough — mirror of TmuxProcess pattern. Default mode
 // does NOT add --dangerously-skip-permissions; bypassPermissions DOES.
 test('claudeArgs include --dangerously-skip-permissions only when permissionMode=bypassPermissions', async () => {

@@ -309,6 +309,95 @@ describe('resolveSessionForSpawn (S2 drift)', () => {
     assert.ok(db.getSession('chat:3'), 'row stays in place');
   });
 
+  // 0.11.0 rc.6: channels boundary. SDK ↔ tmux flips preserve sessions
+  // (per rc.32 reasoning above) but any transition INVOLVING channels
+  // drops the prior session. Channels mode adds a bridge MCP server +
+  // a system-prompt reply-tool directive — sessions created without
+  // those elements have different conversation-context expectations,
+  // and resuming them under channels (or back from channels to a
+  // non-channels backend) caused the live shumorobot 2026-05-25 Music
+  // topic incident: claude resumed a pre-channels session id and
+  // continued the OLD task instead of treating the new channel
+  // message as a fresh prompt.
+  test('rc.6: sdk → channels flip DROPS the session', () => {
+    db.upsertSession({
+      session_key: 'chat:3', chat_id: 'chat', thread_id: '3',
+      claude_session_id: 'sess-pre-channels-from-sdk',
+      agent: 'music-curation:music-curator',
+      cwd: '/Users/ivanshumkov/Music/rekordbox',
+      pm_backend: 'sdk',
+    });
+    const r = resolveSessionForSpawn(db, 'chat:3', { ...resolved, backend: 'channels' });
+    assert.equal(r.existingSessionId, null, 'sdk → channels must drop the session');
+    assert.ok(r.drift, 'drift must be reported');
+    assert.ok(r.drift.fields.includes('pm_backend'), 'pm_backend listed as drifted field');
+    assert.equal(r.drift.before.pm_backend, 'sdk');
+    assert.equal(r.drift.after.pm_backend, 'channels');
+    assert.equal(db.getSession('chat:3'), undefined, 'row deleted');
+  });
+
+  test('rc.6: tmux → channels flip DROPS the session', () => {
+    db.upsertSession({
+      session_key: 'chat:3', chat_id: 'chat', thread_id: '3',
+      claude_session_id: 'sess-pre-channels-from-tmux',
+      agent: 'music-curation:music-curator',
+      cwd: '/Users/ivanshumkov/Music/rekordbox',
+      pm_backend: 'tmux',
+    });
+    const r = resolveSessionForSpawn(db, 'chat:3', { ...resolved, backend: 'channels' });
+    assert.equal(r.existingSessionId, null, 'tmux → channels must drop the session');
+    assert.ok(r.drift, 'drift must be reported');
+    assert.ok(r.drift.fields.includes('pm_backend'), 'pm_backend in drifted fields');
+  });
+
+  test('rc.6: channels → tmux flip ALSO drops (XOR — both directions invalidate)', () => {
+    db.upsertSession({
+      session_key: 'chat:3', chat_id: 'chat', thread_id: '3',
+      claude_session_id: 'sess-from-channels-back-to-tmux',
+      agent: 'music-curation:music-curator',
+      cwd: '/Users/ivanshumkov/Music/rekordbox',
+      pm_backend: 'channels',
+    });
+    const r = resolveSessionForSpawn(db, 'chat:3', { ...resolved, backend: 'tmux' });
+    assert.equal(r.existingSessionId, null,
+      'channels → tmux drops too — the reverse direction is symmetric. ' +
+      'Conversation context from a channels turn (where claude responded via ' +
+      'mcp__polygram-bridge__reply) is incompatible with the inline-reply pattern ' +
+      'tmux expects.');
+    assert.ok(r.drift, 'drift reported in reverse direction too');
+  });
+
+  test('rc.6: channels → channels is NOT drift (in-daemon lazy respawn must --resume)', () => {
+    db.upsertSession({
+      session_key: 'chat:3', chat_id: 'chat', thread_id: '3',
+      claude_session_id: 'sess-still-channels',
+      agent: 'music-curation:music-curator',
+      cwd: '/Users/ivanshumkov/Music/rekordbox',
+      pm_backend: 'channels',
+    });
+    const r = resolveSessionForSpawn(db, 'chat:3', { ...resolved, backend: 'channels' });
+    assert.equal(r.existingSessionId, 'sess-still-channels',
+      'channels → channels preserves the session — the lazy-respawn case ' +
+      'after a bridge-disconnect depends on --resume restoring the in-flight turn');
+    assert.equal(r.drift, null);
+  });
+
+  test('rc.6: sdk → tmux still preserves (rc.32 contract untouched)', () => {
+    // Defensive: make sure the channels-boundary addition didn't break
+    // the rc.32 invariant that sdk ↔ tmux is freely interchangeable.
+    db.upsertSession({
+      session_key: 'chat:3', chat_id: 'chat', thread_id: '3',
+      claude_session_id: 'sess-sdk-to-tmux-keep',
+      agent: 'music-curation:music-curator',
+      cwd: '/Users/ivanshumkov/Music/rekordbox',
+      pm_backend: 'sdk',
+    });
+    const r = resolveSessionForSpawn(db, 'chat:3', { ...resolved, backend: 'tmux' });
+    assert.equal(r.existingSessionId, 'sess-sdk-to-tmux-keep',
+      'sdk → tmux must STILL preserve — channels boundary is the only new exception');
+    assert.equal(r.drift, null);
+  });
+
   test('model/effort difference does NOT invalidate (applied live, not spawn-identity)', () => {
     // /model and /effort are pushed into a live session via
     // setModel / applyFlagSettings — no respawn. Including them here
