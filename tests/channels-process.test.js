@@ -320,23 +320,45 @@ test('P8 parity: --session-id used when NO existingSessionId (fresh session)', a
   assert.equal(args.indexOf('--resume'), -1, 'no --resume on fresh');
 });
 
-// rc.6: a second --append-system-prompt block carries the channels-mode
-// protocol contract. Without it the agent writes responses inline to its
-// TUI and polygram never sees them (every turn times out at 3min).
-test('rc.6: channels-mode spawn appends channels-protocol hint to system prompt', async () => {
+// rc.7 (2026-05-26): channels-mode spawn carries a SINGLE
+// --append-system-prompt block combining the Telegram display rules AND
+// the channels-mode reply-tool contract. Originally two separate flags
+// (rc.6) — but that broke MCP server registration, suspected
+// --append-system-prompt variadic greedy-eating --setting-sources and
+// --mcp-config. Merging into one block sidesteps it.
+test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display + channels hints', async () => {
   const args = await captureSpawnArgs({}, {});
   const appendIdxs = [];
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--append-system-prompt') appendIdxs.push(i);
   }
-  assert.equal(appendIdxs.length, 2,
-    'channels spawn carries TWO --append-system-prompt blocks (display hint + channels protocol)');
-  const channelsHint = args[appendIdxs[1] + 1];
-  assert.match(channelsHint, /channels mode/i, 'second hint mentions channels mode');
-  assert.match(channelsHint, /mcp__polygram-bridge__reply/, 'mentions the exact tool name');
-  assert.match(channelsHint, /HARD CONTRACT|MUST/i, 'language is unambiguous');
-  assert.match(channelsHint, /Do NOT respond conversationally|inline text will/i,
+  assert.equal(appendIdxs.length, 1,
+    'EXACTLY ONE --append-system-prompt — multiple instances break --mcp-config arg parsing');
+  const hint = args[appendIdxs[0] + 1];
+  // Display half (POLYGRAM_DISPLAY_HINT content)
+  assert.match(hint, /Telegram display rules|Tables — HARD RULE/i,
+    'block contains the polygram display rules');
+  // Channels half (reply-tool contract)
+  assert.match(hint, /channels mode/i, 'block mentions channels mode');
+  assert.match(hint, /mcp__polygram-bridge__reply/, 'mentions the exact tool name');
+  assert.match(hint, /HARD CONTRACT|MUST/i, 'reply-tool directive is unambiguous');
+  assert.match(hint, /Do NOT respond conversationally|inline text will/i,
     'explicitly tells claude not to respond inline');
+});
+
+// rc.7: --mcp-config must remain the LAST flag in args (variadic <configs...>)
+// to avoid the variadic flag eating subsequent args. Regression guard for
+// the bug where two --append-system-prompt flags broke MCP registration.
+test('rc.7: --mcp-config is the LAST flag in claudeArgs (variadic safety)', async () => {
+  const args = await captureSpawnArgs({}, {});
+  const mcpIdx = args.indexOf('--mcp-config');
+  assert.ok(mcpIdx >= 0, '--mcp-config present');
+  // After the mcp-config value there should be no more flags.
+  // Allowed: only the value immediately following.
+  for (let i = mcpIdx + 2; i < args.length; i++) {
+    assert.ok(!args[i].startsWith('--'),
+      `found flag '${args[i]}' AFTER --mcp-config <path>; --mcp-config is variadic and will eat it`);
+  }
 });
 
 // permissionMode passthrough — mirror of TmuxProcess pattern. Default mode
