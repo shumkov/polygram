@@ -87,6 +87,10 @@ const { createStore: createPairingsStore, parseTtl: parsePairingTtl } = require(
 const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/telegram/voice');
 const { createStreamer } = require('./lib/telegram/streamer');
 const { chunkMarkdownText } = require('./lib/telegram/chunk');
+// F#23: shared agent-reply helper. parseResponse + sanitizer + chunked
+// delivery + inline sticker/react in one place. Wired into both the
+// channels dispatcher (F#1) and the autonomous-wakeup handler (F#23).
+const { processAndDeliverAgentText } = require('./lib/telegram/process-agent-reply');
 const { deliverReplies } = require('./lib/telegram/deliver');
 const { sanitizeAssistantReply } = require('./lib/telegram/sanitize-reply');
 const { announce, shouldAnnounce } = require('./lib/announces');
@@ -2209,6 +2213,11 @@ async function main() {
     db, dbWrite, config, bot, botName: BOT_NAME, tg, logEvent,
     classifyToolName, announce, shouldAnnounce, contextHintShown,
     extractAssistantText, getChatIdFromKey, getThreadIdFromKey,
+    // F#23: enable parse/sanitize/sticker/react on the autonomous-wakeup path.
+    // Pre-fix the handler did raw tg(sendMessage) and `[sticker:NAME]`,
+    // `[react:EMOJI]`, `No response requested.` all leaked as literal text.
+    parseResponse, sanitizeAssistantReply, chunkMarkdownText, deliverReplies,
+    processAndDeliverAgentText,
     logger: console,
   });
   // 0.10.0: sdkCallbacks (the polygram-side lifecycle handlers — status

@@ -480,6 +480,113 @@ describe('onAutonomousAssistantMessage — bot-initiated wakeup', () => {
     assert.equal(h.tgCalls.length, 1, 'SDK shape: existing tg send must still fire');
     assert.equal(h.tgCalls[0].params.text, 'sdk wakeup');
   });
+
+  // ─── F#23 — autonomous wakeup respects parseResponse + sanitizer ──────
+  //
+  // F#22 closed the channels double-send. But the handler's `tg(sendMessage)`
+  // path is RAW — no parseResponse, no sanitizeAssistantReply, no inline
+  // sticker/react handling. For SDK/tmux autonomous wakeups (ScheduleWakeup,
+  // tmux autosteer extra reply, etc.) `[sticker:NAME]` and `No response
+  // requested.` still leak as literal text into Telegram. The rc.51 helper
+  // (lib/telegram/process-agent-reply.js, backported in rc.10 F#1) was built
+  // exactly for this — autonomous-wakeup was its original target use-case.
+  // Wire it through.
+
+  function makeAutonomousDeps() {
+    const h = baseDeps();
+    const stickerSentCalls = [];
+    const deliverCalls = [];
+
+    // Real-shape parseResponse stub (matches lib/telegram/parse.js contract).
+    h.deps.parseResponse = (text) => {
+      const stickers = [];
+      const reactions = [];
+      let cleaned = String(text);
+      cleaned = cleaned.replace(/\[sticker:([a-zA-Z0-9_-]+)\]/g, (_m, name) => {
+        stickers.push({ name, fileId: `file-id-${name}` });
+        return '';
+      });
+      cleaned = cleaned.replace(/\[react:(.+?)\]/g, (_m, emoji) => {
+        reactions.push(emoji);
+        return '';
+      });
+      return {
+        text: cleaned.trim(),
+        sticker: null, stickerLabel: null, stickers,
+        reaction: null, reactions,
+      };
+    };
+    h.deps.sanitizeAssistantReply = (text) => {
+      if (/^No response requested\.?$/i.test(String(text).trim())) {
+        return { text: '(canned reply suppressed)', replaced: true, original: text };
+      }
+      return { text, replaced: false };
+    };
+    h.deps.chunkMarkdownText = (text) => [text];
+    h.deps.deliverReplies = async ({ chunks, chatId, threadId }) => {
+      deliverCalls.push({ chunks: [...chunks], chatId, threadId });
+      return { sent: chunks.map((_, i) => ({ message_id: i + 1 })), failed: [], results: [] };
+    };
+    // Wire the REAL helper so the integration is tested end-to-end.
+    h.deps.processAndDeliverAgentText = require('../lib/telegram/process-agent-reply').processAndDeliverAgentText;
+
+    // Track sticker sends (real helper invokes tg(sendSticker)).
+    return { h, deliverCalls, stickerSentCalls };
+  }
+
+  test('F#23: autonomous wakeup with [sticker:pumped] strips tag from delivered text + sends sticker', async () => {
+    const { h, deliverCalls } = makeAutonomousDeps();
+    const cbs = createSdkCallbacks(h.deps);
+
+    cbs.onAutonomousAssistantMessage('12345', {
+      message: { content: [{ type: 'text', text: 'Wake-up! [sticker:pumped]' }] },
+    });
+    // Helper is async; let microtasks settle.
+    await new Promise(r => setImmediate(r));
+
+    // No raw tg sendMessage with the literal sticker tag.
+    const literalSticker = h.tgCalls.find(c =>
+      c.method === 'sendMessage' && /\[sticker:/.test(String(c.params?.text || ''))
+    );
+    assert.equal(
+      literalSticker,
+      undefined,
+      `[sticker:NAME] must NOT reach Telegram as literal text. tgCalls: ${JSON.stringify(h.tgCalls.map(c => ({ method: c.method, text: c.params?.text })))}`,
+    );
+
+    // Delivered text (via deliverReplies → helper) has the tag stripped.
+    const allDelivered = deliverCalls.flatMap(c => c.chunks).join('\n');
+    assert.ok(
+      !allDelivered.includes('[sticker:'),
+      `Expected sticker tag stripped from delivered chunks. Got: ${JSON.stringify(allDelivered)}`,
+    );
+
+    // sendSticker IS fired (via tg from the helper's inline-sticker branch).
+    const stickerSent = h.tgCalls.find(
+      c => c.method === 'sendSticker' && c.params?.sticker === 'file-id-pumped',
+    );
+    assert.ok(
+      stickerSent,
+      `Expected sendSticker(file-id-pumped). tgCalls: ${JSON.stringify(h.tgCalls.map(c => c.method))}`,
+    );
+  });
+
+  test('F#23: autonomous wakeup with `No response requested.` is sanitized', async () => {
+    const { h, deliverCalls } = makeAutonomousDeps();
+    const cbs = createSdkCallbacks(h.deps);
+
+    cbs.onAutonomousAssistantMessage('12345', {
+      message: { content: [{ type: 'text', text: 'No response requested.' }] },
+    });
+    await new Promise(r => setImmediate(r));
+
+    const allDelivered = deliverCalls.flatMap(c => c.chunks).join('\n');
+    assert.ok(
+      !/^No response requested\.?$/i.test(allDelivered.trim()),
+      `Sanitizer should have replaced canned string on the autonomous-wakeup path. Got: ${JSON.stringify(allDelivered)}`,
+    );
+    assert.match(allDelivered, /suppressed/i, 'Expected canned-reply replacement marker');
+  });
 });
 
 describe('onCompactBoundary — surface compaction + clear hint flag', () => {
