@@ -80,13 +80,13 @@ const main = async () => {
   console.log(`tmp_dir=${process.env.TMPDIR}`);
   console.log('\n[1/3] start()…');
   const t0 = Date.now();
+  // Music-topic config from shumorobot (~/.polygram/config.json topic 3):
   await proc.start({
-    cwd: process.cwd(),
-    agent: null,        // bare claude, no agent
+    cwd: '/Users/ivanshumkov/Music/rekordbox',
+    agent: 'music-curation:music-curator',
     model: 'sonnet',
-    effort: 'low',
+    effort: 'high',
     permissionMode: 'bypassPermissions',
-    // Music-topic config: isolateUserConfig → strict-mcp-config + setting-sources project,local
     isolateUserConfig: true,
   });
   console.log(`\n[1/3] start() done in ${Date.now() - t0}ms`);
@@ -94,9 +94,30 @@ const main = async () => {
   // Snapshot the pane right after start
   dumpPane();
 
-  console.log('\n[2/3] send()…');
-  const promise = proc.send('Reply with the literal text: PONG. Nothing else.', {
-    context: { user: 'spike', sourceMsgId: '1' },
+  // rc.10 followup: mirror polygram's buildPrompt() output so the agent
+  // sees the same XML wrapping it sees on shumorobot. Bare prompts succeed
+  // (spike #2); live Music topic stalls on the wrapped form.
+  const { buildPrompt } = require('../../lib/prompt.js');
+  const { buildHistoryBlock } = require('../../lib/history-preload.js');
+  const fakeMsg = {
+    chat: { id: -1003807211164 },
+    message_id: 9999,
+    from: { id: 68861949, first_name: 'spike' },
+    date: Math.floor(Date.now() / 1000),
+    message_thread_id: 3,
+    text: 'how are you?',
+  };
+  const prompt = buildPrompt({
+    msg: fakeMsg,
+    topicName: 'Music',
+    sessionCtx: '',
+    attachments: [],
+    replyTo: null,
+    polygramHistory: '',  // fresh session, no history
+  });
+  console.log(`\n[2/3] send() — prompt_len=${prompt.length}, head=${JSON.stringify(prompt.slice(0, 200))}…`);
+  const promise = proc.send(prompt, {
+    context: { user: 'spike', sourceMsgId: '9999' },
   });
 
   // Snapshot every 5s while waiting for reply
