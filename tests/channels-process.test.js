@@ -407,9 +407,12 @@ test('rc.7: --mcp-config is the LAST flag in claudeArgs (variadic safety)', asyn
   }
 });
 
-// permissionMode passthrough — mirror of TmuxProcess pattern. Default mode
-// does NOT add --dangerously-skip-permissions; bypassPermissions DOES.
-test('claudeArgs include --dangerously-skip-permissions only when permissionMode=bypassPermissions', async () => {
+// rc.9 (2026-05-26): channels backend defaults to permissionMode='bypassPermissions'.
+// Without it, claude TUI shows the interactive permission prompt for every
+// mcp__polygram-bridge__reply call — channels mode has no interactive surface
+// to answer it, so every first turn hangs until the 30-min turn timeout. The
+// reproducing spike is scripts/spikes/channels-first-turn.mjs.
+test('channels backend defaults to bypassPermissions (rc.9: first-turn-dead-zone fix)', async () => {
   const net = require('node:net');
   const fs = require('node:fs');
 
@@ -444,20 +447,34 @@ test('claudeArgs include --dangerously-skip-permissions only when permissionMode
     return spawnedArgs;
   }
 
+  // rc.9: with NO permissionMode override, the default is bypassPermissions —
+  // the only mode that lets a fresh-spawn channels turn actually reply.
   const defaultArgs = await captureSpawnArgs(undefined);
-  assert.ok(!defaultArgs.includes('--dangerously-skip-permissions'),
-    'default mode: no skip-permissions');
-  assert.ok(!defaultArgs.includes('--permission-mode'),
-    'default mode: no permission-mode flag');
+  assert.ok(defaultArgs.includes('--dangerously-skip-permissions'),
+    'default channels mode: skip-permissions flag is on (no interactive surface)');
+  assert.deepEqual(
+    defaultArgs.slice(defaultArgs.indexOf('--permission-mode'), defaultArgs.indexOf('--permission-mode') + 2),
+    ['--permission-mode', 'bypassPermissions'],
+    'default channels mode: permission-mode=bypassPermissions');
 
+  // Explicit bypassPermissions still works (idempotent with default).
   const bypassArgs = await captureSpawnArgs('bypassPermissions');
   assert.ok(bypassArgs.includes('--dangerously-skip-permissions'),
-    'bypassPermissions: skip-permissions flag added');
+    'explicit bypassPermissions: skip-permissions flag still present');
   assert.deepEqual(
     bypassArgs.slice(bypassArgs.indexOf('--permission-mode'), bypassArgs.indexOf('--permission-mode') + 2),
     ['--permission-mode', 'bypassPermissions'],
-    'bypassPermissions: permission-mode flag carries the value',
-  );
+    'explicit bypassPermissions: permission-mode flag carries the value');
+
+  // Explicit non-bypass override is honored — chat owner can opt out of the
+  // default if they actually want a different permission mode wired up.
+  const acceptEditsArgs = await captureSpawnArgs('acceptEdits');
+  assert.ok(!acceptEditsArgs.includes('--dangerously-skip-permissions'),
+    'acceptEdits override: skip-permissions NOT added');
+  assert.deepEqual(
+    acceptEditsArgs.slice(acceptEditsArgs.indexOf('--permission-mode'), acceptEditsArgs.indexOf('--permission-mode') + 2),
+    ['--permission-mode', 'acceptEdits'],
+    'acceptEdits override: permission-mode carries the override value');
 });
 
 // rc.5: launch cwd MUST be the resolved topic/chat cwd, not opts.cwd ||
