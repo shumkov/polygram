@@ -435,6 +435,51 @@ describe('onAutonomousAssistantMessage — bot-initiated wakeup', () => {
     }));
     assert.equal(h.tgCalls.length, 0);
   });
+
+  // ─── F#22 — channels backend: dispatcher already delivered, handler skips ──
+  //
+  // Production observation: Claude continued researching post-turn-resolve and
+  // called reply again. Dispatcher delivered → channels-process emitted the
+  // autonomous-assistant-message event → handler delivered AGAIN. Double-send.
+  // The channels emit now carries alreadyDelivered: true (see
+  // channels-process-lifecycle.test.js's F#22). Handler must honor it.
+
+  test('F#22: alreadyDelivered=true skips tg send (channels dispatcher already shipped)', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onAutonomousAssistantMessage('12345', {
+      text: 'orphan reply',
+      sessionId: 'sess-1',
+      backend: 'channels',
+      alreadyDelivered: true,
+    });
+    assert.equal(
+      h.tgCalls.length,
+      0,
+      'handler must skip the second tg(sendMessage) when alreadyDelivered=true',
+    );
+    // Forensic log still fires — the transcript line is the record of the
+    // autonomous wakeup having happened, just not the delivery.
+    assert.equal(h.events.length, 1);
+    assert.equal(h.events[0].kind, 'autonomous-wakeup-message');
+    assert.equal(
+      h.events[0].detail.already_delivered,
+      true,
+      'event detail records that the dispatcher (not this handler) delivered',
+    );
+  });
+
+  test('F#22: alreadyDelivered missing/false → existing delivery path still fires', () => {
+    // Regression-safety against the new branch — SDK/tmux shapes without the
+    // flag must still get the existing sendMessage behavior.
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onAutonomousAssistantMessage('12345', {
+      message: { content: [{ type: 'text', text: 'sdk wakeup' }] },
+    });
+    assert.equal(h.tgCalls.length, 1, 'SDK shape: existing tg send must still fire');
+    assert.equal(h.tgCalls[0].params.text, 'sdk wakeup');
+  });
 });
 
 describe('onCompactBoundary — surface compaction + clear hint flag', () => {

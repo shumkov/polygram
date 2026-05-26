@@ -189,3 +189,39 @@ test('F#9: resetSession closes bridgeServer and unlinks mcp-config tmp file', as
   // cleanup
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
 });
+
+// ─── F#22 — autonomous-assistant-message event must signal alreadyDelivered ──
+//
+// Production observation: Claude continued researching after its turn resolved,
+// then called reply again — an "autonomous wakeup". polygram routed it via the
+// autonomous-assistant-message event… but delivered TWICE (OUT 1148 + 1149
+// identical text, same timestamp). The path:
+//   1. Dispatcher delivers immediately on tool call (rc.10 F#1 helper)
+//   2. _recordReplyForPendingTurn finds no pending turn (post-resolve)
+//   3. Emits autonomous-assistant-message event
+//   4. polygram's onAutonomousAssistantMessage handler ALSO does tg(sendMessage)
+//
+// F#2's alreadyDelivered flag covers the in-turn pm.send pipeline; the
+// autonomous emit didn't carry the flag — handler had no signal to skip.
+//
+// Post-fix: channels emits the event with alreadyDelivered: true; polygram's
+// handler (in lib/sdk/callbacks.js) checks the flag and skips the second send.
+
+test('F#22: orphan reply with zero pending turns emits autonomous event WITH alreadyDelivered=true', () => {
+  const proc = makeProc();
+
+  let emittedPayload = null;
+  proc.on('autonomous-assistant-message', (payload) => { emittedPayload = payload; });
+
+  // pendingTurns.size === 0 → falls into the autonomous-emit branch
+  proc._recordReplyForPendingTurn('post-turn-resolve orphan reply', undefined);
+
+  assert.ok(emittedPayload, 'autonomous-assistant-message must fire when no pending turns');
+  assert.equal(emittedPayload.text, 'post-turn-resolve orphan reply');
+  assert.equal(emittedPayload.backend, 'channels');
+  assert.equal(
+    emittedPayload.alreadyDelivered,
+    true,
+    'channels-emit must carry alreadyDelivered=true so polygram\'s handler skips the redundant send (the dispatcher already shipped the text)',
+  );
+});
