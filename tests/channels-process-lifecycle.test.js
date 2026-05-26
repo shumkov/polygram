@@ -122,3 +122,70 @@ test('F#8: respondToPermission on a live instance still writes verdict', async (
     kind: 'perm_verdict', request_id: 'req-live-456', behavior: 'allow',
   });
 });
+
+// ─── F#9 — resetSession leaks tmux + bridge + socket + mcp-config ────────
+//
+// Pre-fix: resetSession only drained pendings and cleared claudeSessionId,
+// returning closed:false. pm.resetSession unconditionally deletes the proc
+// from the map → the underlying tmux session, bridge socket server, and
+// secret-bearing mcp-config tmp file (0600) all leak until daemon boot.
+//
+// Post-fix: resetSession also kills the tmux session, closes the bridge
+// server, unlinks the mcp-config tmp file, clears timers, sets closed=true,
+// and returns closed:true so the contract is honest.
+
+test('F#9: resetSession kills tmux session', async () => {
+  const killed = [];
+  const proc = new (require('../lib/process/channels-process').ChannelsProcess)({
+    sessionKey: 'sess-1', chatId: '12345',
+    tmuxRunner: {
+      sendControl: async () => {},
+      killSession: async (name) => { killed.push(name); },
+    },
+    botName: 'testbot', claudeBin: '/usr/bin/false',
+    toolDispatcher: async () => ({ ok: true }),
+    logger: quietLogger,
+  });
+  proc.tmuxSession = 'polygram-testbot-channels-abc';
+
+  const result = await proc.resetSession({ reason: 'reset' });
+
+  assert.deepEqual(killed, ['polygram-testbot-channels-abc']);
+  assert.equal(result.closed, true, 'must return closed:true so pm knows underlying resources were freed');
+  assert.equal(proc.tmuxSession, null);
+});
+
+test('F#9: resetSession closes bridgeServer and unlinks mcp-config tmp file', async () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const os = require('node:os');
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pgr-reset-mcp-'));
+  const mcpPath = path.join(tmpDir, 'mcp-config.json');
+  fs.writeFileSync(mcpPath, '{}', { mode: 0o600 });
+
+  let bridgeClosed = 0;
+  const proc = new (require('../lib/process/channels-process').ChannelsProcess)({
+    sessionKey: 'sess-1', chatId: '12345',
+    tmuxRunner: { sendControl: async () => {}, killSession: async () => {} },
+    botName: 'testbot', claudeBin: '/usr/bin/false',
+    toolDispatcher: async () => ({ ok: true }),
+    logger: quietLogger,
+  });
+  proc.bridgeServer = { close: async () => { bridgeClosed++; } };
+  proc.mcpConfigPath = mcpPath;
+
+  await proc.resetSession({ reason: 'reset' });
+
+  assert.equal(bridgeClosed, 1, 'bridgeServer.close() must be called exactly once');
+  assert.equal(proc.bridgeServer, null);
+  assert.equal(
+    fs.existsSync(mcpPath),
+    false,
+    'mcp-config tmp file (secret-bearing) must be unlinked',
+  );
+  assert.equal(proc.mcpConfigPath, null);
+
+  // cleanup
+  try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+});

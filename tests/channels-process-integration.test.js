@@ -546,7 +546,11 @@ test('P2 AC8: resetSession drains pendings, clears session id, emits session-res
   const resetP = new Promise(resolve => cp.once('session-reset', resolve));
   const res = await cp.resetSession({ reason: '/new' });
   assert.equal(typeof res.closed, 'boolean');
-  assert.equal(res.closed, false);   // Channels does not close on reset; only clears state
+  // Review F#9: post-fix resetSession does a full teardown (kills tmux,
+  // closes bridgeServer, unlinks mcp-config) and returns closed:true so
+  // pm.resetSession's caller knows the underlying resources are gone.
+  // Pre-fix returned false → those resources leaked across /new /reset.
+  assert.equal(res.closed, true, 'F#9 contract: resetSession owns the full teardown');
   assert.equal(res.drainedPendings, 1);
   const evt = await resetP;
   assert.equal(evt.reason, '/new');
@@ -554,6 +558,8 @@ test('P2 AC8: resetSession drains pendings, clears session id, emits session-res
   await rejectAssertion;
 
   bridge.close();
+  // Post-fix proc.closed is already true; kill('test') is a no-op double-call,
+  // which existing kill() implementations handle idempotently.
   await cp.kill('test');
 });
 
