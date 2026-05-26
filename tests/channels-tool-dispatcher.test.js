@@ -17,6 +17,14 @@ const fakeBot = {};
 const fakeChunk = (text, _max) => [text];      // pass-through chunker
 const quietLogger = { warn: () => {}, error: () => {}, log: () => {}, debug: () => {} };
 
+// Review F#1: dispatcher now routes through processAndDeliverAgentText.
+// parseResponse + sanitizeAssistantReply are required deps. Use no-op
+// identity stubs in tests that aren't asserting pipeline behavior.
+const fakeParse = (text) => ({
+  text, sticker: null, stickerLabel: null, stickers: [], reaction: null, reactions: [],
+});
+const fakeSanitize = (text) => ({ text, replaced: false });
+
 function makeRecordingSend() {
   const sent = [];
   const send = async (_bot, method, params, _meta) => {
@@ -50,7 +58,7 @@ test('dispatches reply text via deliverReplies', async () => {
     deliverReplies: async ({ chunks, chatId, threadId }) => {
       return { sent: chunks.map((_, i) => ({ message_id: i + 1 })), failed: [], results: [] };
     },
-    logger: quietLogger,
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
   });
 
   const result = await dispatcher({
@@ -67,7 +75,7 @@ test('returns error when toolName is not reply', async () => {
     send: async () => ({}),
     chunkText: fakeChunk,
     deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
-    logger: quietLogger,
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
   });
 
   const result = await dispatcher({
@@ -84,7 +92,7 @@ test('returns error on missing text', async () => {
     send: async () => ({}),
     chunkText: fakeChunk,
     deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
-    logger: quietLogger,
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
   });
   const result = await dispatcher({
     sessionKey: 'sess-1', chatId: '12345', threadId: null,
@@ -100,7 +108,7 @@ test('returns error on missing chat_id', async () => {
     send: async () => ({}),
     chunkText: fakeChunk,
     deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
-    logger: quietLogger,
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
   });
   const result = await dispatcher({
     sessionKey: 'sess-1', chatId: null, threadId: null,
@@ -120,7 +128,7 @@ test('partial delivery surfaces failure count', async () => {
       failed: [{ chunk: chunks[1], error: new Error('429 rate limit') }],
       results: [],
     }),
-    logger: quietLogger,
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
   });
   const result = await dispatcher({
     sessionKey: 'sess-1', chatId: '12345', threadId: null,
@@ -144,7 +152,7 @@ test('sends file attachments via sendPhoto for images', async () => {
     const dispatcher = createChannelsToolDispatcher({
       bot: fakeBot, send, chunkText: fakeChunk,
       deliverReplies: async () => ({ sent: [{ message_id: 1 }], failed: [], results: [] }),
-      logger: quietLogger,
+      parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
     });
     await dispatcher({
       sessionKey: 'sess-1', chatId: '12345', threadId: null,
@@ -244,7 +252,7 @@ test('dispatcher REJECTS Claude reply with files=/etc/passwd (exfiltration defen
     const dispatcher = createChannelsToolDispatcher({
       bot: fakeBot, send, chunkText: fakeChunk,
       deliverReplies: async () => ({ sent: [{ message_id: 1 }], failed: [], results: [] }),
-      logger: quietLogger,
+      parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
       attachmentAllowlist: [tmpRoot],   // ONLY this dir allowed
     });
     const result = await dispatcher({
@@ -272,7 +280,7 @@ test('dispatcher ACCEPTS files under sessionCwd', async () => {
     const dispatcher = createChannelsToolDispatcher({
       bot: fakeBot, send, chunkText: fakeChunk,
       deliverReplies: async () => ({ sent: [{ message_id: 1 }], failed: [], results: [] }),
-      logger: quietLogger,
+      parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
     });
     const result = await dispatcher({
       sessionKey: 'sess-ok', chatId: '12345', threadId: null,
@@ -307,7 +315,7 @@ test('file attach upload failure surfaces as ok:false with details (R9)', async 
     const dispatcher = createChannelsToolDispatcher({
       bot: fakeBot, send, chunkText: fakeChunk,
       deliverReplies: async () => ({ sent: [{ message_id: 1 }], failed: [], results: [] }),
-      logger: quietLogger,
+      parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
     });
     const result = await dispatcher({
       sessionKey: 'sess-1', chatId: '12345', threadId: null,

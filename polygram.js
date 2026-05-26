@@ -1361,6 +1361,31 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       return;
     }
 
+    // Review F#2: channels dispatcher has already delivered the reply text
+    // to Telegram incrementally during the turn (each `reply` tool call
+    // → dispatcher → processAndDeliverAgentText → deliverReplies). result.text
+    // is the *cumulative* of those replies, kept for transcript + telemetry
+    // but MUST NOT re-flow through streamer.finalize / deliverReplies — that
+    // would deliver every channels turn twice. Short-circuit BEFORE the
+    // parseResponse/finalize/deliver block; still clear reactor + mark
+    // replied so the reactive UI elements close cleanly.
+    if (result.alreadyDelivered) {
+      logEvent('channels-turn-resolved', {
+        chat_id: chatId,
+        msg_id: msg.message_id,
+        session_id: result.sessionId,
+        duration_ms: result.duration,
+        chars: result.text?.length || 0,
+        replies: result.metrics?.numAssistantMessages || 0,
+        bot: BOT_NAME,
+      });
+      reactor.clear().catch(() => {});
+      clearAutosteeredReactions(sessionKey).catch(() => {});
+      console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | channels-delivered | ${chatConfig.model}/${chatConfig.effort}`);
+      markReplied();
+      return;
+    }
+
     const parsed = parseResponse(result.text);
     // rc.39: intercept CLI-context canned-string leaks (`No response
     // requested.` etc.) before they reach the streamer/deliver path.
@@ -2266,6 +2291,11 @@ async function main() {
     send: tg,
     chunkText: chunkMarkdownText,
     deliverReplies,
+    // Review F#1: required so [sticker:NAME] / [react:EMOJI] / canned-string
+    // (`No response requested.`) protections fire on channels replies too.
+    parseResponse,
+    sanitizeAssistantReply,
+    logEvent,
     logger: console,
   });
   const channelsClaudeBin = pinnedClaudeBin;
