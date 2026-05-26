@@ -57,6 +57,45 @@ describe('classify — typed-code short-circuit', () => {
     const r = classify(err);
     assert.equal(r.kind, 'queueOverflow');
   });
+
+  // ─── Review F#5: channels-specific error codes get proper user messages ──
+  //
+  // Pre-fix all four channels error codes fell through CODES table to the
+  // generic 'unknown' kind → user saw "Hit a snag: bridge disconnected. Try
+  // resending." (or worse: the raw 'turn timeout (600000ms)' string). Mirrors
+  // the rc.46→rc.47 tmuxToolWedge incident exactly.
+
+  test('F#5: BRIDGE_DISCONNECTED has a dedicated kind + user-facing message', () => {
+    const err = Object.assign(new Error('bridge disconnected'), { code: 'BRIDGE_DISCONNECTED' });
+    const r = classify(err);
+    assert.notEqual(r.kind, 'unknown', 'must not fall through to unknown');
+    assert.equal(r.kind, 'bridgeDisconnected');
+    assert.ok(r.userMessage && r.userMessage.length > 0, 'must surface a user-facing message');
+  });
+
+  test('F#5: CHANNELS_HANDSHAKE_TIMEOUT has a dedicated kind + user-facing message', () => {
+    const err = Object.assign(new Error('handshake timeout'), { code: 'CHANNELS_HANDSHAKE_TIMEOUT' });
+    const r = classify(err);
+    assert.notEqual(r.kind, 'unknown');
+    assert.equal(r.kind, 'channelsHandshakeTimeout');
+    assert.ok(r.userMessage && r.userMessage.length > 0);
+  });
+
+  test('F#5: CHANNELS_DIALOG_TIMEOUT has a dedicated kind + user-facing message', () => {
+    const err = Object.assign(new Error('dialog timeout'), { code: 'CHANNELS_DIALOG_TIMEOUT' });
+    const r = classify(err);
+    assert.notEqual(r.kind, 'unknown');
+    assert.equal(r.kind, 'channelsDialogTimeout');
+    assert.ok(r.userMessage && r.userMessage.length > 0);
+  });
+
+  test('F#5: TURN_TIMEOUT has a dedicated kind + user-facing message', () => {
+    const err = Object.assign(new Error('turn timeout (600000ms)'), { code: 'TURN_TIMEOUT' });
+    const r = classify(err);
+    assert.notEqual(r.kind, 'unknown');
+    assert.equal(r.kind, 'turnTimeout');
+    assert.ok(r.userMessage && r.userMessage.length > 0);
+  });
 });
 
 describe('classify — PATTERNS coverage (one sample per kind)', () => {

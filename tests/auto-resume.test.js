@@ -150,4 +150,32 @@ describe('isAutoResumable — gate', () => {
     assert.equal(isAutoResumable({ error: null }), false);
     assert.equal(isAutoResumable({}), false);
   });
+
+  // ─── Review F#6: channels-specific error codes drive auto-resume too ──
+  //
+  // Pre-fix the regex only matched the tmux 'idle with no Claude activity'
+  // string. Channels throws Error('bridge disconnected') with code
+  // BRIDGE_DISCONNECTED, Error('turn timeout (600000ms)') with code
+  // TURN_TIMEOUT — neither matches. Auto-resume silently never fires on
+  // channels chats.
+  //
+  // Post-fix: code-based match for BRIDGE_DISCONNECTED (it's a wedge —
+  // bridge socket dropped, claude likely crashed mid-turn, resume helps).
+  // TURN_TIMEOUT stays non-resumable (10-min wall-clock cap is the channels
+  // analog of the tmux ceiling — runaway, not wedge; resuming risks loop).
+
+  test('F#6: BRIDGE_DISCONNECTED code → resumable (bridge wedge, mirror of idle pattern)', () => {
+    const err = Object.assign(new Error('bridge disconnected'), { code: 'BRIDGE_DISCONNECTED' });
+    assert.equal(isAutoResumable({ error: err }), true);
+  });
+
+  test('F#6: TURN_TIMEOUT code → NOT resumable (wall-clock ceiling, same as tmux 1800s)', () => {
+    const err = Object.assign(new Error('turn timeout (600000ms)'), { code: 'TURN_TIMEOUT' });
+    assert.equal(isAutoResumable({ error: err }), false);
+  });
+
+  test('F#6: BRIDGE_DISCONNECTED + aborted=true blocks (user said stop)', () => {
+    const err = Object.assign(new Error('bridge disconnected'), { code: 'BRIDGE_DISCONNECTED' });
+    assert.equal(isAutoResumable({ error: err, aborted: true }), false);
+  });
 });
