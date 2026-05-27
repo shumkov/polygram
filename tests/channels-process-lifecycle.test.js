@@ -207,6 +207,161 @@ test('F#9: resetSession closes bridgeServer and unlinks mcp-config tmp file', as
 // Post-fix: channels emits the event with alreadyDelivered: true; polygram's
 // handler (in lib/sdk/callbacks.js) checks the flag and skips the second send.
 
+// ─── F#17 — mid-turn dialog watchdog ─────────────────────────────────────
+//
+// Even though channels uses MCP for IO, the underlying claude TUI can still
+// pop interactive prompts mid-turn (session-age, future usage-limit menus)
+// that don't surface as MCP notifications. Without polling the pane we'd
+// only catch them when the F#13 idle ceiling fires (~10 min). The fix
+// piggybacks on the pong-watchdog's 5s tick: when pending turns exist AND
+// the tmux session is live, capture-pane and match against a known-pattern
+// catalog. action='enter' dismisses; action='emit-only' surfaces telemetry.
+
+function makeProcWithCapture(paneContent, opts = {}) {
+  const sendCalls = [];
+  const runner = {
+    sendControl: async (name, key) => { sendCalls.push({ name, key }); },
+    killSession: async () => {},
+    captureWide: async () => paneContent,
+  };
+  const events = [];
+  const proc = new (require('../lib/process/channels-process').ChannelsProcess)({
+    sessionKey: 'sess-1', chatId: '12345',
+    tmuxRunner: runner, botName: 'testbot', claudeBin: '/usr/bin/false',
+    toolDispatcher: async () => ({ ok: true }),
+    logger: quietLogger,
+    db: { logEvent: (kind, detail) => events.push({ kind, detail }) },
+    ...opts,
+  });
+  proc.tmuxSession = 'pgr-testbot-channels-abc';
+  return { proc, runner, sendCalls, events };
+}
+
+test('F#17: session-age dialog mid-turn → sendControl(Enter) fires', async () => {
+  const paneShowingDialog =
+    'Some pre-amble...\n' +
+    'This session is 8h 38m old and 117.6k tokens.\n' +
+    'Resuming the full session will consume a substantial portion of your usage limits.\n' +
+    '> 1. Resume from summary (recommended)\n' +
+    '  2. Resume full session as-is';
+  const { proc, sendCalls } = makeProcWithCapture(paneShowingDialog);
+  proc.pendingTurns.set('turn-1', { resolve: () => {}, reject: () => {}, replies: [] });
+
+  await proc._pollMidTurnDialogs();
+
+  assert.equal(
+    sendCalls.length,
+    1,
+    'one sendControl(Enter) must fire on detection',
+  );
+  assert.equal(sendCalls[0].name, 'pgr-testbot-channels-abc');
+  assert.equal(sendCalls[0].key, 'Enter');
+});
+
+test('F#17: emits mid-turn-dialog-detected event with pattern name + action', async () => {
+  const paneShowingDialog =
+    'Resuming the full session will consume a substantial portion of your usage limits.\n' +
+    'Resume from summary';
+  const { proc, events } = makeProcWithCapture(paneShowingDialog);
+  proc.pendingTurns.set('turn-1', { resolve: () => {}, reject: () => {}, replies: [] });
+
+  let emitted = null;
+  proc.on('mid-turn-dialog-detected', (payload) => { emitted = payload; });
+
+  await proc._pollMidTurnDialogs();
+
+  assert.ok(emitted, 'mid-turn-dialog-detected must fire');
+  assert.equal(emitted.name, 'session-age');
+  assert.equal(emitted.action, 'enter');
+  assert.equal(emitted.backend, 'channels');
+
+  const logEvt = events.find(e => e.kind === 'channels-mid-turn-dialog-detected');
+  assert.ok(logEvt, 'channels-mid-turn-dialog-detected forensic event must fire');
+  assert.equal(logEvt.detail.name, 'session-age');
+  assert.equal(logEvt.detail.pending_count, 1);
+});
+
+test('F#17: skipped when no pending turns (idle = no work)', async () => {
+  const paneShowingDialog =
+    'Resuming the full session will consume a substantial portion of your usage limits.\n' +
+    'Resume from summary';
+  const { proc, sendCalls } = makeProcWithCapture(paneShowingDialog);
+  // proc.pendingTurns is empty — idle
+
+  await proc._pollMidTurnDialogs();
+
+  assert.equal(sendCalls.length, 0, 'idle proc must NOT poll/act');
+});
+
+test('F#17: skipped when no tmuxSession (pre-spawn / post-kill)', async () => {
+  const { proc, sendCalls } = makeProcWithCapture('Resume from summary');
+  proc.pendingTurns.set('turn-1', { resolve: () => {}, reject: () => {}, replies: [] });
+  proc.tmuxSession = null;   // simulate pre-spawn
+
+  await proc._pollMidTurnDialogs();
+
+  assert.equal(sendCalls.length, 0, 'no tmux session → no capture, no action');
+});
+
+test('F#17: dedups within rate-limit window', async () => {
+  const paneShowingDialog =
+    'Resuming the full session will consume a substantial portion of your usage limits.\n' +
+    'Resume from summary';
+  const { proc, sendCalls } = makeProcWithCapture(paneShowingDialog);
+  proc.pendingTurns.set('turn-1', { resolve: () => {}, reject: () => {}, replies: [] });
+
+  // First poll fires
+  await proc._pollMidTurnDialogs();
+  // Second poll (same tick, same dialog) must dedup
+  await proc._pollMidTurnDialogs();
+  // Third
+  await proc._pollMidTurnDialogs();
+
+  assert.equal(
+    sendCalls.length,
+    1,
+    'lingering dialog across multiple polls must not spam sendControl(Enter)',
+  );
+});
+
+test('F#17: captureWide failure is swallowed (does not throw, does not crash watchdog)', async () => {
+  const runner = {
+    sendControl: async () => {},
+    killSession: async () => {},
+    captureWide: async () => { throw new Error('tmux died'); },
+  };
+  const proc = new (require('../lib/process/channels-process').ChannelsProcess)({
+    sessionKey: 'sess-1', chatId: '12345',
+    tmuxRunner: runner, botName: 'testbot', claudeBin: '/usr/bin/false',
+    toolDispatcher: async () => ({ ok: true }),
+    logger: quietLogger,
+  });
+  proc.tmuxSession = 'pgr-testbot-channels-abc';
+  proc.pendingTurns.set('turn-1', { resolve: () => {}, reject: () => {}, replies: [] });
+
+  // Must not throw — the pong watchdog calls this via .catch() too, but we
+  // pin the contract here.
+  await proc._pollMidTurnDialogs();
+});
+
+test('F#17: normal turn output (no dialog) → no action', async () => {
+  const benignPane =
+    'I am thinking about your question.\n' +
+    'Let me check a few files first.\n' +
+    'esc to interrupt';
+  const { proc, sendCalls, events } = makeProcWithCapture(benignPane);
+  proc.pendingTurns.set('turn-1', { resolve: () => {}, reject: () => {}, replies: [] });
+
+  await proc._pollMidTurnDialogs();
+
+  assert.equal(sendCalls.length, 0);
+  assert.equal(
+    events.filter(e => e.kind === 'channels-mid-turn-dialog-detected').length,
+    0,
+    'no false positives on benign turn output',
+  );
+});
+
 test('F#22: orphan reply with zero pending turns emits autonomous event WITH alreadyDelivered=true', () => {
   const proc = makeProc();
 
