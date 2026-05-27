@@ -362,6 +362,119 @@ test('F#17: normal turn output (no dialog) → no action', async () => {
   );
 });
 
+// ─── F#24 — injectUserMessage on ChannelsProcess (autosteer parity) ─────
+//
+// Pre-fix: channels inherited the base-class default (returns false), so
+// polygram's autosteer flow (lib/handlers/autosteer.js:77) reported
+// {autosteered: false} for any follow-up arriving mid-turn. End result:
+// no AUTOSTEERED (✍) reaction was set on the follow-up message; it sat
+// without any reactor state until the stdin-lock released.
+//
+// Post-fix: ChannelsProcess.injectUserMessage writes the follow-up to
+// the bridge as a fresh user_msg. Returns true so autosteer.tryAutosteer
+// reports {autosteered: true, priority}. Polygram then marks ✍ on the
+// follow-up msg + records it in autosteeredRefs.
+
+test('F#24: injectUserMessage returns true + emits inject-user-message when inFlight + content valid', () => {
+  const proc = makeProc();
+  proc.bridgeReady = true;
+  proc.bridgeServer = { writeMessage: () => {} };
+  proc.inFlight = true;
+
+  let emitted = null;
+  proc.on('inject-user-message', (payload) => { emitted = payload; });
+
+  const ok = proc.injectUserMessage({ content: 'follow-up payload', priority: 'next', msgId: 1234 });
+
+  assert.equal(ok, true, 'must return true for valid content + live turn');
+  assert.ok(emitted, 'inject-user-message event must fire');
+  assert.equal(emitted.text_len, 'follow-up payload'.length);
+  assert.equal(emitted.priority, 'next');
+  assert.equal(emitted.msgId, '1234');
+});
+
+test('F#24: injectUserMessage returns false when not in-flight (no live turn to merge into)', () => {
+  const proc = makeProc();
+  proc.bridgeReady = true;
+  proc.bridgeServer = { writeMessage: () => {} };
+  proc.inFlight = false;   // no live turn
+
+  const ok = proc.injectUserMessage({ content: 'follow-up' });
+  assert.equal(ok, false, 'idle proc → return false so polygram falls through to normal send');
+});
+
+test('F#24: injectUserMessage returns false when bridge not ready', () => {
+  const proc = makeProc();
+  proc.bridgeReady = false;
+  proc.bridgeServer = null;
+  proc.inFlight = true;
+
+  const ok = proc.injectUserMessage({ content: 'follow-up' });
+  assert.equal(ok, false);
+});
+
+test('F#24: injectUserMessage sanitizes C0 control chars + emits prompt-sanitized', () => {
+  const proc = makeProc();
+  proc.bridgeReady = true;
+  proc.bridgeServer = { writeMessage: () => {} };
+  proc.inFlight = true;
+
+  let sanitizedEvent = null;
+  proc.on('prompt-sanitized', (payload) => { sanitizedEvent = payload; });
+
+  // "hi\x01\x02world" — two control chars between hi and world
+  const ok = proc.injectUserMessage({ content: 'hi\x01\x02world' });
+  assert.equal(ok, true);
+  assert.ok(sanitizedEvent, 'prompt-sanitized event must fire');
+  assert.equal(sanitizedEvent.stripped, 2);
+  assert.equal(sanitizedEvent.source, 'inject');
+});
+
+test('F#24: injectUserMessage returns false when content sanitizes to empty (only control chars)', () => {
+  const proc = makeProc();
+  proc.bridgeReady = true;
+  proc.bridgeServer = { writeMessage: () => {} };
+  proc.inFlight = true;
+
+  const ok = proc.injectUserMessage({ content: '\x01\x02\x03' });
+  assert.equal(ok, false, 'all-control-chars sanitizes to empty → return false');
+});
+
+test('F#24: injectUserMessage emits inject-fail on transport failure (bridge gone)', () => {
+  const proc = makeProc();
+  proc.bridgeReady = true;
+  proc.bridgeServer = null;   // F#18: _writeToBridge returns false on no-bridge
+  proc.inFlight = true;
+
+  let failEvent = null;
+  proc.on('inject-fail', (payload) => { failEvent = payload; });
+
+  const ok = proc.injectUserMessage({ content: 'follow-up' });
+  assert.equal(ok, false, 'transport failure must return false');
+  assert.ok(failEvent, 'inject-fail must fire');
+  assert.equal(typeof failEvent.err, 'string');
+  assert.ok(failEvent.err.length > 0);
+  assert.equal(failEvent.source, 'inject');
+});
+
+test('F#24: injectUserMessage actually writes user_msg to the bridge with correct shape', () => {
+  const proc = makeProc();
+  proc.bridgeReady = true;
+  proc.inFlight = true;
+  let written = null;
+  proc.bridgeServer = { writeMessage: (obj) => { written = obj; } };
+
+  const ok = proc.injectUserMessage({ content: 'merge this in', msgId: 5678 });
+  assert.equal(ok, true);
+  assert.ok(written, 'bridge writeMessage must be called');
+  assert.equal(written.kind, 'user_msg');
+  assert.equal(written.text, 'merge this in');
+  assert.equal(written.chat_id, '12345');
+  assert.equal(written.msg_id, '5678');
+  assert.equal(typeof written.turn_id, 'string');
+  assert.ok(written.turn_id.length > 0);
+});
+
 test('F#22: orphan reply with zero pending turns emits autonomous event WITH alreadyDelivered=true', () => {
   const proc = makeProc();
 

@@ -39,7 +39,9 @@ const CHANNELS_SKIPS = new Set([
   'C21',  // prompt-sanitized event (channels accepts as-is; sanitization upstream)
   // SDK/tmux pending-queue + injection semantics not implemented by channels
   'C7',   // drainQueue + throwing reject (pendingTurns map shape differs)
-  'C10', 'C11', 'C23',  // injectUserMessage (channels: Process default false)
+  // C10, C11, C23: injectUserMessage — now implemented for channels (F#24),
+  // so these run on the channels backend too. Backend-specific transport
+  // poisoning for C11/C23 is wired below.
   'C20',  // concurrent send() serialization (channels relies on upstream queue)
   'C27',  // pendingQueue introspection (channels uses pendingTurns)
   'C25',  // cost + token-breakdown metrics (Channels protocol doesn't expose them)
@@ -223,8 +225,12 @@ for (const kind of BACKENDS) {
       // Backend-specific: poison the transport so the underlying paste/push
       // fails. SdkProcess's inputController.push throws on closed input;
       // closing the query first works. TmuxProcess: replace pasteText.
+      // ChannelsProcess (F#24): null out bridgeServer so _writeToBridge
+      // returns false; injectUserMessage emits 'inject-fail' from that path.
       if (kind === 'sdk') {
         proc.inputController.close();
+      } else if (kind === 'channels') {
+        proc.bridgeServer = null;
       } else {
         proc.runner.pasteText = async () => { throw new Error('boom'); };
       }
@@ -386,8 +392,12 @@ for (const kind of BACKENDS) {
       const { proc, driver } = await setupReady(kind);
       proc.inFlight = true;
       // Poison the underlying transport so the inject path's send fails.
+      // ChannelsProcess (F#24): null out bridgeServer so _writeToBridge
+      // returns false; injectUserMessage emits 'inject-fail'.
       if (kind === 'sdk') {
         proc.inputController.close();  // pushes throw on closed input
+      } else if (kind === 'channels') {
+        proc.bridgeServer = null;
       } else {
         proc.runner.pasteText = async () => { throw new Error('paste boom'); };
       }
