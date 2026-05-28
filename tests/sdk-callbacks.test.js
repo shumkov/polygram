@@ -439,10 +439,10 @@ describe('onAutonomousAssistantMessage — bot-initiated wakeup', () => {
   // ─── F#22 — channels backend: dispatcher already delivered, handler skips ──
   //
   // Production observation: Claude continued researching post-turn-resolve and
-  // called reply again. Dispatcher delivered → channels-process emitted the
+  // called reply again. Dispatcher delivered → cli-process emitted the
   // autonomous-assistant-message event → handler delivered AGAIN. Double-send.
   // The channels emit now carries alreadyDelivered: true (see
-  // channels-process-lifecycle.test.js's F#22). Handler must honor it.
+  // cli-process-lifecycle.test.js's F#22). Handler must honor it.
 
   test('F#22: alreadyDelivered=true skips tg send (channels dispatcher already shipped)', () => {
     const h = baseDeps();
@@ -450,7 +450,7 @@ describe('onAutonomousAssistantMessage — bot-initiated wakeup', () => {
     cbs.onAutonomousAssistantMessage('12345', {
       text: 'orphan reply',
       sessionId: 'sess-1',
-      backend: 'channels',
+      backend: 'cli',
       alreadyDelivered: true,
     });
     assert.equal(

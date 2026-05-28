@@ -3,8 +3,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { ChannelsProcess } = require('../lib/process/channels-process');
-const { createProcessFactory, pickBackend } = require('../lib/process/factory');
+const { CliProcess } = require('../lib/process/cli-process');
+const factory = require('../lib/process/factory');
+const { createProcessFactory, pickBackend } = factory;
 
 // Minimal fakes so we can construct without touching tmux / claude.
 // Method shape matches lib/tmux/tmux-runner.js exports.
@@ -16,31 +17,31 @@ const fakeRunner = {
 };
 const fakeDispatcher = async () => ({ ok: true });
 
-test('ChannelsProcess construction — required params', () => {
+test('CliProcess construction — required params', () => {
   assert.throws(
-    () => new ChannelsProcess({}),
+    () => new CliProcess({}),
     /sessionKey/,
     'sessionKey required',
   );
 
   assert.throws(
-    () => new ChannelsProcess({ sessionKey: 'k', botName: 'b', toolDispatcher: fakeDispatcher }),
+    () => new CliProcess({ sessionKey: 'k', botName: 'b', toolDispatcher: fakeDispatcher }),
     /tmuxRunner required/,
   );
 
   assert.throws(
-    () => new ChannelsProcess({ sessionKey: 'k', tmuxRunner: fakeRunner, toolDispatcher: fakeDispatcher }),
+    () => new CliProcess({ sessionKey: 'k', tmuxRunner: fakeRunner, toolDispatcher: fakeDispatcher }),
     /botName required/,
   );
 
   assert.throws(
-    () => new ChannelsProcess({ sessionKey: 'k', tmuxRunner: fakeRunner, botName: 'b' }),
+    () => new CliProcess({ sessionKey: 'k', tmuxRunner: fakeRunner, botName: 'b' }),
     /toolDispatcher.*required/,
   );
 });
 
-test('ChannelsProcess construction — valid params', () => {
-  const p = new ChannelsProcess({
+test('CliProcess construction — valid params', () => {
+  const p = new CliProcess({
     sessionKey: 'session-1',
     chatId: '12345',
     threadId: null,
@@ -56,15 +57,15 @@ test('ChannelsProcess construction — valid params', () => {
   assert.equal(p.chatId, '12345');
   assert.equal(p.threadId, null);
   assert.equal(p.label, 'test-chat');
-  assert.equal(p.backend, 'channels');
+  assert.equal(p.backend, 'cli');
   assert.equal(p.cost, 3);
   assert.equal(p.closed, false);
   assert.equal(p.inFlight, false);
   assert.equal(p.bridgeReady, false);
 });
 
-test('ChannelsProcess.respondToPermission validates behavior arg', async () => {
-  const p = new ChannelsProcess({
+test('CliProcess.respondToPermission validates behavior arg', async () => {
+  const p = new CliProcess({
     sessionKey: 'k', chatId: '1', tmuxRunner: fakeRunner, botName: 'b',
     toolDispatcher: fakeDispatcher, claudeBin: '/usr/bin/echo',
     logger: { warn: () => {}, error: () => {}, log: () => {} },
@@ -76,8 +77,8 @@ test('ChannelsProcess.respondToPermission validates behavior arg', async () => {
   );
 });
 
-test('ChannelsProcess.send rejects on unstarted instance', async () => {
-  const p = new ChannelsProcess({
+test('CliProcess.send rejects on unstarted instance', async () => {
+  const p = new CliProcess({
     sessionKey: 'k', chatId: '1', tmuxRunner: fakeRunner, botName: 'b',
     toolDispatcher: fakeDispatcher, claudeBin: '/usr/bin/echo',
     logger: { warn: () => {}, error: () => {}, log: () => {} },
@@ -89,12 +90,18 @@ test('ChannelsProcess.send rejects on unstarted instance', async () => {
   );
 });
 
-test('pickBackend honors channels via chatConfig.pm', () => {
+// 0.12: pm:'channels' is now an alias for pm:'cli' (the canonical post-0.12
+// backend name). pickBackend resolves the alias and emits a once-per-process
+// deprecation warn. These tests assert the alias resolves to 'cli'.
+
+test('pickBackend resolves channels alias → cli via chatConfig.pm', () => {
+  factory._resetAliasWarnings();
   const cfg = { chats: { '12345': { pm: 'channels' } } };
-  assert.equal(pickBackend({ config: cfg, chatId: '12345', threadId: null }), 'channels');
+  assert.equal(pickBackend({ config: cfg, chatId: '12345', threadId: null, logger: { warn: () => {} } }), 'cli');
 });
 
-test('pickBackend honors channels via topicConfig.pm overriding chat', () => {
+test('pickBackend resolves channels alias → cli via topicConfig.pm overriding chat', () => {
+  factory._resetAliasWarnings();
   const cfg = {
     chats: {
       '12345': {
@@ -103,12 +110,23 @@ test('pickBackend honors channels via topicConfig.pm overriding chat', () => {
       },
     },
   };
-  assert.equal(pickBackend({ config: cfg, chatId: '12345', threadId: '7' }), 'channels');
+  assert.equal(pickBackend({ config: cfg, chatId: '12345', threadId: '7', logger: { warn: () => {} } }), 'cli');
 });
 
-test('pickBackend honors channels via bot.pm default', () => {
+test('pickBackend resolves channels alias → cli via bot.pm default', () => {
+  factory._resetAliasWarnings();
   const cfg = { bot: { pm: 'channels' } };
-  assert.equal(pickBackend({ config: cfg, chatId: '99', threadId: null }), 'channels');
+  assert.equal(pickBackend({ config: cfg, chatId: '99', threadId: null, logger: { warn: () => {} } }), 'cli');
+});
+
+test('pickBackend emits once-per-process deprecation warn on channels alias', () => {
+  factory._resetAliasWarnings();
+  const warns = [];
+  const cfg = { chats: { '12345': { pm: 'channels' } } };
+  pickBackend({ config: cfg, chatId: '12345', threadId: null, logger: { warn: msg => warns.push(msg) } });
+  pickBackend({ config: cfg, chatId: '12345', threadId: null, logger: { warn: msg => warns.push(msg) } });
+  assert.equal(warns.length, 1, 'should warn exactly once for repeated calls');
+  assert.match(warns[0], /'channels' is deprecated/);
 });
 
 test('factory falls back to sdk when channels wiring incomplete', () => {
@@ -136,7 +154,7 @@ test('factory falls back to sdk when channels wiring incomplete', () => {
   proc.kill?.('test-cleanup').catch(() => {});
 });
 
-test('factory constructs ChannelsProcess when fully wired', () => {
+test('factory constructs CliProcess when fully wired', () => {
   const cfg = { bot: { pm: 'channels' } };
   const factory = createProcessFactory({
     config: cfg,
@@ -149,7 +167,7 @@ test('factory constructs ChannelsProcess when fully wired', () => {
   });
 
   const proc = factory('sess-2', { chatId: '99' });
-  assert.equal(proc.backend, 'channels');
+  assert.equal(proc.backend, 'cli');
   assert.equal(proc.cost, 3);
 });
 
@@ -166,7 +184,7 @@ test('pickBackend warns and falls back to sdk on unknown pm value', () => {
 
 // Review #11: tmux session name carries the polygram-${botName}- prefix so
 // orphan-sweep (lib/tmux/orphan-sweep.js) finds channels sessions at boot.
-test('ChannelsProcess.start tmux session name uses polygram- prefix for orphan-sweep', async () => {
+test('CliProcess.start tmux session name uses polygram- prefix for orphan-sweep', async () => {
   const calls = [];
   const runner = {
     spawn: async opts => { calls.push(opts); },
@@ -178,7 +196,7 @@ test('ChannelsProcess.start tmux session name uses polygram- prefix for orphan-s
   // tap into _createSocketServer to discover sockPath, connect a node net
   // client, then send hello+session_init.
   const net = require('node:net');
-  const p = new ChannelsProcess({
+  const p = new CliProcess({
     sessionKey: 'sess-prefix', chatId: '111', threadId: null, label: 'prefix-test',
     tmuxRunner: runner,
     botName: 'shumorobot',
@@ -208,7 +226,7 @@ test('ChannelsProcess.start tmux session name uses polygram- prefix for orphan-s
 // request_id is dropped (no second perm_verdict).
 test('respondToPermission is idempotent — second call dropped', async () => {
   const warns = [];
-  const p = new ChannelsProcess({
+  const p = new CliProcess({
     sessionKey: 'sess-idemp', chatId: '1', tmuxRunner: fakeRunner, botName: 'b',
     toolDispatcher: fakeDispatcher, claudeBin: '/usr/bin/echo',
     logger: { warn: m => warns.push(m), error: () => {}, log: () => {} },
@@ -252,7 +270,7 @@ async function captureSpawnArgs(constructorOpts, startOpts) {
   };
   const fs = require('node:fs');
   const net = require('node:net');
-  const p = new ChannelsProcess({
+  const p = new CliProcess({
     sessionKey: 'sess-x',
     chatId: '1', threadId: null, label: 'parity-test',
     tmuxRunner: runner, botName: 'b',
@@ -425,7 +443,7 @@ test('channels backend defaults to bypassPermissions (rc.9: first-turn-dead-zone
       sendControl: async () => {},
       captureWide: async () => 'Listening for channel messages from: server:polygram-bridge',
     };
-    const p = new ChannelsProcess({
+    const p = new CliProcess({
       sessionKey: `sess-${permissionMode || 'default'}`,
       chatId: '1', tmuxRunner: runner, botName: 'b',
       toolDispatcher: fakeDispatcher,
@@ -493,7 +511,7 @@ async function captureSpawnOpts(constructorOpts, startOpts) {
   };
   const fs = require('node:fs');
   const net = require('node:net');
-  const p = new ChannelsProcess({
+  const p = new CliProcess({
     sessionKey: 'sess-cwd-test',
     chatId: '1', threadId: null, label: 'cwd-test',
     tmuxRunner: runner, botName: 'b',
@@ -545,12 +563,12 @@ test('rc.5: tmuxRunner.spawn cwd falls back to opts.cwd then process.cwd() when 
 
 // Review M2: claudeBin is required (factory enforces this, but the class
 // should reject missing claudeBin if env not set too).
-test('ChannelsProcess throws when claudeBin missing and env unset', () => {
+test('CliProcess throws when claudeBin missing and env unset', () => {
   const oldEnv = process.env.POLYGRAM_CLAUDE_BIN;
   delete process.env.POLYGRAM_CLAUDE_BIN;
   try {
     assert.throws(
-      () => new ChannelsProcess({
+      () => new CliProcess({
         sessionKey: 'k', chatId: '1', tmuxRunner: fakeRunner, botName: 'b',
         toolDispatcher: fakeDispatcher,
         logger: { warn: () => {}, error: () => {}, log: () => {} },

@@ -2,7 +2,7 @@
 /**
  * cli-driver-spike/validate-subagent.mjs — Phase 0.3.
  *
- * Spawns ChannelsProcess + hook injection (same as run.mjs), sends a
+ * Spawns CliProcess + hook injection (same as run.mjs), sends a
  * prompt that triggers an Agent tool spawn (subagent), and validates:
  *
  *   (a) SubagentStop fires for the subagent's lifecycle
@@ -22,7 +22,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 
 const require = createRequire(import.meta.url);
-const { ChannelsProcess }   = require('../../lib/process/channels-process.js');
+const { CliProcess }   = require('../../lib/process/cli-process.js');
 const { createTmuxRunner }  = require('../../lib/tmux/tmux-runner.js');
 const { writeHookFiles }    = require('../../lib/process/hook-settings.js');
 const { createHookTail, normalizeHookEvent } = require('../../lib/process/hook-event-tail.js');
@@ -78,7 +78,7 @@ async function main() {
     return { ok: true };
   };
 
-  const proc = new ChannelsProcess({
+  const proc = new CliProcess({
     sessionKey:    SESSION_KEY,
     chatId:        CHAT_ID,
     threadId:      null,

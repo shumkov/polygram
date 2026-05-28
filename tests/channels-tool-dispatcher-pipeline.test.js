@@ -9,7 +9,7 @@
  *      `[sticker:NAME]` / `[react:EMOJI]` / `No response requested.` leak
  *      as literal text into the chat.
  *
- * #2 — ChannelsProcess result.alreadyDelivered must be true so polygram.js
+ * #2 — CliProcess result.alreadyDelivered must be true so polygram.js
  *      post-pm.send pipeline does NOT redeliver the same text. Pre-fix:
  *      every channels turn delivers twice (dispatcher + post-pm.send).
  *
@@ -19,7 +19,7 @@
  *      Q1's source message.
  *
  * These tests are written to be GREEN against the fixed dispatcher /
- * channels-process and RED against rc.9 HEAD.
+ * cli-process and RED against rc.9 HEAD.
  */
 
 const test = require('node:test');
@@ -202,18 +202,18 @@ test('F#1: dispatcher applies `[react:EMOJI]` reactions when target msg id prese
 
 // ─── Finding #2: double-send short-circuit ─────────────────────────────────
 //
-// The double-send bug lives at the boundary between channels-process and
-// polygram.js — channels-process resolves `result.text` = concat of replies,
-// polygram.js then re-delivers it. We pin the contract via channels-process's
+// The double-send bug lives at the boundary between cli-process and
+// polygram.js — cli-process resolves `result.text` = concat of replies,
+// polygram.js then re-delivers it. We pin the contract via cli-process's
 // _resolveTurn result shape.
 
 function makeMinimalChannelsProc(extra = {}) {
-  const { ChannelsProcess } = require('../lib/process/channels-process');
+  const { CliProcess } = require('../lib/process/cli-process');
   const events = [];
   const fakeDb = {
     logEvent: (kind, detail) => { events.push({ kind, detail }); },
   };
-  const proc = new ChannelsProcess({
+  const proc = new CliProcess({
     sessionKey: 'sess-1',
     chatId: '12345',
     tmuxRunner: { sendControl: async () => {} },
@@ -227,8 +227,8 @@ function makeMinimalChannelsProc(extra = {}) {
   return { proc, events };
 }
 
-test('F#2: channels-process _resolveTurn marks result.alreadyDelivered=true', async () => {
-  // Contract: when ChannelsProcess.send() resolves, the result must signal
+test('F#2: cli-process _resolveTurn marks result.alreadyDelivered=true', async () => {
+  // Contract: when CliProcess.send() resolves, the result must signal
   // that text has ALREADY been delivered by the dispatcher. polygram.js's
   // post-pm.send pipeline then short-circuits its own delivery branch.
   const { proc } = makeMinimalChannelsProc();

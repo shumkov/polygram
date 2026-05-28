@@ -3,7 +3,7 @@
  * cli-driver-spike/run.mjs — Phase 0.1 main spike.
  *
  * Validates that hooks fire alongside --dangerously-load-development-channels
- * on the pinned claude binary. Reuses ChannelsProcess (the 0.11 driver) and
+ * on the pinned claude binary. Reuses CliProcess (the 0.11 driver) and
  * injects --settings via a tmuxRunner wrapper.
  *
  * Output:
@@ -25,7 +25,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 
 const require = createRequire(import.meta.url);
-const { ChannelsProcess }   = require('../../lib/process/channels-process.js');
+const { CliProcess }   = require('../../lib/process/cli-process.js');
 const { createTmuxRunner }  = require('../../lib/tmux/tmux-runner.js');
 const { writeHookFiles }    = require('../../lib/process/hook-settings.js');
 const { createHookTail }    = require('../../lib/process/hook-event-tail.js');
@@ -107,7 +107,7 @@ async function main() {
   await hookTail.start();
   console.log('[setup] hook tail armed');
 
-  // 3. Spawn ChannelsProcess with a wrapped runner that injects --settings.
+  // 3. Spawn CliProcess with a wrapped runner that injects --settings.
   const realRunner    = createTmuxRunner({ logger: console });
   const wrappedRunner = wrapRunner(realRunner, settingsPath);
 
@@ -117,7 +117,7 @@ async function main() {
     return { ok: true };
   };
 
-  const proc = new ChannelsProcess({
+  const proc = new CliProcess({
     sessionKey:    SESSION_KEY,
     chatId:        CHAT_ID,
     threadId:      null,

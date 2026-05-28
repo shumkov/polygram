@@ -23,7 +23,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 
 const require = createRequire(import.meta.url);
-const { ChannelsProcess }   = require('../../lib/process/channels-process.js');
+const { CliProcess }   = require('../../lib/process/cli-process.js');
 const { createTmuxRunner }  = require('../../lib/tmux/tmux-runner.js');
 const { writeHookFiles }    = require('../../lib/process/hook-settings.js');
 
@@ -55,7 +55,7 @@ async function oneTrial({ label, postStartDelayMs }) {
   const realRunner = createTmuxRunner({ logger: { log: () => {}, warn: () => {}, error: () => {} } });
   const wrapped = wrapRunner(realRunner, settingsPath);
 
-  const proc = new ChannelsProcess({
+  const proc = new CliProcess({
     sessionKey, chatId: '-9999999999', threadId: null, label: 'probe',
     tmuxRunner: wrapped, botName: 'cli-spike', claudeBin: CLAUDE_BIN,
     toolDispatcher: async () => ({ ok: true }),

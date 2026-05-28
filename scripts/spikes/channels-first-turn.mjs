@@ -2,7 +2,7 @@
 // channels-first-turn — isolate "first user message after fresh spawn is
 // swallowed" bug observed live on shumorobot 2026-05-26.
 //
-// Spawns a real ChannelsProcess against a real claude TUI, sends ONE
+// Spawns a real CliProcess against a real claude TUI, sends ONE
 // user_msg, watches for the reply tool to fire. Captures the pane every
 // 2 seconds so we can SEE what claude does. Times out after 90s.
 //
@@ -18,7 +18,7 @@ import { createRequire } from 'node:module';
 import { spawn, spawnSync } from 'node:child_process';
 const require = createRequire(import.meta.url);
 
-const { ChannelsProcess } = require('../../lib/process/channels-process.js');
+const { CliProcess } = require('../../lib/process/cli-process.js');
 const { createTmuxRunner } = require('../../lib/tmux/tmux-runner.js');
 
 const CLAUDE_BIN = '/Users/ivanshumkov/.local/share/claude/versions/2.1.142';
@@ -33,7 +33,7 @@ const toolDispatcher = async ({ toolName, text, chatId }) => {
   return { ok: true };
 };
 
-const proc = new ChannelsProcess({
+const proc = new CliProcess({
   sessionKey: SESSION_KEY,
   chatId: CHAT_ID,
   threadId: null,

@@ -23,7 +23,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 
 const require = createRequire(import.meta.url);
-const { ChannelsProcess }   = require('../../lib/process/channels-process.js');
+const { CliProcess }   = require('../../lib/process/cli-process.js');
 const { createTmuxRunner }  = require('../../lib/tmux/tmux-runner.js');
 const { writeHookFiles }    = require('../../lib/process/hook-settings.js');
 const { createHookTail }    = require('../../lib/process/hook-event-tail.js');
@@ -92,7 +92,7 @@ async function main() {
   const realRunner    = createTmuxRunner({ logger: console });
   const wrappedRunner = wrapRunner(realRunner, settingsPath);
 
-  const proc = new ChannelsProcess({
+  const proc = new CliProcess({
     sessionKey:    SESSION_KEY,
     chatId:        CHAT_ID,
     threadId:      null,

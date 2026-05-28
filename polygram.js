@@ -42,7 +42,7 @@ const { filterAttachments } = require('./lib/attachments');
 const { ProcessManager } = require('./lib/process-manager');
 const { createProcessFactory, pickBackend } = require('./lib/process/factory');
 const { extractAssistantText } = require('./lib/process/sdk-process');
-// 0.11.0: channels backend tool dispatcher — adapts ChannelsProcess's reply
+// 0.11.0: channels backend tool dispatcher — adapts CliProcess's reply
 // tool callback into polygram's existing chunkText + deliverReplies primitives.
 // ADV-14: chunkMarkdownText (fence-aware) is imported once below (~line 88)
 // and reused by createChannelsToolDispatcher inside main() — Claude replies
@@ -481,7 +481,7 @@ async function sendToProcess(sessionKey, prompt, context = {}, { onDispatched } 
   const timeoutMs = (chatConfig.timeout || config.defaults.timeout) * 1000;
   const maxTurnMs = (chatConfig.maxTurn || config.defaults?.maxTurn || 1800) * 1000;
 
-  // ChannelsProcess-only liveness heartbeat. Lazy-attached HERE (after
+  // CliProcess-only liveness heartbeat. Lazy-attached HERE (after
   // getOrSpawnForChat) so handleMessage stays fast for slash commands and
   // any other non-pm.send paths — earlier wiring at handleMessage:~1003
   // forced a cold-spawn (~30s on channels) before THINKING reactor /

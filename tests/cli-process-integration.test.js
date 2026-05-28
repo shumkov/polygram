@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * ChannelsProcess integration tests — exercise the daemon-side socket
+ * CliProcess integration tests — exercise the daemon-side socket
  * protocol end-to-end with a fake bridge subprocess (just speaks the
  * line-delimited JSON socket protocol, no MCP). Covers:
  *
@@ -22,7 +22,7 @@ const assert = require('node:assert/strict');
 const net = require('node:net');
 const fs = require('node:fs');
 
-const { ChannelsProcess } = require('../lib/process/channels-process');
+const { CliProcess } = require('../lib/process/cli-process');
 
 const READY_BANNER = 'Listening for channel messages from: server:polygram-bridge';
 const quietLogger = { warn: () => {}, error: () => {}, log: () => {}, debug: () => {} };
@@ -49,9 +49,12 @@ function connectFakeBridge({ sockPath, sessionKey, secret, claudeSessionId = 'te
     sock.setEncoding('utf8');
 
     sock.on('connect', () => {
-      // hello + session_init
+      // hello + session_init + mcp-ready (0.12 Phase 1.6 — fake bridge
+      // synthesizes the mcp-ready signal that the real bridge emits on
+      // first ListToolsRequest from claude; tests don't run real claude).
       sock.write(JSON.stringify({ kind: 'hello', session_key: sessionKey, secret }) + '\n');
       sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: claudeSessionId }) + '\n');
+      sock.write(JSON.stringify({ kind: 'mcp-ready', session: sessionKey }) + '\n');
     });
 
     sock.on('data', chunk => {
@@ -96,12 +99,12 @@ function connectFakeBridge({ sockPath, sessionKey, secret, claudeSessionId = 'te
   });
 }
 
-function makeChannelsProcess({
+function makeCliProcess({
   chatId = 'chat-1',
   toolDispatcher = async () => ({ ok: true }),
   paneText,
 } = {}) {
-  return new ChannelsProcess({
+  return new CliProcess({
     sessionKey: `sess-${chatId}`,
     chatId,
     threadId: null,
@@ -119,7 +122,7 @@ function makeChannelsProcess({
 // Start it in the background then connect the fake bridge.
 async function startWithFakeBridge(cp) {
   const startPromise = cp.start();
-  // Wait for the socket file to exist (ChannelsProcess creates it before awaiting handshake)
+  // Wait for the socket file to exist (CliProcess creates it before awaiting handshake)
   for (let i = 0; i < 50; i++) {
     if (cp.sockPath && fs.existsSync(cp.sockPath)) break;
     await new Promise(r => setTimeout(r, 20));
@@ -136,7 +139,7 @@ async function startWithFakeBridge(cp) {
 // ─── tests ──────────────────────────────────────────────────────────
 
 test('start() completes after fake bridge handshakes', async () => {
-  const cp = makeChannelsProcess();
+  const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
   assert.equal(cp.bridgeReady, true);
   assert.ok(cp.sockPath);
@@ -149,7 +152,7 @@ test('start() completes after fake bridge handshakes', async () => {
 });
 
 test('hello with wrong secret is rejected', async () => {
-  const cp = makeChannelsProcess();
+  const cp = makeCliProcess();
   const startPromise = cp.start();
   for (let i = 0; i < 50; i++) {
     if (cp.sockPath && fs.existsSync(cp.sockPath)) break;
@@ -173,7 +176,7 @@ test('hello with wrong secret is rejected', async () => {
 
 test('tool call dispatches via toolDispatcher and ACKs', async () => {
   const dispatched = [];
-  const cp = makeChannelsProcess({
+  const cp = makeCliProcess({
     toolDispatcher: async (call) => {
       dispatched.push(call);
       return { ok: true };
@@ -203,7 +206,7 @@ test('tool call dispatches via toolDispatcher and ACKs', async () => {
 
 test('tool call with wrong chat_id is dropped (security guard)', async () => {
   const dispatched = [];
-  const cp = makeChannelsProcess({
+  const cp = makeCliProcess({
     chatId: 'chat-A',
     toolDispatcher: async (call) => { dispatched.push(call); return { ok: true }; },
   });
@@ -227,7 +230,7 @@ test('tool call with wrong chat_id is dropped (security guard)', async () => {
 });
 
 test('tool dispatcher failure surfaces as tool_ack ok:false', async () => {
-  const cp = makeChannelsProcess({
+  const cp = makeCliProcess({
     toolDispatcher: async () => ({ ok: false, error: 'telegram api down' }),
   });
   const bridge = await startWithFakeBridge(cp);
@@ -246,7 +249,7 @@ test('tool dispatcher failure surfaces as tool_ack ok:false', async () => {
 });
 
 test('perm_req emits approval-required and respondToPermission round-trips', async () => {
-  const cp = makeChannelsProcess();
+  const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
 
   const approvalP = new Promise(resolve => cp.once('approval-required', resolve));
@@ -269,7 +272,7 @@ test('perm_req emits approval-required and respondToPermission round-trips', asy
   assert.equal(typeof ap.toolInput, 'string', 'toolInput is a string per TmuxProcess contract');
   assert.match(ap.toolInput, /ls -la/, 'input_preview included');
   assert.match(ap.toolInput, /list dir/, 'description folded in when distinct from preview');
-  assert.equal(ap.backend, 'channels');
+  assert.equal(ap.backend, 'cli');
   assert.equal(typeof ap.respond, 'function');
 
   // Verdict via the canonical respond() closure
@@ -283,7 +286,7 @@ test('perm_req emits approval-required and respondToPermission round-trips', asy
 });
 
 test('send() resolves after reply tool call + quiet window', async () => {
-  const cp = new ChannelsProcess({
+  const cp = new CliProcess({
     sessionKey: 'sess-quiet', chatId: 'chat-1', threadId: null, label: 'test-quiet',
     tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
     toolDispatcher: async () => ({ ok: true }),
@@ -318,7 +321,7 @@ test('send() resolves after reply tool call + quiet window', async () => {
 });
 
 test('kill() tears down socket file and rejects pending turns', async () => {
-  const cp = makeChannelsProcess();
+  const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
 
   // Pre-attach rejection assertion BEFORE triggering kill, otherwise
@@ -341,7 +344,7 @@ test('kill() tears down socket file and rejects pending turns', async () => {
 // secret (verified via the recorded spawn args).
 test('P0 #1: mcp-config written to 0o600 file, secret NOT in argv', async () => {
   const fs = require('node:fs');
-  const cp = makeChannelsProcess();
+  const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
   try {
     // mcpConfigPath was created and exists
@@ -378,7 +381,7 @@ test('P0 #3: bridge-disconnected triggers kill via ProcessManager subscriber', a
   // The ProcessManager listener calls proc.kill('bridge-disconnected'). We
   // simulate that wiring directly here — full pm integration covered by
   // tests/process-manager.test.js.
-  const cp = makeChannelsProcess();
+  const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
 
   // Simulate process-manager.js bridge-disconnect listener
@@ -386,12 +389,12 @@ test('P0 #3: bridge-disconnected triggers kill via ProcessManager subscriber', a
     cp.kill('bridge-disconnected').catch(() => {});
   });
 
-  // Close the fake bridge → real channels-process sees socket close → emits
+  // Close the fake bridge → real cli-process sees socket close → emits
   bridge.close();
   // Allow the close handler to fire and the kill chain to settle
   await new Promise(r => setTimeout(r, 50));
 
-  assert.equal(cp.closed, true, 'ChannelsProcess killed after bridge disconnect');
+  assert.equal(cp.closed, true, 'CliProcess killed after bridge disconnect');
   // Socket cleanup confirmed
   const fs = require('node:fs');
   assert.ok(!fs.existsSync(cp.sockPath), 'socket unlinked');
@@ -401,7 +404,7 @@ test('P0 #3: bridge-disconnected triggers kill via ProcessManager subscriber', a
 // Review #5: bridge disconnect drains pendingTurns immediately instead of
 // leaving 10-min hardTimers running.
 test('bridge disconnect drains pendingTurns immediately (no 10min hardTimer wait)', async () => {
-  const cp = makeChannelsProcess();
+  const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
 
   // Pre-attach rejection assertion before triggering disconnect to avoid
@@ -434,7 +437,7 @@ test('bridge disconnect drains pendingTurns immediately (no 10min hardTimer wait
 // be recorded into pendingTurn.replies — otherwise send() resolves with text
 // that was never delivered to Telegram.
 test('toolDispatcher failure does NOT record reply into pending turn', async () => {
-  const cp = new ChannelsProcess({
+  const cp = new CliProcess({
     sessionKey: 'sess-fail', chatId: 'chat-1', threadId: null, label: 'test-fail',
     tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
     toolDispatcher: async () => ({ ok: false, error: 'telegram down' }),
@@ -477,7 +480,7 @@ test('toolDispatcher failure does NOT record reply into pending turn', async () 
 // P2 ADV-6: token-bucket rate limit on reply tool calls. Burst of 20 + 5/s
 // refill (defaults). After exhausting the bucket, NACK kicks in.
 test('P2 ADV-6: tool rate limit NACKs after burst exhausted', async () => {
-  const cp = new ChannelsProcess({
+  const cp = new CliProcess({
     sessionKey: 'sess-rate', chatId: 'chat-1', threadId: null, label: 'rate',
     tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
     toolDispatcher: async () => ({ ok: true }),
@@ -515,7 +518,7 @@ test('P2 ADV-6: tool rate limit NACKs after burst exhausted', async () => {
 // P2 AC7: fireUserMessage queues a user-shaped message into the bridge
 // without registering a pending turn (used by polygram's /compact slash).
 test('P2 AC7: fireUserMessage writes user_msg without pending-turn registration', async () => {
-  const cp = makeChannelsProcess();
+  const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
 
   assert.equal(cp.fireUserMessage('/compact'), true);
@@ -534,7 +537,7 @@ test('P2 AC7: fireUserMessage writes user_msg without pending-turn registration'
 
 // P2 AC8: resetSession drains pendingTurns + clears claudeSessionId
 test('P2 AC8: resetSession drains pendings, clears session id, emits session-reset', async () => {
-  const cp = makeChannelsProcess();
+  const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
   const originalSid = cp.claudeSessionId;
   assert.ok(originalSid);
@@ -582,7 +585,7 @@ test('P1 #18: _handleStartupDialogs sends Enter on dev-channel WARNING', async (
       return out;
     },
   };
-  const cp = new ChannelsProcess({
+  const cp = new CliProcess({
     sessionKey: 'sess-dialog', chatId: 'chat-1', threadId: null, label: 'dialog',
     tmuxRunner: runner, botName: 'testbot', claudeBin: '/usr/bin/true',
     toolDispatcher: async () => ({ ok: true }),
@@ -621,7 +624,7 @@ test('P1 #18: _handleStartupDialogs sends Enter on trust dialog', async () => {
       return out;
     },
   };
-  const cp = new ChannelsProcess({
+  const cp = new CliProcess({
     sessionKey: 'sess-trust', chatId: 'chat-1', threadId: null, label: 'trust',
     tmuxRunner: runner, botName: 'testbot', claudeBin: '/usr/bin/true',
     toolDispatcher: async () => ({ ok: true }),
@@ -650,7 +653,7 @@ test('P1 #18: _handleStartupDialogs throws on 30s timeout (banner never appears)
     // Never returns the ready banner — pane stuck at "loading…"
     captureWide: async () => 'loading…',
   };
-  const cp = new ChannelsProcess({
+  const cp = new CliProcess({
     sessionKey: 'sess-timeout', chatId: 'chat-1', threadId: null, label: 'timeout',
     tmuxRunner: runner, botName: 'testbot', claudeBin: '/usr/bin/true',
     toolDispatcher: async () => ({ ok: true }),
@@ -686,7 +689,7 @@ test('P1 #18: _handleStartupDialogs throws on 30s timeout (banner never appears)
 // P1 #4: reply MUST route by echoed turn_id when present so concurrent send()s
 // don't cross-attribute their replies.
 test('P1 #4: reply with echoed turn_id routes to matching pending turn (no fan-out)', async () => {
-  const cp = new ChannelsProcess({
+  const cp = new CliProcess({
     sessionKey: 'sess-multi', chatId: 'chat-1', threadId: null, label: 'multi',
     tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
     toolDispatcher: async () => ({ ok: true }),
@@ -736,7 +739,7 @@ test('P1 #4: reply with echoed turn_id routes to matching pending turn (no fan-o
 // P1 #15: emit 'tool-use' event on every bridge tool message so polygram's
 // reactor chain gets per-tool icons (CALLBACK_TO_EVENT.onToolUse).
 test('P1 #15: bridge tool dispatch emits canonical tool-use event', async () => {
-  const cp = makeChannelsProcess();
+  const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
 
   const toolUseP = new Promise(resolve => cp.once('tool-use', resolve));
@@ -754,7 +757,7 @@ test('P1 #15: bridge tool dispatch emits canonical tool-use event', async () => 
 // P1 #15: emit 'autonomous-assistant-message' when a reply arrives with no
 // pending turn (e.g. ScheduleWakeup-style proactive push from Claude).
 test('P1 #15: reply with no pending turn emits autonomous-assistant-message', async () => {
-  const cp = makeChannelsProcess();
+  const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
 
   const autoP = new Promise(resolve => cp.once('autonomous-assistant-message', resolve));
@@ -766,7 +769,7 @@ test('P1 #15: reply with no pending turn emits autonomous-assistant-message', as
 
   const payload = await autoP;
   assert.equal(payload.text, 'proactive update');
-  assert.equal(payload.backend, 'channels');
+  assert.equal(payload.backend, 'cli');
   assert.equal(payload.sessionId, cp.claudeSessionId);
 
   bridge.close();
@@ -776,7 +779,7 @@ test('P1 #15: reply with no pending turn emits autonomous-assistant-message', as
 // P1 #14: pendingQueue is populated with per-turn context so polygram's SDK
 // callback path can find streamer/reactor via entry.pendingQueue[0].context.
 test('P1 #14: send() populates pendingQueue with per-turn context', async () => {
-  const cp = makeChannelsProcess();
+  const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
 
   const fakeStreamer = { write: () => {} };
@@ -808,7 +811,7 @@ test('P1 #14: send() populates pendingQueue with per-turn context', async () => 
 // P1 #7: duplicate tool_call_id re-ACKs without re-dispatching (idempotency).
 test('P1 #7: duplicate tool_call_id is re-ACKed without re-dispatching', async () => {
   let dispatchCount = 0;
-  const cp = new ChannelsProcess({
+  const cp = new CliProcess({
     sessionKey: 'sess-idemp', chatId: 'chat-1', threadId: null, label: 'idemp',
     tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
     toolDispatcher: async () => { dispatchCount++; return { ok: true }; },
@@ -843,7 +846,7 @@ test('P1 #7: duplicate tool_call_id is re-ACKed without re-dispatching', async (
 // P1 #12: quiet-window cap. After maxRepliesPerTurn replies, send() resolves
 // without waiting for the quiet window — prevents chatty-Claude 10-min hang.
 test('P1 #12: send() resolves at maxRepliesPerTurn cap (no chatty-hang)', async () => {
-  const cp = new ChannelsProcess({
+  const cp = new CliProcess({
     sessionKey: 'sess-chatty', chatId: 'chat-1', threadId: null, label: 'chatty',
     tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
     toolDispatcher: async () => ({ ok: true }),
@@ -879,8 +882,8 @@ test('P1 #12: send() resolves at maxRepliesPerTurn cap (no chatty-hang)', async 
 });
 
 test('two concurrent sessions have isolated sockets and routing', async () => {
-  const cpA = makeChannelsProcess({ chatId: 'chat-A' });
-  const cpB = makeChannelsProcess({ chatId: 'chat-B' });
+  const cpA = makeCliProcess({ chatId: 'chat-A' });
+  const cpB = makeCliProcess({ chatId: 'chat-B' });
 
   const bridgeA = await startWithFakeBridge(cpA);
   const bridgeB = await startWithFakeBridge(cpB);
@@ -910,14 +913,14 @@ test('two concurrent sessions have isolated sockets and routing', async () => {
 // ─── Step E: emit 'idle' on turn-timeout / resetSession / interrupt-grace ───
 //
 // HeartbeatReactor (lib/telegram/heartbeat-reactor.js) stops cycling only on
-// 'idle' or 'close'. ChannelsProcess used to resolve/reject pending turns on
+// 'idle' or 'close'. CliProcess used to resolve/reject pending turns on
 // turn-timeout, resetSession, and interrupt-grace-resolve WITHOUT emitting
 // 'idle' — which would leave a wired reactor cycling emoji forever (or until
 // the user typed something else). These tests pin the contract so the bug
 // can't regress.
 
 test('Step E: turn-timeout emits idle so reaction-cyclers stop', async () => {
-  const cp = new ChannelsProcess({
+  const cp = new CliProcess({
     sessionKey: 'sess-idle-tt', chatId: 'chat-1', threadId: null, label: 'idle-tt',
     tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
     toolDispatcher: async () => ({ ok: true }),
@@ -947,7 +950,7 @@ test('Step E: turn-timeout emits idle so reaction-cyclers stop', async () => {
 });
 
 test('Step E: resetSession emits idle so reaction-cyclers stop', async () => {
-  const cp = makeChannelsProcess();
+  const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
 
   const idleP = new Promise(resolve => cp.once('idle', () => resolve(true)));
@@ -969,7 +972,7 @@ test('Step E: resetSession emits idle so reaction-cyclers stop', async () => {
 });
 
 test('Step E: interrupt grace-resolve emits idle so reaction-cyclers stop', async () => {
-  const cp = new ChannelsProcess({
+  const cp = new CliProcess({
     sessionKey: 'sess-idle-int', chatId: 'chat-1', threadId: null, label: 'idle-int',
     tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
     toolDispatcher: async () => ({ ok: true }),

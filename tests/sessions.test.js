@@ -327,12 +327,12 @@ describe('resolveSessionForSpawn (S2 drift)', () => {
       cwd: '/Users/ivanshumkov/Music/rekordbox',
       pm_backend: 'sdk',
     });
-    const r = resolveSessionForSpawn(db, 'chat:3', { ...resolved, backend: 'channels' });
+    const r = resolveSessionForSpawn(db, 'chat:3', { ...resolved, backend: 'cli' });
     assert.equal(r.existingSessionId, null, 'sdk → channels must drop the session');
     assert.ok(r.drift, 'drift must be reported');
     assert.ok(r.drift.fields.includes('pm_backend'), 'pm_backend listed as drifted field');
     assert.equal(r.drift.before.pm_backend, 'sdk');
-    assert.equal(r.drift.after.pm_backend, 'channels');
+    assert.equal(r.drift.after.pm_backend, 'cli');
     assert.equal(db.getSession('chat:3'), undefined, 'row deleted');
   });
 
@@ -344,7 +344,7 @@ describe('resolveSessionForSpawn (S2 drift)', () => {
       cwd: '/Users/ivanshumkov/Music/rekordbox',
       pm_backend: 'tmux',
     });
-    const r = resolveSessionForSpawn(db, 'chat:3', { ...resolved, backend: 'channels' });
+    const r = resolveSessionForSpawn(db, 'chat:3', { ...resolved, backend: 'cli' });
     assert.equal(r.existingSessionId, null, 'tmux → channels must drop the session');
     assert.ok(r.drift, 'drift must be reported');
     assert.ok(r.drift.fields.includes('pm_backend'), 'pm_backend in drifted fields');
@@ -356,7 +356,7 @@ describe('resolveSessionForSpawn (S2 drift)', () => {
       claude_session_id: 'sess-from-channels-back-to-tmux',
       agent: 'music-curation:music-curator',
       cwd: '/Users/ivanshumkov/Music/rekordbox',
-      pm_backend: 'channels',
+      pm_backend: 'cli',
     });
     const r = resolveSessionForSpawn(db, 'chat:3', { ...resolved, backend: 'tmux' });
     assert.equal(r.existingSessionId, null,
@@ -373,9 +373,9 @@ describe('resolveSessionForSpawn (S2 drift)', () => {
       claude_session_id: 'sess-still-channels',
       agent: 'music-curation:music-curator',
       cwd: '/Users/ivanshumkov/Music/rekordbox',
-      pm_backend: 'channels',
+      pm_backend: 'cli',
     });
-    const r = resolveSessionForSpawn(db, 'chat:3', { ...resolved, backend: 'channels' });
+    const r = resolveSessionForSpawn(db, 'chat:3', { ...resolved, backend: 'cli' });
     assert.equal(r.existingSessionId, 'sess-still-channels',
       'channels → channels preserves the session — the lazy-respawn case ' +
       'after a bridge-disconnect depends on --resume restoring the in-flight turn');

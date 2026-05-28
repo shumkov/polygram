@@ -10,12 +10,12 @@
  *      probe the secret via response timing.
  *   2. Static secret never rotates → if the bridge dies and an attacker
  *      who scraped `POLYGRAM_SOCK_SECRET` from `/proc/<pid>/environ`
- *      connects before the daemon spawns a fresh ChannelsProcess, they
+ *      connects before the daemon spawns a fresh CliProcess, they
  *      authenticate as the legitimate bridge.
  *
  * Post-fix: `_verifyHelloAuth` uses crypto.timingSafeEqual and the
  * sockSecret is cleared on the first successful auth (one-shot per
- * ChannelsProcess instance — matches the bridge process lifecycle, which
+ * CliProcess instance — matches the bridge process lifecycle, which
  * exits on socket close, so no legitimate re-auth ever occurs).
  */
 

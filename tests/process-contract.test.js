@@ -27,11 +27,11 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const { makeBackend } = require('./_helpers/backend-driver');
 
-const BACKENDS = ['sdk', 'tmux', 'channels'];
+const BACKENDS = ['sdk', 'tmux', 'cli'];
 
 // Channels backend skips scenarios that test transport-specific features
 // the Channels protocol intentionally doesn't expose. Channels-specific
-// contract assertions live in tests/channels-process-integration.test.js.
+// contract assertions live in tests/cli-process-integration.test.js.
 const CHANNELS_SKIPS = new Set([
   // SDK/tmux-specific event shapes the Channels protocol doesn't surface
   'C24',  // autonomous-assistant-message (channels delivers via reply tool)
@@ -50,10 +50,10 @@ const CHANNELS_SKIPS = new Set([
   'C16',  // setPermissionMode — channels controls perms via the relay flow
   'C17',  // getContextUsage — Channels protocol doesn't expose usage
   // C13 (resetSession) + C28 (fireUserMessage) — now implemented in
-  // ChannelsProcess per review AC7 + AC8. No longer skipped.
+  // CliProcess per review AC7 + AC8. No longer skipped.
 ]);
 function shouldSkip(kind, scenario) {
-  return kind === 'channels' && CHANNELS_SKIPS.has(scenario);
+  return kind === 'cli' && CHANNELS_SKIPS.has(scenario);
 }
 
 const CHAT_CONFIG = { model: 'sonnet', effort: 'high', cwd: '/tmp' };
@@ -225,11 +225,11 @@ for (const kind of BACKENDS) {
       // Backend-specific: poison the transport so the underlying paste/push
       // fails. SdkProcess's inputController.push throws on closed input;
       // closing the query first works. TmuxProcess: replace pasteText.
-      // ChannelsProcess (F#24): null out bridgeServer so _writeToBridge
+      // CliProcess (F#24): null out bridgeServer so _writeToBridge
       // returns false; injectUserMessage emits 'inject-fail' from that path.
       if (kind === 'sdk') {
         proc.inputController.close();
-      } else if (kind === 'channels') {
+      } else if (kind === 'cli') {
         proc.bridgeServer = null;
       } else {
         proc.runner.pasteText = async () => { throw new Error('boom'); };
@@ -392,11 +392,11 @@ for (const kind of BACKENDS) {
       const { proc, driver } = await setupReady(kind);
       proc.inFlight = true;
       // Poison the underlying transport so the inject path's send fails.
-      // ChannelsProcess (F#24): null out bridgeServer so _writeToBridge
+      // CliProcess (F#24): null out bridgeServer so _writeToBridge
       // returns false; injectUserMessage emits 'inject-fail'.
       if (kind === 'sdk') {
         proc.inputController.close();  // pushes throw on closed input
-      } else if (kind === 'channels') {
+      } else if (kind === 'cli') {
         proc.bridgeServer = null;
       } else {
         proc.runner.pasteText = async () => { throw new Error('paste boom'); };

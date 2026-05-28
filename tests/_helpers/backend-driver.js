@@ -399,15 +399,15 @@ function makeTmuxBackend({ sessionKey = 'chat:100', chatId = '100', threadId = n
 // ─── channels driver ─────────────────────────────────────────────────
 
 const net = require('net');
-const { ChannelsProcess } = require('../../lib/process/channels-process');
+const { CliProcess } = require('../../lib/process/cli-process');
 
 const CHANNELS_READY_BANNER = 'Listening for channel messages from: server:polygram-bridge';
 
 /**
  * Fake bridge — speaks the line-delimited JSON socket protocol
- * ChannelsProcess expects from the real lib/process/channels-bridge.mjs.
+ * CliProcess expects from the real lib/process/channels-bridge.mjs.
  * Does NOT speak MCP — we exercise the daemon-side socket layer only.
- * Same shape as the helper in tests/channels-process-integration.test.js.
+ * Same shape as the helper in tests/cli-process-integration.test.js.
  */
 function connectFakeChannelsBridge({ sockPath, sessionKey, secret, claudeSessionId = 'fake-claude-sid' }) {
   return new Promise((resolve, reject) => {
@@ -420,6 +420,11 @@ function connectFakeChannelsBridge({ sockPath, sessionKey, secret, claudeSession
     sock.on('connect', () => {
       sock.write(JSON.stringify({ kind: 'hello', session_key: sessionKey, secret }) + '\n');
       sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: claudeSessionId }) + '\n');
+      // 0.12 Phase 1.6: fake-bridge mimics the real bridge's mcp-ready
+      // signal so CliProcess's _waitForBridgeHandshake doesn't timeout.
+      // The real bridge emits this on first ListToolsRequest from claude;
+      // tests don't run a real claude, so we synthesize it after session_init.
+      sock.write(JSON.stringify({ kind: 'mcp-ready', session: sessionKey }) + '\n');
     });
 
     sock.on('data', chunk => {
@@ -505,7 +510,7 @@ function makeChannelsBackend({ sessionKey = 'chat:100', chatId = '100', threadId
     return userDispatcher(call);
   };
 
-  const proc = new ChannelsProcess({
+  const proc = new CliProcess({
     sessionKey, chatId, threadId, label: 'channels-test',
     tmuxRunner: runner,
     botName: 'test',
@@ -568,7 +573,7 @@ function makeChannelsBackend({ sessionKey = 'chat:100', chatId = '100', threadId
   };
 
   const driver = {
-    kind: 'channels',
+    kind: 'cli',
     _proc: proc,
     get _bridge() { return bridge; },
 
@@ -638,7 +643,9 @@ function makeChannelsBackend({ sessionKey = 'chat:100', chatId = '100', threadId
 function makeBackend(kind, opts) {
   if (kind === 'sdk') return makeSdkBackend(opts);
   if (kind === 'tmux') return makeTmuxBackend(opts);
-  if (kind === 'channels') return makeChannelsBackend(opts);
+  // 0.12: 'cli' is the canonical name; 'channels' kept as alias so any
+  // straggler call sites still work during the transition.
+  if (kind === 'cli' || kind === 'channels') return makeChannelsBackend(opts);
   throw new Error(`makeBackend: unknown kind "${kind}"`);
 }
 

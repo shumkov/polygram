@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Tests for channels-process lifecycle findings in 0.11.0-channels review.
+ * Tests for cli-process lifecycle findings in 0.11.0-channels review.
  *
  * F#4 — `_teardownOnStartFailure` references `this.sockClient` and
  *       `this.sockServer`, neither of which is assigned anywhere post-M1
@@ -13,12 +13,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { ChannelsProcess } = require('../lib/process/channels-process');
+const { CliProcess } = require('../lib/process/cli-process');
 
 const quietLogger = { warn: () => {}, error: () => {}, log: () => {}, debug: () => {} };
 
 function makeProc() {
-  return new ChannelsProcess({
+  return new CliProcess({
     sessionKey: 'sess-1',
     chatId: '12345',
     tmuxRunner: { sendControl: async () => {}, killSession: async () => {} },
@@ -67,7 +67,7 @@ test('F#4: teardown swallows bridgeServer.close() errors (defensive)', async () 
 // ─── F#8 — late permission verdict on closed instance ──────────────────────
 //
 // Scenario: user taps Approve 11+ min after the request. Turn timed out, the
-// ChannelsProcess was killed (this.closed=true, bridgeServer=null), respawn
+// CliProcess was killed (this.closed=true, bridgeServer=null), respawn
 // already happened on a new inbound. The respond() closure stored from
 // canUseTool() is bound to the ORIGINAL (now-closed) instance. Pre-fix,
 // respondToPermission silently no-ops because _writeToBridge returns early
@@ -80,8 +80,8 @@ test('F#4: teardown swallows bridgeServer.close() errors (defensive)', async () 
 test('F#8: respondToPermission on a closed instance logs + does not silently no-op', async () => {
   const events = [];
   const fakeDb = { logEvent: (kind, detail) => { events.push({ kind, detail }); } };
-  const { ChannelsProcess } = require('../lib/process/channels-process');
-  const proc = new ChannelsProcess({
+  const { CliProcess } = require('../lib/process/cli-process');
+  const proc = new CliProcess({
     sessionKey: 'sess-1', chatId: '12345',
     tmuxRunner: { sendControl: async () => {}, killSession: async () => {} },
     botName: 'testbot', claudeBin: '/usr/bin/false',
@@ -136,7 +136,7 @@ test('F#8: respondToPermission on a live instance still writes verdict', async (
 
 test('F#9: resetSession kills tmux session', async () => {
   const killed = [];
-  const proc = new (require('../lib/process/channels-process').ChannelsProcess)({
+  const proc = new (require('../lib/process/cli-process').CliProcess)({
     sessionKey: 'sess-1', chatId: '12345',
     tmuxRunner: {
       sendControl: async () => {},
@@ -165,7 +165,7 @@ test('F#9: resetSession closes bridgeServer and unlinks mcp-config tmp file', as
   fs.writeFileSync(mcpPath, '{}', { mode: 0o600 });
 
   let bridgeClosed = 0;
-  const proc = new (require('../lib/process/channels-process').ChannelsProcess)({
+  const proc = new (require('../lib/process/cli-process').CliProcess)({
     sessionKey: 'sess-1', chatId: '12345',
     tmuxRunner: { sendControl: async () => {}, killSession: async () => {} },
     botName: 'testbot', claudeBin: '/usr/bin/false',
@@ -225,7 +225,7 @@ function makeProcWithCapture(paneContent, opts = {}) {
     captureWide: async () => paneContent,
   };
   const events = [];
-  const proc = new (require('../lib/process/channels-process').ChannelsProcess)({
+  const proc = new (require('../lib/process/cli-process').CliProcess)({
     sessionKey: 'sess-1', chatId: '12345',
     tmuxRunner: runner, botName: 'testbot', claudeBin: '/usr/bin/false',
     toolDispatcher: async () => ({ ok: true }),
@@ -273,7 +273,7 @@ test('F#17: emits mid-turn-dialog-detected event with pattern name + action', as
   assert.ok(emitted, 'mid-turn-dialog-detected must fire');
   assert.equal(emitted.name, 'session-age');
   assert.equal(emitted.action, 'enter');
-  assert.equal(emitted.backend, 'channels');
+  assert.equal(emitted.backend, 'cli');
 
   const logEvt = events.find(e => e.kind === 'channels-mid-turn-dialog-detected');
   assert.ok(logEvt, 'channels-mid-turn-dialog-detected forensic event must fire');
@@ -330,7 +330,7 @@ test('F#17: captureWide failure is swallowed (does not throw, does not crash wat
     killSession: async () => {},
     captureWide: async () => { throw new Error('tmux died'); },
   };
-  const proc = new (require('../lib/process/channels-process').ChannelsProcess)({
+  const proc = new (require('../lib/process/cli-process').CliProcess)({
     sessionKey: 'sess-1', chatId: '12345',
     tmuxRunner: runner, botName: 'testbot', claudeBin: '/usr/bin/false',
     toolDispatcher: async () => ({ ok: true }),
@@ -362,7 +362,7 @@ test('F#17: normal turn output (no dialog) → no action', async () => {
   );
 });
 
-// ─── F#24 — injectUserMessage on ChannelsProcess (autosteer parity) ─────
+// ─── F#24 — injectUserMessage on CliProcess (autosteer parity) ─────
 //
 // Pre-fix: channels inherited the base-class default (returns false), so
 // polygram's autosteer flow (lib/handlers/autosteer.js:77) reported
@@ -370,7 +370,7 @@ test('F#17: normal turn output (no dialog) → no action', async () => {
 // no AUTOSTEERED (✍) reaction was set on the follow-up message; it sat
 // without any reactor state until the stdin-lock released.
 //
-// Post-fix: ChannelsProcess.injectUserMessage writes the follow-up to
+// Post-fix: CliProcess.injectUserMessage writes the follow-up to
 // the bridge as a fresh user_msg. Returns true so autosteer.tryAutosteer
 // reports {autosteered: true, priority}. Polygram then marks ✍ on the
 // follow-up msg + records it in autosteeredRefs.
@@ -486,7 +486,7 @@ test('F#22: orphan reply with zero pending turns emits autonomous event WITH alr
 
   assert.ok(emittedPayload, 'autonomous-assistant-message must fire when no pending turns');
   assert.equal(emittedPayload.text, 'post-turn-resolve orphan reply');
-  assert.equal(emittedPayload.backend, 'channels');
+  assert.equal(emittedPayload.backend, 'cli');
   assert.equal(
     emittedPayload.alreadyDelivered,
     true,
