@@ -275,8 +275,8 @@ test('F#17: emits mid-turn-dialog-detected event with pattern name + action', as
   assert.equal(emitted.action, 'enter');
   assert.equal(emitted.backend, 'cli');
 
-  const logEvt = events.find(e => e.kind === 'channels-mid-turn-dialog-detected');
-  assert.ok(logEvt, 'channels-mid-turn-dialog-detected forensic event must fire');
+  const logEvt = events.find(e => e.kind === 'cli-mid-turn-dialog-detected');
+  assert.ok(logEvt, 'cli-mid-turn-dialog-detected forensic event must fire');
   assert.equal(logEvt.detail.name, 'session-age');
   assert.equal(logEvt.detail.pending_count, 1);
 });
@@ -356,7 +356,7 @@ test('F#17: normal turn output (no dialog) → no action', async () => {
 
   assert.equal(sendCalls.length, 0);
   assert.equal(
-    events.filter(e => e.kind === 'channels-mid-turn-dialog-detected').length,
+    events.filter(e => e.kind === 'cli-mid-turn-dialog-detected').length,
     0,
     'no false positives on benign turn output',
   );
