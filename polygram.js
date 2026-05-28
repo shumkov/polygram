@@ -2287,12 +2287,19 @@ async function main() {
     toolDispatcher: channelsToolDispatcher,
     channelsClaudeBin,
   });
-  // 0.10.0: route tmux backend's in-pane approval prompts through the
-  // SAME canUseTool plumbing that SDK chats use. TmuxProcess emits
-  // 'approval-required' with a respond() closure when it detects the
-  // TUI's "Do you want to do this?" prompt; we call makeCanUseTool
-  // (admin-chat card, chat_tool_decisions persistence, timeout race —
-  // all reused from SDK) and feed its decision back to the TUI.
+  // Route in-process approval prompts through the SAME canUseTool plumbing
+  // that SDK chats use:
+  //   - SdkProcess: SDK callbacks fire 'approval-required' via its own
+  //                 canUseTool wiring (Anthropic SDK feature).
+  //   - CliProcess (0.12): two paths emit this shape:
+  //                 1. Channels bridge perm_req (experimental channel
+  //                    permission API). Currently doesn't fire for
+  //                    regular MCP tool calls (rc.9 finding).
+  //                 2. Hook Notification on chats with non-bypass
+  //                    permissionMode (0.12 Phase 4.5). respond() pipes
+  //                    the verdict back via tmux send-keys "1"/"3"+Enter.
+  // makeCanUseTool handles admin card, chat_tool_decisions persistence,
+  // and timeout race — all reused from SDK.
   sdkCallbacks.onApprovalRequired = async (sessionKey, payload) => {
     const { toolName, toolInput, id, respond } = payload || {};
     if (typeof respond !== 'function') return;

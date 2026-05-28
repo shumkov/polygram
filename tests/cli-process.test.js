@@ -129,6 +129,57 @@ test('pickBackend emits once-per-process deprecation warn on channels alias', ()
   assert.match(warns[0], /'channels' is deprecated/);
 });
 
+// 0.12 Phase 4.5.3 (R12 mitigation tests). Operators migrating from
+// pm:'tmux' to the cli alias without setting permissionMode silently lose
+// approval gating. The R12 warning surfaces this as a deliberate trade-off.
+
+test('R12: pm:"tmux" alias WITHOUT permissionMode emits per-chat migration warning', () => {
+  factory._resetAliasWarnings();
+  const warns = [];
+  const cfg = { chats: { '12345': { pm: 'tmux' } } };
+  pickBackend({ config: cfg, chatId: '12345', threadId: null, logger: { warn: msg => warns.push(msg) } });
+  assert.equal(warns.length, 2, 'should emit BOTH deprecation alias warn AND R12 migration warn');
+  assert.ok(warns.some(w => /'tmux' is deprecated/.test(w)), 'alias deprecation warn');
+  assert.ok(warns.some(w => /R12 migration warning/.test(w)), 'R12 migration warn');
+  assert.ok(warns.some(w => /permissionMode/.test(w)), 'R12 warn mentions permissionMode opt-in');
+});
+
+test('R12: pm:"tmux" alias WITH permissionMode:"default" suppresses R12 warn', () => {
+  factory._resetAliasWarnings();
+  const warns = [];
+  const cfg = { chats: { '12345': { pm: 'tmux', permissionMode: 'default' } } };
+  pickBackend({ config: cfg, chatId: '12345', threadId: null, logger: { warn: msg => warns.push(msg) } });
+  // Alias deprecation still fires; R12 should NOT.
+  assert.ok(warns.some(w => /'tmux' is deprecated/.test(w)));
+  assert.ok(!warns.some(w => /R12 migration warning/.test(w)),
+    'R12 must not fire when operator explicitly opted into a non-bypass mode');
+});
+
+test('R12: pm:"channels" alias (which had no implicit approvals) does NOT fire R12 warn', () => {
+  factory._resetAliasWarnings();
+  const warns = [];
+  const cfg = { chats: { '12345': { pm: 'channels' } } };
+  pickBackend({ config: cfg, chatId: '12345', threadId: null, logger: { warn: msg => warns.push(msg) } });
+  // Channels alias deprecation fires; R12 should NOT — channels backend in 0.11
+  // also had bypassPermissions default, so there's no UX regression to warn about.
+  assert.ok(warns.some(w => /'channels' is deprecated/.test(w)));
+  assert.ok(!warns.some(w => /R12 migration warning/.test(w)));
+});
+
+test('R12: warning is per-chat-tuple — different chats each warn once', () => {
+  factory._resetAliasWarnings();
+  const warns = [];
+  const cfg = { chats: { '111': { pm: 'tmux' }, '222': { pm: 'tmux' } } };
+  pickBackend({ config: cfg, chatId: '111', threadId: null, logger: { warn: msg => warns.push(msg) } });
+  pickBackend({ config: cfg, chatId: '222', threadId: null, logger: { warn: msg => warns.push(msg) } });
+  pickBackend({ config: cfg, chatId: '111', threadId: null, logger: { warn: msg => warns.push(msg) } });
+  // Alias warn fires once (process-wide). R12 fires once per chat.
+  const aliasWarns = warns.filter(w => /'tmux' is deprecated/.test(w));
+  const r12Warns = warns.filter(w => /R12 migration warning/.test(w));
+  assert.equal(aliasWarns.length, 1, 'alias warn is process-wide-once');
+  assert.equal(r12Warns.length, 2, 'R12 warn fires once per (chatId, threadId) tuple');
+});
+
 test('factory falls back to sdk when channels wiring incomplete', () => {
   const warns = [];
   const logger = { warn: msg => warns.push(msg) };
