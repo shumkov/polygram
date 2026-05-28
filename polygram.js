@@ -49,7 +49,6 @@ const { extractAssistantText } = require('./lib/process/sdk-process');
 // containing code blocks or HTML-style tags aren't split mid-element by the
 // size cap.
 const { createChannelsToolDispatcher } = require('./lib/process/channels-tool-dispatcher');
-const { HeartbeatReactor } = require('./lib/telegram/heartbeat-reactor');
 const { createTmuxRunner } = require('./lib/tmux/tmux-runner');
 const { sweepTmuxOrphans } = require('./lib/tmux/orphan-sweep');
 const { normalizeTuiToolInput } = require('./lib/tmux/tui-tool-input');
@@ -481,29 +480,15 @@ async function sendToProcess(sessionKey, prompt, context = {}, { onDispatched } 
   const timeoutMs = (chatConfig.timeout || config.defaults.timeout) * 1000;
   const maxTurnMs = (chatConfig.maxTurn || config.defaults?.maxTurn || 1800) * 1000;
 
-  // CliProcess-only liveness heartbeat. Lazy-attached HERE (after
-  // getOrSpawnForChat) so handleMessage stays fast for slash commands and
-  // any other non-pm.send paths — earlier wiring at handleMessage:~1003
-  // forced a cold-spawn (~30s on channels) before THINKING reactor /
-  // typing indicator / autosteer decision, hiding user feedback. Now the
-  // reactor only exists when we genuinely need a turn.
-  //
-  // Gated on entry.backend === 'channels' AND context.sourceMsgId (the
-  // TG user-msg to react on). Non-msg callers (boot-replay,
-  // autonomous-wakeup re-dispatch) pass no sourceMsgId and skip the
-  // reactor entirely.
-  let heartbeatReactor = null;
-  if (entry.backend === 'channels'
-      && typeof context.heartbeatSetReaction === 'function'
-      && context.sourceMsgId != null) {
-    heartbeatReactor = new HeartbeatReactor({
-      process: entry,
-      chatId,
-      messageId: context.sourceMsgId,
-      setReaction: context.heartbeatSetReaction,
-      logger: { debug: () => {}, warn: (m) => console.warn(`[${sessionKey}] ${m}`) },
-    });
-  }
+  // 0.12 Phase 2.1: HeartbeatReactor binding removed for CliProcess.
+  // 0.11.0-channels needed a random-cycling working-pool reactor because
+  // the channels protocol gave no per-tool visibility. CliProcess (0.12)
+  // now emits per-tool 'tool-use' events from hook PreToolUse (Phase 1.3),
+  // so the standard rc.32 reactor cascade (THINKING → THINKING_DEEPER →
+  // THINKING_DEEPEST → STALL + per-tool emoji from classifyToolName) drives
+  // the reaction surface uniformly with SDK + tmux backends. Same UX, no
+  // backend-specific wiring. heartbeat-reactor.js stays in tree until
+  // Phase 4 deletion alongside other channels-specific dead code.
 
   // Hold the per-session lock across the FULL turn (write + result wait),
   // not just the stdin write. Claude's stream-json input mode batches any
@@ -533,10 +518,6 @@ async function sendToProcess(sessionKey, prompt, context = {}, { onDispatched } 
     return await turnP;
   } finally {
     release();
-    // Belt-and-braces stop. The reactor auto-stops on idle/close/
-    // bridge-disconnected events from the Process, so this is idempotent
-    // — but it also covers the "send threw before any event fired" path.
-    heartbeatReactor?.stop();
   }
 }
 
@@ -1034,20 +1015,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       });
     },
   });
-  // Channels-only heartbeat setReaction adapter. Plumbed into sendToProcess
-  // via context; sendToProcess instantiates the actual HeartbeatReactor
-  // lazily after getOrSpawnForChat returns (rc.3: see sendToProcess body
-  // for why we no longer construct here). Closure over `bot` keeps the
-  // tg() dependency local.
-  const heartbeatSetReaction = async (cid, mid, emoji) => {
-    await tg(bot, 'setMessageReaction', {
-      chat_id: cid,
-      message_id: mid,
-      reaction: emoji.length ? [{ type: 'emoji', emoji: emoji[0] }] : [],
-    }, { source: 'channels-heartbeat', botName: BOT_NAME }).catch(() => {});
-  };
+  // 0.12 Phase 2.1: heartbeatSetReaction adapter removed. The 0.11.0-channels
+  // HeartbeatReactor is no longer bound (CliProcess uses the standard rc.32
+  // reactor cascade); the adapter that fed it is now dead code.
 
-  // rc.32: skip QUEUED (👀) entirely for first-message-in-chain. Go
+// rc.32: skip QUEUED (👀) entirely for first-message-in-chain. Go
   // straight to THINKING (🤔). The 👀 → 🤔 two-hop didn't add
   // user-readable signal — Telegram's ✓✓ already conveys "delivered",
   // and the technical "received-but-not-started vs thinking"
@@ -1112,7 +1084,6 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       await new Promise((dispatched) => {
         sendPromise = sendToProcess(sessionKey, prompt, {
           streamer, reactor, sourceMsgId: msg.message_id,
-          heartbeatSetReaction,
           // 0.7.4 (item B): fire THINKING when Claude actually starts
           // emitting — not the moment we wrote stdin.
           onFirstStream: () => reactor.setState('THINKING'),
@@ -1132,8 +1103,6 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // AUTOSTEERED is terminal; stop the reactor's STALL / TIMEOUT
     // timers so they don't pin the closure for up to 30s.
     reactor.stop();
-    // No channels-heartbeat stop here — autosteer skips sendToProcess
-    // entirely, so no HeartbeatReactor was constructed.
     markReplied();
     return;
   }
@@ -1659,8 +1628,6 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   } finally {
     stopTyping();
     reactor.stop();
-    // HeartbeatReactor (channels-only) is stopped inside sendToProcess's
-    // own finally block — no handleMessage-level stop needed.
     // rc.38: defensive clear-on-exit for ✍ reactions. Pre-rc.38 only
     // the success path (line ~2622), the abort path (line ~2858), and
     // the tool-only-completion path (line ~2681) cleared
