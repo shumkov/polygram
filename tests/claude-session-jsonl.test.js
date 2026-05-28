@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const EventEmitter = require('events');
 const {
   encodeCwd, sessionLogPath, parseLine, pipeToParser,
-} = require('../lib/tmux/session-log-parser');
+} = require('../lib/util/claude-session-jsonl');
 
 // ─── path helpers ────────────────────────────────────────────────────
 

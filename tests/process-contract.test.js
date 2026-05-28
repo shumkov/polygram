@@ -27,7 +27,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const { makeBackend } = require('./_helpers/backend-driver');
 
-const BACKENDS = ['sdk', 'tmux', 'cli'];
+const BACKENDS = ['sdk', 'cli'];
 
 // Channels backend skips scenarios that test transport-specific features
 // the Channels protocol intentionally doesn't expose. Channels-specific

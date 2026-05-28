@@ -15,7 +15,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   SessionEventAggregator, parseLine,
-} = require('../lib/tmux/session-log-parser');
+} = require('../lib/util/claude-session-jsonl');
 
 // Hand-written JSONL line helpers.
 function asstLine(message, sessionId = 'sess-1') {

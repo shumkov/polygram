@@ -51,7 +51,6 @@ const { extractAssistantText } = require('./lib/process/sdk-process');
 const { createChannelsToolDispatcher } = require('./lib/process/channels-tool-dispatcher');
 const { createTmuxRunner } = require('./lib/tmux/tmux-runner');
 const { sweepTmuxOrphans } = require('./lib/tmux/orphan-sweep');
-const { normalizeTuiToolInput } = require('./lib/tmux/tui-tool-input');
 const { PollScheduler } = require('./lib/tmux/poll-scheduler');
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
 // (pm.injectUserMessage) replaces the buffer + PostToolBatch detour.
@@ -2240,7 +2239,7 @@ async function main() {
   // 0.11.0: binCheck reused for channels backend wiring below.
   let pinnedClaudeBin = null;
   {
-    const { CLAUDE_CLI_PINNED_VERSION } = require('./lib/process/tmux-process');
+    const { CLAUDE_CLI_PINNED_VERSION } = require('./lib/claude-bin');
     const { verifyPinnedClaudeBin } = require('./lib/claude-bin');
     const binCheck = verifyPinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION);
     if (binCheck.ok) {
@@ -2299,8 +2298,13 @@ async function main() {
     if (typeof respond !== 'function') return;
     try {
       const canUseTool = makeCanUseTool(sessionKey);
-      const input = normalizeTuiToolInput(toolName, toolInput);
-      const decision = await canUseTool(toolName, input, { toolUseID: id });
+      // 0.12 Phase 4: normalizeTuiToolInput was a TmuxProcess-specific
+      // adapter that converted pane-scraped tool-input STRINGS into
+      // structured objects. CliProcess + SdkProcess both deliver
+      // structured tool_input directly (from channels permission_request
+      // notification or SDK canUseTool callback) — no normalization
+      // needed. Pass toolInput through as-is.
+      const decision = await canUseTool(toolName, toolInput, { toolUseID: id });
       const verdict = decision?.behavior === 'allow' ? 'allow' : 'deny';
       await respond(verdict, decision?.message);
     } catch (err) {
