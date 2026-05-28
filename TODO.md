@@ -44,6 +44,19 @@ Tracking known-but-deferred work. Anything that surfaced during a release but di
 
 ## Feature follow-ups
 
+### SessionStart-driven cwd auto-pairing (F#25 — design filed)
+
+Operator runs `claude` in a project dir, then types `/use <cwd>` from any new Telegram chat to pair it without editing `config.json`. The SessionStart hook is the proof-of-physical-access credential; replaces (for operator self-serve) the current "hardcoded `pairedChatDefaults.cwd`" model.
+
+Full design + threat model + open questions: [`docs/0.12.0-session-start-pair-spec.md`](docs/0.12.0-session-start-pair-spec.md). Open questions need operator decision before implementation:
+- Operator-only or also guest-usable?
+- Skip or record polygram-spawned-claude SessionStarts in the recentCwds cache?
+- Install hooks globally in `~/.claude/settings.json`, or offer project-local fallback?
+
+**Effort estimate**: ~4 hr total; ~2 hr without the `/here` picker.
+
+---
+
 ### Hot-reload agent files without `/reload`
 
 **Current**: editing `~/.claude/agents/<name>.md` requires `/reload` in chat (or cold spawn) to pick up changes.
