@@ -181,12 +181,13 @@ test('R12: warning is per-chat-tuple — different chats each warn once', () => 
 });
 
 test('factory falls back to sdk when channels wiring incomplete', () => {
+  factory._resetAliasWarnings();
   const warns = [];
   const logger = { warn: msg => warns.push(msg) };
   const cfg = { bot: { pm: 'channels' } };
 
   // Missing toolDispatcher + channelsClaudeBin
-  const factory = createProcessFactory({
+  const f = createProcessFactory({
     config: cfg,
     spawnFn: () => ({}),
     tmuxRunner: fakeRunner,
@@ -194,12 +195,16 @@ test('factory falls back to sdk when channels wiring incomplete', () => {
     logger,
   });
 
-  const proc = factory('sess-1', { chatId: '99' });
+  const proc = f('sess-1', { chatId: '99' });
   assert.equal(proc.backend, 'sdk', 'falls back to SDK');
-  assert.equal(warns.length, 1, 'logged a warning');
-  assert.match(warns[0], /channels/);
-  assert.match(warns[0], /toolDispatcher/);
-  assert.match(warns[0], /channelsClaudeBin/);
+  // 0.12: two warns expected — alias deprecation AND wiring-incomplete.
+  // No R12 warn (channels alias doesn't trigger R12; that's tmux-only).
+  assert.equal(warns.length, 2, 'logged 2 warnings (alias deprecation + wiring-incomplete fallback)');
+  assert.ok(warns.some(w => /'channels' is deprecated/.test(w)), 'alias deprecation warn');
+  const wiringWarn = warns.find(w => /toolDispatcher/.test(w));
+  assert.ok(wiringWarn, 'wiring-incomplete warn');
+  assert.match(wiringWarn, /pm:'cli'/);
+  assert.match(wiringWarn, /channelsClaudeBin/);
 
   // cleanup — SdkProcess construction may have spun up internals
   proc.kill?.('test-cleanup').catch(() => {});
