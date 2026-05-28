@@ -44,16 +44,28 @@ Tracking known-but-deferred work. Anything that surfaced during a release but di
 
 ## Feature follow-ups
 
-### SessionStart-driven cwd auto-pairing (F#25 — design filed)
+### SessionStart-driven cwd auto-pairing (design filed)
 
 Operator runs `claude` in a project dir, then types `/use <cwd>` from any new Telegram chat to pair it without editing `config.json`. The SessionStart hook is the proof-of-physical-access credential; replaces (for operator self-serve) the current "hardcoded `pairedChatDefaults.cwd`" model.
 
 Full design + threat model + open questions: [`docs/0.12.0-session-start-pair-spec.md`](docs/0.12.0-session-start-pair-spec.md). Open questions need operator decision before implementation:
 - Operator-only or also guest-usable?
-- Skip or record polygram-spawned-claude SessionStarts in the recentCwds cache?
+- Skip or record polygram-spawned-claude SessionStarts in the recent-sessions cache?
 - Install hooks globally in `~/.claude/settings.json`, or offer project-local fallback?
 
 **Effort estimate**: ~4 hr total; ~2 hr without the `/here` picker.
+
+---
+
+### Context & token observability via hooks (design filed)
+
+Build on the pairing spec's hook plumbing to surface claude's context-window state in Telegram. `/context` shows tokens used + % of window + last assistant message (read from the session JSONL via tail-read, same pattern moshi-hooks uses). Proactive push at 85% threshold warns before claude's auto-compact fires near 92%.
+
+Two new commands (`/context`, `/tail`) + one new IPC op (`hook-stop`) + transcript tail-reader. Closes two gaps in the current `getContextUsage()`: works for idle sessions (transcript path stashed on SessionStart, survives turn-end) and works for terminal-run claude sessions (not just polygram-spawned).
+
+Full design: [`docs/0.12.0-context-observability-spec.md`](docs/0.12.0-context-observability-spec.md). Depends on the pairing spec shipping first.
+
+**Effort estimate**: ~3 hr total (assumes pairing infra is in place); ~1.5 hr without `/tail` + threshold push.
 
 ---
 
