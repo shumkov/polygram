@@ -271,6 +271,10 @@ test('CliProcess.start tmux session name uses polygram- prefix for orphan-sweep'
   await new Promise(r => sock.once('connect', r));
   sock.write(JSON.stringify({ kind: 'hello', session_key: p.sessionKey, secret: p.sockSecret }) + '\n');
   sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: 'test-sid' }) + '\n');
+  // 0.12 Phase 1.6: also synthesize the mcp-ready signal that real bridges
+  // emit on first claude ListToolsRequest. Without it, _waitForBridgeHandshake
+  // would block until the 5s mcp-ready timeout.
+  sock.write(JSON.stringify({ kind: 'mcp-ready', session: p.sessionKey }) + '\n');
   await startP;
   assert.equal(calls.length, 1);
   assert.match(calls[0].name, /^polygram-shumorobot-channels-/, `tmux name should start with polygram-<botName>-channels- but got '${calls[0].name}'`);
@@ -344,6 +348,10 @@ async function captureSpawnArgs(constructorOpts, startOpts) {
   await new Promise(r => sock.once('connect', r));
   sock.write(JSON.stringify({ kind: 'hello', session_key: p.sessionKey, secret: p.sockSecret }) + '\n');
   sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: 'test-sid' }) + '\n');
+  // 0.12 Phase 1.6: also synthesize the mcp-ready signal that real bridges
+  // emit on first claude ListToolsRequest. Without it, _waitForBridgeHandshake
+  // would block until the 5s mcp-ready timeout.
+  sock.write(JSON.stringify({ kind: 'mcp-ready', session: p.sessionKey }) + '\n');
   await startP;
   sock.end();
   await p.kill('test');
@@ -515,6 +523,8 @@ test('channels backend defaults to bypassPermissions (rc.9: first-turn-dead-zone
     await new Promise(r => sock.once('connect', r));
     sock.write(JSON.stringify({ kind: 'hello', session_key: p.sessionKey, secret: p.sockSecret }) + '\n');
     sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: 'test-sid' }) + '\n');
+    // 0.12 Phase 1.6: synthesize mcp-ready so _waitForBridgeHandshake doesn't 5s-block.
+    sock.write(JSON.stringify({ kind: 'mcp-ready', session: p.sessionKey }) + '\n');
     await startP;
     sock.end();
     await p.kill('test');
@@ -585,6 +595,10 @@ async function captureSpawnOpts(constructorOpts, startOpts) {
   await new Promise(r => sock.once('connect', r));
   sock.write(JSON.stringify({ kind: 'hello', session_key: p.sessionKey, secret: p.sockSecret }) + '\n');
   sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: 'test-sid' }) + '\n');
+  // 0.12 Phase 1.6: also synthesize the mcp-ready signal that real bridges
+  // emit on first claude ListToolsRequest. Without it, _waitForBridgeHandshake
+  // would block until the 5s mcp-ready timeout.
+  sock.write(JSON.stringify({ kind: 'mcp-ready', session: p.sessionKey }) + '\n');
   await startP;
   sock.end();
   await p.kill('test');

@@ -684,6 +684,13 @@ test('P1 #18: _handleStartupDialogs throws on 30s timeout (banner never appears)
   // Either the real 30s timeout error or our test-deadline guard — both fail
   // the start path. Just confirm a non-success outcome.
   assert.match(err.message, /test deadline|did not resolve within 30s/);
+  // CRITICAL: the abandoned _handleStartupDialogs is still polling
+  // captureWide via runStartupGate's setInterval. Without explicit
+  // teardown, that interval keeps the test runner's event loop alive
+  // for the full 30s deadline. Killing cp triggers _doKill, which closes
+  // the bridge server + tail; runStartupGate's interval doesn't have a
+  // hard handle, so the runner cleanup is what unblocks the loop.
+  await cp.kill('test-cleanup').catch(() => {});
 });
 
 // P1 #4: reply MUST route by echoed turn_id when present so concurrent send()s
@@ -738,17 +745,32 @@ test('P1 #4: reply with echoed turn_id routes to matching pending turn (no fan-o
 
 // P1 #15: emit 'tool-use' event on every bridge tool message so polygram's
 // reactor chain gets per-tool icons (CALLBACK_TO_EVENT.onToolUse).
-test('P1 #15: bridge tool dispatch emits canonical tool-use event', async () => {
+// 0.12 Phase 1.5: bridge `tool` messages NO LONGER emit 'tool-use'.
+// Hook PreToolUse is the canonical 'tool-use' source for ALL tools (not
+// just bridge-exposed ones). The bridge's tool message still triggers
+// dispatch (delivers replies to Telegram); just no longer emits the
+// per-tool event. This test pins the new contract: dispatch fires, no
+// 'tool-use' emit from the bridge path.
+test('P1 #15 (0.12 Phase 1.5): bridge tool dispatch does NOT emit tool-use; hook PreToolUse is sole source', async () => {
   const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
 
-  const toolUseP = new Promise(resolve => cp.once('tool-use', resolve));
+  let toolUseFired = false;
+  cp.once('tool-use', () => { toolUseFired = true; });
+
+  // Drive a bridge tool call.
   bridge.send({
     kind: 'tool', session: cp.sessionKey, tool_call_id: 'tu-1',
     name: 'reply', args: { chat_id: 'chat-1', text: 'hi' },
   });
-  const toolName = await toolUseP;
-  assert.equal(toolName, 'reply');
+  // Wait for the tool_ack — confirms dispatch ran.
+  const ack = await bridge.waitFor(m => m.kind === 'tool_ack');
+  assert.equal(ack.ok, true, 'dispatch should succeed (toolDispatcher returns ok:true)');
+
+  // Give the event loop a moment in case 'tool-use' was emitted synchronously.
+  await new Promise(r => setImmediate(r));
+  assert.equal(toolUseFired, false,
+    'bridge tool dispatch must NOT emit tool-use — hook PreToolUse is the canonical source');
 
   bridge.close();
   await cp.kill('test');
@@ -855,14 +877,19 @@ test('P1 #12: send() resolves at maxRepliesPerTurn cap (no chatty-hang)', async 
     turnQuietMs: 100_000,            // huge — would never resolve on quiet
     turnTimeoutMs: 5_000,
     maxRepliesPerTurn: 3,            // small cap for the test
+    // 0.12 Phase 1.7: _resolveTurn schedules a stopGraceMs window to wait
+    // for the Stop hook. Tests don't run a real claude → Stop never fires.
+    // Use a short grace so the test resolves quickly while still exercising
+    // the cap-resolve path.
+    stopGraceMs: 50,
   });
   const bridge = await startWithFakeBridge(cp);
 
   const sendP = cp.send('do many things');
   const userMsg = await bridge.waitFor(m => m.kind === 'user_msg');
 
-  // Stream 3 reply tool calls — at the 3rd, send() should resolve IMMEDIATELY
-  // (quiet timer is 100s; cap fires first).
+  // Stream 3 reply tool calls — at the 3rd, send() should resolve via the
+  // cap path (quiet timer is 100s; cap fires first; stopGraceMs adds ~50ms).
   for (let i = 1; i <= 3; i++) {
     bridge.send({
       kind: 'tool', session: cp.sessionKey, tool_call_id: `r${i}`,
@@ -870,12 +897,12 @@ test('P1 #12: send() resolves at maxRepliesPerTurn cap (no chatty-hang)', async 
     });
     await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === `r${i}`);
   }
-  // sendP should resolve within ms, not 100s
+  // sendP should resolve within ~stopGraceMs (50ms) + epsilon, not 100s
   const winner = await Promise.race([
     sendP.then(() => 'resolved'),
     new Promise(r => setTimeout(() => r('timeout'), 500)),
   ]);
-  assert.equal(winner, 'resolved', 'send() resolved at cap, not via quiet window');
+  assert.equal(winner, 'resolved', 'send() resolved at cap (+stopGrace), not via quiet window');
 
   bridge.close();
   await cp.kill('test');

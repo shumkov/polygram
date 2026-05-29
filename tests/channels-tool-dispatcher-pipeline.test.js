@@ -231,7 +231,11 @@ test('F#2: cli-process _resolveTurn marks result.alreadyDelivered=true', async (
   // Contract: when CliProcess.send() resolves, the result must signal
   // that text has ALREADY been delivered by the dispatcher. polygram.js's
   // post-pm.send pipeline then short-circuits its own delivery branch.
-  const { proc } = makeMinimalChannelsProc();
+  //
+  // 0.12 Phase 1.7: _resolveTurn now schedules finalization via stopGraceMs
+  // to wait for the Stop hook. Use stopGraceMs: 0 so the test sees the
+  // synchronous resolution on the next tick.
+  const { proc } = makeMinimalChannelsProc({ stopGraceMs: 0 });
 
   const turnId = 'turn-test';
   let resolvedResult = null;
@@ -246,6 +250,8 @@ test('F#2: cli-process _resolveTurn marks result.alreadyDelivered=true', async (
   });
 
   proc._resolveTurn(turnId);
+  // Wait one tick for the 0ms stopGraceTimer to fire _finalizeTurn.
+  await new Promise(r => setTimeout(r, 5));
 
   assert.ok(resolvedResult, 'turn must have resolved');
   assert.equal(

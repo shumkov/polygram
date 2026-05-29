@@ -73,7 +73,10 @@ describe('hook-settings — buildHookSettings', () => {
     const cmd = s.hooks.PreToolUse[0].hooks[0].command;
     assert.match(cmd, /^node /);
     assert.ok(cmd.includes(HOOK_HELPER_ABS_PATH), 'command should include the helper abs path');
-    assert.ok(cmd.endsWith('/abs/foo.ndjson'), 'command should end with the ndjson abs path');
+    // 0.12 Phase 1.2 SEC-03: command shell-quotes both paths so HOME with
+    // spaces doesn't break tokenization. Quoted form ends with "'/abs/foo.ndjson'".
+    assert.ok(cmd.includes('/abs/foo.ndjson'), 'command should include the ndjson abs path');
+    assert.match(cmd, /'\/abs\/foo\.ndjson'$/, 'command should end with single-quoted ndjson path');
   });
 
   test('default helper path is the shipped polygram-hook-append.js', () => {
