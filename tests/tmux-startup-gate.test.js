@@ -358,3 +358,137 @@ test('timeout message lists triggers that fired even when ready never came', asy
     },
   );
 });
+
+// ─── Progress-aware (stall-based) gate — shumorobot General incident ──────
+//
+// 2026-05-30: a cold-spawn of the General topic was killed by the blind
+// 30s wall-clock deadline while claude was mid-download (pane showed a
+// `24%` progress bar — genuine progress). The gate must distinguish
+// "downloading / doing something" (pane CHANGING → keep waiting) from
+// "wedged" (pane FROZEN for stallMs → fail). When `stallMs` is set:
+//   - the stall clock resets every time the pane content changes
+//   - the gate fails only after stallMs of NO change
+//   - an absolute backstop (deadlineMs) still bounds a forever-animating
+//     but never-ready pane
+// When `stallMs` is NOT set, behavior is the pure wall-clock as before.
+
+test('stall gate: does NOT fire while the pane keeps changing past stallMs (download progress)', async () => {
+  // Pane advances 0% → 24% → 60% → ready over many polls. Each frame is
+  // distinct, so a stall deadline shorter than the total runtime must NOT
+  // trip — the gate should ride the progress out to the ready signal.
+  const frames = [
+    'downloading claude runtime\n▰▱▱▱▱ 0%',
+    'downloading claude runtime\n▰▰▱▱▱ 24%',
+    'downloading claude runtime\n▰▰▰▱▱ 60%',
+    'downloading claude runtime\n▰▰▰▰▰ 98%',
+    'Listening for channel messages from: server:polygram-bridge',
+  ];
+  let i = 0;
+  const runner = {
+    sent: [],
+    captureWide: async () => frames[Math.min(i++, frames.length - 1)],
+    sendControl: async () => {},
+  };
+  const result = await runStartupGate({
+    runner,
+    tmuxName: 'sess',
+    triggers: [],
+    readySignal: /Listening for channel messages from: server:polygram-bridge/i,
+    logger: quietLogger,
+    pollMs: 10,
+    settleMs: 10,
+    stallMs: 40,        // shorter than the 5-frame * 10ms progression
+    deadlineMs: 10_000, // generous absolute backstop
+  });
+  assert.deepEqual(result.matchedTriggers, []);
+});
+
+test('stall gate: fires when the pane is FROZEN for stallMs (genuinely wedged)', async () => {
+  // Pane never changes and never shows ready → stall deadline must trip
+  // well before the (much larger) absolute backstop.
+  const runner = {
+    sent: [],
+    captureWide: async () => 'frozen pane — nothing happening here',
+    sendControl: async () => {},
+  };
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => runStartupGate({
+      runner,
+      tmuxName: 'sess',
+      triggers: [],
+      readySignal: /never/,
+      logger: quietLogger,
+      pollMs: 5,
+      settleMs: 5,
+      stallMs: 60,
+      deadlineMs: 10_000,   // would dominate if stall logic were ignored
+      timeoutCode: 'CHANNELS_DIALOG_TIMEOUT',
+    }),
+    (err) => {
+      assert.equal(err.code, 'CHANNELS_DIALOG_TIMEOUT');
+      assert.match(err.message, /no pane activity for 60ms/);
+      return true;
+    },
+  );
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 3_000, `stall should fire fast (~60ms), got ${elapsed}ms`);
+});
+
+test('stall gate: absolute deadline still bounds a forever-animating-but-never-ready pane', async () => {
+  // Pane changes on EVERY poll (so the stall clock never trips) but the
+  // ready signal never appears. The absolute backstop must still fire.
+  let n = 0;
+  const runner = {
+    sent: [],
+    captureWide: async () => `spinner frame ${n++}`, // always distinct
+    sendControl: async () => {},
+  };
+  await assert.rejects(
+    () => runStartupGate({
+      runner,
+      tmuxName: 'sess',
+      triggers: [],
+      readySignal: /never/,
+      logger: quietLogger,
+      pollMs: 5,
+      settleMs: 5,
+      stallMs: 10_000,  // never trips — pane always changes
+      deadlineMs: 80,   // absolute backstop must win
+    }),
+    (err) => {
+      assert.match(err.message, /startup gate did not resolve within 80ms/);
+      return true;
+    },
+  );
+});
+
+test('stall gate: a fired trigger counts as activity (resets the stall clock)', async () => {
+  // Pane shows the dev-channels banner (static text) until the trigger
+  // fires, then flips to ready. Even though the pre-trigger pane is
+  // unchanging, sending the trigger key is activity — the stall clock must
+  // reset so we don't fail a session that's actively being navigated.
+  let fired = false;
+  const runner = {
+    sent: [],
+    captureWide: async () => (fired
+      ? 'Listening for channel messages from: server:polygram-bridge'
+      : 'WARNING: Loading development channels'),
+    sendControl: async (_n, k) => { fired = true; runner.sent.push(k); },
+  };
+  const result = await runStartupGate({
+    runner,
+    tmuxName: 'sess',
+    triggers: [
+      { name: 'dev-channels', regex: /WARNING: Loading development channels/i, key: 'Enter' },
+    ],
+    readySignal: /Listening for channel messages from: server:polygram-bridge/i,
+    logger: quietLogger,
+    pollMs: 5,
+    settleMs: 5,
+    stallMs: 1_000,   // the static banner would trip a naive stall timer well before this if triggers didn't count
+    deadlineMs: 10_000,
+  });
+  assert.deepEqual(result.matchedTriggers, ['dev-channels']);
+  assert.deepEqual(runner.sent, ['Enter']);
+});
