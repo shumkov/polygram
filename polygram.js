@@ -51,7 +51,6 @@ const { extractAssistantText } = require('./lib/process/sdk-process');
 const { createChannelsToolDispatcher } = require('./lib/process/channels-tool-dispatcher');
 const { createTmuxRunner } = require('./lib/tmux/tmux-runner');
 const { sweepTmuxOrphans } = require('./lib/tmux/orphan-sweep');
-const { PollScheduler } = require('./lib/tmux/poll-scheduler');
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
 // (pm.injectUserMessage) replaces the buffer + PostToolBatch detour.
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
