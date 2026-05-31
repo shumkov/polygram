@@ -2243,19 +2243,13 @@ async function main() {
     const binCheck = verifyPinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION);
     if (binCheck.ok) {
       console.log(
-        `[polygram] tmux backend pinned to claude CLI v${CLAUDE_CLI_PINNED_VERSION}: ${binCheck.path}`,
+        `[polygram] CliProcess pinned to claude CLI v${CLAUDE_CLI_PINNED_VERSION}: ${binCheck.path}`,
       );
       pinnedClaudeBin = binCheck.path;
     } else {
       console.warn(`[polygram] WARNING: ${binCheck.reason}`);
     }
   }
-  // O1 optimization: shared poll-tick scheduler. N TmuxProcess
-  // instances share ONE setInterval instead of spawning N independent
-  // setTimeout chains. Idle when no chats are in flight (zero timers
-  // running). Configurable via config.bot.tmuxPollIntervalMs.
-  const tmuxPollIntervalMs = config.bot?.tmuxPollIntervalMs || 250;
-  const pollScheduler = new PollScheduler({ intervalMs: tmuxPollIntervalMs });
   // 0.11.0: channels backend wiring. Used when a chat opts in via
   // `pm: 'channels'` config. Falls back to SDK gracefully if the pinned
   // claude binary isn't present (see factory.js — channelsClaudeBin
@@ -2281,7 +2275,6 @@ async function main() {
     logger: console,
     tmuxRunner,
     botName: BOT_NAME,
-    pollScheduler,
     // channels backend
     toolDispatcher: channelsToolDispatcher,
     channelsClaudeBin,
