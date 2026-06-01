@@ -427,7 +427,7 @@ test('stall gate: fires when the pane is FROZEN for stallMs (genuinely wedged)',
     }),
     (err) => {
       assert.equal(err.code, 'CHANNELS_DIALOG_TIMEOUT');
-      assert.match(err.message, /no pane activity for 60ms/);
+      assert.match(err.message, /went static for 60ms/);
       return true;
     },
   );
@@ -491,4 +491,58 @@ test('stall gate: a fired trigger counts as activity (resets the stall clock)', 
   });
   assert.deepEqual(result.matchedTriggers, ['dev-channels']);
   assert.deepEqual(runner.sent, ['Enter']);
+});
+
+// ─── Blank-pane cold-start must NOT trip the stall timer (Music incident) ──
+//
+// shumorobot Music topic (2026-06-01 14:20): a cold CLI spawn whose TUI
+// rendered slowly left the captured pane BLANK for >stallMs. The stall
+// check killed it at 30s with "Pane appears wedged" — but a blank pane is
+// "claude hasn't started rendering yet" (cold start), NOT wedged. The stall
+// timer must only arm once the pane has shown SOME content; until then the
+// absolute deadline alone governs.
+
+test('stall gate: a BLANK pane does NOT trip the stall timer (slow cold-start)', async () => {
+  // Production shape: pane is the SAME blank string every poll for longer
+  // than stallMs, THEN renders. Identical bytes each poll = no reference
+  // change, so a naive stall timer (reset only on change) trips. The fix:
+  // the stall timer must not arm until the pane has shown content.
+  let calls = 0;
+  const runner = {
+    sent: [],
+    captureWide: async () => { calls++; return calls <= 6 ? '' : 'Listening for channel messages from: server:polygram-bridge'; },
+    sendControl: async () => {},
+  };
+  const result = await runStartupGate({
+    runner,
+    tmuxName: 'sess',
+    triggers: [],
+    readySignal: /Listening for channel messages from: server:polygram-bridge/i,
+    logger: quietLogger,
+    pollMs: 10,
+    settleMs: 10,
+    stallMs: 25,        // SHORTER than the blank-pane phase (4 frames × 10ms)
+    deadlineMs: 10_000, // absolute backstop, generous
+  });
+  assert.deepEqual(result.matchedTriggers, []);
+});
+
+test('stall gate: still fires when the pane RENDERED then froze (real wedge, content seen)', async () => {
+  const runner = {
+    sent: [],
+    captureWide: async () => 'Claude Code v2.1.142\n  ~/work\n> ',  // rendered, static
+    sendControl: async () => {},
+  };
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => runStartupGate({
+      runner, tmuxName: 'sess', triggers: [],
+      readySignal: /never-appears/,
+      logger: quietLogger, pollMs: 5, settleMs: 5,
+      stallMs: 60, deadlineMs: 10_000,
+      timeoutCode: 'CHANNELS_DIALOG_TIMEOUT',
+    }),
+    (err) => { assert.equal(err.code, 'CHANNELS_DIALOG_TIMEOUT'); assert.equal(err.reason, 'stall'); return true; },
+  );
+  assert.ok(Date.now() - startedAt < 3_000, 'stall still fires fast once content was seen');
 });
