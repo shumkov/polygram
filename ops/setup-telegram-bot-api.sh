@@ -12,7 +12,11 @@
 
 set -euo pipefail
 
-PREFIX="${1:-/opt/homebrew}"
+# Install prefix. Default /usr/local (binary → /usr/local/bin) — the
+# standard spot for manual, non-Homebrew installs (Homebrew itself lives at
+# /opt/homebrew on Apple Silicon, so this keeps the standalone binary out of
+# brew's prefix). Pass an alternate prefix as $1.
+PREFIX="${1:-/usr/local}"
 DATA_DIR="$HOME/.telegram-bot-api"
 BUILD_DIR="$(mktemp -d)"
 
@@ -52,9 +56,9 @@ echo "       - replace API_ID_HERE / API_HASH_HERE with your my.telegram.org val
 echo "       - confirm the binary path ($PREFIX/bin/telegram-bot-api)"
 echo "  2. cp ops/telegram-bot-api.plist.example ~/Library/LaunchAgents/com.telegram.bot-api.plist"
 echo "  3. launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.telegram.bot-api.plist"
-echo "  4. Verify it's up:  curl -s http://localhost:8081/  (expect a Telegram error JSON, not connection-refused)"
-echo "  5. In ~/.polygram/config.json set:  \"bot\": { ..., \"apiRoot\": \"http://localhost:8081\" }"
+echo "  4. Verify it's up:  curl -s http://localhost:8082/  (expect a Telegram error JSON, not connection-refused)"
+echo "  5. In ~/.polygram/config.json set:  \"bot\": { ..., \"apiRoot\": \"http://localhost:8082\" }"
 echo "  6. Restart polygram:  launchctl kickstart -k gui/\$(id -u)/com.polygram.shumorobot"
-echo "     Boot log should print: [polygram] using local Telegram Bot API server: http://localhost:8081"
+echo "     Boot log should print: [polygram] using local Telegram Bot API server: http://localhost:8082"
 echo
 echo "Cleanup build dir: rm -rf $BUILD_DIR"

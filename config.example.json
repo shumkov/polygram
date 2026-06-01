@@ -4,7 +4,7 @@
   "bots": {
     "admin-bot": {
       "token": "REPLACE_WITH_BOT_TOKEN_FROM_BOTFATHER",
-      "_comment_apiRoot": "Optional. Point grammy at a self-hosted Telegram Bot API server (e.g. 'http://localhost:8081' from a local `telegram-bot-api --local` process) to raise file send/receive limits from cloud's 50MB-out / 20MB-in to 2GB both ways. Omit for cloud Telegram (default, unchanged). The server is a separate localhost-only companion daemon — see docs/0.12.0-file-send.md.",
+      "_comment_apiRoot": "Optional. Point grammy at a self-hosted Telegram Bot API server (e.g. 'http://localhost:8082' from a local `telegram-bot-api --local` process) to raise file send/receive limits from cloud's 50MB-out / 20MB-in to 2GB both ways. Omit for cloud Telegram (default, unchanged). The server is a separate localhost-only companion daemon — see docs/0.12.0-file-send.md.",
       "allowConfigCommands": true,
       "_comment_adminChatId": "Required when allowConfigCommands is true for pairing commands (/pair-code, /pairings, /unpair) to work. These grant cross-chat trust and are gated to the admin chat only.",
       "adminChatId": "123456789",
@@ -72,8 +72,7 @@
       "effort": "medium",
       "cwd": "/Users/you/admin-agent",
       "timeout": 600,
-      "_comment_maxFileBytes": "Optional per-chat file-size cap in BYTES for send/receive, also settable per-topic (topic wins). Default follows the backend: cloud Telegram 50MB send / 20MB receive; with bot.apiRoot (local Bot API server) 2GB both ways. An override can only LOWER the cap below the backend ceiling — Telegram rejects anything larger regardless. Example: 104857600 = 100MB (only effective when apiRoot is set).",
-      "maxFileBytes": 104857600
+      "_comment_maxFileBytes": "OPTIONAL per-chat (or per-topic; topic wins) file-size cap in BYTES. There is NO fixed default — the default is backend-derived: cloud Telegram = 50MB send / 20MB receive; with a local Bot API server (bot.apiRoot set) = 2GB both ways. This key only LOWERS that ceiling for this chat (Telegram rejects anything above the backend limit regardless); omit it to use the full backend default. To set one, add e.g. \"maxFileBytes\": 104857600 (=100MB) — only meaningful when apiRoot is set, since cloud already clamps to 50/20MB."
     },
 
     "-1000000000001": {

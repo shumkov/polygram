@@ -9,13 +9,13 @@
 
   Setup (do these first — see docs/0.12.0-file-send.md):
     1. Get TELEGRAM_API_ID + TELEGRAM_API_HASH from https://my.telegram.org
-    2. Install the binary: ops/setup-telegram-bot-api.sh  (builds it; not on Homebrew)
+    2. Install the binary: ops/setup-telegram-bot-api.sh /usr/local  (builds it; not on Homebrew)
 
   Then:
     - replace API_ID_HERE / API_HASH_HERE / the binary path below
     - cp this to ~/Library/LaunchAgents/com.telegram.bot-api.plist
     - launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.telegram.bot-api.plist
-    - set config.bot.apiRoot = "http://localhost:8081" and restart polygram
+    - set config.bot.apiRoot = "http://localhost:8082" and restart polygram
 -->
 <plist version="1.0">
 <dict>
@@ -23,12 +23,12 @@
     <string>com.telegram.bot-api</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/homebrew/bin/telegram-bot-api</string>
+        <string>/usr/local/bin/telegram-bot-api</string>
         <string>--api-id=API_ID_HERE</string>
         <string>--api-hash=API_HASH_HERE</string>
         <!-- bind to loopback ONLY — never 0.0.0.0 -->
         <string>--http-ip-address=127.0.0.1</string>
-        <string>--http-port=8081</string>
+        <string>--http-port=8082</string>
         <!-- --local enables 2 GB limits + local-file paths -->
         <string>--local</string>
         <string>--dir=/Users/ivanshumkov/.telegram-bot-api</string>
