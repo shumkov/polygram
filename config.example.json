@@ -4,6 +4,7 @@
   "bots": {
     "admin-bot": {
       "token": "REPLACE_WITH_BOT_TOKEN_FROM_BOTFATHER",
+      "_comment_apiRoot": "Optional. Point grammy at a self-hosted Telegram Bot API server (e.g. 'http://localhost:8081' from a local `telegram-bot-api --local` process) to raise file send/receive limits from cloud's 50MB-out / 20MB-in to 2GB both ways. Omit for cloud Telegram (default, unchanged). The server is a separate localhost-only companion daemon — see docs/0.12.0-file-send.md.",
       "allowConfigCommands": true,
       "_comment_adminChatId": "Required when allowConfigCommands is true for pairing commands (/pair-code, /pairings, /unpair) to work. These grant cross-chat trust and are gated to the admin chat only.",
       "adminChatId": "123456789",

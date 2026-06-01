@@ -1672,9 +1672,23 @@ function shouldHandle(msg, chatConfig, botUsername) {
 }
 
 function createBot(token) {
+  // Optional self-hosted Telegram Bot API server. When config.bot.apiRoot is
+  // set (e.g. "http://localhost:8081" from a local `telegram-bot-api`
+  // process), grammy routes all Bot API calls there instead of
+  // api.telegram.org — which lifts file send/receive from cloud's 50 MB-out /
+  // 20 MB-in to 2 GB both ways. Omit it (default) → cloud Telegram, unchanged.
+  // The local server is a separate companion daemon; this is just the knob
+  // that points polygram at it. See docs/0.12.0-file-send.md.
+  const apiRoot = config.bot?.apiRoot;
   const bot = new Bot(token, {
-    client: { timeoutSeconds: 60 },
+    client: {
+      timeoutSeconds: 60,
+      ...(apiRoot ? { apiRoot } : {}),
+    },
   });
+  if (apiRoot) {
+    console.log(`[polygram] using local Telegram Bot API server: ${apiRoot} (2GB file limit)`);
+  }
   let botUsername = '';
   // Cached once @botUsername is known — was recompiling per inbound msg.
   let mentionRe = null;

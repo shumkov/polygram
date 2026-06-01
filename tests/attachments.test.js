@@ -53,19 +53,21 @@ describe('filterAttachments', () => {
   });
 
   test('enforces total size cap across multiple files', () => {
+    // Caps raised to Telegram cloud reality: 20MB per-file, 50MB total.
+    // 3×18MB = 54MB > 50MB total → the third is rejected (first two = 36MB fit).
     const atts = [
-      { name: 'a', mime_type: 'image/jpeg', size: 9 * 1024 * 1024 },
-      { name: 'b', mime_type: 'image/jpeg', size: 9 * 1024 * 1024 },
-      { name: 'c', mime_type: 'image/jpeg', size: 9 * 1024 * 1024 },
+      { name: 'a', mime_type: 'image/jpeg', size: 18 * 1024 * 1024 },
+      { name: 'b', mime_type: 'image/jpeg', size: 18 * 1024 * 1024 },
+      { name: 'c', mime_type: 'image/jpeg', size: 18 * 1024 * 1024 },
     ];
     const { accepted, rejected, totalBytes } = filterAttachments(atts);
     assert.equal(accepted.length, 2);
     assert.equal(rejected.length, 1);
     assert.match(rejected[0].reason, /total size cap/);
-    assert.equal(totalBytes, 18 * 1024 * 1024);
+    assert.equal(totalBytes, 36 * 1024 * 1024);
   });
 
-  test('rejects single file that exceeds per-file cap', () => {
+  test('rejects single file that exceeds per-file cap (20MB cloud limit)', () => {
     const atts = [
       { name: 'huge.mp4', mime_type: 'video/mp4', size: 50 * 1024 * 1024 },
     ];
