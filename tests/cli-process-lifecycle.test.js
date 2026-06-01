@@ -362,81 +362,53 @@ test('F#17: normal turn output (no dialog) → no action', async () => {
   );
 });
 
-// ─── Wedge recovery — channels MCP registration lost mid-turn ──────
+// ─── rc.14: benign dev-channels banner must NOT trigger a kill ──────
 //
-// Music topic incident (2026-06-01): msg 1275 got no reply for 25 minutes.
-// Root cause: after the turn spawned, claude auto-/compacted a large
-// resumed session; the TUI redraw left the channel source unresolved —
-// "server:polygram-bridge  no MCP server configured with that name". The
-// bridge SOCKET stayed up, so the socket-close recovery path
-// (bridgeServer 'bridge-disconnected' → _handleBridgeDisconnected) never
-// fired. claude could no longer deliver its reply, the turn orphaned, and
-// this watchdog logged cli-mid-turn-unknown-prompt every 30s while
-// recovering NOTHING. Fix: detect the dead-bridge pane signal and route it
-// through the SAME recovery as a real socket disconnect.
+// rc.11 added a pane matcher (BRIDGE_DEAD_RE) that treated the line
+//   "server:polygram-bridge  no MCP server configured with that name"
+// as a dead bridge and tore the turn down. That was a MISDIAGNOSIS: the line
+// is a BENIGN banner that `--dangerously-load-development-channels` +
+// `--strict-mcp-config` prints on EVERY healthy session — the channel still
+// delivers messages and the reply tool still works (reproduced 2026-06-01
+// with a test MCP server that demonstrably functions; see
+// tests/e2e-channels-real-claude.test.js). The matcher false-fired ~5s into
+// every channels turn and killed healthy Music sessions (the "mid-turn
+// detach" regression that started 06-01 with rc.11; Music worked 05-31
+// because the matcher didn't exist yet). rc.14 removed it. This test pins
+// that the banner is now IGNORED. Real bridge loss is the socket-close path
+// (bridgeServer 'bridge-disconnected' → _handleBridgeDisconnected), not
+// anything observable in the pane.
+//
+// Red→green: with rc.11's BRIDGE_DEAD_RE present this test FAILS (the banner
+// rejects the turn + emits 'bridge-disconnected'); after rc.14's removal it
+// passes.
 
-test('wedge-recovery: dead-bridge pane mid-turn → pending turn rejected (BRIDGE_DISCONNECTED) + bridge-disconnected emitted', async () => {
-  // Exact shape from the wedged Music pane (PID 9435, session 218be7d5).
-  const deadBridgePane =
-    'music-curator(Search rekordbox by artist names DROXAL and Ace Vision)\n' +
-    '  Called polygram-bridge (ctrl+o to expand)\n' +
+test('rc.14: benign "no MCP server configured" dev-channels banner does NOT kill a healthy turn', async () => {
+  // Exact banner from a HEALTHY session (reproduced with a working test MCP
+  // server): the line is present but the channel functions normally.
+  const healthyPaneWithBanner =
+    '  Claude Code v2.1.142\n' +
+    '  @music-curation:music-curator  ~/Music/rekordbox\n' +
     '  Listening for channel messages from: server:polygram-bridge\n' +
     '  server:polygram-bridge  no MCP server configured with that name\n' +
-    ' Conversation compacted (ctrl+o for history)';
-  const { proc, events } = makeProcWithCapture(deadBridgePane);
+    '  esc to interrupt';
+  const { proc, events } = makeProcWithCapture(healthyPaneWithBanner);
 
-  let rejectedErr = null;
-  proc.pendingTurns.set('turn-1', {
-    resolve: () => {},
-    reject: (err) => { rejectedErr = err; },
-    replies: [],
-  });
-
+  let rejected = false;
+  proc.pendingTurns.set('turn-1', { resolve: () => {}, reject: () => { rejected = true; }, replies: [] });
   let bridgeDisconnectedEmitted = false;
   proc.on('bridge-disconnected', () => { bridgeDisconnectedEmitted = true; });
 
   await proc._pollMidTurnDialogs();
 
-  assert.ok(
-    rejectedErr,
-    'orphaned pending turn must be rejected, not left hanging until the wall-clock cap',
-  );
+  assert.equal(rejected, false, 'the benign banner must NOT reject the in-flight turn');
+  assert.equal(bridgeDisconnectedEmitted, false, "the benign banner must NOT emit 'bridge-disconnected'");
+  assert.equal(proc.pendingTurns.size, 1, 'turn stays in flight — the channel is healthy');
   assert.equal(
-    rejectedErr.code,
-    'BRIDGE_DISCONNECTED',
-    'rejection must carry BRIDGE_DISCONNECTED so the user gets the 🔌 "please resend" message',
+    events.filter(e => e.kind === 'cli-bridge-detached-midturn').length,
+    0,
+    'no false bridge-detach event from the cosmetic banner',
   );
-  assert.equal(proc.pendingTurns.size, 0, 'pendingTurns must drain so the slot frees');
-  assert.ok(
-    bridgeDisconnectedEmitted,
-    "'bridge-disconnected' must emit so process-manager kills + lazy-respawns the dead instance",
-  );
-  const evt = events.find(e => e.kind === 'cli-bridge-detached-midturn');
-  assert.ok(evt, 'forensic event cli-bridge-detached-midturn must fire (distinguishes this trigger from socket-close)');
-  assert.equal(evt.detail.pending_count, 1);
-});
-
-test('wedge-recovery: benign polygram-bridge connection line does NOT trigger false recovery', async () => {
-  // The normal channels connection notice mentions "polygram-bridge" on
-  // every turn. The recovery must key on the SPECIFIC "no MCP server
-  // configured" error, not the bridge name alone — else every healthy turn
-  // would be torn down.
-  const benignPane =
-    'polygram-bridge: <polygram-info>You are connected via a Telegram daemon\n' +
-    'Working on it.\n' +
-    'esc to interrupt';
-  const { proc } = makeProcWithCapture(benignPane);
-
-  let rejected = false;
-  proc.pendingTurns.set('turn-1', { resolve: () => {}, reject: () => { rejected = true; }, replies: [] });
-  let emitted = false;
-  proc.on('bridge-disconnected', () => { emitted = true; });
-
-  await proc._pollMidTurnDialogs();
-
-  assert.equal(rejected, false, 'a healthy bridge connection line must not be mistaken for a dead bridge');
-  assert.equal(emitted, false, "no spurious 'bridge-disconnected'");
-  assert.equal(proc.pendingTurns.size, 1, 'turn stays in flight');
 });
 
 // ─── F#24 — injectUserMessage on CliProcess (autosteer parity) ─────
