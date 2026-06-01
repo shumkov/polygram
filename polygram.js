@@ -28,7 +28,7 @@ const {
   migrateJsonToDb, getClaudeSessionId, resolveSessionForSpawn,
 } = require('./lib/db/sessions');
 const { buildPrompt } = require('./lib/prompt');
-const { filterAttachments } = require('./lib/attachments');
+const { filterAttachments, resolveFileCaps, MAX_TOTAL_BYTES } = require('./lib/attachments');
 // 0.9.0: SDK ProcessManager is the only pm. CLI pm
 // (lib/process-manager.js) deleted in commit 6.
 // Both implementations expose the same public API (constructor +
@@ -461,6 +461,10 @@ function buildSpawnContext(sessionKey) {
     threadId: threadId || null,
     label: getSessionLabel(chatConfig, threadId),
     existingSessionId,
+    // File-send outbound cap inputs: localApi (bot-level) so CliProcess can
+    // resolve the per-chat/topic outbound cap (resolveFileCaps) the same way
+    // it resolves cwd/agent. Override itself lives in chatConfig/topic.
+    localApi: !!config.bot?.apiRoot,
   };
 }
 
@@ -754,7 +758,19 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const sessionCtx = !pm.has(sessionKey) ? await readSessionContext(sessionKey, chatConfig.cwd) : '';
 
   const rawAtts = extractAttachments(msg);
-  const { accepted, rejected } = filterAttachments(rawAtts);
+  // Backend-derived inbound cap with per-topic/chat override. Cloud → 20MB;
+  // a local Bot API server (config.bot.apiRoot) → 2GB; override via
+  // chats[id].maxFileBytes or topics[t].maxFileBytes, clamped to the
+  // backend ceiling. Bytes-valued config; resolveFileCaps does the clamp.
+  const _inTopicCfg = getTopicConfig(chatConfig, threadIdStr || null);
+  const _fileCaps = resolveFileCaps({
+    localApi: !!config.bot?.apiRoot,
+    override: _inTopicCfg.maxFileBytes ?? chatConfig.maxFileBytes ?? null,
+  });
+  const { accepted, rejected } = filterAttachments(rawAtts, {
+    maxFileBytes: _fileCaps.inBytes,
+    maxTotalBytes: Math.max(_fileCaps.inBytes, MAX_TOTAL_BYTES),
+  });
   for (const { att, reason } of rejected) {
     console.log(`[${label}] attachment skipped: ${att.name} (${reason})`);
     logEvent('attachment-skipped', { chat_id: chatId, msg_id: msg.message_id, name: att.name, reason });

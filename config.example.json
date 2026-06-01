@@ -71,7 +71,9 @@
       "model": "opus",
       "effort": "medium",
       "cwd": "/Users/you/admin-agent",
-      "timeout": 600
+      "timeout": 600,
+      "_comment_maxFileBytes": "Optional per-chat file-size cap in BYTES for send/receive, also settable per-topic (topic wins). Default follows the backend: cloud Telegram 50MB send / 20MB receive; with bot.apiRoot (local Bot API server) 2GB both ways. An override can only LOWER the cap below the backend ceiling — Telegram rejects anything larger regardless. Example: 104857600 = 100MB (only effective when apiRoot is set).",
+      "maxFileBytes": 104857600
     },
 
     "-1000000000001": {
