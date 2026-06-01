@@ -66,6 +66,8 @@ describe('createSdkCallbacks — factory contract', () => {
       'onInit', 'onClose', 'onStreamChunk', 'onToolUse',
       'onAssistantMessageStart', 'onAutonomousAssistantMessage',
       'onCompactBoundary',
+      // rc.13: per-chat compaction warning (proactive + reactive).
+      'onCompactionWarn',
       // rc.7 + rc.9 additions — tmux backend NEW-TURN autosteer
       // visual bridge:
       'onExtraTurnStarted', 'onExtraTurnReply',
@@ -884,5 +886,38 @@ describe('FOLD-path safety (rc.7) — sdk callbacks must not emit visible noise 
     const h = baseDeps();
     createSdkCallbacks(h.deps);
     assert.equal(h.tgCalls.length, 0);
+  });
+});
+
+describe('onCompactionWarn — per-chat compaction warning (rc.13)', () => {
+  test('proactive: posts "context ~N% full → run /compact" threaded under the topic + logs event', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onCompactionWarn('12345:3', { kind: 'proactive', pct: 80, backend: 'cli' });
+
+    const send = h.tgCalls.find((c) => c.method === 'sendMessage');
+    assert.ok(send, 'must post a chat message');
+    assert.equal(send.params.chat_id, '12345');
+    assert.equal(send.params.message_thread_id, 3, 'threaded under the topic');
+    assert.match(send.params.text, /80%/, 'states the fill %');
+    assert.match(send.params.text, /\/compact/, 'proposes /compact');
+    assert.ok(
+      h.events.some((e) => e.kind === 'compaction-warn' && e.detail.kind === 'proactive' && e.detail.pct === 80),
+      'forensic compaction-warn event must fire',
+    );
+  });
+
+  test('reactive: posts "auto-compacting now, resend if quiet"; no thread → no message_thread_id', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onCompactionWarn('12345', { kind: 'reactive', backend: 'cli' });
+
+    const send = h.tgCalls.find((c) => c.method === 'sendMessage');
+    assert.ok(send);
+    assert.equal(send.params.chat_id, '12345');
+    assert.equal(send.params.message_thread_id, undefined);
+    assert.match(send.params.text, /auto-compact/i);
+    assert.match(send.params.text, /resend/i);
+    assert.ok(h.events.some((e) => e.kind === 'compaction-warn' && e.detail.kind === 'reactive'));
   });
 });

@@ -570,3 +570,91 @@ test('F#22: orphan reply with zero pending turns emits autonomous event WITH alr
     'channels-emit must carry alreadyDelivered=true so polygram\'s handler skips the redundant send (the dispatcher already shipped the text)',
   );
 });
+
+// ─── Compaction warning (0.12.0-rc.13): PreCompact/PostCompact + proactive Stop ───
+//
+// Music topic root cause: claude auto-compaction detaches the channels MCP
+// bridge mid-turn. rc.11/rc.12 recover after the fact; rc.13 WARNS the user
+// (per-chat opt-in) so they can /compact on their terms BEFORE it happens
+// (proactive, at a context-% threshold) and tells them when it happens anyway
+// (reactive, on PreCompact trigger=auto). Manual /compact is the user's own
+// deliberate action and must NOT nag.
+
+const _cwFs = require('node:fs');
+const _cwOs = require('node:os');
+const _cwPath = require('node:path');
+
+function writeTranscript(usage) {
+  const dir = _cwFs.mkdtempSync(_cwPath.join(_cwOs.tmpdir(), 'pgr-cw-'));
+  const tp = _cwPath.join(dir, 't.jsonl');
+  _cwFs.writeFileSync(tp, JSON.stringify({
+    type: 'assistant',
+    message: { role: 'assistant', usage },
+  }) + '\n');
+  return { tp, dir };
+}
+
+test('rc.13 compaction-warn: PreCompact trigger=auto (enabled) → emits reactive warn', () => {
+  const { proc } = makeProcWithCapture('');
+  proc.compactionWarn = { enabled: true, thresholdPct: 75 };
+  let warn = null;
+  proc.on('compaction-warn', (p) => { warn = p; });
+  proc._handleHookEvent({ type: 'PreCompact', trigger: 'auto' });
+  assert.ok(warn, 'auto-compaction must emit a reactive warning the chat layer posts');
+  assert.equal(warn.kind, 'reactive');
+});
+
+test('rc.13 compaction-warn: PreCompact trigger=manual → NO warn (deliberate user action)', () => {
+  const { proc } = makeProcWithCapture('');
+  proc.compactionWarn = { enabled: true, thresholdPct: 75 };
+  let warned = false;
+  proc.on('compaction-warn', () => { warned = true; });
+  proc._handleHookEvent({ type: 'PreCompact', trigger: 'manual' });
+  assert.equal(warned, false, 'manual /compact must not nag the user');
+});
+
+test('rc.13 compaction-warn: PreCompact when feature disabled → NO warn', () => {
+  const { proc } = makeProcWithCapture('');
+  proc.compactionWarn = { enabled: false, thresholdPct: 75 };
+  let warned = false;
+  proc.on('compaction-warn', () => { warned = true; });
+  proc._handleHookEvent({ type: 'PreCompact', trigger: 'auto' });
+  assert.equal(warned, false, 'off-by-default: disabled chat gets no warning');
+});
+
+test('rc.13 compaction-warn: PostCompact re-arms the proactive warn-once', () => {
+  const { proc } = makeProcWithCapture('');
+  proc.compactionWarn = { enabled: true, thresholdPct: 75 };
+  proc._compactionWarned = true;
+  proc._handleHookEvent({ type: 'PostCompact', trigger: 'auto' });
+  assert.equal(proc._compactionWarned, false, 'PostCompact (context dropped) must re-arm for the next climb');
+});
+
+test('rc.13 compaction-warn: proactive fires at/above threshold, once per climb', async () => {
+  // 160010 / 200000 ≈ 80% ≥ 75% threshold.
+  const { tp, dir } = writeTranscript({ input_tokens: 10, cache_read_input_tokens: 160000, cache_creation_input_tokens: 0 });
+  const { proc } = makeProcWithCapture('');
+  proc.compactionWarn = { enabled: true, thresholdPct: 75 };
+  const warns = [];
+  proc.on('compaction-warn', (p) => warns.push(p));
+
+  await proc._maybeProactiveCompactionWarn(tp);
+  await proc._maybeProactiveCompactionWarn(tp);   // same climb → deduped
+  _cwFs.rmSync(dir, { recursive: true, force: true });
+
+  assert.equal(warns.length, 1, 'warns exactly once per climb (no per-turn spam)');
+  assert.equal(warns[0].kind, 'proactive');
+  assert.equal(warns[0].pct, 80);
+});
+
+test('rc.13 compaction-warn: proactive does NOT fire below threshold', async () => {
+  // 100010 / 200000 ≈ 50% < 75%.
+  const { tp, dir } = writeTranscript({ input_tokens: 10, cache_read_input_tokens: 100000, cache_creation_input_tokens: 0 });
+  const { proc } = makeProcWithCapture('');
+  proc.compactionWarn = { enabled: true, thresholdPct: 75 };
+  let warned = false;
+  proc.on('compaction-warn', () => { warned = true; });
+  await proc._maybeProactiveCompactionWarn(tp);
+  _cwFs.rmSync(dir, { recursive: true, force: true });
+  assert.equal(warned, false, '~50% is below the 75% threshold → no warning');
+});

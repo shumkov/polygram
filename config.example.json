@@ -72,7 +72,9 @@
       "effort": "medium",
       "cwd": "/Users/you/admin-agent",
       "timeout": 600,
-      "_comment_maxFileBytes": "OPTIONAL per-chat (or per-topic; topic wins) file-size cap in BYTES. There is NO fixed default — the default is backend-derived: cloud Telegram = 50MB send / 20MB receive; with a local Bot API server (bot.apiRoot set) = 2GB both ways. This key only LOWERS that ceiling for this chat (Telegram rejects anything above the backend limit regardless); omit it to use the full backend default. To set one, add e.g. \"maxFileBytes\": 104857600 (=100MB) — only meaningful when apiRoot is set, since cloud already clamps to 50/20MB."
+      "_comment_maxFileBytes": "OPTIONAL per-chat (or per-topic; topic wins) file-size cap in BYTES. There is NO fixed default — the default is backend-derived: cloud Telegram = 50MB send / 20MB receive; with a local Bot API server (bot.apiRoot set) = 2GB both ways. This key only LOWERS that ceiling for this chat (Telegram rejects anything above the backend limit regardless); omit it to use the full backend default. To set one, add e.g. \"maxFileBytes\": 104857600 (=100MB) — only meaningful when apiRoot is set, since cloud already clamps to 50/20MB.",
+      "_comment_compactionWarnings": "OPTIONAL per-chat (or per-topic; topic wins). CLI/channels backend (pm:'cli') only. Default OFF. When ON, polygram warns the chat as Claude's context fills so you can /compact on your terms BEFORE an auto-compaction interrupts a turn (auto-compaction detaches the channels MCP bridge mid-turn — see docs/0.12.0-compaction-warnings.md). Two forms: `true` (enable at the 75% default threshold) or `{ \"enabled\": true, \"thresholdPct\": 80 }` (custom 1-99 threshold). Proactive: at the threshold it posts 'context ~N% full, run /compact or /new at a break'. Reactive backstop: when claude auto-compacts anyway it posts 'compacting now, resend if quiet'. Manual /compact never warns. Requires the bot to allow /compact + /new commands.",
+      "compactionWarnings": true
     },
 
     "-1000000000001": {
