@@ -32,6 +32,7 @@ function fixture(overrides = {}) {
     events: [],
     autoResumeAttempts: [],
     autoResumeClears: [],
+    clearSessionId: [],
     deliverReplies: [],
   };
 
@@ -47,6 +48,7 @@ function fixture(overrides = {}) {
     config: { bot: { queueWarnThreshold: overrides.queueWarnThreshold ?? 3 } },
     db: {
       setInboundHandlerStatus: (row) => calls.setInboundStatus.push(row),
+      clearSessionId: (sk) => calls.clearSessionId.push(sk),
     },
     dbWrite: (fn) => { try { fn(); } catch {} },
     tg: async (bot, method, params, meta) => {
@@ -249,6 +251,77 @@ describe('createDispatcher — auto-resume gating', () => {
     await nextTick(); await nextTick();
     assert.equal(fx.calls.autoResumeAttempts.length, 0);
     assert.equal(fx.calls.tg.length, 1);
+  });
+});
+
+describe('createDispatcher — poisoned-session reset after bridge-detach (Music topic, 2026-06-01)', () => {
+  // A channels session whose context grew large enough to auto-/compact on
+  // resume loses its MCP bridge binding on EVERY resume ("no MCP server
+  // configured"), so the resumed turn re-detaches (BRIDGE_DISCONNECTED) and
+  // auto-resume fails. The persisted claude_session_id is then poisoned:
+  // every future message re-resumes it and re-detaches — an endless
+  // "🔌 please resend" loop (the 18:01 production trace). Break it by
+  // dropping the session row when a bridge-detached turn ALSO fails to
+  // auto-resume, so the next message spawns FRESH (no --resume).
+  function bridgeErr() {
+    const e = new Error('bridge disconnected');
+    e.code = 'BRIDGE_DISCONNECTED';
+    return e;
+  }
+
+  test('bridge-detach + auto-resume re-detaches → clearSessionId drops the poisoned session', async () => {
+    const fx = fixture({
+      isAutoResumable: true,
+      // resume itself re-detaches → attemptAutoResume throws → auto-resume-failed
+      sendToProcessResult: { error: 'bridge disconnected again' },
+    });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(bridgeErr());
+    await nextTick(); await nextTick(); await nextTick(); await nextTick();
+
+    assert.deepEqual(
+      fx.calls.clearSessionId,
+      ['sk'],
+      'poisoned session id MUST be dropped so the next message forks a fresh session (no --resume)',
+    );
+    assert.ok(
+      fx.calls.events.some((e) => e.kind === 'session-reset-after-bridge-detach'),
+      'forensic event must record the poison reset',
+    );
+    assert.ok(fx.calls.events.some((e) => e.kind === 'auto-resume-failed'));
+  });
+
+  test('GUARD: bridge-detach that auto-resumes SUCCESSFULLY → session id preserved (one-off crash, not poison)', async () => {
+    // sendToProcess returns text (default) → resume succeeds → NOT poisoned.
+    const fx = fixture({ isAutoResumable: true });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(bridgeErr());
+    await nextTick(); await nextTick(); await nextTick(); await nextTick();
+
+    assert.deepEqual(
+      fx.calls.clearSessionId,
+      [],
+      'a session that resumes cleanly is a one-off bridge crash, not poison — keep its context',
+    );
+    assert.ok(fx.calls.events.some((e) => e.kind === 'auto-resume-success'));
+  });
+
+  test('GUARD: non-bridge resumable (300s timeout) that fails auto-resume → session id NOT cleared', async () => {
+    // A wedged-tool timeout is not session poison; resuming usually works and
+    // clearing would needlessly discard recoverable context.
+    const fx = fixture({ isAutoResumable: true, sendToProcessResult: { error: 'still wedged' } });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(new Error('300s no activity'));  // no .code
+    await nextTick(); await nextTick(); await nextTick(); await nextTick();
+
+    assert.deepEqual(
+      fx.calls.clearSessionId,
+      [],
+      'timeout-wedge is not bridge poison — must not drop the session id',
+    );
   });
 });
 
