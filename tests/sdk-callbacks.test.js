@@ -145,7 +145,7 @@ describe('onInit — upserts session row with TOPIC-RESOLVED spawn identity', ()
       cwd: '/Users/ivanshumkov/Music/rekordbox',
       model: 'sonnet',                        // ← inherited from chat (no topic override)
       effort: 'high',
-      pm_backend: 'tmux',                     // ← topic override
+      pm_backend: 'cli',                      // ← topic override; pm:'tmux' aliases to 'cli' (factory.js Phase 4)
     });
   });
 
@@ -163,8 +163,9 @@ describe('onInit — upserts session row with TOPIC-RESOLVED spawn identity', ()
     createSdkCallbacks(deps).onInit('99', { session_id: 's' }, {
       chatId: '99', threadId: null, label: 't',
     });
-    assert.equal(upsertCalls[0].pm_backend, 'tmux',
-      'pm_backend must be passed explicitly so DB layer never defaults');
+    assert.equal(upsertCalls[0].pm_backend, 'cli',
+      "pm_backend must be passed explicitly so DB layer never defaults "
+        + "(pm:'tmux' aliases to 'cli' — factory.js Phase 4)");
   });
 });
 
