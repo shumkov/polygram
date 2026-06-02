@@ -97,6 +97,7 @@ const { startTyping } = require('./lib/telegram/typing');
 // consumer is lib/handlers/download.js.
 const { createReactionManager, classifyToolName } = require('./lib/telegram/reactions');
 const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
+const { applyReactionToMessages } = require('./lib/telegram/album-reactions');
 const { classify: classifyError, detectWedgedSessionError, isTransientHttpError } = require('./lib/error/classify');
 const { createAutoResumeTracker, isAutoResumable } = require('./lib/db/auto-resume');
 const { resolveReplayWindowMs } = require('./lib/db/replay-window');
@@ -998,13 +999,17 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const availableEmojis = await getReactionAllowlist(bot, chatId);
   const reactor = createReactionManager({
     apply: async (emoji) => {
-      const params = {
-        chat_id: chatId,
-        message_id: msg.message_id,
-        reaction: emoji ? [{ type: 'emoji', emoji }] : [],
-      };
-      await tg(bot, 'setMessageReaction', params,
-        { source: 'status-reaction', botName: BOT_NAME });
+      // rc.16: mirror the reaction onto album siblings too, so a multi-file
+      // send shows the same status emoji on EVERY item, not just the anchor.
+      // For a normal single message, _albumSiblingMsgIds is undefined and this
+      // is exactly the prior single setMessageReaction. Anchor is awaited
+      // (failure surfaces to the reactor); siblings are best-effort.
+      await applyReactionToMessages({
+        tg, bot, chatId,
+        msgIds: [msg.message_id, ...(msg._albumSiblingMsgIds || [])],
+        emoji,
+        botName: BOT_NAME,
+      });
     },
     availableEmojis,
     logError: (m) => console.error(`[${label}] ${m}`),
@@ -1892,6 +1897,10 @@ function createBot(token) {
       }
 
       const synthetic = { ...primary, _mergedAttachments: merged };
+      // rc.16: carry the album sibling msg_ids so the status reactor can mirror
+      // its emoji onto every item (not just the anchor) — see the reactor
+      // `apply` closure + lib/telegram/album-reactions.js.
+      if (siblingMsgIds.length) synthetic._albumSiblingMsgIds = siblingMsgIds;
       // Carry the primary's text verbatim (dispatchRegularMessage re-cleans
       // the mention). Caption → text so downstream sees it uniformly.
       if (!synthetic.text && synthetic.caption) synthetic.text = synthetic.caption;

@@ -94,6 +94,17 @@ test('e2e: real claude channels round-trip — reply delivered, NO false bridge-
       bridgeDisconnected, false,
       "the benign 'no MCP server configured' banner must NOT trigger a false bridge-disconnect mid-turn (rc.14 regression guard)",
     );
+
+    // Turn-end observability premise: polygram resolves turns off hooks (the
+    // 0.12 channels+hooks design), so the Stop hook MUST be written to the
+    // ndjson. If this is empty, the whole hook pipeline is broken (the cause
+    // of the 2026-06-02 stuck-turn) and no turn-resolution logic can work.
+    const hookNdjson = proc._hookNdjsonPath;
+    const hookContent = (hookNdjson && fs.existsSync(hookNdjson)) ? fs.readFileSync(hookNdjson, 'utf8') : '';
+    assert.match(
+      hookContent, /"hook_event_name"\s*:\s*"Stop"/,
+      `the Stop hook MUST land in the ndjson (turn-end is observed via hooks, not the pane). ndjson=${hookNdjson} size=${hookContent.length}`,
+    );
   } finally {
     try { await proc.kill('e2e-done'); } catch {}
     try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}

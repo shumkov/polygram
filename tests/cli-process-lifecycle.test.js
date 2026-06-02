@@ -630,3 +630,53 @@ test('rc.13 compaction-warn: proactive does NOT fire below threshold', async () 
   _cwFs.rmSync(dir, { recursive: true, force: true });
   assert.equal(warned, false, '~50% is below the 75% threshold → no warning');
 });
+
+// ─── rc.16: Stop hook is the authoritative turn-end (Phase 1.7 completion) ───
+//
+// Bug (2026-06-02 stuck Music turn): a turn that ended WITHOUT a reply tool
+// call had no quiet-window to fire _resolveTurn, and the Stop hook was only
+// consumed inside that post-reply grace window — so such a turn hung until the
+// 30-min wall-clock backstop while the unknown-prompt watchdog spun. This is a
+// REAL fix (Stop resolves the turn), not a pane-scraping workaround. The e2e
+// (tests/e2e-channels-real-claude.test.js) confirms the Stop hook actually
+// lands in the ndjson, so this resolution path is reachable in production.
+
+test('rc.16: Stop resolves an in-flight turn that ended WITHOUT a reply tool call (delivers fallback text)', () => {
+  const { proc, events } = makeProcWithCapture('');
+  let result = null;
+  proc.pendingTurns.set('t1', { resolve: (r) => { result = r; }, reject: () => {}, replies: [], startedAt: Date.now() });
+
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'Removed the skill. Done.' });
+
+  assert.ok(result, 'turn MUST resolve on Stop — not hang until the wall-clock backstop');
+  assert.equal(proc.pendingTurns.size, 0, 'pendingTurns drains');
+  assert.equal(result.text, 'Removed the skill. Done.', 'falls back to last_assistant_message when no reply tool call');
+  assert.equal(result.alreadyDelivered, false, 'no-reply fallback must be DELIVERED (nothing was sent yet) — else the user still sees nothing');
+  assert.ok(events.find((e) => e.kind === 'cli-turn-resolved-by-stop'), 'observability: cli-turn-resolved-by-stop must fire');
+});
+
+test('rc.16: Stop resolves a turn WITH replies → already-delivered, no double-send', () => {
+  const { proc } = makeProcWithCapture('');
+  let result = null;
+  proc.pendingTurns.set('t1', { resolve: (r) => { result = r; }, reject: () => {}, replies: ['hello', 'world'], startedAt: Date.now() });
+
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'ignored-when-replies-exist' });
+
+  assert.ok(result);
+  assert.equal(result.text, 'hello\n\nworld', 'uses the reply-tool text');
+  assert.equal(result.alreadyDelivered, true, 'reply-tool text was already delivered incrementally — must not re-send');
+});
+
+test('rc.16: Stop does NOT force-resolve when multiple turns are in flight (no cross-attribution)', () => {
+  const { proc, events } = makeProcWithCapture('');
+  let r1 = false, r2 = false;
+  proc.pendingTurns.set('t1', { resolve: () => { r1 = true; }, reject: () => {}, replies: [], startedAt: Date.now() });
+  proc.pendingTurns.set('t2', { resolve: () => { r2 = true; }, reject: () => {}, replies: [], startedAt: Date.now() });
+
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'x' });
+
+  assert.equal(r1, false, 'must not finalize t1 (Stop has no turn_id — cannot attribute)');
+  assert.equal(r2, false, 'must not finalize t2');
+  assert.equal(proc.pendingTurns.size, 2, 'both stay in flight (each resolves on its own grace/reply)');
+  assert.ok(events.find((e) => e.kind === 'cli-stop-unattributed'), 'observability: cli-stop-unattributed must fire');
+});
