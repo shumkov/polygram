@@ -1698,7 +1698,14 @@ function createBot(token) {
   const apiRoot = config.bot?.apiRoot;
   const bot = new Bot(token, {
     client: {
-      timeoutSeconds: 60,
+      // rc.15: with the local Bot API server, getFile DOWNLOADS the file
+      // synchronously (server fetches it from Telegram's DC, then responds) —
+      // a large lossless WAV can take >60s, so the cloud-tuned 60s timeout
+      // fired before the download finished (the file still landed on the
+      // server's disk, but polygram's getFile call already errored). The
+      // local server is localhost, so non-download calls stay fast; the
+      // higher ceiling only matters for big getFile downloads.
+      timeoutSeconds: apiRoot ? 180 : 60,
       ...(apiRoot ? { apiRoot } : {}),
     },
   });
