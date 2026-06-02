@@ -680,3 +680,62 @@ test('rc.16: Stop does NOT force-resolve when multiple turns are in flight (no c
   assert.equal(proc.pendingTurns.size, 2, 'both stay in flight (each resolves on its own grace/reply)');
   assert.ok(events.find((e) => e.kind === 'cli-stop-unattributed'), 'observability: cli-stop-unattributed must fire');
 });
+
+// ─── Finding #11: hook-Notification approval path feeds makeCanUseTool ───────
+//
+// The Phase 4.5 hook-Notification approval path (non-bypass permissionMode)
+// was shipped UNTESTED. makeCanUseTool matches gated patterns via
+// matchesAnyPattern, which reads input.command (Bash) / input.url (WebFetch) —
+// i.e. it needs the STRUCTURED tool_input. The Notification handler passed a
+// formatted STRING (_formatToolInputForApproval), so input.command was
+// undefined → a gated `Bash(rm *)` never matched → the tool was ALLOWED with
+// NO approval card. Approval gating silently failed for Bash/WebFetch on the
+// CLI backend. This test pins the structured-input contract; respond() verdict
+// mapping is covered too.
+
+const { matchesAnyPattern } = require('../lib/approvals/store');
+
+test('finding #11: hook-Notification emits STRUCTURED toolInput so gated Bash patterns actually match', () => {
+  const { proc } = makeProcWithCapture('pane');
+  proc.permissionMode = 'default';          // non-bypass → approval path active
+  proc.tmuxSession = 'pgr-testbot-channels-abc';
+
+  let approval = null;
+  proc.on('approval-required', (p) => { approval = p; });
+
+  // Real hook-Notification permission payload for a gated Bash command.
+  proc._handleHookEvent({
+    type: 'Notification',
+    toolName: 'Bash',
+    toolInput: { command: 'rm -rf /tmp/x', description: 'clean tmp' },
+    toolUseId: 'tu-1',
+    raw: {},
+  });
+
+  assert.ok(approval, 'non-bypass Notification with a tool must emit approval-required');
+  assert.equal(approval.toolName, 'Bash');
+  // The crux: matchesAnyPattern reads input.command for Bash. A formatted
+  // STRING makes that undefined → the gate never matches → silent bypass.
+  const gate = matchesAnyPattern('Bash', approval.toolInput, ['Bash(rm *)']);
+  assert.equal(
+    gate.matched, true,
+    'gated Bash(rm *) MUST match the hook-Notification toolInput — else approval gating silently fails',
+  );
+});
+
+test('finding #11: hook-Notification respond() pipes allow→"1"+Enter, deny→"3"+Enter to the TUI', async () => {
+  const { proc, sendCalls } = makeProcWithCapture('pane');
+  proc.permissionMode = 'default';
+  proc.tmuxSession = 'pgr-testbot-channels-abc';
+  let approval = null;
+  proc.on('approval-required', (p) => { approval = p; });
+
+  proc._handleHookEvent({ type: 'Notification', toolName: 'Bash', toolInput: { command: 'rm -rf /x' }, toolUseId: 'tu-2', raw: {} });
+  assert.ok(approval?.respond, 'approval-required must carry a respond closure');
+
+  await approval.respond('allow');
+  assert.deepEqual(sendCalls.map((c) => c.key), ['1', 'Enter'], "allow → '1' then Enter");
+  sendCalls.length = 0;
+  await approval.respond('deny');
+  assert.deepEqual(sendCalls.map((c) => c.key), ['3', 'Enter'], "deny → '3' then Enter");
+});
