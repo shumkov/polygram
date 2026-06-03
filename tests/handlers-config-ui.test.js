@@ -137,3 +137,52 @@ describe('MODEL_VERSIONS_DESC', () => {
     }
   });
 });
+
+describe('config card — per-topic override resolution (Music topic /model bug, 2026-06-03)', () => {
+  // The Music topic (thread 3) overrides agent → music-curation:music-curator,
+  // but /model rendered the chat-level "Agent: shumabit" because the card read
+  // chatConfig directly. The card must resolve topic > chat for the displayed
+  // agent/model/effort, mirroring the spawn path. Before the fix the new
+  // `topicConfig` arg didn't exist and these asserts fail (chat-level leaks).
+  function buildFormat() {
+    return createFormatConfigInfoText({
+      pm: { has: () => true, get: () => ({ closed: false }) },
+      db: {},
+      getClaudeSessionId: () => 'sess-abcd1234',
+    });
+  }
+
+  test('topic agent override wins over chat-level in the card', () => {
+    const fmt = buildFormat();
+    const chatConfig = { model: 'sonnet', effort: 'high', agent: 'shumabit' };
+    const out = fmt(chatConfig, 'all', 'sk', { agent: 'music-curation:music-curator' });
+    assert.match(out, /^Agent: music-curation:music-curator/m, 'must show the topic agent');
+    assert.doesNotMatch(out, /Agent: shumabit/, 'must NOT leak the chat-level agent');
+  });
+
+  test('topic model + effort overrides win in card AND keyboard ✓', () => {
+    const fmt = buildFormat();
+    const chatConfig = { model: 'sonnet', effort: 'high', agent: 'x' };
+    const topicConfig = { model: 'opus', effort: 'max' };
+    const out = fmt(chatConfig, 'all', 'sk', topicConfig);
+    assert.match(out, /^Model: opus/m);
+    assert.match(out, /^Effort: max/m);
+    const modelRow = buildConfigKeyboard(chatConfig, 'all', topicConfig).inline_keyboard[0];
+    assert.match(modelRow.find((b) => b.callback_data === 'cfg:model:opus').text, /^✓ opus$/);
+    assert.equal(modelRow.find((b) => b.callback_data === 'cfg:model:sonnet').text, 'sonnet');
+  });
+
+  test('no topic / empty / partial overrides fall back to chat-level (backward compat)', () => {
+    const fmt = buildFormat();
+    const chatConfig = { model: 'sonnet', effort: 'high', agent: 'shumabit' };
+    assert.match(fmt(chatConfig, 'all', 'sk', null), /^Agent: shumabit/m);
+    assert.match(fmt(chatConfig, 'all', 'sk', {}), /^Agent: shumabit/m);
+    assert.match(buildConfigKeyboard(chatConfig, 'all').inline_keyboard[0]
+      .find((b) => b.callback_data === 'cfg:model:sonnet').text, /^✓ sonnet$/);
+    // partial override: topic sets only agent → model/effort stay chat-level
+    const out = fmt(chatConfig, 'all', 'sk', { agent: 'curator' });
+    assert.match(out, /^Agent: curator/m);
+    assert.match(out, /^Model: sonnet/m);
+    assert.match(out, /^Effort: high/m);
+  });
+});

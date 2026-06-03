@@ -740,8 +740,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
 
   if (botAllowsCommands && (text === '/model' || text === '/config' || text === '/effort')) {
     const show = text === '/effort' ? 'effort' : text === '/model' ? 'model' : 'all';
-    const info = formatConfigInfoText(chatConfig, show, sessionKey);
-    const reply_markup = buildConfigKeyboard(chatConfig, show);
+    // Resolve per-topic overrides so a topic's card shows its REAL
+    // agent/model/effort, not the chat-level default — Music topic (thread 3)
+    // showed "Agent: shumabit" instead of music-curation:music-curator
+    // (2026-06-03). getTopicConfig returns {} when there's no active topic.
+    const _cardTopicCfg = getTopicConfig(chatConfig, threadIdStr || null);
+    const info = formatConfigInfoText(chatConfig, show, sessionKey, _cardTopicCfg);
+    const reply_markup = buildConfigKeyboard(chatConfig, show, _cardTopicCfg);
     await sendReply(info, { params: { reply_markup } });
     return;
   }
