@@ -349,3 +349,52 @@ describe('createDispatcher — happy path', () => {
     assert.equal(fx.calls.events.filter((e) => e.kind === 'handler-error').length, 0);
   });
 });
+
+describe('createDispatcher — poisoned-session reset after startup-gate death (general chat, 2026-06-03)', () => {
+  // An aged claude_session_id renders claude's "Resume from summary?" dialog
+  // whose /compact resume exits code 0 → the startup-gate reports
+  // TMUX_SESSION_GONE. Every message re-resumes the same dead id → the chat sat
+  // stuck for DAYS. Fix: poison-clear on the startup-gate codes (mirroring the
+  // BRIDGE_DISCONNECTED clear) so the NEXT message spawns FRESH (no --resume).
+  // This replaced an rc.19 in-CliProcess recursive this.start() retry that
+  // reused a lifecycle-closed instance ("cannot start a closed instance"
+  // regression that took down BOTH chats after a restart).
+  function gateErr(code) {
+    const e = new Error('[Shumabit@HOME:startup-gate] tmux session disappeared for polygram-... (matched: dev-channels, session-age)');
+    e.code = code;
+    return e;
+  }
+  async function settle() { for (let i = 0; i < 4; i++) await nextTick(); }
+
+  test('TMUX_SESSION_GONE → clearSessionId drops the unresumable session', async () => {
+    const fx = fixture({});
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(gateErr('TMUX_SESSION_GONE'));
+    await settle();
+    assert.deepEqual(fx.calls.clearSessionId, ['sk'],
+      'unresumable session id MUST be dropped so the next message spawns fresh (no --resume)');
+    assert.ok(fx.calls.events.some((e) => e.kind === 'session-reset-after-startup-gate'),
+      'forensic event must record the startup-gate poison reset');
+  });
+
+  test('CHANNELS_DIALOG_TIMEOUT also poison-clears', async () => {
+    const fx = fixture({});
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(gateErr('CHANNELS_DIALOG_TIMEOUT'));
+    await settle();
+    assert.deepEqual(fx.calls.clearSessionId, ['sk']);
+  });
+
+  test('GUARD: a non-startup-gate failure does NOT clear the session', async () => {
+    const fx = fixture({});
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    const e = new Error('claude crashed mid-turn'); // no startup-gate code
+    fx.getResolver().reject(e);
+    await settle();
+    assert.deepEqual(fx.calls.clearSessionId, [],
+      'only startup-gate deaths poison-clear; a generic failure keeps the session');
+  });
+});
