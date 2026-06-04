@@ -770,3 +770,26 @@ test('P2 watchdog: a fresh background-work window gets its own self-check', asyn
   await p._pollBackgroundWork();        // window 2: fires again
   assert.equal(p._fired.length, 2, 'fresh window → fresh self-check');
 });
+
+test('P4 visibility: emits bg-work-status running on first detection, cleared on clear', async () => {
+  const p = makeWatchdogProc({ live: true });
+  const events = [];
+  p.on('bg-work-status', (e) => events.push(e));
+  await p._pollBackgroundWork();                 // first detection → running
+  assert.equal(p._bgWorkStatusShown, true);
+  assert.deepEqual(events, [{ state: 'running', count: 1 }]);
+  p._probeState = { live: false, count: 0 };
+  await p._pollBackgroundWork();                 // work clears → cleared
+  assert.equal(p._bgWorkStatusShown, false);
+  assert.deepEqual(events, [{ state: 'running', count: 1 }, { state: 'cleared' }]);
+});
+
+test('P4 visibility: exactly one running emit while work stays live', async () => {
+  const p = makeWatchdogProc({ live: true });
+  const events = [];
+  p.on('bg-work-status', (e) => events.push(e));
+  await p._pollBackgroundWork();
+  await p._pollBackgroundWork();
+  await p._pollBackgroundWork();
+  assert.equal(events.filter((e) => e.state === 'running').length, 1, 'one running emit per window');
+});

@@ -922,3 +922,53 @@ describe('onCompactionWarn — per-chat compaction warning (rc.13)', () => {
     assert.ok(h.events.some((e) => e.kind === 'compaction-warn' && e.detail.kind === 'reactive'));
   });
 });
+
+describe('onBgWorkStatus — background-work visibility (Use 3)', () => {
+  test('running → posts a status message in the topic thread + stores its id', async () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    await cbs.onBgWorkStatus('12345:3', { state: 'running', count: 1 });
+    const send = h.tgCalls.find((c) => c.method === 'sendMessage');
+    assert.ok(send, 'a status message was sent');
+    assert.match(send.params.text, /working in the background/i);
+    assert.equal(send.params.message_thread_id, 3, 'posted in the topic thread');
+    assert.ok(h.events.some((e) => e.kind === 'bg-work-status' && e.detail.state === 'running'));
+  });
+
+  test('running is idempotent while one is already shown', async () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    await cbs.onBgWorkStatus('12345:3', { state: 'running', count: 1 });
+    await cbs.onBgWorkStatus('12345:3', { state: 'running', count: 2 });
+    assert.equal(h.tgCalls.filter((c) => c.method === 'sendMessage').length, 1, 'one status message, not two');
+  });
+
+  test('cleared → edits the status message to done', async () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    await cbs.onBgWorkStatus('12345:3', { state: 'running', count: 1 });
+    await cbs.onBgWorkStatus('12345:3', { state: 'cleared' });
+    const edit = h.tgCalls.find((c) => c.method === 'editMessageText');
+    assert.ok(edit, 'edited the status message');
+    assert.equal(edit.params.message_id, 1);
+    assert.match(edit.params.text, /finished/i);
+    assert.ok(h.events.some((e) => e.kind === 'bg-work-status' && e.detail.state === 'cleared'));
+  });
+
+  test('cleared with no prior running is a no-op', async () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    await cbs.onBgWorkStatus('12345:3', { state: 'cleared' });
+    assert.equal(h.tgCalls.length, 0, 'nothing to edit');
+  });
+
+  test('onClose edits a dangling status message to ended', async () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    await cbs.onBgWorkStatus('12345:3', { state: 'running', count: 1 });
+    cbs.onClose('12345:3', 0, { chatId: '12345', label: 'topic' });
+    const edit = h.tgCalls.find((c) => c.method === 'editMessageText');
+    assert.ok(edit, 'closed session edits the dangling status');
+    assert.match(edit.params.text, /ended|restarted/i);
+  });
+});
