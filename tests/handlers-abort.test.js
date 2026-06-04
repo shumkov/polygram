@@ -11,7 +11,7 @@ const { createHandleAbort } = require('../lib/handlers/abort');
 
 const silentLogger = { log: () => {}, error: () => {} };
 
-function makeDeps(overrides = {}) {
+function makeDeps({ procBackend = 'sdk', ...overrides } = {}) {
   const events = [];
   const tgCalls = [];
   const pmCalls = [];
@@ -21,8 +21,9 @@ function makeDeps(overrides = {}) {
     deps: {
       pm: {
         has: (k) => true,
-        get: (k) => ({ inFlight: true }),
+        get: (k) => ({ inFlight: true, backend: procBackend }),
         interrupt: async (k) => { pmCalls.push(['interrupt', k]); },
+        kill: async (k, reason) => { pmCalls.push(['kill', k, reason]); },
         drainQueue: (k, code) => { pmCalls.push(['drainQueue', k, code]); return 1; },
       },
       bot: { mock: true },
@@ -84,6 +85,36 @@ describe('handleAbortIfRequested — abort path', () => {
     assert.ok(drain);
     assert.equal(drain[2], 'INTERRUPTED');
     assert.equal(m.tgCalls[0].params.text, 'Stopped.');
+  });
+
+  // 2026-06-04: "/stop said Stopped but reaction+typing kept going, and it should
+  // stop everything including background like the SDK backend." A soft C-c
+  // interrupt on the channels backend leaves detached background shells +
+  // subagents running. Fix: /stop on the cli backend HARD-kills the session
+  // (process tree), respawn fresh next message. (red→green: pre-fix the cli path
+  // called interrupt, not kill.)
+  test('channels (cli) backend + active → HARD kill (not interrupt) + drainQueue + ack', async () => {
+    const m = makeDeps({ procBackend: 'cli' });
+    const fn = createHandleAbort(m.deps);
+    const r = await fn(makeMsg('stop'), '12345', { model: 'sonnet' }, 'stop');
+    assert.equal(r, true);
+    const kill = m.pmCalls.find((c) => c[0] === 'kill');
+    const interrupt = m.pmCalls.find((c) => c[0] === 'interrupt');
+    const drain = m.pmCalls.find((c) => c[0] === 'drainQueue');
+    assert.ok(kill, 'channels /stop must hard-kill the session (process tree → all background work)');
+    assert.equal(kill[2], 'abort');
+    assert.ok(!interrupt, 'channels /stop must NOT use the soft C-c interrupt (it leaves background shells running)');
+    assert.ok(drain, 'queued pendings still drained');
+    assert.equal(drain[2], 'INTERRUPTED');
+    assert.equal(m.tgCalls[0].params.text, 'Stopped.');
+  });
+
+  test('GUARD: SDK backend still uses the soft interrupt, never kill', async () => {
+    const m = makeDeps({ procBackend: 'sdk' });
+    const fn = createHandleAbort(m.deps);
+    await fn(makeMsg('stop'), '12345', { model: 'sonnet' }, 'stop');
+    assert.ok(m.pmCalls.find((c) => c[0] === 'interrupt'), 'SDK keeps the non-destructive interrupt');
+    assert.ok(!m.pmCalls.find((c) => c[0] === 'kill'), 'SDK Query must NOT be killed');
   });
 
   test('"стоп" → Russian ack', async () => {
