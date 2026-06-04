@@ -706,6 +706,33 @@ test('P1 probe: a `· 1 shell ·` scrolled into history (not the tail) is ignore
   assert.equal((await p.probeBusyState()).backgroundShell, false, 'viewport-anchored: stale scrollback must not match');
 });
 
+// Prod regression (shumorobot Music, 2026-06-04): the live mode line reads
+// "⏵⏵ bypass permissions on · 1 shell …", NOT "auto mode on …" — every
+// shumorobot session runs bypass-permissions mode, but the P0 spike was captured
+// in auto mode, so BACKGROUND_SHELL_RE anchored on "auto mode on" and NEVER
+// matched in production (bg-work-status fired zero times ever). The bg-shell
+// detector must be mode-INDEPENDENT: the `· N shell ·` count is identical across
+// modes; only the mode prefix differs.
+test('P1 probe: detects shells in BYPASS-PERMISSIONS mode (the prod default — was a silent miss)', async () => {
+  // Verbatim tail captured from the live shumorobot Music pane.
+  const pane = [
+    "⏺ I'll report back when the background job completes.",
+    '✻ Baked for 1m 35s · 1 shell still running',
+    '❯ ',
+    '  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage',
+  ].join('\n');
+  const p = makeBgProc(async () => pane);
+  const s = await p.probeBusyState();
+  assert.equal(s.backgroundShell, true, 'bypass-permissions mode line must detect the bg shell');
+  assert.equal(s.shellCount, 1);
+  assert.deepEqual(await p.hasLiveBackgroundWork(), { live: true, count: 1 });
+});
+
+test('P1 probe: accept-edits mode also detects shells (mode-independent anchor)', async () => {
+  const p = makeBgProc(async () => '  ⏵⏵ accept edits on · 2 shells · ← for agents · ↓ to manage');
+  assert.equal((await p.probeBusyState()).shellCount, 2);
+});
+
 function makeWatchdogProc({ live, count = 1, stallMs = 1000 } = {}) {
   const p = makeBgProc(async () => '');
   p.bridgeReady = true;
