@@ -649,3 +649,124 @@ test('CliProcess throws when claudeBin missing and env unset', () => {
     if (oldEnv) process.env.POLYGRAM_CLAUDE_BIN = oldEnv;
   }
 });
+
+// ─── 0.12.0 background-work lifecycle: probe + stall-watchdog ────────
+//
+// P0 (docs/0.12.0-background-work-lifecycle-plan.md) confirmed claude 2.1.158's
+// TUI mode line shows a live `· N shell ·` count while a run_in_background Bash
+// outlives its turn, clearing in-place on exit. P1 = the probe; P2 = the
+// stall-watchdog that re-invokes the agent (read-only) via fireUserMessage —
+// NOT injectUserMessage, which no-ops when !inFlight (the idle state here).
+
+function makeBgProc(captureWide) {
+  const p = new CliProcess({
+    sessionKey: 'k', chatId: '1', threadId: null, label: 'bgtest',
+    tmuxRunner: { spawn: async () => {}, killSession: async () => {}, sendControl: async () => {}, captureWide },
+    botName: 'b', claudeBin: '/usr/bin/echo', toolDispatcher: fakeDispatcher,
+    logger: { warn: () => {}, error: () => {}, log: () => {} },
+  });
+  p.tmuxSession = 'fake-tmux'; // probeBusyState early-returns without it
+  return p;
+}
+
+test('P1 probe: detects `· 1 shell ·` background-shell count in the mode line', async () => {
+  const pane = ['╭─ Claude Code ─╮', 'output', '❯ ', '  ⏵⏵ auto mode on · 1 shell · ← for agents · ↓ to manage'].join('\n');
+  const p = makeBgProc(async () => pane);
+  const s = await p.probeBusyState();
+  assert.equal(s.backgroundShell, true);
+  assert.equal(s.shellCount, 1);
+  assert.equal(s.streaming, false);
+  assert.equal(s.busy, false, 'busy stays streaming-only — abort path unchanged');
+  assert.deepEqual(await p.hasLiveBackgroundWork(), { live: true, count: 1 });
+});
+
+test('P1 probe: plural shells parse the count', async () => {
+  const p = makeBgProc(async () => '  ⏵⏵ auto mode on · 3 shells · ← for agents · ↓ to manage');
+  assert.equal((await p.probeBusyState()).shellCount, 3);
+});
+
+test('P1 probe: idle mode line with no shells → no background work', async () => {
+  const p = makeBgProc(async () => '❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)');
+  const s = await p.probeBusyState();
+  assert.equal(s.backgroundShell, false);
+  assert.equal(s.shellCount, 0);
+});
+
+test('P1 probe: streaming hint alone is NOT background work', async () => {
+  const p = makeBgProc(async () => '  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt');
+  const s = await p.probeBusyState();
+  assert.equal(s.streaming, true);
+  assert.equal(s.backgroundShell, false);
+});
+
+test('P1 probe: a `· 1 shell ·` scrolled into history (not the tail) is ignored', async () => {
+  const stale = '  ⏵⏵ auto mode on · 1 shell · ← for agents';
+  const pane = stale + '\n' + 'x'.repeat(600) + '\n❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)';
+  const p = makeBgProc(async () => pane);
+  assert.equal((await p.probeBusyState()).backgroundShell, false, 'viewport-anchored: stale scrollback must not match');
+});
+
+function makeWatchdogProc({ live, count = 1, stallMs = 1000 } = {}) {
+  const p = makeBgProc(async () => '');
+  p.bridgeReady = true;
+  p.bgWorkStallMs = stallMs;
+  p._probeState = { live, count };
+  p.hasLiveBackgroundWork = async () => p._probeState;
+  p._fired = [];
+  p.fireUserMessage = (text) => { p._fired.push(text); return true; };
+  return p;
+}
+
+test('P2 watchdog: live shell while idle → starts the clock, no fire on first tick', async () => {
+  const p = makeWatchdogProc({ live: true });
+  await p._pollBackgroundWork();
+  assert.notEqual(p._bgWorkSince, null, 'clock started');
+  assert.equal(p._fired.length, 0, 'no self-check on first observation');
+});
+
+test('P2 watchdog: stalled > bgWorkStallMs → exactly one read-only self-check via fireUserMessage', async () => {
+  const p = makeWatchdogProc({ live: true, stallMs: 1000 });
+  await p._pollBackgroundWork();        // start clock
+  p._bgWorkSince = Date.now() - 5000;   // simulate 5s elapsed (> 1s stall)
+  await p._pollBackgroundWork();        // should fire
+  assert.equal(p._fired.length, 1, 'one self-check fired');
+  assert.match(p._fired[0], /background job/i);
+  assert.match(p._fired[0], /do NOT start new work|report only/i, 'read-only framing');
+  await p._pollBackgroundWork();        // must NOT re-fire
+  assert.equal(p._fired.length, 1, 'one self-check per window');
+});
+
+test('P2 watchdog: no live shell → no fire, clock + escalations reset', async () => {
+  const p = makeWatchdogProc({ live: false, count: 0 });
+  p._bgWorkSince = Date.now() - 999999;
+  p._bgWorkEscalations = 1;
+  await p._pollBackgroundWork();
+  assert.equal(p._bgWorkSince, null);
+  assert.equal(p._bgWorkEscalations, 0);
+  assert.equal(p._fired.length, 0);
+});
+
+test('P2 watchdog: skips while a turn is in flight (no fire, clock preserved)', async () => {
+  const p = makeWatchdogProc({ live: true });
+  p._bgWorkSince = Date.now() - 999999; // would otherwise be stalled
+  p.pendingTurns.set('turn-1', {});     // active turn
+  await p._pollBackgroundWork();
+  assert.equal(p._fired.length, 0, 'no watchdog while a turn is active');
+  assert.notEqual(p._bgWorkSince, null, 'clock preserved — same shell still running');
+});
+
+test('P2 watchdog: a fresh background-work window gets its own self-check', async () => {
+  const p = makeWatchdogProc({ live: true, stallMs: 1000 });
+  await p._pollBackgroundWork();
+  p._bgWorkSince = Date.now() - 5000;
+  await p._pollBackgroundWork();        // fires (window 1)
+  assert.equal(p._fired.length, 1);
+  p._probeState = { live: false, count: 0 };
+  await p._pollBackgroundWork();        // work clears → reset
+  assert.equal(p._bgWorkSince, null);
+  p._probeState = { live: true, count: 1 };
+  await p._pollBackgroundWork();        // window 2: start clock
+  p._bgWorkSince = Date.now() - 5000;
+  await p._pollBackgroundWork();        // window 2: fires again
+  assert.equal(p._fired.length, 2, 'fresh window → fresh self-check');
+});
