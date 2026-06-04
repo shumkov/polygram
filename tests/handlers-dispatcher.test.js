@@ -82,6 +82,7 @@ function fixture(overrides = {}) {
       calls.deliverReplies.push(args);
     },
     chunkBudget: 4096,
+    startupRetryDelayMs: overrides.startupRetryDelayMs,
     getIsShuttingDown: () => overrides.shuttingDown === true,
     logger: { log: () => {}, error: () => {} },
   });
@@ -396,5 +397,92 @@ describe('createDispatcher — poisoned-session reset after startup-gate death (
     await settle();
     assert.deepEqual(fx.calls.clearSessionId, [],
       'only startup-gate deaths poison-clear; a generic failure keeps the session');
+  });
+});
+
+describe('createDispatcher — startup auto-retry (silent recovery from TMUX_SESSION_GONE)', () => {
+  // 2026-06-04 (option a). The dev-channels startup gate intermittently fails
+  // (claude exits before the channel goes live) ~once every 9h on shumorobot.
+  // Today that surfaces "🔄 That chat got stuck starting up, so I reset it. Send
+  // your message again…" and forces the user to RESEND. But TMUX_SESSION_GONE
+  // means the message was NEVER delivered to claude (the session died IN the
+  // startup gate, pre-channel) — so re-delivery is idempotent by construction.
+  // The session_id is poison-cleared on this code, so a re-dispatch spawns a
+  // FRESH session and delivers the same message. Fix: silently re-dispatch once;
+  // a transient flake never reaches the user. One-shot (_startupRetried) so a
+  // host that genuinely can't start claude shows the friendly reset reply after
+  // exactly one retry instead of looping.
+  function gateErr(code) {
+    const e = new Error('[Shumabit@HOME:startup-gate] tmux session disappeared for polygram-...');
+    e.code = code;
+    return e;
+  }
+  // The retry is scheduled via setTimeout INSIDE the rejection's .catch
+  // microtask, so we must (1) drain that microtask to let the retry timer arm,
+  // then (2) wait past the retry delay (Node clamps setTimeout(0) to ~1ms) — a
+  // plain setTimeout(0) flush-resolver scheduled before the microtask runs would
+  // otherwise win the 1ms tie and the assertion would race the retry.
+  async function flush() {
+    await nextTick();                                  // let .catch arm the retry timer
+    await new Promise((r) => setTimeout(r, 25));        // 25ms ≫ clamped retry delay
+    for (let i = 0; i < 4; i++) await nextTick();       // let the retry turn settle
+  }
+  function resetReplySent(calls) {
+    return calls.tg.some((t) => t.method === 'sendMessage'
+      && t.meta?.source === 'error-reply');
+  }
+
+  test('TMUX_SESSION_GONE → silently re-dispatches the SAME message fresh, suppresses the reset reply', async () => {
+    const handled = [];
+    let n = 0;
+    const handleMessage = (sk, chatId, msg) => {
+      handled.push(msg);
+      n += 1;
+      // First attempt dies in the startup gate; the retry succeeds.
+      return n === 1 ? Promise.reject(gateErr('TMUX_SESSION_GONE')) : Promise.resolve();
+    };
+    const fx = fixture({ handleMessage, startupRetryDelayMs: 0 });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, { ...baseMsg }, {});
+    await flush();
+
+    assert.equal(handled.length, 2, 'the message is re-dispatched exactly once on TMUX_SESSION_GONE');
+    assert.equal(handled[1]._startupRetried, true,
+      'the retry carries the one-shot marker so it cannot retry again');
+    assert.ok(fx.calls.events.some((e) => e.kind === 'startup-auto-retry'),
+      'forensic event records the silent retry');
+    assert.equal(resetReplySent(fx.calls), false,
+      'the user sees NO "reset it, resend" message — the retry recovered transparently');
+  });
+
+  test('GUARD: second startup-gate death (already retried) → NO third dispatch, shows the reset reply', async () => {
+    const handled = [];
+    const handleMessage = (sk, chatId, msg) => {
+      handled.push(msg);
+      return Promise.reject(gateErr('TMUX_SESSION_GONE')); // persistent failure
+    };
+    const fx = fixture({ handleMessage, startupRetryDelayMs: 0 });
+    // Arrive already-retried: the retry's own failure must surface, not loop.
+    fx.dispatcher.dispatchHandleMessage('sk', 100, { ...baseMsg, _startupRetried: true }, {});
+    await flush();
+
+    assert.equal(handled.length, 1, 'an already-retried message must NOT be re-dispatched again');
+    assert.ok(!fx.calls.events.some((e) => e.kind === 'startup-auto-retry'),
+      'no further retry is scheduled');
+    assert.equal(resetReplySent(fx.calls), true,
+      'a persistent startup failure still surfaces the friendly reset reply');
+  });
+
+  test('GUARD: a non-TMUX_SESSION_GONE failure is never startup-retried', async () => {
+    const handled = [];
+    const handleMessage = (sk, chatId, msg) => {
+      handled.push(msg);
+      return Promise.reject(new Error('claude crashed mid-turn')); // no startup-gate code
+    };
+    const fx = fixture({ handleMessage, startupRetryDelayMs: 0 });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, { ...baseMsg }, {});
+    await flush();
+
+    assert.equal(handled.length, 1, 'only TMUX_SESSION_GONE triggers the startup retry');
+    assert.ok(!fx.calls.events.some((e) => e.kind === 'startup-auto-retry'));
   });
 });
