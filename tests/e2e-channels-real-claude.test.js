@@ -110,3 +110,85 @@ test('e2e: real claude channels round-trip — reply delivered, NO false bridge-
     try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
   }
 });
+
+// rc.26 regression guard. The bg-work visibility feature (rc.23) silently never
+// fired in prod for SIX rc's because BACKGROUND_SHELL_RE was anchored on
+// "auto mode on", while every shumorobot session runs "⏵⏵ bypass permissions on".
+// A captured-string unit test fixes the regex, but only a REAL claude in
+// bypass-permissions mode proves the mode line renders the way the regex expects.
+// This spawns real claude, launches a real run_in_background shell, and asserts
+// the probe detects it AND bg-work-status fires — the exact path that was dead.
+test('e2e: real claude — bg-shell probe detects a detached shell in bypass-permissions mode', {
+  skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
+  timeout: 180_000,
+}, async () => {
+  // Fresh temp cwd — the startup gate navigates the "trust the files in this
+  // folder" dialog (triggers include name:'trust'). Safe to rm in finally (ours).
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-e2e-bg-'));
+  const chatConfig = { cwd, permissionMode: 'bypassPermissions', isolateUserConfig: true };
+
+  const bgStatusEvents = [];
+  const proc = new CliProcess({
+    sessionKey: 'e2e-bg:1',
+    chatId: '987654322',
+    threadId: null,
+    label: 'e2e-bg',
+    tmuxRunner: createTmuxRunner(),
+    botName: 'e2etest',
+    claudeBin: resolvePinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION),
+    toolDispatcher: async () => ({ ok: true }),
+    logger: { warn: (...a) => console.error('[e2e:warn]', ...a), error: (...a) => console.error('[e2e:err]', ...a), log: () => {}, debug: () => {} },
+    db: { logEvent: () => {} },
+  });
+  proc.on('bg-work-status', (e) => bgStatusEvents.push(e));
+
+  try {
+    await proc.start({ cwd, chatConfig, existingSessionId: null });
+
+    // Launch a REAL detached background shell that outlives the turn. Explicit
+    // about run_in_background so claude detaches it (vs blocking the turn on it).
+    await proc.send(
+      'Use the Bash tool with run_in_background set to true to run exactly this command: sleep 60. '
+      + 'Do not wait for it. Then reply with exactly the single word: STARTED',
+      {
+        timeoutMs: 120_000,
+        maxTurnMs: 150_000,
+        context: { streamer: noopStreamer, reactor: noopReactor, threadId: null },
+      },
+    );
+
+    // Turn resolved; the `sleep 60` shell is now detached and the mode line
+    // should read "⏵⏵ bypass permissions on · 1 shell · …". Poll the REAL probe
+    // — this is the assertion that the mode-independent regex matches real
+    // claude's bypass-mode TUI (the rc.26 fix). Allow a few seconds for the TUI
+    // to render the shell count after the Bash launches.
+    let probe = { live: false, count: 0 };
+    const deadline = Date.now() + 25_000;
+    while (Date.now() < deadline) {
+      probe = await proc.hasLiveBackgroundWork();
+      if (probe.live) break;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    assert.equal(
+      probe.live, true,
+      `the bg-shell probe MUST detect the detached shell in bypass-permissions mode (mode-independent regex). last probe=${JSON.stringify(probe)}`,
+    );
+    assert.ok(probe.count >= 1, `parsed shell count must be ≥1: ${JSON.stringify(probe)}`);
+
+    // End-to-end visibility: _pollBackgroundWork (idle, pendingTurns===0) must
+    // emit bg-work-status 'running' so callbacks.js can post "⏳ Working in the
+    // background…". The pong watchdog may have already emitted it on its own tick;
+    // a manual call here makes the assertion deterministic. Either way the event
+    // must be present.
+    await proc._pollBackgroundWork();
+    const running = bgStatusEvents.find((e) => e.state === 'running');
+    assert.ok(
+      running,
+      `bg-work-status 'running' MUST be emitted once a real bg shell is detected (the dead-since-rc.23 path). events=${JSON.stringify(bgStatusEvents)}`,
+    );
+    assert.ok(running.count >= 1, `the running event carries the shell count: ${JSON.stringify(running)}`);
+  } finally {
+    try { await proc.kill('e2e-done'); } catch {}
+    try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
+  }
+});

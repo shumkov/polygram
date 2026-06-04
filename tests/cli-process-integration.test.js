@@ -645,6 +645,48 @@ test('P1 #18: _handleStartupDialogs sends Enter on trust dialog', async () => {
   await cp.kill('test');
 });
 
+// Regression (2026-06-04): claude 2.1.158 reworded the trust dialog to "Quick
+// safety check: Is this a project you created or one you trust? … 1. Yes, I trust
+// this folder". The old regex /trust the files in this folder/i no longer matched,
+// so an untrusted cwd wedged the startup gate → CHANNELS_DIALOG_TIMEOUT (the E2E
+// caught this with a fresh temp dir). The mode-independent unit fixture pins the
+// NEW wording so a future reword is caught in CI (the E2E that found it is gated).
+test('P1 #18: _handleStartupDialogs sends Enter on the claude 2.1.158 trust dialog wording', async () => {
+  const sentKeys = [];
+  let phase = 0;
+  const runner = {
+    spawn: async () => {},
+    killSession: async () => {},
+    sendControl: async (_name, key) => { sentKeys.push(key); },
+    captureWide: async () => {
+      const out = phase === 0
+        ? '  Quick safety check: Is this a project you created or one you trust?\n  ❯ 1. Yes, I trust this folder\n    2. No, exit\n  Enter to confirm · Esc to cancel'
+        : 'Listening for channel messages from: server:polygram-bridge';
+      phase++;
+      return out;
+    },
+  };
+  const cp = new CliProcess({
+    sessionKey: 'sess-trust-2158', chatId: 'chat-1', threadId: null, label: 'trust2158',
+    tmuxRunner: runner, botName: 'testbot', claudeBin: '/usr/bin/true',
+    toolDispatcher: async () => ({ ok: true }),
+    logger: quietLogger,
+    handshakeTimeoutMs: 2000,
+  });
+
+  const startP = cp.start();
+  for (let i = 0; i < 50 && (!cp.sockPath || !require('fs').existsSync(cp.sockPath)); i++) {
+    await new Promise(r => setTimeout(r, 20));
+  }
+  const bridge = await connectFakeBridge({
+    sockPath: cp.sockPath, sessionKey: cp.sessionKey, secret: cp.sockSecret,
+  });
+  await startP;
+  assert.deepEqual(sentKeys, ['Enter'], 'the gate must navigate the 2.1.158 trust dialog');
+  bridge.close();
+  await cp.kill('test');
+});
+
 test('P1 #18: _handleStartupDialogs throws on 30s timeout (banner never appears)', async () => {
   const runner = {
     spawn: async () => {},
