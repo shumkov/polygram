@@ -24,17 +24,21 @@ function harness(opts = {}) {
   let sends = 0;
   const tgCalls = [];
   const answers = [];      // [sessionKey, toolCallId, result]
+  const logEvents = [];    // [{ kind, detail }]
+  const errors = [];       // logger.error messages
   const store = createQuestionStore(db);
   const h = createQuestionHandlers({
     questions: store,
     bot: {},
     botName: 'b',
-    logEvent: () => {},
+    logEvent: (kind, detail) => { logEvents.push({ kind, detail }); },
     answerQuestion: (sk, tc, result) => {
       if (opts.throwAnswer) throw new Error('bridge write-back failed');
+      if (opts.falsyAnswer) return false;   // undelivered: session gone / no live bridge
       answers.push({ sk, tc, result });
+      return true;
     },
-    logger: { error: () => {} },
+    logger: { error: (m) => { errors.push(m); } },
     tg: async (_b, method, params) => {
       tgCalls.push({ method, params });
       if (method === 'sendMessage') {
@@ -45,7 +49,7 @@ function harness(opts = {}) {
       return { ok: true };
     },
   });
-  return { db, dir, store, h, tgCalls, answers,
+  return { db, dir, store, h, tgCalls, answers, logEvents, errors,
     lastSend: () => [...tgCalls].reverse().find((c) => c.method === 'sendMessage'),
     edits: () => tgCalls.filter((c) => c.method === 'editMessageText') };
 }
@@ -172,6 +176,64 @@ describe('question handler — anti-hang on failures (review)', () => {
       assert.equal(H.store.getById(row.id).status, 'timeout');
       assert.ok(H.edits().some((e) => /timed out/i.test(e.params.text)), 'keyboard stripped with a notice');
     } finally { H.db.close(); fs.rmSync(H.dir, { recursive: true, force: true }); }
+  });
+});
+
+// Wiring-review (commit 768b17e follow-up): the anti-hang contract must also hold
+// when the STORE or the bridge write-back misbehaves, and the free-text "Other"
+// flow must reach the dispatcher even behind a group's mention gate.
+describe('question handler — wiring-review hardening', () => {
+  let H;
+  beforeEach(() => { H = harness(); });
+  afterEach(() => { try { H.db.close(); fs.rmSync(H.dir, { recursive: true, force: true }); } catch {} });
+
+  // Finding E: a throw inside tryConsumeAsAnswer (e.g. SQLITE_BUSY, poisoned
+  // state_json) must NOT propagate — the dispatcher would otherwise drop the
+  // user's unrelated message entirely (no reply, no new turn).
+  test('tryConsumeAsAnswer never throws on a store error → falls through (msg not dropped)', async () => {
+    H.store.getOpenForSession = () => { throw new Error('SQLITE_BUSY'); };
+    const r = await H.h.tryConsumeAsAnswer({ sessionKey: 's:1', fromId: 7, text: 'an unrelated message' });
+    assert.equal(r.consumed, false, 'a store error must degrade to "not an answer", never throw out of the dispatcher');
+  });
+
+  // Finding C: if renderAsk throws BEFORE a row is issued, no row exists for the
+  // sweep to recover — claude would block until the bridge's 20-min ceiling.
+  // It must answer {cancelled} immediately instead.
+  test('renderAsk throwing before issuing a row still answers claude {cancelled} (no 20-min hang)', async () => {
+    H.store.issue = () => { throw new Error('SQLITE_BUSY at issue'); };
+    await H.h.renderAsk({ sessionKey: 's:1', chatId: '100', toolCallId: 'tcZ', questions: SINGLE });
+    assert.ok(H.answers.find((a) => a.tc === 'tcZ' && a.result.cancelled),
+      'claude is answered {cancelled} rather than left to the 20-min bridge ceiling');
+  });
+
+  // Finding A: pm.answerQuestion returns false (session gone / no live bridge) —
+  // a no-op, not a throw. finalize must surface it loudly AND still resolve the
+  // row so the 30s sweep does not re-strip + re-answer it forever.
+  test('undelivered answer (answerQuestion → false) is surfaced loud + row still resolved', async () => {
+    const H2 = harness({ falsyAnswer: true });
+    try {
+      await H2.h.renderAsk({ sessionKey: 's:1', chatId: '100', toolCallId: 'tc1', questions: SINGLE });
+      const row = H2.store.getOpenForSession('s:1');
+      await H2.h.handleQuestionCallback(cbCtx(`q:${row.id}:${row.callback_token}:opt:0`));
+      assert.notEqual(H2.store.getById(row.id).status, 'pending',
+        'resolved (not left pending) so the timeout sweep does not loop forever on a dead session');
+      assert.ok(H2.logEvents.find((e) => e.kind === 'question-answer-undelivered'),
+        'undelivered delivery is emitted as an event (fail loud)');
+      assert.ok(H2.errors.some((m) => /undeliver/i.test(m)), 'and logged');
+    } finally { H2.db.close(); fs.rmSync(H2.dir, { recursive: true, force: true }); }
+  });
+
+  // Finding 1: in a mention-gated group the owner's free-text "Other" answer is
+  // sent without an @mention; the dispatcher needs a way to know it should bypass
+  // the gate. isAwaitingOtherFrom is that predicate — owner-only.
+  test('isAwaitingOtherFrom is true only for the owner of an open free-text capture', async () => {
+    await H.h.renderAsk({ sessionKey: 's:1', chatId: '100', toolCallId: 'tc1', questions: SINGLE });
+    const row = H.store.getOpenForSession('s:1');
+    assert.equal(H.h.isAwaitingOtherFrom('s:1', 7), false, 'not awaiting Other before any tap');
+    await H.h.handleQuestionCallback(cbCtx(`q:${row.id}:${row.callback_token}:other`, 7));  // user 7 claims + arms Other
+    assert.equal(H.h.isAwaitingOtherFrom('s:1', 7), true, 'owner is awaiting their free-text answer');
+    assert.equal(H.h.isAwaitingOtherFrom('s:1', 99), false, 'a different user does NOT bypass the gate');
+    assert.equal(H.h.isAwaitingOtherFrom('s:none', 7), false, 'no open question for that session');
   });
 });
 

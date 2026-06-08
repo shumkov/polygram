@@ -1859,17 +1859,25 @@ function createBot(token) {
       return;
     }
 
-    if (!shouldHandle(msg, chatConfig, botUsername)) return;
+    const threadId = msg.message_thread_id?.toString();
+    const sessionKey = getSessionKey(chatId, threadId, chatConfig);
+
+    // 0.12 interactive questions: the owner's free-text "Other" answer arrives
+    // WITHOUT an @mention, so in a mention-gated group shouldHandle would reject
+    // it and the "Other" flow would silently dead-end. Let the claimed owner's
+    // typed answer bypass the gate (owner-only; bystanders still respect it).
+    const ownsOpenOther = questionHandlers
+      ? questionHandlers.isAwaitingOtherFrom(sessionKey, msg.from?.id)
+      : false;
+    if (!ownsOpenOther && !shouldHandle(msg, chatConfig, botUsername)) return;
 
     if (botUsername) {
       msg.text = cleanText;
     }
 
-    const threadId = msg.message_thread_id?.toString();
-    const sessionKey = getSessionKey(chatId, threadId, chatConfig);
-    // 0.12 interactive questions: a typed message while a question is in free-text
-    // capture for this session+user becomes the answer (not a new turn). Only an
-    // in-progress "Other" diverts; ordinary chatter and /commands fall through.
+    // A typed message while a question is in free-text capture for this
+    // session+user becomes the answer (not a new turn). Only an in-progress
+    // "Other" diverts; ordinary chatter and /commands fall through.
     if (questionHandlers) {
       const r = await questionHandlers.tryConsumeAsAnswer({ sessionKey, fromId: msg.from?.id, text: cleanText });
       if (r.consumed) return;
