@@ -56,6 +56,8 @@ const { sweepTmuxOrphans } = require('./lib/tmux/orphan-sweep');
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
 const { createBuildSdkOptions } = require('./lib/sdk/build-options');
 const { createSdkCallbacks } = require('./lib/sdk/callbacks');
+const { createQuestionStore } = require('./lib/questions/store');
+const { createQuestionHandlers } = require('./lib/handlers/questions');
 const { createTranscribeVoiceAttachments } = require('./lib/handlers/voice');
 const { createDownloadAttachments } = require('./lib/handlers/download');
 const { createHandleConfigCallback } = require('./lib/handlers/config-callback');
@@ -644,6 +646,9 @@ let maybeInjectEditCorrection = null;
 // approvals store are available.
 let makeCanUseTool = null;
 let handleApprovalCallback = null;
+// 0.12 interactive questions — assigned in main() once db.raw + pm exist; the
+// createSdkCallbacks onQuestionAsked closure + the callback router read it late.
+let questionHandlers = null;
 let resolveApprovalWaiter = null;
 let startApprovalSweeper = null;
 let cancelAllWaiters = null;
@@ -1862,6 +1867,13 @@ function createBot(token) {
 
     const threadId = msg.message_thread_id?.toString();
     const sessionKey = getSessionKey(chatId, threadId, chatConfig);
+    // 0.12 interactive questions: a typed message while a question is in free-text
+    // capture for this session+user becomes the answer (not a new turn). Only an
+    // in-progress "Other" diverts; ordinary chatter and /commands fall through.
+    if (questionHandlers) {
+      const r = await questionHandlers.tryConsumeAsAnswer({ sessionKey, fromId: msg.from?.id, text: cleanText });
+      if (r.consumed) return;
+    }
     dispatchHandleMessage(sessionKey, chatId, msg, bot);
   };
 
@@ -1975,6 +1987,8 @@ function createBot(token) {
       const data = ctx.callbackQuery.data;
       if (data.startsWith('cfg:')) {
         await handleConfigCallback(ctx);
+      } else if (data.startsWith('q:')) {
+        if (questionHandlers) await questionHandlers.handleQuestionCallback(ctx);
       } else {
         await handleApprovalCallback(ctx);
       }
@@ -2234,6 +2248,9 @@ async function main() {
     // `[react:EMOJI]`, `No response requested.` all leaked as literal text.
     parseResponse, sanitizeAssistantReply, chunkMarkdownText, deliverReplies,
     processAndDeliverAgentText,
+    // 0.12 interactive questions: 'question-asked' (claude called the ask tool)
+    // → render the Telegram keyboard. Late-bound; questionHandlers is assigned below.
+    renderQuestion: (payload) => questionHandlers?.renderAsk(payload),
     logger: console,
   });
   // 0.10.0: sdkCallbacks (the polygram-side lifecycle handlers — status
@@ -2253,6 +2270,23 @@ async function main() {
     config, db, bot, botName: BOT_NAME, tg, logEvent,
     approvals, getChatIdFromKey, logger: console,
   }));
+
+  // 0.12 interactive questions: store + handlers + timeout sweep. answerQuestion
+  // is late-bound to pm (a tap can land minutes later, pm is live by then).
+  const questionStore = createQuestionStore(db.raw);
+  questionHandlers = createQuestionHandlers({
+    questions: questionStore, tg, bot, botName: BOT_NAME, logEvent,
+    answerQuestion: (sk, tc, result) => pm.answerQuestion(sk, tc, result),
+    logger: console,
+  });
+  // Resolve expired questions with {timedout} so claude never hangs on an ignored ask.
+  setInterval(() => {
+    try {
+      for (const row of questionStore.sweepTimedOut()) {
+        questionHandlers.expireQuestion(row).catch((e) => console.error(`[${BOT_NAME}] question expire: ${e.message}`));
+      }
+    } catch (e) { console.error(`[${BOT_NAME}] question sweep: ${e.message}`); }
+  }, 30_000).unref?.();
   buildSdkOptions = createBuildSdkOptions({
     config,
     botName: BOT_NAME,

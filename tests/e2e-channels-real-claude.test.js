@@ -111,6 +111,65 @@ test('e2e: real claude channels round-trip — reply delivered, NO false bridge-
   }
 });
 
+// 0.12 interactive questions: the FULL round-trip against real claude — claude
+// calls the `ask` tool, the daemon emits 'question-asked' (no TUI widget, no
+// wedge), we hand the answer back via writeQuestionAnswer, and claude continues
+// with the selection. This validates the bridge `ask` CallTool + question_answer
+// transport + the daemon emit/keep-alive end-to-end (the part unit tests can't).
+test('e2e: real claude — ask tool round-trip (question emitted, answer flows back)', {
+  skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
+  timeout: 180_000,
+}, async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-e2e-ask-'));
+  const chatConfig = { cwd, permissionMode: 'bypassPermissions', isolateUserConfig: true };
+  const replies = [];
+  const asked = [];
+  let chosenLabel = null;
+
+  const proc = new CliProcess({
+    sessionKey: 'e2e-ask:1', chatId: '987654323', threadId: null, label: 'e2e-ask',
+    tmuxRunner: createTmuxRunner(), botName: 'e2etest',
+    claudeBin: resolvePinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION),
+    toolDispatcher: async ({ toolName, text }) => { if (toolName === 'reply') replies.push(text); return { ok: true }; },
+    logger: { warn: (...a) => console.error('[e2e:warn]', ...a), error: (...a) => console.error('[e2e:err]', ...a), log: () => {}, debug: () => {} },
+    db: { logEvent: () => {} },
+  });
+
+  // When claude asks, answer it: pick the first option + hand it back to the tool.
+  proc.on('question-asked', (ev) => {
+    asked.push(ev);
+    const q = ev.questions?.[0];
+    if (!q || !Array.isArray(q.options) || !q.options.length) return;
+    chosenLabel = q.options[0].label;
+    proc.writeQuestionAnswer(ev.toolCallId, { answers: [{ header: q.header || '', selected: [chosenLabel] }] });
+  });
+
+  try {
+    await proc.start({ cwd, chatConfig, existingSessionId: null });
+
+    const result = await proc.send(
+      'Use the `mcp__polygram-bridge__ask` tool to ask me ONE question: "Cats or dogs?" with exactly two '
+      + 'options labelled "Cats" and "Dogs". After I answer, reply (via the reply tool) with EXACTLY: '
+      + '"You picked: <the label I chose>".',
+      { timeoutMs: 150_000, maxTurnMs: 170_000, context: { streamer: noopStreamer, reactor: noopReactor, threadId: null } },
+    );
+
+    assert.ok(asked.length >= 1, `claude must call the ask tool. asked=${JSON.stringify(asked).slice(0, 200)}`);
+    assert.ok((asked[0].questions?.[0]?.options?.length || 0) >= 2, 'the question carried its options');
+    assert.equal(asked[0].toolCallId && typeof asked[0].toolCallId, 'string');
+
+    const replyText = replies.join(' ') + ' ' + (result?.text || '');
+    assert.ok(chosenLabel, 'we recorded a chosen label');
+    assert.match(
+      replyText, new RegExp(chosenLabel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'),
+      `claude must continue and confirm the chosen label "${chosenLabel}" after the answer flowed back. replyText=${replyText.slice(0, 200)}`,
+    );
+  } finally {
+    try { await proc.kill('e2e-done'); } catch {}
+    try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
+  }
+});
+
 // rc.26 regression guard. The bg-work visibility feature (rc.23) silently never
 // fired in prod for SIX rc's because BACKGROUND_SHELL_RE was anchored on
 // "auto mode on", while every shumorobot session runs "⏵⏵ bypass permissions on".
