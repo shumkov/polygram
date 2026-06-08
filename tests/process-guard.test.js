@@ -41,11 +41,13 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const child_process = require('child_process');
+const { EventEmitter } = require('events');
 
 const {
   claimPidFile,
   releasePidFile,
   _makeUncaughtHandler,
+  guardStdio,
 } = require('../lib/process-guard');
 
 describe('claimPidFile', () => {
@@ -253,5 +255,86 @@ describe('_makeUncaughtHandler — re-entry safety + circuit breaker', () => {
     handler(new Error('out of memory')); // 2
     handler(new Error('write EIO'));   // 3 — trips
     assert.equal(exitCalls.length, 1);
+  });
+});
+
+// rc.30 follow-up: the uncaughtException handler above already prevents the
+// re-entrant LOOP, but stdout/stderr EIO/EPIPE writes during shutdown still
+// reach uncaughtException — 100 rows + a circuit-breaker panic-exit every
+// deploy (observed live on the rc.29→rc.30 restart, 2026-06-08). guardStdio
+// attaches an 'error' listener to the streams so those write errors emit on
+// the stream (dropped) instead of being promoted to uncaughtException, letting
+// the graceful drain finish. Genuine (non-EIO/EPIPE) stream errors still surface.
+describe('guardStdio — swallow stdout/stderr EPIPE/EIO on shutdown', () => {
+  function fakeStream() { return new EventEmitter(); }
+  const eio = () => Object.assign(new Error('write EIO'), { code: 'EIO' });
+  const epipe = () => Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+
+  test('baseline: an unguarded stream error throws (this is what reaches uncaughtException)', () => {
+    const s = fakeStream();
+    assert.throws(() => s.emit('error', eio()));
+  });
+
+  test('swallows EIO so it never becomes an uncaughtException', () => {
+    const s = fakeStream();
+    guardStdio({ streams: [s] });
+    assert.doesNotThrow(() => s.emit('error', eio()));
+  });
+
+  test('swallows EPIPE (broken pipe on pane teardown)', () => {
+    const s = fakeStream();
+    guardStdio({ streams: [s] });
+    assert.doesNotThrow(() => s.emit('error', epipe()));
+  });
+
+  test('does NOT mask a genuine stream error (non-EPIPE/EIO surfaces)', () => {
+    const s = fakeStream();
+    guardStdio({ streams: [s] });
+    assert.throws(() => s.emit('error', Object.assign(new Error('disk full'), { code: 'ENOSPC' })), /disk full/);
+  });
+
+  test('uninstall removes the guard (error throws again)', () => {
+    const s = fakeStream();
+    const g = guardStdio({ streams: [s] });
+    g.uninstall();
+    assert.throws(() => s.emit('error', eio()));
+  });
+
+  // The ACTUAL shutdown mechanism (rc.50 incident): stdout is a TTY/pty, so
+  // console.error → write() throws EIO SYNCHRONOUSLY. An 'error' listener does
+  // not catch a synchronous throw — guardStdio must also wrap write().
+  test('swallows a synchronous write() EIO throw → returns false, no throw', () => {
+    const s = fakeStream();
+    s.write = () => { throw eio(); };
+    guardStdio({ streams: [s] });
+    let ret;
+    assert.doesNotThrow(() => { ret = s.write('draining...\n'); });
+    assert.equal(ret, false, 'write dropped (pane gone) instead of throwing to uncaughtException');
+  });
+
+  test('a synchronous non-EIO write() error still throws (no masking)', () => {
+    const s = fakeStream();
+    s.write = () => { throw Object.assign(new Error('boom'), { code: 'ENOSPC' }); };
+    guardStdio({ streams: [s] });
+    assert.throws(() => s.write('x'), /boom/);
+  });
+
+  test('a successful write() is unaffected (normal logging passes through)', () => {
+    const s = fakeStream();
+    const seen = [];
+    s.write = (chunk) => { seen.push(chunk); return true; };
+    guardStdio({ streams: [s] });
+    assert.equal(s.write('hello'), true);
+    assert.deepEqual(seen, ['hello']);
+  });
+
+  test('uninstall restores the original write()', () => {
+    const s = fakeStream();
+    const orig = () => { throw eio(); };
+    s.write = orig;
+    const g = guardStdio({ streams: [s] });
+    g.uninstall();
+    assert.equal(s.write, orig, 'original write restored');
+    assert.throws(() => s.write('x'));
   });
 });
