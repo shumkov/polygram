@@ -472,6 +472,12 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
   assert.match(hint, /HARD CONTRACT|MUST/i, 'reply-tool directive is unambiguous');
   assert.match(hint, /Do NOT respond conversationally|inline text will/i,
     'explicitly tells claude not to respond inline');
+  // 2026-06-08 wedge mitigation: AskUserQuestion / interactive menus open a
+  // blocking TUI widget the channel can't answer → session parks. The prompt
+  // must forbid it (numbered-list-in-reply instead). REMOVE this assertion when
+  // the rich question→Telegram-keyboard feature ships (deliberate, not forgotten).
+  assert.match(hint, /NEVER use the AskUserQuestion tool/i,
+    'forbids the interactive AskUserQuestion widget (wedge mitigation)');
 });
 
 // rc.7: --mcp-config must remain the LAST flag in args (variadic <configs...>)
