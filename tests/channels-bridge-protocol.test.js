@@ -85,6 +85,16 @@ test('parseDaemonToBridgeMessage accepts tool_ack with optional error', () => {
   assert.equal(r2.ok, true);
 });
 
+test('0.13: tool_ack carries an optional message_id (reply → edit_message)', () => {
+  const ok = parseDaemonToBridgeMessage({ kind: 'tool_ack', tool_call_id: 'tc', ok: true, message_id: 4242 });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.msg.message_id, 4242, 'numeric message_id round-trips');
+  // absent is fine (errors / re-acks don't carry one)
+  assert.equal(parseDaemonToBridgeMessage({ kind: 'tool_ack', tool_call_id: 'tc', ok: true }).ok, true);
+  // null is fine (solo sticker/reaction reply has no bubble id)
+  assert.equal(parseDaemonToBridgeMessage({ kind: 'tool_ack', tool_call_id: 'tc', ok: true, message_id: null }).ok, true);
+});
+
 test('passthrough() preserves extra fields', () => {
   const r = parseBridgeToDaemonMessage({
     kind: 'tool',

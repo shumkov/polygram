@@ -169,6 +169,117 @@ test('sends file attachments via sendPhoto for images', async () => {
   }
 });
 
+// ─── 0.13 edit_message + reply returns message_id (progressive status) ──
+
+test('reply returns the message_id of the delivered bubble (numeric sent[], real deliver.js shape)', async () => {
+  const { send } = makeRecordingSend();
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot, send, chunkText: fakeChunk,
+    // real deliver.js pushes numeric message_ids, NOT objects
+    deliverReplies: async () => ({ sent: [4242], failed: [], results: [] }),
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
+  });
+  const result = await dispatcher({
+    sessionKey: 'sess-1', chatId: '12345', threadId: null,
+    toolName: 'reply', text: 'Looking into it…', files: null,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.message_id, 4242, 'claude needs this id to later edit_message it');
+});
+
+test('reply message_id also tolerates {message_id} object shape', async () => {
+  const { send } = makeRecordingSend();
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot, send, chunkText: fakeChunk,
+    deliverReplies: async () => ({ sent: [{ message_id: 99 }], failed: [], results: [] }),
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
+  });
+  const result = await dispatcher({
+    sessionKey: 'sess-1', chatId: '12345', threadId: null,
+    toolName: 'reply', text: 'hi', files: null,
+  });
+  assert.equal(result.message_id, 99);
+});
+
+test('edit_message edits the target bubble via editMessageText', async () => {
+  const { send, sent } = makeRecordingSend();
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot, send, chunkText: fakeChunk,
+    deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
+  });
+  const result = await dispatcher({
+    sessionKey: 'sess-1', chatId: '12345', threadId: '7',
+    toolName: 'edit_message', messageId: 500, text: 'Found it — fixing now…',
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.message_id, 500);
+  const edits = sent.filter(c => c.method === 'editMessageText');
+  assert.equal(edits.length, 1, 'one editMessageText call');
+  assert.equal(edits[0].params.chat_id, '12345');
+  assert.equal(edits[0].params.message_id, 500);
+  assert.equal(edits[0].params.text, 'Found it — fixing now…');
+  assert.equal(edits[0].params.message_thread_id, '7', 'thread carried for forum topics');
+});
+
+test('edit_message rejects missing message_id / chat_id / text', async () => {
+  const { send } = makeRecordingSend();
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot, send, chunkText: fakeChunk,
+    deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
+  });
+  const base = { sessionKey: 's', chatId: '1', threadId: null, toolName: 'edit_message' };
+  assert.match((await dispatcher({ ...base, messageId: null, text: 'x' })).error, /message_id missing/);
+  assert.match((await dispatcher({ ...base, chatId: null, messageId: 5, text: 'x' })).error, /chat_id missing/);
+  assert.match((await dispatcher({ ...base, messageId: 5, text: '' })).error, /text missing/);
+});
+
+test('edit_message rejects text too long to fit one bubble', async () => {
+  const { send } = makeRecordingSend();
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot, send, chunkText: fakeChunk, maxChunkLen: 50,
+    deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
+  });
+  const result = await dispatcher({
+    sessionKey: 's', chatId: '1', threadId: null,
+    toolName: 'edit_message', messageId: 5, text: 'z'.repeat(120),
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /too long/);
+});
+
+test('edit_message applies the same agent-text hygiene as reply (strips inline markers)', async () => {
+  const { send, sent } = makeRecordingSend();
+  // parseResponse strips a trailing [react:🔥] marker, returning clean text
+  const stripParse = (text) => ({ text: text.replace(/\s*\[react:[^\]]+\]\s*$/, ''), sticker: null, stickers: [], reaction: '🔥', reactions: [] });
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot, send, chunkText: fakeChunk,
+    deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
+    parseResponse: stripParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
+  });
+  await dispatcher({
+    sessionKey: 's', chatId: '1', threadId: null,
+    toolName: 'edit_message', messageId: 5, text: 'Done [react:🔥]',
+  });
+  const edit = sent.find(c => c.method === 'editMessageText');
+  assert.equal(edit.params.text, 'Done', 'inline marker stripped before edit, not leaked as literal text');
+});
+
+test('react is still unsupported (only reply + edit_message route here)', async () => {
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot, send: async () => ({}), chunkText: fakeChunk,
+    deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
+  });
+  const result = await dispatcher({
+    sessionKey: 's', chatId: '1', threadId: null, toolName: 'react', text: '🔥',
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /unsupported tool/);
+});
+
 // ─── P0 #2: file-attachment allowlist (path traversal / exfiltration) ──
 
 test('validateAttachmentPath rejects non-absolute path', () => {

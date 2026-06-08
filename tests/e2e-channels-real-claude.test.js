@@ -170,6 +170,61 @@ test('e2e: real claude — ask tool round-trip (question emitted, answer flows b
   }
 });
 
+// 0.13 edit_message: the FULL round-trip against real claude — claude sends a
+// status via `reply`, READS the message_id we return through the bridge, then
+// calls `edit_message` with that SAME id. Validates the new bridge behavior
+// (reply returns {ok,message_id}; edit_message routes through the dispatcher) —
+// the parts unit tests can't cover (the bridge .mjs CallTool + tool_ack id surfacing).
+test('e2e: real claude — edit_message round-trip (reply returns id, edit targets it)', {
+  skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
+  timeout: 180_000,
+}, async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-e2e-edit-'));
+  const chatConfig = { cwd, permissionMode: 'bypassPermissions', isolateUserConfig: true };
+  const REPLY_MSG_ID = 7777;          // the id we hand back from the fake reply
+  const replies = [];
+  const edits = [];                   // { messageId, text }
+
+  const proc = new CliProcess({
+    sessionKey: 'e2e-edit:1', chatId: '987654324', threadId: null, label: 'e2e-edit',
+    tmuxRunner: createTmuxRunner(), botName: 'e2etest',
+    claudeBin: resolvePinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION),
+    toolDispatcher: async ({ toolName, text, messageId }) => {
+      if (toolName === 'reply') { replies.push(text); return { ok: true, message_id: REPLY_MSG_ID }; }
+      if (toolName === 'edit_message') { edits.push({ messageId, text }); return { ok: true, message_id: messageId }; }
+      return { ok: false, error: `unexpected tool ${toolName}` };
+    },
+    logger: { warn: (...a) => console.error('[e2e:warn]', ...a), error: (...a) => console.error('[e2e:err]', ...a), log: () => {}, debug: () => {} },
+    db: { logEvent: () => {} },
+  });
+
+  try {
+    await proc.start({ cwd, chatConfig, existingSessionId: null });
+
+    const result = await proc.send(
+      'Do EXACTLY this, in order: (1) call the `mcp__polygram-bridge__reply` tool with text "Working on it…" '
+      + '— it returns a message_id. (2) Then call the `mcp__polygram-bridge__edit_message` tool with that same '
+      + 'message_id and text EXACTLY: "EDIT-DONE-4242". Do not send any other messages.',
+      { timeoutMs: 150_000, maxTurnMs: 170_000, context: { streamer: noopStreamer, reactor: noopReactor, threadId: null } },
+    );
+
+    assert.ok(replies.length >= 1, `claude must first reply. replies=${JSON.stringify(replies).slice(0, 200)}`);
+    assert.ok(edits.length >= 1, `claude must call edit_message. edits=${JSON.stringify(edits).slice(0, 200)} result=${JSON.stringify(result).slice(0, 200)}`);
+    // The crux: claude used the message_id we surfaced through the bridge reply ack.
+    assert.equal(
+      Number(edits[edits.length - 1].messageId), REPLY_MSG_ID,
+      `edit_message must target the id returned by reply (${REPLY_MSG_ID}). got ${JSON.stringify(edits)}`,
+    );
+    assert.match(
+      edits[edits.length - 1].text, /EDIT-DONE-4242/,
+      `the edit must carry the new text. edits=${JSON.stringify(edits).slice(0, 200)}`,
+    );
+  } finally {
+    try { await proc.kill('e2e-done'); } catch {}
+    try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
+  }
+});
+
 // rc.26 regression guard. The bg-work visibility feature (rc.23) silently never
 // fired in prod for SIX rc's because BACKGROUND_SHELL_RE was anchored on
 // "auto mode on", while every shumorobot session runs "⏵⏵ bypass permissions on".
