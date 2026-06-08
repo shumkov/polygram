@@ -320,6 +320,47 @@ test('send() resolves after reply tool call + quiet window', async () => {
   await cp.kill('test');
 });
 
+// 2026-06-08 Shumabit@UMI WA-topic incident: claude replied ("Do this:"), then
+// kept TOOL-working in the SAME turn (Read a follow-up screenshot, ran Bash, then
+// replied "Confirmed live" 90s later — no Stop hook until the end). The reply-quiet
+// window resolved the turn mid-work (it resets only on REPLY tool calls), tearing
+// down the reactor/typing and orphaning the late reply to the autonomous path. Fix:
+// PreToolUse/PostToolUse hooks extend the quiet window (claude is still working).
+test('tool activity extends the reply-quiet window so a still-working turn is not resolved (WA-topic)', async () => {
+  const cp = new CliProcess({
+    sessionKey: 'sess-toolquiet', chatId: 'chat-1', threadId: null, label: 'test-toolquiet',
+    tmuxRunner: makeFakeRunner(), botName: 'testbot', claudeBin: '/usr/bin/true',
+    toolDispatcher: async () => ({ ok: true }),
+    logger: quietLogger,
+    handshakeTimeoutMs: 2000,
+    turnQuietMs: 10_000,        // large: the window must NOT fire during the synchronous test
+    turnTimeoutMs: 60_000,
+  });
+  const bridge = await startWithFakeBridge(cp);
+  const sendP = cp.send('analyze these two screenshots');
+  sendP.catch(() => {});        // resolves only on kill at teardown; swallow
+  await bridge.waitFor((m) => m.kind === 'user_msg');
+
+  // claude replies once → arms the per-turn quiet window.
+  bridge.send({ kind: 'tool', session: cp.sessionKey, tool_call_id: 'r1', name: 'reply', args: { chat_id: 'chat-1', text: 'Do this:' } });
+  await bridge.waitFor((m) => m.kind === 'tool_ack');
+  const [pending] = cp.pendingTurns.values();
+  assert.ok(pending.quietTimer, 'reply armed the quiet window');
+  const armedTimer = pending.quietTimer;
+
+  // claude keeps TOOL-working (reads the follow-up screenshot) — NOT a reply.
+  cp._handleHookEvent({ type: 'PostToolUse', toolName: 'Read' });
+
+  assert.equal(cp.pendingTurns.size, 1, 'turn still pending — not resolved mid-work');
+  const [pending2] = cp.pendingTurns.values();
+  assert.ok(pending2.quietTimer, 'quiet window still armed');
+  assert.notEqual(pending2.quietTimer, armedTimer,
+    'tool activity RESET (extended) the quiet window — without the fix it stays the stale timer and the turn resolves mid-work, orphaning the late reply to the autonomous path');
+
+  bridge.close();
+  await cp.kill('test');
+});
+
 test('kill() tears down socket file and rejects pending turns', async () => {
   const cp = makeCliProcess();
   const bridge = await startWithFakeBridge(cp);
