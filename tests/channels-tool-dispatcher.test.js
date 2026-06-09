@@ -267,6 +267,55 @@ test('edit_message applies the same agent-text hygiene as reply (strips inline m
   assert.equal(edit.params.text, 'Done', 'inline marker stripped before edit, not leaked as literal text');
 });
 
+test('reply with a multi-chunk send returns the FIRST bubble id (the edit handle)', async () => {
+  const { send } = makeRecordingSend();
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot, send, chunkText: fakeChunk,
+    deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
+    // control deliverResult directly: two bubbles delivered
+    processAndDeliverAgentText: async () => ({ deliverResult: { sent: [101, 102], failed: [] } }),
+  });
+  const result = await dispatcher({
+    sessionKey: 's', chatId: '1', threadId: null, toolName: 'reply', text: 'long...', files: null,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.message_id, 101, 'first chunk is the bubble claude edits');
+});
+
+test('reply with no text bubble (solo sticker, deliverResult null) returns message_id null', async () => {
+  const { send } = makeRecordingSend();
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot, send, chunkText: fakeChunk,
+    deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
+    processAndDeliverAgentText: async () => ({ deliverResult: null }),   // solo sticker/reaction
+  });
+  const result = await dispatcher({
+    sessionKey: 's', chatId: '1', threadId: null, toolName: 'reply', text: '[sticker:wave]', files: null,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.message_id, null, 'nothing to edit → null id (no crash)');
+});
+
+test('edit_message send failure surfaces ok:false (no throw, no hang)', async () => {
+  const send = async (_b, method) => {
+    if (method === 'editMessageText') throw new Error('TG 400: message to edit not found');
+    return {};
+  };
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot, send, chunkText: fakeChunk,
+    deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
+  });
+  const result = await dispatcher({
+    sessionKey: 's', chatId: '1', threadId: null,
+    toolName: 'edit_message', messageId: 9, text: 'too late',
+  });
+  assert.equal(result.ok, false, 'a failed edit returns ok:false (claude sees an error, never hangs)');
+  assert.match(result.error, /message to edit not found/);
+});
+
 test('react is still unsupported (only reply + edit_message route here)', async () => {
   const dispatcher = createChannelsToolDispatcher({
     bot: fakeBot, send: async () => ({}), chunkText: fakeChunk,

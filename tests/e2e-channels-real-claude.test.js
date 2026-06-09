@@ -201,24 +201,79 @@ test('e2e: real claude — edit_message round-trip (reply returns id, edit targe
   try {
     await proc.start({ cwd, chatConfig, existingSessionId: null });
 
+    // The plumbing (reply returns id → claude reads it → edit targets it) is 100%
+    // reliable; what's NOT reliable is claude's DISCRETION to make the 2nd tool call
+    // — it sometimes replies and ends the turn. Since this test proves the round-trip,
+    // retry past that coin-flip (each send is a fresh turn) and fail only if claude
+    // never edits across all attempts.
+    let result = null;
+    for (let attempt = 1; attempt <= 3 && edits.length === 0; attempt++) {
+      result = await proc.send(
+        'This is a test of the edit_message tool. Send a placeholder via '
+        + '`mcp__polygram-bridge__reply` with text "one moment" — it returns a message_id. '
+        + 'Then deliver your real and ONLY answer by calling `mcp__polygram-bridge__edit_message` '
+        + 'with that EXACT message_id and text "EDIT-DONE-4242". The placeholder is NOT your answer; '
+        + 'the edit is. You must call edit_message before ending your turn.',
+        { timeoutMs: 150_000, maxTurnMs: 170_000, context: { streamer: noopStreamer, reactor: noopReactor, threadId: null } },
+      );
+    }
+
+    assert.ok(replies.length >= 1, `claude must reply. replies=${JSON.stringify(replies).slice(0, 200)}`);
+    assert.ok(edits.length >= 1, `claude must call edit_message within 3 attempts. edits=${JSON.stringify(edits).slice(0, 200)} result=${JSON.stringify(result).slice(0, 200)}`);
+    // The crux: every edit targets the id surfaced through the bridge reply ack —
+    // proves claude read the returned message_id and used it. (Repeated/progressive
+    // edits to one id are covered deterministically in cli-process-dispatch.test.js;
+    // asserting an exact multi-edit SEQUENCE against real claude is flaky — the turn
+    // can resolve between steps.)
+    for (const e of edits) {
+      assert.equal(Number(e.messageId), REPLY_MSG_ID, `every edit targets reply's id (${REPLY_MSG_ID}). got ${JSON.stringify(edits)}`);
+    }
+    assert.match(edits[edits.length - 1].text, /EDIT-DONE-4242/, `the edit carries the new text. edits=${JSON.stringify(edits).slice(0, 200)}`);
+  } finally {
+    try { await proc.kill('e2e-done'); } catch {}
+    try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
+  }
+});
+
+// 0.13 edit_message FAILURE path against real claude: a failed edit (daemon returns
+// ok:false) must surface to claude as a tool error and let the turn COMPLETE — never
+// hang (edit_message is a fast ack, not a blocking await like `ask`). The fake
+// dispatcher fails the edit; claude should see the error and still finish with a reply.
+test('e2e: real claude — failed edit_message does not hang the turn (clean error)', {
+  skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
+  timeout: 180_000,
+}, async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-e2e-editfail-'));
+  const chatConfig = { cwd, permissionMode: 'bypassPermissions', isolateUserConfig: true };
+  const replies = [];
+  let editAttempts = 0;
+
+  const proc = new CliProcess({
+    sessionKey: 'e2e-editfail:1', chatId: '987654325', threadId: null, label: 'e2e-editfail',
+    tmuxRunner: createTmuxRunner(), botName: 'e2etest',
+    claudeBin: resolvePinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION),
+    toolDispatcher: async ({ toolName, text }) => {
+      if (toolName === 'reply') { replies.push(text); return { ok: true, message_id: 321 }; }
+      if (toolName === 'edit_message') { editAttempts++; return { ok: false, error: 'message to edit not found' }; }
+      return { ok: false, error: `unexpected tool ${toolName}` };
+    },
+    logger: { warn: (...a) => console.error('[e2e:warn]', ...a), error: (...a) => console.error('[e2e:err]', ...a), log: () => {}, debug: () => {} },
+    db: { logEvent: () => {} },
+  });
+
+  try {
+    await proc.start({ cwd, chatConfig, existingSessionId: null });
+
+    // The turn resolving at all (within the timeout) IS the no-hang assertion.
     const result = await proc.send(
-      'Do EXACTLY this, in order: (1) call the `mcp__polygram-bridge__reply` tool with text "Working on it…" '
-      + '— it returns a message_id. (2) Then call the `mcp__polygram-bridge__edit_message` tool with that same '
-      + 'message_id and text EXACTLY: "EDIT-DONE-4242". Do not send any other messages.',
+      'Call `mcp__polygram-bridge__reply` with "hi" to get a message_id, then call '
+      + '`mcp__polygram-bridge__edit_message` with message_id 321 and text "update". '
+      + 'If the edit fails, just call `reply` once more with text "EDIT-FAILED-OK" and stop.',
       { timeoutMs: 150_000, maxTurnMs: 170_000, context: { streamer: noopStreamer, reactor: noopReactor, threadId: null } },
     );
 
-    assert.ok(replies.length >= 1, `claude must first reply. replies=${JSON.stringify(replies).slice(0, 200)}`);
-    assert.ok(edits.length >= 1, `claude must call edit_message. edits=${JSON.stringify(edits).slice(0, 200)} result=${JSON.stringify(result).slice(0, 200)}`);
-    // The crux: claude used the message_id we surfaced through the bridge reply ack.
-    assert.equal(
-      Number(edits[edits.length - 1].messageId), REPLY_MSG_ID,
-      `edit_message must target the id returned by reply (${REPLY_MSG_ID}). got ${JSON.stringify(edits)}`,
-    );
-    assert.match(
-      edits[edits.length - 1].text, /EDIT-DONE-4242/,
-      `the edit must carry the new text. edits=${JSON.stringify(edits).slice(0, 200)}`,
-    );
+    assert.ok(editAttempts >= 1, 'claude attempted the edit');
+    assert.ok(replies.length >= 1, `the turn completed with at least one reply (no hang). replies=${JSON.stringify(replies).slice(0, 200)} result=${JSON.stringify(result).slice(0, 200)}`);
   } finally {
     try { await proc.kill('e2e-done'); } catch {}
     try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
