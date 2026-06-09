@@ -16,13 +16,21 @@ function transcript() {
   ].join('\n') + '\n';
 }
 
-function fakeFs(content) {
+function fakeFs(content, { failWrite = false } = {}) {
   const writes = {};
+  const writeTargets = [];
+  const renames = [];
   return {
-    writes,
+    writes, writeTargets, renames,
     impl: {
       readFileSync: () => { if (content == null) { const e = new Error('no file'); e.code = 'ENOENT'; throw e; } return content; },
-      writeFileSync: (p, data, opts) => { writes[p] = { data, opts }; },
+      writeFileSync: (p, data, opts) => {
+        writeTargets.push(p);
+        if (failWrite) { const e = new Error('disk full'); e.code = 'ENOSPC'; throw e; }
+        writes[p] = { data, opts };
+      },
+      renameSync: (from, to) => { renames.push({ from, to }); writes[to] = writes[from]; delete writes[from]; },
+      unlinkSync: (p) => { delete writes[p]; },
     },
   };
 }
@@ -99,5 +107,71 @@ describe('buildFork', () => {
     const r = buildFork({ transcriptPath: '/p/OLD.jsonl', targetMsgId: 200, newSessionId: 'NEW' }, { fsImpl: fakeFs('{not json\n').impl });
     assert.equal(r.ok, false);
     assert.match(r.error, /not valid JSONL/i);
+  });
+
+  // Finding B (silent-failure-hunter): the cut locator must match the channel ENVELOPE's
+  // own msg_id, never a `<reply_to msg_id="X">` echoed inside a LATER turn's body. When the
+  // genuine target (msg_id=200) has been compacted away but a later turn replied to it, the
+  // bare-substring matcher false-matches the reply turn and silently cuts at the WRONG point
+  // (reporting success) — defeating the not-found fail-safe. The fix returns not-found.
+  test('reply_to echo of a compacted-away target → not-found fail-safe (no false-match)', () => {
+    // msg_id=200's own turn is GONE (compacted). msg_id=300 replied to it, so its body
+    // carries the escaped reply_to block — `&lt;reply_to msg_id="200" …&gt;` (quotes are NOT
+    // escaped by escapeChannelBody, so the substring `msg_id="200"` is present).
+    const lines = [
+      J({ type: 'system', sessionId: 'OLD', subtype: 'init' }),
+      J({ type: 'user', sessionId: 'OLD', uuid: 'u1', message: { role: 'user', content: '<channel source="polygram-bridge" msg_id="100">remember APPLE' } }),
+      J({ type: 'assistant', sessionId: 'OLD', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'OK1' }] } }),
+      J({ type: 'user', sessionId: 'OLD', uuid: 'u3', message: { role: 'user', content: '<channel source="polygram-bridge" msg_id="300">\n&lt;reply_to msg_id="200" source="telegram"&gt;\nremember BANANA\n&lt;/reply_to&gt;\n&lt;untrusted-input&gt;and CHERRY&lt;/untrusted-input&gt;' } }),
+      J({ type: 'assistant', sessionId: 'OLD', uuid: 'a3', message: { role: 'assistant', content: [{ type: 'text', text: 'OK3' }] } }),
+    ].join('\n') + '\n';
+    const f = fakeFs(lines);
+    const r = buildFork({ transcriptPath: '/p/OLD.jsonl', targetMsgId: 200, newSessionId: 'NEW' }, { fsImpl: f.impl });
+    assert.equal(r.ok, false, 'must NOT false-match the reply_to echo in the msg_id=300 turn');
+    assert.match(r.error, /couldn.t find that message/i);
+    assert.equal(Object.keys(f.writes).length, 0, 'no fork written on the not-found fail-safe');
+  });
+
+  test('the genuine envelope still matches even when a later turn echoes its id in reply_to', () => {
+    // Both the real target (msg_id=200, its OWN envelope) AND a later reply to it are present.
+    // The cut must land on the genuine target turn, dropping it and everything after.
+    const lines = [
+      J({ type: 'system', sessionId: 'OLD' }),
+      J({ type: 'user', sessionId: 'OLD', message: { role: 'user', content: '<channel source="polygram-bridge" msg_id="100">APPLE' } }),
+      J({ type: 'user', sessionId: 'OLD', message: { role: 'user', content: '<channel source="polygram-bridge" msg_id="200">BANANA' } }),
+      J({ type: 'assistant', sessionId: 'OLD', message: { role: 'assistant', content: [{ type: 'text', text: 'OK' }] } }),
+      J({ type: 'user', sessionId: 'OLD', message: { role: 'user', content: '<channel source="polygram-bridge" msg_id="300">\n&lt;reply_to msg_id="200"&gt;BANANA&lt;/reply_to&gt;CHERRY' } }),
+    ].join('\n') + '\n';
+    const f = fakeFs(lines);
+    const r = buildFork({ transcriptPath: '/p/OLD.jsonl', targetMsgId: 200, newSessionId: 'NEW' }, { fsImpl: f.impl });
+    assert.equal(r.ok, true);
+    const kept = f.writes['/p/NEW.jsonl'].data;
+    assert.ok(kept.includes('APPLE'), 'APPLE (before target) kept');
+    assert.ok(!kept.includes('BANANA'), 'target (msg_id=200) and everything after dropped');
+    assert.ok(!kept.includes('CHERRY'), 'the later reply turn dropped too');
+  });
+
+  // Finding C (silent-failure-hunter): the fork must be written atomically. A direct write to
+  // the live resume path can leave a truncated <newId>.jsonl that claude resumes as
+  // partial/empty context. Write to a temp sibling then rename into place.
+  test('atomic write: fork goes to a temp path then renames into place', () => {
+    const f = fakeFs(transcript());
+    const r = buildFork({ transcriptPath: '/p/OLD.jsonl', targetMsgId: 200, newSessionId: 'NEW' }, { fsImpl: f.impl });
+    assert.equal(r.ok, true);
+    assert.equal(f.writeTargets.length, 1, 'one write');
+    assert.notEqual(f.writeTargets[0], '/p/NEW.jsonl', 'write goes to a temp sibling, not the live resume path');
+    assert.equal(f.renames.length, 1, 'renamed into place');
+    assert.equal(f.renames[0].to, '/p/NEW.jsonl', 'rename target is the resume path');
+    assert.equal(f.renames[0].from, f.writeTargets[0], 'rename moves the temp file');
+    assert.ok(f.writes['/p/NEW.jsonl'], 'final fork lives at the resume path');
+  });
+
+  test('interrupted write leaves NO file at the resume path (cleans the temp)', () => {
+    const f = fakeFs(transcript(), { failWrite: true });
+    const r = buildFork({ transcriptPath: '/p/OLD.jsonl', targetMsgId: 200, newSessionId: 'NEW' }, { fsImpl: f.impl });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /write the fork/i);
+    assert.equal(f.writes['/p/NEW.jsonl'], undefined, 'no truncated fork at the resume path');
+    assert.equal(f.renames.length, 0, 'never renamed a failed write into place');
   });
 });

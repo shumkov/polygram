@@ -122,6 +122,38 @@ describe('createRewindHandler.tryConsume', () => {
     assert.equal(execCalls.length, 1, 'runs once the turn ends');
   });
 
+  // Finding D (both reviewers): the proc emits 'close'/'session-reset' on teardown, NEVER
+  // 'idle'. A deferred rewind parked on once('idle') is silently lost if the in-flight turn
+  // is killed/evicted/disconnected — the operator was told "queued" and then never hears back.
+  test('deferred /rewind: proc CLOSES before idle → operator is told, not left hanging', async () => {
+    const { h, execCalls, proc, lastSend } = harness({ inFlight: true });
+    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', isOperator: true, botUsername: 'b' });
+    assert.match(lastSend(), /queued/i);
+    proc.emit('close', 0);   // turn torn down (kill / LRU evict / bridge disconnect)
+    await tick();
+    assert.equal(execCalls.length, 0, 'executor does NOT run on a dead proc');
+    assert.match(lastSend(), /couldn.t rewind/i, 'operator is told instead of left waiting');
+  });
+
+  test('deferred /rewind: session-reset before idle → operator is told', async () => {
+    const { h, execCalls, proc, lastSend } = harness({ inFlight: true });
+    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', isOperator: true, botUsername: 'b' });
+    proc.emit('session-reset', { reason: 'model-change' });
+    await tick();
+    assert.equal(execCalls.length, 0);
+    assert.match(lastSend(), /couldn.t rewind/i);
+  });
+
+  test('deferred /rewind runs exactly once on idle (no double-fire if close follows)', async () => {
+    const { h, execCalls, proc } = harness({ inFlight: true });
+    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', isOperator: true, botUsername: 'b' });
+    proc.emit('idle');
+    await tick();
+    proc.emit('close', 0);   // teardown after the turn finished — must NOT re-run or re-ack
+    await tick();
+    assert.equal(execCalls.length, 1, 'ran once on idle; the trailing close is ignored');
+  });
+
   test('executor failure → "couldn\'t rewind", not a crash', async () => {
     const { h, lastSend } = harness({ inFlight: false, execResult: { ok: false, error: 'compacted transcript' } });
     await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', isOperator: true, botUsername: 'b' });

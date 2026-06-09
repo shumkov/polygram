@@ -1882,7 +1882,10 @@ function createBot(token) {
         const r = await rewindHandler.tryConsume({ sessionKey, chatId, threadId, msg, cleanText, isOperator, botUsername });
         if (r.consumed) return;
       } catch (err) {
+        // The text IS a recognized /rewind command — on an internal error, consume it anyway
+        // (Finding I). Falling through would send "/rewind" to claude as a normal prompt.
         console.error(`[${BOT_NAME}] rewind tryConsume failed: ${err?.message || err}`);
+        return;
       }
     }
 
