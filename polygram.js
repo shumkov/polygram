@@ -337,6 +337,9 @@ function formatPrompt(msg, sessionCtx, attachments = [], { sessionKey = null } =
           db,
           chatId,
           threadId: threadId || null,
+          // Per-topic sessions must only preload their OWN thread — else a message
+          // in one topic gets fed other topics' history (2026-06-09 cross-topic bleed).
+          isolateTopics: chatConfig?.isolateTopics === true,
           excludeMsgId: msg.message_id,
           logger: console,
         });

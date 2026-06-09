@@ -342,6 +342,31 @@ describe('buildHistoryBlock — rc.52 inline preload', () => {
     assert.match(blockA, /thread_id="A"/);
   });
 
+  // Cross-topic bleed fix (2026-06-09 Shumabit@UMI incident): a message in the
+  // GENERAL topic (null thread) of an isolateTopics chat must NOT preload other
+  // threads' history. Pre-fix `recent()` only filtered when threadId was truthy,
+  // so the null/General case pulled the WHOLE chat across all topics — a "Yes" in
+  // General got fed another topic's plan and acted on it.
+  test('isolateTopics: General topic (null thread) does NOT pull other threads', () => {
+    seedMessages('12345', [
+      { msg_id: 1, ts: 1_700_000_000_000, user: 'Ivan', text: 'hire-topic plan', thread_id: '2251' },
+      { msg_id: 2, ts: 1_700_000_001_000, user: 'Ivan', text: 'general-topic chatter', thread_id: null },
+    ]);
+    const block = buildHistoryBlock({ db, chatId: '12345', threadId: null, isolateTopics: true, since: null });
+    assert.match(block, /general-topic chatter/);
+    assert.doesNotMatch(block, /hire-topic plan/, 'General must NOT see thread 2251 — no cross-topic bleed');
+  });
+
+  test('isolateTopics false: chat-wide session still preloads all threads (unchanged)', () => {
+    seedMessages('12345', [
+      { msg_id: 1, ts: 1_700_000_000_000, user: 'Ivan', text: 'thread-X msg', thread_id: 'X' },
+      { msg_id: 2, ts: 1_700_000_001_000, user: 'Ivan', text: 'general msg', thread_id: null },
+    ]);
+    const block = buildHistoryBlock({ db, chatId: '12345', threadId: null, isolateTopics: false, since: null });
+    assert.match(block, /thread-X msg/);
+    assert.match(block, /general msg/);
+  });
+
   test('returns empty when db is missing or chatId missing (defensive)', () => {
     assert.equal(buildHistoryBlock({}), '');
     assert.equal(buildHistoryBlock({ db, chatId: '' }), '');
