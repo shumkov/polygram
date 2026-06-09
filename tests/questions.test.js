@@ -62,6 +62,25 @@ describe('questions — multi-select (checkboxes)', () => {
     assert.equal(kb.find(r => /submit/i.test(r[0].callback_data))[0].text, '✅ Submit');
   });
 
+  test('UNCHECKED options show an empty checkbox ☐ so multi-select reads as toggles', () => {
+    // Prod (hire topic, 2026-06-09): an unchecked multi-select button had NO prefix, so it
+    // looked identical to a single-select button — the operator couldn't tell it was a
+    // tap-to-toggle-then-submit checklist and didn't interact. Unchecked must show ☐.
+    const st = Q.initState(multi());
+    const view = Q.renderCurrent(st, BASE);
+    const kb = view.reply_markup.inline_keyboard;
+    assert.match(kb[0][0].text, /^☐ /, 'unchecked option button shows ☐');
+    assert.match(kb[1][0].text, /^☐ /);
+    assert.match(kb[2][0].text, /^☐ /);
+    assert.match(view.text, /☐ A/, 'body list shows ☐ for unchecked too');
+
+    // toggling flips just that one to ☑️; siblings stay ☐
+    const st2 = Q.applyTap(st, Q.parseAction('opt:1')).state;
+    const kb2 = Q.renderCurrent(st2, BASE).reply_markup.inline_keyboard;
+    assert.match(kb2[1][0].text, /^☑️ /, 'checked → ☑️');
+    assert.match(kb2[0][0].text, /^☐ /, 'unchecked siblings stay ☐');
+  });
+
   test('submit with zero selected is REJECTED (no ambiguous empty submit)', () => {
     const st = Q.initState(multi());
     const res = Q.applyTap(st, Q.parseAction('submit'));
