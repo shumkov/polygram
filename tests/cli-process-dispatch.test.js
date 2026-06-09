@@ -70,7 +70,23 @@ test('edit_message: a duplicate tool_call_id re-ACKs without re-dispatching (ide
   await proc._dispatchToolCall(msg);   // success → caches tool_call_id
   await proc._dispatchToolCall(msg);   // retry with same id → must NOT edit again
   assert.equal(dispatched.length, 1, 'second call with the same tool_call_id did not re-dispatch');
-  assert.ok(acks.filter((a) => a.kind === 'tool_ack' && a.ok).length >= 2, 'both calls got an ok ack');
+  const ts = acks.filter((a) => a.kind === 'tool_ack');
+  assert.ok(ts.length >= 2 && ts.every((a) => a.ok), 'both calls got an ok ack');
+  // Reviewer Finding 2: the re-ack must REPLAY the cached message_id, not drop it —
+  // else a retried reply loses its edit handle (message_id null → can't edit).
+  assert.equal(ts[1].message_id, 7, 'duplicate-id re-ack preserves the cached message_id');
+});
+
+test('reply content-dedup re-ACK preserves the message_id (progressive-status resilience)', async () => {
+  // The reachable path: claude retries an identical reply (new tool_call_id, e.g. after a
+  // slow ack). Content-dedup re-ACKs without re-dispatch — but it MUST return the original
+  // bubble id so claude keeps its edit handle, not null. (Reviewer Finding 2.)
+  const { proc, acks, dispatched } = makeProc({ dispatchResult: { ok: true, message_id: 500 } });
+  await proc._dispatchToolCall({ name: 'reply', tool_call_id: 'a', args: { chat_id: '100', text: 'Working on it…' } });
+  await proc._dispatchToolCall({ name: 'reply', tool_call_id: 'b', args: { chat_id: '100', text: 'Working on it…' } });
+  assert.equal(dispatched.length, 1, 'identical text within the window deduped (one dispatch)');
+  const ts = acks.filter((a) => a.kind === 'tool_ack');
+  assert.equal(ts[1].message_id, 500, 'deduped retry returns the ORIGINAL bubble id, not null');
 });
 
 test('edit_message: progressive — two DISTINCT edits to the same message_id both dispatch', async () => {
