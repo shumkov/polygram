@@ -26,27 +26,46 @@ describe('isRewindCommand', () => {
 
 describe('gateRewindRequest', () => {
   const op = { from: { id: 7 } };
+  // Default safe context: a DM (or isolated group), operator identity, operator access mode.
+  const ctx = { rewindSafe: true, isOperatorIdentity: true, paired: false, accessMode: 'operator', botUsername: 'mybot' };
   test('rejects when there is no reply target', () => {
-    const r = gateRewindRequest({ msg: { from: { id: 7 } }, isOperator: true });
+    const r = gateRewindRequest({ msg: { from: { id: 7 } }, ...ctx });
     assert.equal(r.ok, false);
     assert.match(r.reason, /reply to the message/i);
   });
-  test('rejects a non-operator', () => {
-    const r = gateRewindRequest({ msg: { ...op, reply_to_message: { from: { id: 7 } } }, isOperator: false });
+  test('refuses in a non-isolated group (rewind-unsafe) before anything else', () => {
+    const r = gateRewindRequest({ msg: { ...op, reply_to_message: { from: { id: 7 } } }, ...ctx, rewindSafe: false });
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /isolation|shared group/i);
+  });
+  test('rejects a non-operator in operator mode (even if paired)', () => {
+    const r = gateRewindRequest({ msg: { ...op, reply_to_message: { from: { id: 7 } } }, ...ctx, isOperatorIdentity: false, paired: true });
     assert.equal(r.ok, false);
     assert.match(r.reason, /only the operator/i);
   });
+  test('paired mode lets a paired non-operator rewind their own message', () => {
+    const r = gateRewindRequest({ msg: { ...op, reply_to_message: { from: { id: 7 } } }, ...ctx, isOperatorIdentity: false, paired: true, accessMode: 'paired' });
+    assert.equal(r.ok, true);
+  });
+  test('paired mode still rejects an UNpaired user', () => {
+    const r = gateRewindRequest({ msg: { ...op, reply_to_message: { from: { id: 7 } } }, ...ctx, isOperatorIdentity: false, paired: false, accessMode: 'paired' });
+    assert.equal(r.ok, false);
+  });
+  test('operator is allowed even in paired mode without a pairing', () => {
+    const r = gateRewindRequest({ msg: { ...op, reply_to_message: { from: { id: 7 } } }, ...ctx, isOperatorIdentity: true, paired: false, accessMode: 'paired' });
+    assert.equal(r.ok, true);
+  });
   test('rejects rewinding to ANOTHER user\'s message (ownership)', () => {
-    const r = gateRewindRequest({ msg: { ...op, reply_to_message: { from: { id: 999, username: 'someoneelse' } } }, isOperator: true, botUsername: 'mybot' });
+    const r = gateRewindRequest({ msg: { ...op, reply_to_message: { from: { id: 999, username: 'someoneelse' } } }, ...ctx });
     assert.equal(r.ok, false);
     assert.match(r.reason, /your own messages or mine/i);
   });
   test('accepts the operator\'s own message', () => {
-    const r = gateRewindRequest({ msg: { ...op, reply_to_message: { from: { id: 7 } } }, isOperator: true, botUsername: 'mybot' });
+    const r = gateRewindRequest({ msg: { ...op, reply_to_message: { from: { id: 7 } } }, ...ctx });
     assert.equal(r.ok, true);
   });
   test('accepts a bot bubble', () => {
-    const r = gateRewindRequest({ msg: { ...op, reply_to_message: { from: { id: 42, username: 'mybot' } } }, isOperator: true, botUsername: 'mybot' });
+    const r = gateRewindRequest({ msg: { ...op, reply_to_message: { from: { id: 42, username: 'mybot' } } }, ...ctx });
     assert.equal(r.ok, true);
   });
 });
@@ -78,14 +97,14 @@ const opMsg = (reply) => ({ from: { id: 7 }, reply_to_message: reply });
 describe('createRewindHandler.tryConsume', () => {
   test('non-/rewind text is not consumed', async () => {
     const { h, execCalls } = harness();
-    const r = await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ from: { id: 7 } }), cleanText: 'hello', isOperator: true, botUsername: 'b' });
+    const r = await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ from: { id: 7 } }), cleanText: 'hello', rewindSafe: true, isOperatorIdentity: true, paired: false, accessMode: 'operator', botUsername: 'b' });
     assert.equal(r.consumed, false);
     assert.equal(execCalls.length, 0);
   });
 
   test('/rewind without a reply: consumed, told why, NOT executed', async () => {
     const { h, execCalls, lastSend } = harness();
-    const r = await h.tryConsume({ sessionKey: 's', chatId: '1', msg: { from: { id: 7 } }, cleanText: '/rewind', isOperator: true, botUsername: 'b' });
+    const r = await h.tryConsume({ sessionKey: 's', chatId: '1', msg: { from: { id: 7 } }, cleanText: '/rewind', rewindSafe: true, isOperatorIdentity: true, paired: false, accessMode: 'operator', botUsername: 'b' });
     assert.equal(r.consumed, true, 'a /rewind is always consumed (never starts a normal turn)');
     assert.match(lastSend(), /reply to the message/i);
     assert.equal(execCalls.length, 0);
@@ -93,14 +112,14 @@ describe('createRewindHandler.tryConsume', () => {
 
   test('/rewind from a non-operator: consumed + rejected, NOT executed', async () => {
     const { h, execCalls, lastSend } = harness();
-    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ from: { id: 7 } }), cleanText: '/rewind', isOperator: false, botUsername: 'b' });
+    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ from: { id: 7 } }), cleanText: '/rewind', rewindSafe: true, isOperatorIdentity: false, paired: false, accessMode: 'operator', botUsername: 'b' });
     assert.match(lastSend(), /only the operator/i);
     assert.equal(execCalls.length, 0);
   });
 
   test('valid /rewind on an IDLE session: acks + executes with the target', async () => {
     const { h, execCalls, lastSend } = harness({ inFlight: false });
-    const r = await h.tryConsume({ sessionKey: 's', chatId: '1', threadId: '9', msg: opMsg({ message_id: 500, from: { id: 7 }, text: 'build the thing', date: 123 }), cleanText: '/rewind', isOperator: true, botUsername: 'b' });
+    const r = await h.tryConsume({ sessionKey: 's', chatId: '1', threadId: '9', msg: opMsg({ message_id: 500, from: { id: 7 }, text: 'build the thing', date: 123 }), cleanText: '/rewind', rewindSafe: true, isOperatorIdentity: true, paired: false, accessMode: 'operator', botUsername: 'b' });
     assert.equal(r.consumed, true);
     assert.match(lastSend(), /Rewinding/i);
     await tick();
@@ -113,7 +132,7 @@ describe('createRewindHandler.tryConsume', () => {
 
   test('valid /rewind while a turn is IN FLIGHT: deferred until idle, THEN executes', async () => {
     const { h, execCalls, proc, lastSend } = harness({ inFlight: true });
-    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', isOperator: true, botUsername: 'b' });
+    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', rewindSafe: true, isOperatorIdentity: true, paired: false, accessMode: 'operator', botUsername: 'b' });
     assert.match(lastSend(), /queued/i);
     await tick();
     assert.equal(execCalls.length, 0, 'does NOT run mid-turn');
@@ -127,7 +146,7 @@ describe('createRewindHandler.tryConsume', () => {
   // is killed/evicted/disconnected — the operator was told "queued" and then never hears back.
   test('deferred /rewind: proc CLOSES before idle → operator is told, not left hanging', async () => {
     const { h, execCalls, proc, lastSend } = harness({ inFlight: true });
-    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', isOperator: true, botUsername: 'b' });
+    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', rewindSafe: true, isOperatorIdentity: true, paired: false, accessMode: 'operator', botUsername: 'b' });
     assert.match(lastSend(), /queued/i);
     proc.emit('close', 0);   // turn torn down (kill / LRU evict / bridge disconnect)
     await tick();
@@ -137,7 +156,7 @@ describe('createRewindHandler.tryConsume', () => {
 
   test('deferred /rewind: session-reset before idle → operator is told', async () => {
     const { h, execCalls, proc, lastSend } = harness({ inFlight: true });
-    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', isOperator: true, botUsername: 'b' });
+    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', rewindSafe: true, isOperatorIdentity: true, paired: false, accessMode: 'operator', botUsername: 'b' });
     proc.emit('session-reset', { reason: 'model-change' });
     await tick();
     assert.equal(execCalls.length, 0);
@@ -146,7 +165,7 @@ describe('createRewindHandler.tryConsume', () => {
 
   test('deferred /rewind runs exactly once on idle (no double-fire if close follows)', async () => {
     const { h, execCalls, proc } = harness({ inFlight: true });
-    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', isOperator: true, botUsername: 'b' });
+    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', rewindSafe: true, isOperatorIdentity: true, paired: false, accessMode: 'operator', botUsername: 'b' });
     proc.emit('idle');
     await tick();
     proc.emit('close', 0);   // teardown after the turn finished — must NOT re-run or re-ack
@@ -156,14 +175,14 @@ describe('createRewindHandler.tryConsume', () => {
 
   test('executor failure → "couldn\'t rewind", not a crash', async () => {
     const { h, lastSend } = harness({ inFlight: false, execResult: { ok: false, error: 'compacted transcript' } });
-    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', isOperator: true, botUsername: 'b' });
+    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', rewindSafe: true, isOperatorIdentity: true, paired: false, accessMode: 'operator', botUsername: 'b' });
     await tick();
     assert.match(lastSend(), /couldn.t rewind — compacted transcript/i);
   });
 
   test('executor throwing is caught → "couldn\'t rewind"', async () => {
     const { h, lastSend } = harness({ inFlight: false, execResult: new Error('boom') });
-    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', isOperator: true, botUsername: 'b' });
+    await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ message_id: 5, from: { id: 7 }, text: 'x' }), cleanText: '/rewind', rewindSafe: true, isOperatorIdentity: true, paired: false, accessMode: 'operator', botUsername: 'b' });
     await tick();
     assert.match(lastSend(), /couldn.t rewind — boom/i);
   });

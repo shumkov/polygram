@@ -1869,17 +1869,27 @@ function createBot(token) {
     const sessionKey = getSessionKey(chatId, threadId, chatConfig);
 
     // 0.13 /rewind: the operator replies `/rewind` to a message to rewind the conversation to
-    // before it. A command, so it bypasses the mention gate. Operator-gated (paired AND, if
-    // configured, the exact operatorUserId — NOT just any paired user) + message-ownership in
-    // the handler. P1 detects/gates/defers; P2 runs the fork. Defensive: never drop a message.
+    // before it. A command, so it bypasses the mention gate. Gated in the handler: rewind-safe
+    // chat (DM or isolateTopics group) → operator/admin identity (or any paired user only when
+    // rewindAccess='paired') → message-ownership. P1 detects/gates/defers; P2 runs the fork.
+    // Defensive: never drop a message.
     if (rewindHandler && isRewindCommand(cleanText)) {
       try {
+        // Operator identity: explicit operatorUserId, else the admin user — a PRIVATE adminChatId
+        // equals that user's Telegram id. A group adminChatId (negative) is not a user id → never
+        // matches a positive sender id → default-deny (no valid operator → /rewind refused).
         const opId = config.bot?.operatorUserId;
+        const adminChatId = config.bot?.adminChatId;
+        const operatorUid = opId != null ? Number(opId) : (adminChatId != null ? Number(adminChatId) : null);
+        const isOperatorIdentity = operatorUid != null && msg.from?.id != null && Number(msg.from.id) === operatorUid;
         const paired = pairings && msg.from?.id
           ? pairings.hasLivePairing({ bot_name: BOT_NAME, user_id: msg.from.id, chat_id: chatId })
           : false;
-        const isOperator = paired && (opId == null || Number(msg.from?.id) === Number(opId));
-        const r = await rewindHandler.tryConsume({ sessionKey, chatId, threadId, msg, cleanText, isOperator, botUsername });
+        const accessMode = chatConfig?.rewindAccess === 'paired' ? 'paired' : 'operator';
+        // Rewind-safe: a DM (single session) OR a per-topic-isolated group. A shared group session
+        // would blast every topic/user on rewind — refuse.
+        const rewindSafe = msg.chat?.type === 'private' || chatConfig?.isolateTopics === true;
+        const r = await rewindHandler.tryConsume({ sessionKey, chatId, threadId, msg, cleanText, botUsername, rewindSafe, isOperatorIdentity, paired, accessMode });
         if (r.consumed) return;
       } catch (err) {
         // The text IS a recognized /rewind command — on an internal error, consume it anyway
