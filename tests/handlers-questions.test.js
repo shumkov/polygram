@@ -325,6 +325,22 @@ describe('question handler — multi-select + free-text', () => {
     assert.deepEqual(H.answers[0].result, { answers: [{ header: 'Setup', selected: [], other: 'my own answer' }] });
   });
 
+  // Prod (hire topic, 2026-06-09): a typed "Other" answer was delivered to claude but the
+  // question card stayed frozen on "Send your answer as a message." — no ✓ receipt — so the
+  // user got zero acknowledgment and thought nothing happened. A typed answer must confirm
+  // visibly the same way a button tap does (the `✓ receipt` edit at line ~299).
+  test('Other → typed reply ALSO posts a ✓ receipt (was silent: hire-topic dead-air)', async () => {
+    await H.h.renderAsk({ sessionKey: 's:1', chatId: '100', toolCallId: 'tc1', questions: SINGLE });
+    const row = H.store.getOpenForSession('s:1');
+    await H.h.handleQuestionCallback(cbCtx(`q:${row.id}:${row.callback_token}:other`, 7));
+    const before = H.edits().length;   // the "Send your answer…" edit already happened
+    await H.h.tryConsumeAsAnswer({ sessionKey: 's:1', fromId: 7, text: 'ship it tomorrow' });
+    assert.ok(
+      H.edits().slice(before).some((e) => /✓ ship it tomorrow/.test(e.params.text)),
+      'the typed answer strips the card to a ✓ receipt (visible acknowledgment)',
+    );
+  });
+
   test('typed reply with no open question is NOT consumed', async () => {
     const r = await H.h.tryConsumeAsAnswer({ sessionKey: 's:none', fromId: 7, text: 'hi' });
     assert.equal(r.consumed, false);
