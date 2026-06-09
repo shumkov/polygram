@@ -58,6 +58,7 @@ const { createBuildSdkOptions } = require('./lib/sdk/build-options');
 const { createSdkCallbacks } = require('./lib/sdk/callbacks');
 const { createQuestionStore } = require('./lib/questions/store');
 const { createQuestionHandlers } = require('./lib/handlers/questions');
+const { isRewindCommand, createRewindHandler } = require('./lib/rewind/rewind');
 const { createTranscribeVoiceAttachments } = require('./lib/handlers/voice');
 const { createDownloadAttachments } = require('./lib/handlers/download');
 const { createHandleConfigCallback } = require('./lib/handlers/config-callback');
@@ -652,6 +653,7 @@ let handleApprovalCallback = null;
 // 0.12 interactive questions — assigned in main() once db.raw + pm exist; the
 // createSdkCallbacks onQuestionAsked closure + the callback router read it late.
 let questionHandlers = null;
+let rewindHandler = null;   // 0.13 /rewind (P1); late-bound, assigned in main() after pm exists
 let resolveApprovalWaiter = null;
 let startApprovalSweeper = null;
 let cancelAllWaiters = null;
@@ -1865,6 +1867,24 @@ function createBot(token) {
     const threadId = msg.message_thread_id?.toString();
     const sessionKey = getSessionKey(chatId, threadId, chatConfig);
 
+    // 0.13 /rewind: the operator replies `/rewind` to a message to rewind the conversation to
+    // before it. A command, so it bypasses the mention gate. Operator-gated (paired AND, if
+    // configured, the exact operatorUserId — NOT just any paired user) + message-ownership in
+    // the handler. P1 detects/gates/defers; P2 runs the fork. Defensive: never drop a message.
+    if (rewindHandler && isRewindCommand(cleanText)) {
+      try {
+        const opId = config.bot?.operatorUserId;
+        const paired = pairings && msg.from?.id
+          ? pairings.hasLivePairing({ bot_name: BOT_NAME, user_id: msg.from.id, chat_id: chatId })
+          : false;
+        const isOperator = paired && (opId == null || Number(msg.from?.id) === Number(opId));
+        const r = await rewindHandler.tryConsume({ sessionKey, chatId, threadId, msg, cleanText, isOperator, botUsername });
+        if (r.consumed) return;
+      } catch (err) {
+        console.error(`[${BOT_NAME}] rewind tryConsume failed: ${err?.message || err}`);
+      }
+    }
+
     // 0.12 interactive questions: the owner's free-text "Other" answer arrives
     // WITHOUT an @mention, so in a mention-gated group shouldHandle would reject
     // it and the "Other" flow would silently dead-end. Let the claimed owner's
@@ -2298,6 +2318,18 @@ async function main() {
       }
     } catch (e) { console.error(`[${BOT_NAME}] question sweep: ${e.message}`); }
   }, 30_000).unref?.();
+
+  // 0.13 /rewind: P1 plumbing (detect + operator/ownership gate + turn-end defer + confirm).
+  // The fork executor is P2 — until it lands, a real /rewind is detected, gated, and answered
+  // with "not yet wired" rather than silently doing nothing. (channels/cli only; P0.6 proved
+  // the fork mechanism — see docs/0.13-rewind-design.md.)
+  rewindHandler = createRewindHandler({
+    pm, tg, bot, botName: BOT_NAME, logEvent, logger: console,
+    executeRewind: async (req) => {
+      logEvent('rewind-execute-stub', { session_key: req.sessionKey, target_msg_id: req.target.msg_id });
+      return { ok: false, error: 'rewind execution is not wired yet (P2)' };
+    },
+  });
   buildSdkOptions = createBuildSdkOptions({
     config,
     botName: BOT_NAME,
