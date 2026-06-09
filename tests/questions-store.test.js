@@ -44,7 +44,7 @@ describe('pending_questions store', () => {
     assert.ok(row.id);
     assert.equal(row.status, 'pending');
     assert.ok(row.callback_token && row.callback_token.length >= 16, '128-bit-ish token');
-    assert.equal(row.timeout_ts, 1000 + 8 * 60 * 1000, 'default 8-min timeout under the turn caps');
+    assert.equal(row.timeout_ts, 1000 + 30 * 60 * 1000, 'default timeout aligned to the 30-min turn absolute cap (Option A)');
     assert.deepEqual(JSON.parse(row.questions_json)[0].header, 'H');
   });
 
