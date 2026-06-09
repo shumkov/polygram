@@ -826,3 +826,17 @@ test('P4 visibility: exactly one running emit while work stays live', async () =
   await p._pollBackgroundWork();
   assert.equal(events.filter((e) => e.state === 'running').length, 1, 'one running emit per window');
 });
+
+// 0.12.0 LRU eviction-pin: the sync pin signal _evictLRU reads to skip a session with a live
+// detached background job. Mirrors _bgWorkSince exactly — NO time cap (a long job stays pinned).
+test('eviction-pin: hasActiveBackgroundWork() mirrors _bgWorkSince (no expiry)', () => {
+  const p = new CliProcess({ sessionKey: 'k', tmuxRunner: fakeRunner, botName: 'b', toolDispatcher: fakeDispatcher, claudeBin: '/usr/bin/false' });
+  assert.equal(p._bgWorkSince, null, 'starts with no background work');
+  assert.equal(p.hasActiveBackgroundWork(), false, 'null → false');
+  p._bgWorkSince = Date.now();
+  assert.equal(p.hasActiveBackgroundWork(), true, 'set → true');
+  p._bgWorkSince = Date.now() - 60 * 60 * 1000;   // an hour ago
+  assert.equal(p.hasActiveBackgroundWork(), true, 'a long-running job still pins — no time cap');
+  p._bgWorkSince = null;
+  assert.equal(p.hasActiveBackgroundWork(), false, 'cleared → false');
+});

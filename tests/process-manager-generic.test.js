@@ -274,6 +274,71 @@ describe('ProcessManager — weighted LRU eviction', () => {
   });
 });
 
+describe('ProcessManager — eviction-pin for live background work (Policy C)', () => {
+  // A Process reports active detached background work (the cli `_bgWorkSince` signal).
+  const pin = (p) => { p.hasActiveBackgroundWork = () => true; };
+
+  test('_evictLRU skips a pinned session and evicts the next-oldest UNpinned one', async () => {
+    const pm = new ProcessManager({ processFactory: mockFactory({ cost: 1 }) });
+    for (let i = 0; i < 10; i++) await pm.getOrSpawn('sk' + i);
+    pin(pm.get('sk0'));                       // oldest — but holds a live background job
+    await pm.getOrSpawn('sk10');              // budget full → must evict
+    assert.equal(pm.has('sk0'), true, 'pinned oldest survives');
+    assert.equal(pm.has('sk1'), false, 'next-oldest unpinned evicted instead');
+    assert.equal(pm.has('sk10'), true);
+    assert.equal(pm.size, 10, 'still at budget — evicted, not overflowed');
+  });
+
+  test('the UNpinned session is evicted even when the pinned one is OLDER', async () => {
+    const pm = new ProcessManager({ processFactory: mockFactory({ cost: 1 }), budget: 2 });
+    await pm.getOrSpawn('old');
+    await pm.getOrSpawn('young');
+    pin(pm.get('old'));
+    await pm.getOrSpawn('new');
+    assert.equal(pm.has('old'), true, 'older pinned survives');
+    assert.equal(pm.has('young'), false, 'younger unpinned evicted');
+    assert.equal(pm.has('new'), true);
+  });
+
+  test('Policy C: all free slots pinned → spawns OVER budget, emits lru-overflow-pinned, no job killed', async () => {
+    const events = [];
+    const pm = new ProcessManager({
+      processFactory: mockFactory({ cost: 1 }), budget: 2,
+      db: { logEvent: (kind, detail) => events.push({ kind, detail }) },
+    });
+    await pm.getOrSpawn('bg0'); await pm.getOrSpawn('bg1');
+    pin(pm.get('bg0')); pin(pm.get('bg1'));   // every free slot holds a live job
+    await pm.getOrSpawn('fresh');             // can't evict a job → soft overflow
+    assert.equal(pm.has('bg0'), true);
+    assert.equal(pm.has('bg1'), true, 'no background job killed');
+    assert.equal(pm.has('fresh'), true, 'the new chat is not blocked');
+    assert.equal(pm.size, 3);
+    assert.equal(pm.totalCost, 3, 'spawned over the budget of 2 (soft overflow)');
+    const ov = events.find((e) => e.kind === 'lru-overflow-pinned');
+    assert.ok(ov, 'lru-overflow-pinned emitted');
+    assert.deepEqual(ov.detail.pinned.sort(), ['bg0', 'bg1'], 'names the pinned sessions so the operator can /reset one');
+  });
+
+  test('park-split: all blockers inFlight (NO pin) → parks (times out), does NOT overflow', async () => {
+    const pm = new ProcessManager({ processFactory: mockFactory({ cost: 1 }), budget: 2, lruWaitMs: 80 });
+    await pm.getOrSpawn('sk0'); await pm.getOrSpawn('sk1');
+    pm.get('sk0').inFlight = true; pm.get('sk1').inFlight = true;   // transient blockers, no bg work
+    await assert.rejects(pm.getOrSpawn('sk2'), /lru wait timed out/);
+    assert.equal(pm.size, 2, 'parked for a slot — did NOT overflow the budget');
+  });
+
+  test('end-to-end: over budget with one pinned + one unpinned evicts the unpinned, keeps the background job', async () => {
+    const pm = new ProcessManager({ processFactory: mockFactory({ cost: 1 }), budget: 2 });
+    await pm.getOrSpawn('job');                // the long background job (older)
+    await pm.getOrSpawn('idle');               // a plain idle chat (younger)
+    pin(pm.get('job'));
+    await pm.getOrSpawn('new');
+    assert.equal(pm.has('job'), true, 'background-job session survives eviction');
+    assert.equal(pm.has('idle'), false, 'idle session evicted instead');
+    assert.equal(pm.size, 2, 'evicted (not overflowed) — a free unpinned slot existed');
+  });
+});
+
 describe('ProcessManager — kill / killChat / shutdown', () => {
   test('kill removes from map + calls Process.kill', async () => {
     const pm = new ProcessManager({ processFactory: mockFactory() });
