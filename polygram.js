@@ -66,6 +66,7 @@ const { createHandleConfigCallback } = require('./lib/handlers/config-callback')
 const { createHandleAbort } = require('./lib/handlers/abort');
 const { createAutosteerHandlers } = require('./lib/handlers/autosteer');
 const { createEditCorrectionInjector } = require('./lib/handlers/edit-correction');
+const { createEditRedelivery } = require('./lib/handlers/edit-redelivery');
 const { createSlashCommands } = require('./lib/handlers/slash-commands');
 const { createApprovals } = require('./lib/handlers/approvals');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
@@ -643,6 +644,7 @@ let handleAbortIfRequested = null;
 let autosteer = null;
 let dispatchSlashCommand = null;
 let maybeInjectEditCorrection = null;
+let maybePostTurnEdit = null;
 
 // rc.20: approvalCardText + safeParse moved to lib/approvals/ui.js.
 // 0.9.0 commit 29: makeCanUseTool / handleApprovalCallback /
@@ -2053,6 +2055,10 @@ function createBot(token) {
     }
     const chatId = ctx.editedMessage.chat.id.toString();
     if (!knownChat(chatId)) return;
+    // 0.12.0 spec §3 (HARD): read the OLD text BEFORE recordInbound overwrites the row — the
+    // post-turn changed-guard compares it, and the re-dispatch quotes it in reply_to so claude sees
+    // the before/after. Reading after recordInbound would yield the new text (useless).
+    const oldText = db.getMessage(chatId, ctx.editedMessage.message_id)?.text ?? null;
     recordInbound(ctx.editedMessage);
     logEvent('message-edited', {
       chat_id: chatId,
@@ -2061,16 +2067,15 @@ function createBot(token) {
     });
     console.log(`[${BOT_NAME}] edited ${chatId}/${ctx.editedMessage.message_id}`);
 
-    // 0.9.0: typo-correction injection. If the SDK still has this turn
-    // in flight (handler_status in dispatched/processing AND
-    // pm.get(sk).inFlight), inject a `[edit] corrected: <NEW>` note
-    // via the same channel autosteer uses. Lets users fix typos
-    // mid-turn without /stop + resend. No-op when the turn already
-    // completed.
+    // Mid-turn (turn still in flight) → fold into the running turn via the 0.9.0 injector. Post-turn
+    // (idle) — OR the injector no-ops because the turn just settled at the boundary — → re-dispatch
+    // the edited message as a NEW turn (0.12.0 edit re-delivery). `injected===false` gives the
+    // self-contained boundary fall-through.
     try {
-      maybeInjectEditCorrection?.(ctx.editedMessage);
+      const injected = maybeInjectEditCorrection?.(ctx.editedMessage);
+      if (!injected) maybePostTurnEdit?.(ctx.editedMessage, oldText);
     } catch (err) {
-      console.error(`[${BOT_NAME}] edit-correction injector error: ${err.message}`);
+      console.error(`[${BOT_NAME}] edit handler error: ${err.message}`);
     }
   });
 
@@ -2505,6 +2510,18 @@ async function main() {
     getIsShuttingDown: () => isShuttingDown,
     logger: console,
   }));
+  // 0.12.0 post-turn edit re-delivery: constructed AFTER dispatchHandleMessage is assigned (above).
+  // An edit while a turn is in flight folds via maybeInjectEditCorrection; an edit after the turn
+  // (or when the injector no-ops at the boundary) re-dispatches as a new turn. The on-edit 👀 is a
+  // pre-turn ack for the cold-spawn gap; the synthetic turn's own reactor then takes over the msg.
+  maybePostTurnEdit = createEditRedelivery({
+    pm, config, getSessionKey, shouldHandle, dispatchHandleMessage, bot,
+    mentionRe, botUsername,
+    react: (chatId, msgId) => applyReactionToMessages({
+      tg, bot, chatId, msgIds: [msgId], emoji: '👀', botName: BOT_NAME,
+    }).catch(() => {}),
+    logEvent, logger: console,
+  });
   ({ pollBot, startPollWatchdog } = createPollLoop({
     db, dbWrite, config, botName: BOT_NAME,
     isWellFormedMessage, getTopicName,
