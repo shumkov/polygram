@@ -180,6 +180,28 @@ describe('onClose — logs process-close event', () => {
   });
 });
 
+describe('onQuestionResumed — re-lights the turn reactor after a question is answered', () => {
+  test('sets the head pending reactor to THINKING + logs (regression guard)', () => {
+    const h = baseDeps();
+    const states = [];
+    const entry = { pendingQueue: [{ context: { reactor: { setState: (s) => states.push(s) } } }] };
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onQuestionResumed('12345:7', entry);
+    assert.deepEqual(states, ['THINKING'], 'reactor re-armed to THINKING so post-answer work shows progress');
+    assert.ok(h.events.some((e) => e.kind === 'question-resumed'), 'logs question-resumed for the forensic regression guard');
+  });
+
+  test('dead/torn-down turn (no reactor) → safe no-op, never throws', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onQuestionResumed('12345:7', { pendingQueue: [] });
+    cbs.onQuestionResumed('12345:7', { pendingQueue: [{ context: {} }] });
+    cbs.onQuestionResumed('12345:7', {});
+    cbs.onQuestionResumed('12345:7', undefined);
+    assert.ok(true, 'no throw on any degenerate entry');
+  });
+});
+
 describe('onStreamChunk — routes to head pending streamer + heartbeats reactor', () => {
   test('forwards partial to streamer.onChunk', () => {
     const h = baseDeps();

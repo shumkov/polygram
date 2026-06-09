@@ -840,3 +840,26 @@ test('eviction-pin: hasActiveBackgroundWork() mirrors _bgWorkSince (no expiry)',
   p._bgWorkSince = null;
   assert.equal(p.hasActiveBackgroundWork(), false, 'cleared → false');
 });
+
+// 0.12.0 question-progress-resume: when a blocking `ask` resolves with a REAL answer, the turn
+// resumes working but the reactor cleared during the wait and no hooks re-light it. emit
+// 'question-resumed' so polygram re-arms the reactor (prod: hire topic — "no progress after submit").
+test('writeQuestionAnswer emits question-resumed on a real answer (re-light progress)', () => {
+  const p = new CliProcess({ sessionKey: 'k', tmuxRunner: fakeRunner, botName: 'b', toolDispatcher: fakeDispatcher, claudeBin: '/usr/bin/false' });
+  p._writeToBridge = () => true;   // isolate from the bridge transport
+  p._openQuestions.add('tc1');
+  let resumed = 0;
+  p.on('question-resumed', () => resumed++);
+  p.writeQuestionAnswer('tc1', { answers: [{ header: 'X', selected: ['a'] }] });
+  assert.equal(resumed, 1, 'real answer + no open questions left → emits question-resumed');
+});
+
+test('writeQuestionAnswer does NOT emit question-resumed on cancelled/timeout (turn is ending)', () => {
+  const p = new CliProcess({ sessionKey: 'k', tmuxRunner: fakeRunner, botName: 'b', toolDispatcher: fakeDispatcher, claudeBin: '/usr/bin/false' });
+  p._writeToBridge = () => true;
+  let resumed = 0;
+  p.on('question-resumed', () => resumed++);
+  p._openQuestions.add('tc1'); p.writeQuestionAnswer('tc1', { cancelled: true });
+  p._openQuestions.add('tc2'); p.writeQuestionAnswer('tc2', { timedout: true });
+  assert.equal(resumed, 0, 'terminal results end the turn — no re-arm');
+});
