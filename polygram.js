@@ -59,6 +59,7 @@ const { createSdkCallbacks } = require('./lib/sdk/callbacks');
 const { createQuestionStore } = require('./lib/questions/store');
 const { createQuestionHandlers } = require('./lib/handlers/questions');
 const { isRewindCommand, createRewindHandler } = require('./lib/rewind/rewind');
+const { createRewindExecutor } = require('./lib/rewind/execute');
 const { createTranscribeVoiceAttachments } = require('./lib/handlers/voice');
 const { createDownloadAttachments } = require('./lib/handlers/download');
 const { createHandleConfigCallback } = require('./lib/handlers/config-callback');
@@ -2319,16 +2320,13 @@ async function main() {
     } catch (e) { console.error(`[${BOT_NAME}] question sweep: ${e.message}`); }
   }, 30_000).unref?.();
 
-  // 0.13 /rewind: P1 plumbing (detect + operator/ownership gate + turn-end defer + confirm).
-  // The fork executor is P2 — until it lands, a real /rewind is detected, gated, and answered
-  // with "not yet wired" rather than silently doing nothing. (channels/cli only; P0.6 proved
-  // the fork mechanism — see docs/0.13-rewind-design.md.)
+  // 0.13 /rewind: detect + operator/ownership gate + turn-end defer + confirm (P1), backed by
+  // the copy-only transcript-fork executor (P2/P3: fork → repoint the session → kill → delete
+  // orphaned bot messages). channels/cli only; the fork mechanism was proven in P0.6.
+  // See docs/0.13-rewind-design.md.
+  const executeRewind = createRewindExecutor({ db, pm, tg, bot, botName: BOT_NAME, logEvent, logger: console });
   rewindHandler = createRewindHandler({
-    pm, tg, bot, botName: BOT_NAME, logEvent, logger: console,
-    executeRewind: async (req) => {
-      logEvent('rewind-execute-stub', { session_key: req.sessionKey, target_msg_id: req.target.msg_id });
-      return { ok: false, error: 'rewind execution is not wired yet (P2)' };
-    },
+    pm, tg, bot, botName: BOT_NAME, logEvent, logger: console, executeRewind,
   });
   buildSdkOptions = createBuildSdkOptions({
     config,
