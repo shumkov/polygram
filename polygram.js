@@ -67,6 +67,8 @@ const { createHandleAbort } = require('./lib/handlers/abort');
 const { createAutosteerHandlers } = require('./lib/handlers/autosteer');
 const { createEditCorrectionInjector } = require('./lib/handlers/edit-correction');
 const { createEditRedelivery } = require('./lib/handlers/edit-redelivery');
+const { createGateInbound } = require('./lib/handlers/gate-inbound');
+const { createRedeliver } = require('./lib/handlers/redeliver');
 const { createSlashCommands } = require('./lib/handlers/slash-commands');
 const { createApprovals } = require('./lib/handlers/approvals');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
@@ -645,6 +647,11 @@ let autosteer = null;
 let dispatchSlashCommand = null;
 let maybeInjectEditCorrection = null;
 let maybePostTurnEdit = null;
+// 0.13 D5/D4: the ONE intake gate (assigned in createBot, where botUsername/
+// mentionRe live) + the ONE redelivery tail (assigned in main once the
+// dispatcher exists). See lib/handlers/gate-inbound.js / redeliver.js.
+let gateInbound = null;
+let redeliverAsFreshTurn = null;
 
 // rc.20: approvalCardText + safeParse moved to lib/approvals/ui.js.
 // 0.9.0 commit 29: makeCanUseTool / handleApprovalCallback /
@@ -1741,9 +1748,6 @@ function createBot(token) {
   let botUsername = '';
   // Cached once @botUsername is known — was recompiling per inbound msg.
   let mentionRe = null;
-  // Hoisted admin-command matcher; was re-allocated per message.
-  const ADMIN_CMD_RE = /^\/(model|effort|config|pair-code|pairings|unpair|new|reset|context|compact)(\s|$)/;
-  const PAIR_CLAIM_RE = /^\/pair\s+\S+/;
 
   // The filter in main() guarantees config.chats only contains chats owned
   // by BOT_NAME, so any update for a chat not in config.chats is unknown —
@@ -1841,91 +1845,38 @@ function createBot(token) {
     return newChat;
   }
 
+  // 0.13 D5: the intake chain (abort → admin/pair → rewind → ownsOpenOther ‖
+  // shouldHandle → question-consume → dispatch) moved verbatim into the ONE
+  // gate, lib/handlers/gate-inbound.js, with a tier×stage side-effect table —
+  // the edited_message path and every redelivery now run the SAME chain
+  // (pre-0.13 they ran divergent subsets; the divergences were bugs — an edit
+  // to "/stop" was injected into the very turn it tried to kill, an edit
+  // during an open "Other" capture never became the answer, and any group
+  // member's bare "stop" aborted others' turns pre-gate). Late-bound deps are
+  // getters because this runs at createBot time, before main() wires the
+  // dispatcher/handlers.
+  gateInbound = createGateInbound({
+    config,
+    getBotUsername: () => botUsername,
+    getMentionRe: () => mentionRe,
+    pairings: { hasLivePairing: (args) => !!pairings?.hasLivePairing(args) },
+    isAbortRequest,
+    handleAbortIfRequested: (...a) => handleAbortIfRequested(...a),
+    getRewindHandler: () => rewindHandler,
+    isRewindCommand,
+    getQuestionHandlers: () => questionHandlers,
+    shouldHandle,
+    getSessionKey,
+    dispatchHandleMessage: (...a) => dispatchHandleMessage(...a),
+    bot,
+    botName: BOT_NAME,
+    logEvent,
+    logger: console,
+  });
+
   // Shared post-validation dispatch. Called directly for single messages
   // and for the synthesised "primary" of a media-group bundle.
-  const dispatchRegularMessage = async (msg) => {
-    const chatId = msg.chat.id.toString();
-    const chatConfig = config.chats[chatId];
-    if (!chatConfig) return;
-
-    const rawText = msg.text || '';
-    const cleanText = mentionRe ? rawText.replace(mentionRe, '').trim() : rawText.trim();
-
-    // Abort: skip the queue entirely. Matches bilingual natural-
-    // language cues + slash variants. handleAbortIfRequested
-    // (lib/handlers/abort.js) returns true when handled — short-
-    // circuit out of dispatch.
-    if (await handleAbortIfRequested(msg, chatId, chatConfig, cleanText)) {
-      return;
-    }
-
-    const botAllowsCommands = !!config.bot?.allowConfigCommands;
-    const isAdminCmd = botAllowsCommands && ADMIN_CMD_RE.test(cleanText);
-    const isPairClaim = PAIR_CLAIM_RE.test(cleanText);
-    if (isAdminCmd || isPairClaim) {
-      msg.text = cleanText;
-      const threadId = msg.message_thread_id?.toString();
-      const sessionKey = getSessionKey(chatId, threadId, chatConfig);
-      await handleMessage(sessionKey, chatId, msg, bot);
-      return;
-    }
-
-    const threadId = msg.message_thread_id?.toString();
-    const sessionKey = getSessionKey(chatId, threadId, chatConfig);
-
-    // 0.13 /rewind: the operator replies `/rewind` to a message to rewind the conversation to
-    // before it. A command, so it bypasses the mention gate. Gated in the handler: rewind-safe
-    // chat (DM or isolateTopics group) → operator/admin identity (or any paired user only when
-    // rewindAccess='paired') → message-ownership. P1 detects/gates/defers; P2 runs the fork.
-    // Defensive: never drop a message.
-    if (rewindHandler && isRewindCommand(cleanText)) {
-      try {
-        // Operator identity: explicit operatorUserId, else the admin user — a PRIVATE adminChatId
-        // equals that user's Telegram id. A group adminChatId (negative) is not a user id → never
-        // matches a positive sender id → default-deny (no valid operator → /rewind refused).
-        const opId = config.bot?.operatorUserId;
-        const adminChatId = config.bot?.adminChatId;
-        const operatorUid = opId != null ? Number(opId) : (adminChatId != null ? Number(adminChatId) : null);
-        const isOperatorIdentity = operatorUid != null && msg.from?.id != null && Number(msg.from.id) === operatorUid;
-        const paired = pairings && msg.from?.id
-          ? pairings.hasLivePairing({ bot_name: BOT_NAME, user_id: msg.from.id, chat_id: chatId })
-          : false;
-        const accessMode = chatConfig?.rewindAccess === 'paired' ? 'paired' : 'operator';
-        // Rewind-safe: a DM (single session) OR a per-topic-isolated group. A shared group session
-        // would blast every topic/user on rewind — refuse.
-        const rewindSafe = msg.chat?.type === 'private' || chatConfig?.isolateTopics === true;
-        const r = await rewindHandler.tryConsume({ sessionKey, chatId, threadId, msg, cleanText, botUsername, rewindSafe, isOperatorIdentity, paired, accessMode });
-        if (r.consumed) return;
-      } catch (err) {
-        // The text IS a recognized /rewind command — on an internal error, consume it anyway
-        // (Finding I). Falling through would send "/rewind" to claude as a normal prompt.
-        console.error(`[${BOT_NAME}] rewind tryConsume failed: ${err?.message || err}`);
-        return;
-      }
-    }
-
-    // 0.12 interactive questions: the owner's free-text "Other" answer arrives
-    // WITHOUT an @mention, so in a mention-gated group shouldHandle would reject
-    // it and the "Other" flow would silently dead-end. Let the claimed owner's
-    // typed answer bypass the gate (owner-only; bystanders still respect it).
-    const ownsOpenOther = questionHandlers
-      ? questionHandlers.isAwaitingOtherFrom(sessionKey, msg.from?.id)
-      : false;
-    if (!ownsOpenOther && !shouldHandle(msg, chatConfig, botUsername)) return;
-
-    if (botUsername) {
-      msg.text = cleanText;
-    }
-
-    // A typed message while a question is in free-text capture for this
-    // session+user becomes the answer (not a new turn). Only an in-progress
-    // "Other" diverts; ordinary chatter and /commands fall through.
-    if (questionHandlers) {
-      const r = await questionHandlers.tryConsumeAsAnswer({ sessionKey, fromId: msg.from?.id, text: cleanText });
-      if (r.consumed) return;
-    }
-    dispatchHandleMessage(sessionKey, chatId, msg, bot);
-  };
+  const dispatchRegularMessage = async (msg) => gateInbound(msg, { tier: 'fresh' });
 
   // Media-group buffer: coalesce multi-photo uploads (Telegram delivers
   // each attachment as a separate Message sharing a `media_group_id`) into
@@ -2070,11 +2021,25 @@ function createBot(token) {
     });
     console.log(`[${BOT_NAME}] edited ${chatId}/${ctx.editedMessage.message_id}`);
 
-    // Mid-turn (turn still in flight) → fold into the running turn via the 0.9.0 injector. Post-turn
-    // (idle) — OR the injector no-ops because the turn just settled at the boundary — → re-dispatch
-    // the edited message as a NEW turn (0.12.0 edit re-delivery). `injected===false` gives the
-    // self-contained boundary fall-through.
+    // 0.13 D5: gate FIRST (tier 'edit') — the edited message's CURRENT text
+    // runs the same abort/admin/question-consume/shouldHandle chain as a fresh
+    // message. Closes the S11 holes: an edit-to-"stop" now ABORTS (identity-
+    // gated) instead of being injected into the very turn it tries to kill; an
+    // edit while that user owns an open free-text "Other" capture becomes the
+    // answer; a bystander's un-addressed edit is blocked BEFORE any inject.
+    // Only a 'pass' proceeds to the fold/redeliver machinery below.
     try {
+      const gateRes = await gateInbound(ctx.editedMessage, { tier: 'edit' });
+      if (gateRes.action !== 'pass') {
+        logEvent('edit-gated', {
+          chat_id: chatId, msg_id: ctx.editedMessage.message_id,
+          action: gateRes.action, stage: gateRes.stage ?? null,
+        });
+        return;
+      }
+      // Mid-turn (turn still in flight) → fold into the running turn via the 0.9.0
+      // injector. Post-turn (idle) — OR the injector no-ops because the turn just
+      // settled at the boundary — → re-dispatch as a NEW turn (edit re-delivery).
       const injected = maybeInjectEditCorrection?.(ctx.editedMessage);
       if (!injected) maybePostTurnEdit?.(ctx.editedMessage, oldText);
     } catch (err) {
@@ -2525,6 +2490,20 @@ async function main() {
     }).catch(() => {}),
     logEvent, logger: console,
   });
+  // 0.13 D4: the ONE redelivery tail — boot-replay (below) and the P3
+  // drop-redeliverer converge on it (once-only + _isReplay + redelivery-tier
+  // gate + 👀 ack + dispatch). startup-auto-retry deliberately stays a
+  // same-process re-dispatch (its error path must SURFACE the friendly reset
+  // reply, which the _isReplay tag would suppress); compact-replay stays a
+  // system re-push outside the user-message gate (design §6.7).
+  redeliverAsFreshTurn = createRedeliver({
+    gateInbound: (...a) => gateInbound(...a),
+    dispatchHandleMessage, getSessionKey, config, db, dbWrite,
+    react: (chatId, msgId) => applyReactionToMessages({
+      tg, bot, chatId, msgIds: [msgId], emoji: '👀', botName: BOT_NAME,
+    }).catch(() => {}),
+    bot, logEvent, logger: console,
+  });
   ({ pollBot, startPollWatchdog } = createPollLoop({
     db, dbWrite, config, botName: BOT_NAME,
     isWellFormedMessage, getTopicName,
@@ -2761,22 +2740,19 @@ async function main() {
         }
         const chatConfig = config.chats[row.chat_id];
         if (!chatConfig) { skipped += 1; continue; }
-        // Tag the reconstructed message so dispatchHandleMessage knows
-        // (a) to suppress the "Sorry I couldn't process" error reply on
-        // failure and (b) to flag handler-error events as replay.
-        reconstructed._isReplay = true;
-        // Pre-mark 'replay-attempted' so even if this attempt is killed
-        // mid-turn by yet another restart, the next boot won't replay it
-        // again. Replay is one-shot — handleMessage will overwrite to
-        // 'replied' on success, or the catch will overwrite to 'failed'.
-        // Worst case (polygram dies before either): row stays
-        // 'replay-attempted', getReplayCandidates skips it, no loop.
-        dbWrite(() => db.setInboundHandlerStatus({
-          chat_id: row.chat_id, msg_id: row.msg_id, status: 'replay-attempted',
-        }), 'set handler_status=replay-attempted');
-        const sessionKey = getSessionKey(row.chat_id, row.thread_id, chatConfig);
-        dispatchHandleMessage(sessionKey, row.chat_id, reconstructed, bot);
-        replayed += 1;
+        // 0.13 D4: through the unified redelivery tail — _isReplay tag (error
+        // reply suppressed, not replay-eligible), 'replay-attempted' pre-mark
+        // (one-shot: even if THIS attempt dies mid-turn, the next boot won't
+        // loop), the D5 gate at tier 'redelivery' (abort/admin-shaped rows are
+        // never auto-re-executed; a row whose chat lost its pairing since is
+        // re-checked), a 👀 ack so the recovery is visible, then dispatch.
+        // eslint-disable-next-line no-await-in-loop
+        const r = await redeliverAsFreshTurn({
+          chatId: row.chat_id, msg: reconstructed,
+          source: 'boot-replay', preMark: 'replay-attempted',
+        });
+        if (r.ok) replayed += 1;
+        else skipped += 1;
       }
       if (candidates.length > 0) {
         console.log(`[replay] ${replayed} turns re-dispatched, ${skipped} skipped (already replied or no chat config)`);
