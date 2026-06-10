@@ -170,6 +170,127 @@ test('e2e: real claude — ask tool round-trip (question emitted, answer flows b
   }
 });
 
+// 0.13 D1 (P1): the reply-then-ask shape against REAL claude — the prod bug-#2
+// flow that was previously untested (the ask E2E above answers synchronously,
+// so the WAIT never spans the old reply-quiet window). Claude replies FIRST,
+// then asks; we hold the answer ~8s — far past the pre-D1 finalize point
+// (reply-quiet 2s + stop-grace 2s; prod question 23745077 resolved 21ms after
+// the ask). Pre-D1 the turn is long gone when the answer lands: the
+// question-resume re-arm no-ops (pendingQueue empty) and the post-answer reply
+// orphans to the autonomous path. Under D1 the open question suspends the
+// finalizer, so the turn is STILL PENDING at answer time and the final reply
+// binds to it.
+test('e2e/D1: reply-then-ask — turn survives a delayed answer; final reply binds to the turn', {
+  skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
+  timeout: 180_000,
+}, async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-e2e-d1ask-'));
+  const chatConfig = { cwd, permissionMode: 'bypassPermissions', isolateUserConfig: true };
+  const replies = [];
+  let pendingAtAnswerTime = null;
+  let questionResumedFired = false;
+
+  const proc = new CliProcess({
+    sessionKey: 'e2e-d1ask:1', chatId: '987654329', threadId: null, label: 'e2e-d1ask',
+    tmuxRunner: createTmuxRunner(), botName: 'e2etest',
+    claudeBin: resolvePinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION),
+    toolDispatcher: async ({ toolName, text }) => { if (toolName === 'reply') replies.push(text); return { ok: true }; },
+    logger: { warn: (...a) => console.error('[e2e:warn]', ...a), error: (...a) => console.error('[e2e:err]', ...a), log: () => {}, debug: () => {} },
+    db: { logEvent: () => {} },
+  });
+  proc.on('question-resumed', () => { questionResumedFired = true; });
+
+  // Delay the answer well past the pre-D1 finalize point, then record whether
+  // the turn is still pending at the moment the answer is handed back.
+  proc.on('question-asked', (ev) => {
+    const q = ev.questions?.[0];
+    const label = q?.options?.[0]?.label || 'Yes';
+    setTimeout(() => {
+      pendingAtAnswerTime = proc.pendingTurns.size;
+      proc.writeQuestionAnswer(ev.toolCallId, { answers: [{ header: q?.header || '', selected: [label] }] });
+    }, 8_000);
+  });
+
+  try {
+    await proc.start({ cwd, chatConfig, existingSessionId: null });
+
+    const result = await proc.send(
+      'Do this in order: (1) FIRST send a short reply (via the reply tool) saying exactly "Step one done.". '
+      + '(2) THEN use the `mcp__polygram-bridge__ask` tool to ask me ONE question: "Proceed?" with options '
+      + '"Yes" and "No". (3) AFTER my answer arrives, send a final reply saying exactly "Step two done.".',
+      { timeoutMs: 150_000, maxTurnMs: 170_000, context: { streamer: noopStreamer, reactor: noopReactor, threadId: null } },
+    );
+
+    assert.equal(pendingAtAnswerTime, 1,
+      'D1: the turn must STILL be pending when the delayed answer lands — pre-D1 it finalized ~4s into the wait');
+    assert.equal(questionResumedFired, true, 'question-resumed fired on the real answer');
+    const all = replies.join(' | ') + ' | ' + (result?.text || '');
+    assert.match(all, /Step two done/i,
+      `the post-answer reply must bind to the SAME turn (not orphan to the autonomous path). got: ${all.slice(0, 300)}`);
+  } finally {
+    try { await proc.kill('e2e-done'); } catch {}
+    try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
+  }
+});
+
+// 0.13 D2 (P3): the Tier 2C fold-acknowledgment contract against REAL claude.
+// A mid-cycle inject FOLDS into the trigger's combined reply (P0 spike: no own
+// UPS, incidental echo = trigger-only) — the consumed_turn_ids field on OUR
+// reply tool schema is the only reliable fold signal. Asserts the model
+// actually sets it when instructed by the system prompt, the folded entry
+// resolves, and NO drop (= no redelivery) is declared.
+test('e2e/D2: inject-fold — consumed_turn_ids acknowledges the fold; zero input-dropped', {
+  skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
+  timeout: 180_000,
+}, async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-e2e-d2fold-'));
+  const chatConfig = { cwd, permissionMode: 'bypassPermissions', isolateUserConfig: true };
+  const replies = [];
+  let dropped = null;
+
+  const proc = new CliProcess({
+    sessionKey: 'e2e-d2fold:1', chatId: '987654331', threadId: null, label: 'e2e-d2fold',
+    tmuxRunner: createTmuxRunner(), botName: 'e2etest',
+    claudeBin: resolvePinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION),
+    toolDispatcher: async ({ toolName, text }) => { if (toolName === 'reply') replies.push(text); return { ok: true }; },
+    logger: { warn: (...a) => console.error('[e2e:warn]', ...a), error: (...a) => console.error('[e2e:err]', ...a), log: () => {}, debug: () => {} },
+    db: { logEvent: () => {} },
+    dropConfirmMs: 8_000,
+  });
+  proc.on('input-dropped', (p) => { dropped = p; });
+
+  try {
+    await proc.start({ cwd, chatConfig, existingSessionId: null });
+
+    const sendP = proc.send(
+      'Run `sleep 10` via Bash. Then send ONE reply that answers BOTH this message and any '
+      + 'follow-up channel messages you received during the sleep.',
+      { timeoutMs: 150_000, maxTurnMs: 170_000, context: { streamer: noopStreamer, reactor: noopReactor, threadId: null } },
+    );
+    await new Promise((r) => setTimeout(r, 5_000));   // mid-sleep
+    const injected = proc.injectUserMessage({
+      content: 'Mid-turn follow-up: what is 7+5? Include the answer in your reply.',
+      priority: 'next', msgId: 77, source: 'autosteer',
+    });
+    assert.equal(injected, true);
+    const injectedId = [...proc.inputLedger.keys()].find((k) => proc.inputLedger.get(k).source === 'autosteer');
+
+    await sendP;
+    // give the drop-confirm window time to (wrongly) fire if the ack failed
+    await new Promise((r) => setTimeout(r, 12_000));
+
+    const entry = proc.inputLedger.get(injectedId);
+    assert.ok(['resolved', 'seen'].includes(entry?.state),
+      `the folded inject must be acknowledged (consumed_turn_ids) or seen — got state=${entry?.state}. `
+      + `replies=${replies.join(' | ').slice(0, 200)}`);
+    assert.equal(dropped, null, 'a FOLD must never be declared dropped (the A1 base-rate inversion)');
+    assert.match(replies.join(' '), /12/, 'the fold was actually answered in the combined reply');
+  } finally {
+    try { await proc.kill('e2e-done'); } catch {}
+    try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
+  }
+});
+
 // 0.13 edit_message: the FULL round-trip against real claude — claude sends a
 // status via `reply`, READS the message_id we return through the bridge, then
 // calls `edit_message` with that SAME id. Validates the new bridge behavior

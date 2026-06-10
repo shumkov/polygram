@@ -1,0 +1,351 @@
+'use strict';
+
+/**
+ * 0.13 P1 — D1 finalizer ladder (docs/0.13-channels-lifecycle-design.md §3 D1).
+ *
+ * The channels turn no longer finalizes on the reply-quiet heuristic when the
+ * hook stream is live. The ladder:
+ *   rung 1  attributed Stop (pending.seen via UPS-envelope parse OR ≥1 bound reply;
+ *           never when stop_hook_active=true) — finalizes through stop-grace, and
+ *           any same-session activity during the grace CANCELS it (stale/lagged Stop).
+ *   rung 2  activity-quiet window (hooks + pane thinking heartbeat + bridge tool
+ *           calls + replies all reset it; requires ≥1 delivered reply; suspended
+ *           while a question is open).
+ *   rung 3  legacy reply-quiet — ONLY for sessions where hooks never came up.
+ *   rung 4  ceilings — but a ceiling on a REPLIED turn resolves with its replies
+ *           (cli-turn-ceiling-resolved) instead of rejecting TURN_TIMEOUT, and
+ *           open questions are resolved {timedout} first.
+ *
+ * TDD discipline: every test in this file (except the rung-3 legacy guard, which
+ * pins behavior preservation) FAILS against the pre-D1 cli-process.js — the
+ * red→green transition is surfaced in the commit message.
+ */
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+const { CliProcess } = require('../lib/process/cli-process');
+
+const quietLogger = { warn: () => {}, error: () => {}, log: () => {}, debug: () => {} };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function makeProc(opts = {}) {
+  const events = [];
+  const written = [];
+  const sendCalls = [];
+  const proc = new CliProcess({
+    sessionKey: 'sess-1',
+    chatId: '12345',
+    tmuxRunner: {
+      sendControl: async (name, key) => { sendCalls.push({ name, key }); },
+      killSession: async () => {},
+      captureWide: async () => opts.pane ?? '',
+    },
+    botName: 'testbot',
+    claudeBin: '/usr/bin/false',
+    toolDispatcher: opts.toolDispatcher || (async () => ({ ok: true, message_id: 1 })),
+    logger: quietLogger,
+    db: { logEvent: (kind, detail) => events.push({ kind, detail }) },
+    stopGraceMs: opts.stopGraceMs ?? 40,
+    turnQuietMs: opts.turnQuietMs ?? 30,
+    turnTimeoutMs: opts.turnTimeoutMs ?? 60_000,
+    turnAbsoluteMs: opts.turnAbsoluteMs ?? 60_000,
+    activityQuietMs: opts.activityQuietMs ?? 120,
+    maxRepliesPerTurn: opts.maxRepliesPerTurn ?? 20,
+  });
+  proc.bridgeReady = true;
+  proc.bridgeServer = { writeMessage: (obj) => { written.push(obj); } };
+  proc.tmuxSession = 'pgr-testbot-channels-abc';
+  return { proc, events, written, sendCalls };
+}
+
+// Start a turn and capture the turn_id the bridge write carried.
+function startTurn(proc, written, text = 'do the thing') {
+  const before = written.length;
+  const sendP = proc.send(text, { context: { sourceMsgId: 1 } });
+  sendP.catch(() => {});
+  const userMsg = written.slice(before).find((w) => w.kind === 'user_msg');
+  assert.ok(userMsg, 'send() wrote a user_msg');
+  return { sendP, turnId: userMsg.turn_id };
+}
+
+// A realistic UserPromptSubmit hook payload for a channel pickup: the prompt
+// carries the bridge-authored envelope (verified in the P0 spike — Q1).
+function upsFor(turnId, body = 'hello') {
+  return {
+    type: 'UserPromptSubmit',
+    prompt: `<channel source="polygram-bridge" chat_id="12345" user="probe" msg_id="1" turn_id="${turnId}">${body}</channel>`,
+  };
+}
+
+const ASK_ARGS = {
+  chat_id: '12345',
+  questions: [{ header: 'Pick', question: 'pick one', options: [{ label: 'a' }, { label: 'b' }] }],
+};
+
+// ─── L1: the reply-then-ask shape (bug #2's root, seam S2) ──────────────────
+// Today the reply arms a 2s quiet window the ask cannot park, so the turn
+// finalizes ~4s into the question wait and everything per-turn dies (verified
+// in prod: question 23745077 resolved 21ms after the ask). Under D1 the open
+// question suspends rung 2 and the turn survives the whole wait.
+
+test('L1: reply-then-ask — the turn survives the question wait and finalizes after the answer', async () => {
+  const { proc, events, written } = makeProc({ activityQuietMs: 120, stopGraceMs: 40, turnQuietMs: 30 });
+  const { sendP, turnId } = startTurn(proc, written);
+
+  proc._handleHookEvent(upsFor(turnId));                       // pickup → seen, hooks live
+  proc._recordReplyForPendingTurn('here is my answer — but first:', turnId);
+  await proc._dispatchToolCall({ name: 'ask', tool_call_id: 'q1', args: ASK_ARGS });
+
+  await sleep(320);   // >> reply-quiet + grace AND >> activityQuietMs
+  assert.equal(proc.pendingTurns.size, 1,
+    'the turn must stay pending through the ask wait (rung 2 suspended while a question is open)');
+
+  proc.writeQuestionAnswer('q1', { answers: [{ header: 'Pick', selected: ['a'] }] });
+  await sleep(220);   // > activityQuietMs — rung 2 resumed by the answer
+  assert.equal(proc.pendingTurns.size, 0, 'the turn finalizes via activity-quiet after the answer');
+
+  const result = await sendP;
+  assert.equal(result.alreadyDelivered, true, 'reply-tool text was already delivered');
+  assert.ok(events.find((e) => e.kind === 'cli-activity-quiet-finalize'),
+    'rung-2 finalize is observable in the events DB');
+  await proc.kill('test');
+});
+
+// ─── L2: a foreign cycle's Stop must not finalize an unseen pending ─────────
+// (Seam S5's Stop-identity gap; reachable today: a /compact or wakeup cycle's
+// Stop closes a queued user turn with the FOREIGN cycle's text as its answer.)
+
+test('L2: foreign-cycle Stop does NOT finalize an unseen, reply-less pending', async () => {
+  const { proc, events, written } = makeProc({ stopGraceMs: 40 });
+  const { sendP, turnId } = startTurn(proc, written);
+  void turnId;
+
+  // No UPS for this pending — claude never picked it up (it is queued behind a
+  // foreign cycle). The foreign cycle ends:
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'foreign /compact summary text' });
+  await sleep(120);   // > stopGraceMs
+
+  assert.equal(proc.pendingTurns.size, 1,
+    'an unattributable Stop must never finalize the pending (the foreign text would have been delivered as its answer)');
+  assert.ok(events.find((e) => e.kind === 'cli-stop-foreign'),
+    'the ignored foreign Stop is observable in the events DB');
+
+  sendP.catch(() => {});
+  await proc.kill('test');
+});
+
+// ─── L3: attributed Stop finalizes through a grace that activity cancels ────
+// (Round-2 panel finding: Stop arrives via the ndjson tail with 250ms–5s lag;
+// a lagged foreign Stop can land after our fast first pickup — activity during
+// the grace proves the Stop stale.)
+
+test('L3: in-grace activity cancels an attributed Stop; the NEXT Stop finalizes', async () => {
+  const { proc, events, written } = makeProc({ stopGraceMs: 80, activityQuietMs: 60_000, turnQuietMs: 60_000 });
+  const { sendP, turnId } = startTurn(proc, written);
+
+  proc._handleHookEvent(upsFor(turnId));                       // seen → attributable
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'stale stop' });
+  assert.equal(proc.pendingTurns.size, 1, 'attributed Stop must not finalize synchronously (grace window)');
+
+  await sleep(25);
+  proc._handleHookEvent({ type: 'PreToolUse', toolName: 'Bash' });   // claude is demonstrably still working
+  await sleep(140);   // well past the original grace
+  assert.equal(proc.pendingTurns.size, 1, 'activity inside the grace cancels the stale Stop finalize');
+  assert.ok(events.find((e) => e.kind === 'cli-stop-grace-cancelled'));
+
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'real end' });
+  await sleep(140);   // grace completes undisturbed
+  assert.equal(proc.pendingTurns.size, 0, 'the real Stop finalizes after an undisturbed grace');
+  const result = await sendP;
+  assert.equal(result.text, 'real end', 'text falls back to the REAL stop\'s last_assistant_message');
+  await proc.kill('test');
+});
+
+// ─── L4: pure-thinking tail — the pane heartbeat is activity ────────────────
+// (Round-2 panel finding: pure-thinking gaps exceed 45s with ZERO hooks; a
+// hook-only quiet clock would finalize mid-thought. The pane "esc to interrupt"
+// heartbeat bounds busy-phase gaps at ~5s and must reset rung 2.)
+
+test('L4: pane thinking heartbeat keeps a replied turn alive; rung 2 fires only when the tail goes quiet', async () => {
+  const { proc, events, written } = makeProc({
+    pane: 'working…\nesc to interrupt', activityQuietMs: 120, turnQuietMs: 60_000, stopGraceMs: 30,
+  });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));
+  proc._recordReplyForPendingTurn('quick ack', turnId);         // rung 2 armed
+
+  for (let i = 0; i < 6; i++) {                                 // ~300ms of thinking heartbeats
+    await proc._pollMidTurnDialogs();
+    await sleep(50);
+  }
+  assert.equal(proc.pendingTurns.size, 1,
+    'pane heartbeat (claude thinking, zero hooks) must keep resetting the activity-quiet clock');
+
+  await sleep(240);                                             // heartbeats stopped → tail quiet
+  assert.equal(proc.pendingTurns.size, 0, 'rung 2 finalizes once the whole activity surface is quiet');
+  assert.ok(events.find((e) => e.kind === 'cli-activity-quiet-finalize'));
+  const result = await sendP;
+  assert.equal(result.alreadyDelivered, true);
+  await proc.kill('test');
+});
+
+// ─── L5: ceilings resolve replied turns instead of rejecting ────────────────
+// (Round-2 panel finding: the absolute ceiling REJECTING a turn whose answer
+// was already delivered sends a scary timeout after a successful reply.)
+
+test('L5a: absolute ceiling on a REPLIED turn resolves with its replies (no TURN_TIMEOUT)', async () => {
+  const { proc, events, written } = makeProc({
+    turnAbsoluteMs: 100, activityQuietMs: 60_000, turnQuietMs: 60_000, stopGraceMs: 30,
+  });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));
+  proc._recordReplyForPendingTurn('partial but delivered answer', turnId);
+
+  const result = await sendP;   // the ceiling fires ~100ms in
+  assert.equal(result.text, 'partial but delivered answer');
+  assert.equal(result.alreadyDelivered, true);
+  assert.ok(events.find((e) => e.kind === 'cli-turn-ceiling-resolved'),
+    'ceiling-resolve is observable (distinct from TURN_TIMEOUT)');
+  await proc.kill('test');
+});
+
+test('L5b: absolute ceiling on a ZERO-reply turn still rejects TURN_TIMEOUT', async () => {
+  const { proc, written } = makeProc({ turnAbsoluteMs: 80, activityQuietMs: 60_000, turnQuietMs: 60_000 });
+  const { sendP } = startTurn(proc, written);
+  await assert.rejects(sendP, (err) => err.code === 'TURN_TIMEOUT',
+    'nothing was delivered — the timeout rejection (and its user-facing error) is correct here');
+  await proc.kill('test');
+});
+
+// ─── L6: the ceiling resolves open questions {timedout} FIRST ───────────────
+// (S9's second half: today the absolute cap rejects the turn while the
+// question keyboard stays live and claude hangs blocked on the ask.)
+
+test('L6: open questions are answered {timedout} when the ceiling fires', async () => {
+  const { proc, written } = makeProc({ turnAbsoluteMs: 120, activityQuietMs: 60_000, turnQuietMs: 60_000 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));
+  await proc._dispatchToolCall({ name: 'ask', tool_call_id: 'qq', args: ASK_ARGS });
+
+  await assert.rejects(sendP);   // zero replies → rejection is correct (L5b semantics)
+  const qa = written.find((w) => w.kind === 'question_answer' && w.tool_call_id === 'qq');
+  assert.ok(qa, 'the blocking ask must be unblocked at the ceiling — claude must never stay hung');
+  assert.equal(qa.result.timedout, true);
+  assert.equal(proc._openQuestions.size, 0, 'open-question bookkeeping cleared');
+  await proc.kill('test');
+});
+
+// ─── L7: the UPS-seen parser (the P1 ledger slice) ──────────────────────────
+// (P0 spike Q1: the UPS prompt carries the bridge-authored envelope. The
+// parser anchors on the raw `<channel ` prefix — body text can never contain
+// a raw `<` (bridge body-escape), so a pasted/spoofed turn_id cannot mark seen.)
+
+test('L7a: UPS with the channel envelope marks the pending seen', async () => {
+  const { proc, events, written } = makeProc({});
+  const { sendP, turnId } = startTurn(proc, written);
+
+  proc._handleHookEvent(upsFor(turnId));
+
+  const pending = proc.pendingTurns.get(turnId);
+  assert.equal(pending.seen, true, 'envelope turn_id match must mark the pending seen');
+  const evt = events.find((e) => e.kind === 'cli-ups-seen');
+  assert.ok(evt, 'cli-ups-seen telemetry fires');
+  assert.equal(evt.detail.turn_id, turnId);
+  assert.equal('text' in (evt.detail || {}), false, 'never log prompt content (L13 convention)');
+
+  sendP.catch(() => {});
+  await proc.kill('test');
+});
+
+test('L7b: a turn_id pasted in body text (no raw <channel prefix) does NOT mark seen', async () => {
+  const { proc, written } = makeProc({});
+  const { sendP, turnId } = startTurn(proc, written);
+
+  // Spoof shape: the uuid appears, but not inside a bridge-authored raw tag —
+  // e.g. a user pasted an old envelope; the bridge body-escape turns its `<`
+  // into `&lt;` so the raw prefix can only ever be bridge-authored.
+  proc._handleHookEvent({
+    type: 'UserPromptSubmit',
+    prompt: `&lt;channel turn_id="${turnId}"&gt; pasted log line turn_id="${turnId}"`,
+  });
+
+  assert.notEqual(proc.pendingTurns.get(turnId).seen, true,
+    'spoofed/pasted turn_id must not count as pickup');
+  sendP.catch(() => {});
+  await proc.kill('test');
+});
+
+// ─── L8: stop_hook_active=true means the cycle is NOT over ──────────────────
+
+test('L8: Stop with stop_hook_active=true never finalizes (forced continuation)', async () => {
+  const { proc, written } = makeProc({ stopGraceMs: 40, activityQuietMs: 60_000, turnQuietMs: 60_000 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));
+  proc._recordReplyForPendingTurn('answer so far', turnId);
+
+  proc._handleHookEvent({ type: 'Stop', stopHookActive: true, lastAssistantMessage: 'not really done' });
+  await sleep(120);   // > grace
+  assert.equal(proc.pendingTurns.size, 1,
+    'a stop-hook-forced continuation Stop must not close the turn');
+  sendP.catch(() => {});
+  await proc.kill('test');
+});
+
+// ─── L9: legacy guard — hooks-never-alive sessions keep today's exact path ──
+// (Rung 3. This test must pass BOTH before and after D1: byte-identical
+// behavior for the hook-dead session class.)
+
+test('L9: hook-never-alive session — reply-quiet + stop-grace finalize exactly as today', async () => {
+  const { proc, written } = makeProc({ turnQuietMs: 40, stopGraceMs: 40 });
+  const { sendP, turnId } = startTurn(proc, written);
+
+  // NO hook events at all (_sawHookStream stays false).
+  proc._recordReplyForPendingTurn('legacy answer', turnId);
+
+  const result = await sendP;   // quiet 40ms + grace 40ms
+  assert.equal(result.text, 'legacy answer');
+  assert.equal(result.alreadyDelivered, true);
+  assert.equal(proc.pendingTurns.size, 0);
+  await proc.kill('test');
+});
+
+// ─── L10: the single-active-cycle invariant becomes an observable assertion ─
+
+test('L10: a second concurrent pending logs the multi-pending assertion event (drop-rather-than-misattribute)', async () => {
+  const { proc, events, written } = makeProc({});
+  const a = startTurn(proc, written, 'first');
+  const b = startTurn(proc, written, 'second');   // violates the daemon-side stdinLock contract
+
+  assert.ok(events.find((e) => e.kind === 'cli-multi-pending-assert'),
+    'the unreachable-in-prod state must be loudly observable, never silent');
+
+  a.sendP.catch(() => {}); b.sendP.catch(() => {});
+  await proc.kill('test');
+});
+
+// ─── L11: the maxRepliesPerTurn cap no longer instant-resolves under live hooks ─
+// (Seam S1's third premature-finalize trigger: ≥20 replies resolved IMMEDIATELY
+// mid-work. Under D1 the cap defers to rung 2; the ceilings bound true runaways.)
+
+test('L11: reply cap under live hooks defers to activity-quiet instead of resolving instantly', async () => {
+  const { proc, events, written } = makeProc({
+    maxRepliesPerTurn: 3, activityQuietMs: 150, turnQuietMs: 60_000, stopGraceMs: 30,
+  });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));
+  proc._recordReplyForPendingTurn('one', turnId);
+  proc._recordReplyForPendingTurn('two', turnId);
+  proc._recordReplyForPendingTurn('three', turnId);             // cap reached
+
+  await sleep(90);    // > old grace path — today the cap has already finalized by now
+  assert.equal(proc.pendingTurns.size, 1,
+    'cap must not instant-resolve a turn claude is still working');
+
+  await sleep(200);   // > activityQuietMs with no further activity
+  assert.equal(proc.pendingTurns.size, 0, 'rung 2 finalizes the capped turn once truly quiet');
+  const result = await sendP;
+  assert.equal(result.text, 'one\n\ntwo\n\nthree');
+  assert.ok(events.find((e) => e.kind === 'cli-activity-quiet-finalize'));
+  await proc.kill('test');
+});

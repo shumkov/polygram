@@ -74,13 +74,25 @@ describe('post-turn edit re-delivery', () => {
     assert.equal(H.dispatched.length, 0);
   });
 
-  test('interlock: a re-edit while our re-run is IN FLIGHT folds via inject, no 2nd turn', () => {
+  test('interlock (0.13 per-message): a re-edit of the SAME message while its re-run is in flight folds via inject', () => {
     const H = harness({ inFlight: true });
-    const ok = H.m(editedMsg({ text: 'edited again' }), 'old');
-    assert.equal(ok, false, 'did not start a second turn');
-    assert.equal(H.dispatched.length, 0);
-    assert.equal(H.injected.length, 1, 'folded via inject instead');
-    assert.match(H.injected[0].opts.content, /edited again/);
+    // First edit: no redelivery of THIS message is in flight yet → dispatches
+    // its own redelivery even though A turn is running (pre-0.13 the per-
+    // SESSION interlock folded it as a hand-built "[edit]" inject).
+    const ok1 = H.m(editedMsg({ text: 'first correction' }), 'orig');
+    assert.equal(ok1, true, 'first edit of the message redelivers (autosteer handles the in-flight turn)');
+    assert.equal(H.dispatched.length, 1);
+    assert.equal(H.injected.length, 0);
+    // Second edit of the SAME message while its re-dispatch runs → folds.
+    const ok2 = H.m(editedMsg({ text: 'second correction' }), 'first correction');
+    assert.equal(ok2, false);
+    assert.equal(H.injected.length, 1, 'same-message re-edit folds via inject (no 2nd turn for the same message)');
+    assert.match(H.injected[0].opts.content, /second correction/);
+    assert.ok(H.events.find((e) => e.k === 'edit-redelivery-folded'));
+    // An edit of a DIFFERENT message proceeds as its own redelivery.
+    const ok3 = H.m(editedMsg({ message_id: 501, text: 'other message edit' }), 'other orig');
+    assert.equal(ok3, true, 'different message is NOT held hostage by the per-session state');
+    assert.equal(H.dispatched.length, 2);
   });
 
   test('acknowledges immediately: reaction on the edited message on a real re-dispatch', () => {
