@@ -70,6 +70,7 @@ const { createEditRedelivery } = require('./lib/handlers/edit-redelivery');
 const { createGateInbound } = require('./lib/handlers/gate-inbound');
 const { createRedeliver } = require('./lib/handlers/redeliver');
 const { createDropRedeliverer } = require('./lib/handlers/drop-redeliver');
+const { createSessionFeedback } = require('./lib/feedback/session-feedback');
 const { createSlashCommands } = require('./lib/handlers/slash-commands');
 const { createApprovals } = require('./lib/handlers/approvals');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
@@ -2259,8 +2260,17 @@ async function main() {
 
   bot = createBot(config.bot.token);
 
+  // 0.13 D3: session-scoped feedback for cycles with NO pending turn
+  // (ScheduleWakeup, fireUserMessage self-checks, injected messages picked up
+  // as their own cycle) — typing for the cycle's duration + a 🤔 anchored to
+  // the picked-up message when the input ledger names one.
+  const sessionFeedback = createSessionFeedback({
+    bot, tg, getChatIdFromKey, getThreadIdFromKey, botName: BOT_NAME,
+    logEvent, logger: console,
+  });
+
   const sdkCallbacks = createSdkCallbacks({
-    db, dbWrite, config, bot, botName: BOT_NAME, tg, logEvent,
+    db, dbWrite, config, bot, botName: BOT_NAME, tg, logEvent, sessionFeedback,
     classifyToolName, announce, shouldAnnounce, contextHintShown,
     extractAssistantText, getChatIdFromKey, getThreadIdFromKey,
     // F#23: enable parse/sanitize/sticker/react on the autonomous-wakeup path.
