@@ -21,7 +21,7 @@ function build({ backend = null, inFlight = false, botPm = null, applied = false
     dbWrite: (fn) => { try { fn(); } catch { /* ignore */ } },
     pm,
     pairings: {},
-    modelVersionsDesc: { opus: 'claude-opus-4-7', sonnet: 'claude-sonnet-4-6' },
+    modelVersionsDesc: { opus: 'claude-opus-4-8', sonnet: 'claude-sonnet-4-6' },
     botName: 'b',
     logEvent: () => {},
     logger: { log: () => {}, error: () => {} },
@@ -39,7 +39,7 @@ describe('slash-commands — cli-aware /model + /effort suffix', () => {
   test('cli + idle → "applies on your next message (conversation kept)"', async () => {
     const H = build({ backend: 'cli', inFlight: false });
     await H.run('/model opus');
-    assert.equal(H.replies[0], 'Model → opus (claude-opus-4-7) — applies on your next message (conversation kept)');
+    assert.equal(H.replies[0], 'Model → opus (claude-opus-4-8) — applies on your next message (conversation kept)');
   });
 
   test('cli + in-flight → "applies after this turn (conversation kept)"', async () => {
@@ -51,7 +51,7 @@ describe('slash-commands — cli-aware /model + /effort suffix', () => {
   test('cli cold (no live proc, bot pm=cli) → "applies on your next message"', async () => {
     const H = build({ backend: null, botPm: 'cli' });
     await H.run('/model opus');
-    assert.equal(H.replies[0], 'Model → opus (claude-opus-4-7) — applies on your next message');
+    assert.equal(H.replies[0], 'Model → opus (claude-opus-4-8) — applies on your next message');
   });
 
   test('NOT the old misleading "I\'ll switch when I finish" on cli', async () => {
@@ -63,7 +63,7 @@ describe('slash-commands — cli-aware /model + /effort suffix', () => {
   test('SDK applied live → bare "Model → X" (no suffix)', async () => {
     const H = build({ backend: 'sdk', applied: true });
     await H.run('/model opus');
-    assert.equal(H.replies[0], 'Model → opus (claude-opus-4-7)');
+    assert.equal(H.replies[0], 'Model → opus (claude-opus-4-8)');
   });
 
   test('SDK no live session → keeps "I\'ll switch when I finish"', async () => {
