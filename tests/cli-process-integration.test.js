@@ -349,13 +349,20 @@ test('tool activity extends the reply-quiet window so a still-working turn is no
   const armedTimer = pending.quietTimer;
 
   // claude keeps TOOL-working (reads the follow-up screenshot) — NOT a reply.
+  // 0.13 D1: this hook is the session's FIRST → the finalizer ladder goes
+  // hooks-live; the legacy reply-quiet window is superseded by the
+  // activity-quiet window (rung 2). The WA-topic intent is unchanged — a
+  // still-working turn must NOT resolve mid-work — but the mechanism is now
+  // the activity clock, not a pushed-around 2s reply-quiet timer.
   cp._handleHookEvent({ type: 'PostToolUse', toolName: 'Read' });
 
   assert.equal(cp.pendingTurns.size, 1, 'turn still pending — not resolved mid-work');
   const [pending2] = cp.pendingTurns.values();
-  assert.ok(pending2.quietTimer, 'quiet window still armed');
-  assert.notEqual(pending2.quietTimer, armedTimer,
-    'tool activity RESET (extended) the quiet window — without the fix it stays the stale timer and the turn resolves mid-work, orphaning the late reply to the autonomous path');
+  assert.equal(pending2.quietTimer, null,
+    'D1: the legacy reply-quiet timer is superseded once hooks are live (it could fire mid-work)');
+  assert.ok(pending2._activityQuietTimer,
+    'D1: the activity-quiet window (rung 2) now owns the finalize — armed because the turn has a delivered reply');
+  void armedTimer;
 
   bridge.close();
   await cp.kill('test');

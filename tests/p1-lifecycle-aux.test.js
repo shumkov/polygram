@@ -236,7 +236,7 @@ describe('P1-E: questions store listOpen()', () => {
     const done = store.issue({ bot_name: 'b', session_key: 's:2', chat_id: '1', thread_id: null, tool_call_id: 'tc-done', questions: q, state: { qIndex: 0 } });
     store.resolve(done.id, 'answered');
 
-    const rows = store.listOpen();
+    const rows = store.listOpen('b');
     assert.ok(Array.isArray(rows));
     assert.ok(rows.some((r) => r.tool_call_id === 'tc-open'), 'open row listed');
     assert.ok(!rows.some((r) => r.tool_call_id === 'tc-done'), 'resolved row excluded');

@@ -641,26 +641,39 @@ test('rc.13 compaction-warn: proactive does NOT fire below threshold', async () 
 // (tests/e2e-channels-real-claude.test.js) confirms the Stop hook actually
 // lands in the ndjson, so this resolution path is reachable in production.
 
-test('rc.16: Stop resolves an in-flight turn that ended WITHOUT a reply tool call (delivers fallback text)', () => {
-  const { proc, events } = makeProcWithCapture('');
+// 0.13 D1 update: Stop now finalizes only an ATTRIBUTED pending (seen at
+// pickup via the UPS envelope, or ≥1 bound reply) and does so through a short
+// activity-cancellable grace — an unattributed Stop is a FOREIGN cycle's
+// (/compact, wakeup, self-check) and pre-D1 this test's branch would have
+// delivered that foreign cycle's last_assistant_message as the user's answer.
+// The rc.16 intent (a no-reply turn must not hang to the wall-clock backstop)
+// is preserved: the seen marker is set at pickup in production (P0 spike Q1),
+// so claude's own no-reply Stop still resolves the turn ~stopGraceMs later.
+test('rc.16/D1: Stop resolves an ATTRIBUTED no-reply turn (fallback text) after the grace', async () => {
+  const { proc, events } = makeProcWithCapture('', { stopGraceMs: 30 });
   let result = null;
-  proc.pendingTurns.set('t1', { resolve: (r) => { result = r; }, reject: () => {}, replies: [], startedAt: Date.now() });
+  proc.pendingTurns.set('t1', { resolve: (r) => { result = r; }, reject: () => {}, replies: [], seen: true, startedAt: Date.now() });
 
   proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'Removed the skill. Done.' });
+  assert.equal(result, null, 'D1: finalize goes through the stop-grace, not synchronously');
 
-  assert.ok(result, 'turn MUST resolve on Stop — not hang until the wall-clock backstop');
+  await new Promise((r) => setTimeout(r, 90));
+  assert.ok(result, 'turn MUST resolve on its own (attributed) Stop — not hang until the wall-clock backstop');
   assert.equal(proc.pendingTurns.size, 0, 'pendingTurns drains');
   assert.equal(result.text, 'Removed the skill. Done.', 'falls back to last_assistant_message when no reply tool call');
   assert.equal(result.alreadyDelivered, false, 'no-reply fallback must be DELIVERED (nothing was sent yet) — else the user still sees nothing');
-  assert.ok(events.find((e) => e.kind === 'cli-turn-resolved-by-stop'), 'observability: cli-turn-resolved-by-stop must fire');
+  const evt = events.find((e) => e.kind === 'cli-turn-resolved-by-stop');
+  assert.ok(evt, 'observability: cli-turn-resolved-by-stop must fire');
+  assert.equal(evt.detail.attributed, 'seen', 'attribution path recorded');
 });
 
-test('rc.16: Stop resolves a turn WITH replies → already-delivered, no double-send', () => {
-  const { proc } = makeProcWithCapture('');
+test('rc.16/D1: Stop resolves a turn WITH replies (reply-bound attribution) → already-delivered, no double-send', async () => {
+  const { proc } = makeProcWithCapture('', { stopGraceMs: 30 });
   let result = null;
   proc.pendingTurns.set('t1', { resolve: (r) => { result = r; }, reject: () => {}, replies: ['hello', 'world'], startedAt: Date.now() });
 
   proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'ignored-when-replies-exist' });
+  await new Promise((r) => setTimeout(r, 90));   // D1: through the grace
 
   assert.ok(result);
   assert.equal(result.text, 'hello\n\nworld', 'uses the reply-tool text');

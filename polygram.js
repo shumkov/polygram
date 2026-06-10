@@ -1120,7 +1120,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // pick them off entry.pendingQueue[0].context.
       await new Promise((dispatched) => {
         sendPromise = sendToProcess(sessionKey, prompt, {
-          streamer, reactor, sourceMsgId: msg.message_id,
+          // 0.13 D1 (S8): the typing controller rides the per-turn context so
+          // the question lifecycle (callbacks.js onQuestionAsked/-Resumed) can
+          // pause it while the bot waits on the USER and resume on the answer.
+          streamer, reactor, typing: stopTyping, sourceMsgId: msg.message_id,
           // 0.7.4 (item B): fire THINKING when Claude actually starts
           // emitting — not the moment we wrote stdin.
           onFirstStream: () => reactor.setState('THINKING'),
@@ -2573,6 +2576,28 @@ async function main() {
     console.log('\nShutting down...');
     // 1. Stop accepting new inbound first so nothing new queues behind the drain.
     if (bot && bot._stop) bot._stop();
+
+    // 1.5 (0.13 D1): expire open interactive questions {cancelled} BEFORE the
+    // drain. With D1 the asking turn stays in flight for the whole wait, so a
+    // deploy during a question would otherwise eat the entire 30s drain and
+    // mark the inbound replay-pending mid-ask. Cancelling unblocks claude's
+    // ask so the cycle can end inside the drain; the boot-replay re-ask is the
+    // documented recovery path (design §3 D1 ask-wait semantics).
+    try {
+      const openQuestions = questionStore.listOpen?.(BOT_NAME) || [];
+      for (const row of openQuestions) {
+        // eslint-disable-next-line no-await-in-loop
+        await questionHandlers.expireQuestion(row, {
+          status: 'cancelled',
+          message: 'Bot is restarting — this question was cancelled. It may be re-asked in a moment.',
+        }).catch(() => {});
+      }
+      if (openQuestions.length) {
+        logEvent('shutdown-questions-cancelled', { count: openQuestions.length });
+      }
+    } catch (err) {
+      console.error(`[shutdown] question expiry failed: ${err.message}`);
+    }
 
     // 2. Drain in-flight handlers. Wait for inFlightHandlers to empty or
     //    SHUTDOWN_DRAIN_MS to elapse. pm handlers resolve naturally when
