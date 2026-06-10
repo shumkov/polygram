@@ -233,6 +233,64 @@ test('e2e/D1: reply-then-ask — turn survives a delayed answer; final reply bin
   }
 });
 
+// 0.13 D2 (P3): the Tier 2C fold-acknowledgment contract against REAL claude.
+// A mid-cycle inject FOLDS into the trigger's combined reply (P0 spike: no own
+// UPS, incidental echo = trigger-only) — the consumed_turn_ids field on OUR
+// reply tool schema is the only reliable fold signal. Asserts the model
+// actually sets it when instructed by the system prompt, the folded entry
+// resolves, and NO drop (= no redelivery) is declared.
+test('e2e/D2: inject-fold — consumed_turn_ids acknowledges the fold; zero input-dropped', {
+  skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
+  timeout: 180_000,
+}, async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-e2e-d2fold-'));
+  const chatConfig = { cwd, permissionMode: 'bypassPermissions', isolateUserConfig: true };
+  const replies = [];
+  let dropped = null;
+
+  const proc = new CliProcess({
+    sessionKey: 'e2e-d2fold:1', chatId: '987654331', threadId: null, label: 'e2e-d2fold',
+    tmuxRunner: createTmuxRunner(), botName: 'e2etest',
+    claudeBin: resolvePinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION),
+    toolDispatcher: async ({ toolName, text }) => { if (toolName === 'reply') replies.push(text); return { ok: true }; },
+    logger: { warn: (...a) => console.error('[e2e:warn]', ...a), error: (...a) => console.error('[e2e:err]', ...a), log: () => {}, debug: () => {} },
+    db: { logEvent: () => {} },
+    dropConfirmMs: 8_000,
+  });
+  proc.on('input-dropped', (p) => { dropped = p; });
+
+  try {
+    await proc.start({ cwd, chatConfig, existingSessionId: null });
+
+    const sendP = proc.send(
+      'Run `sleep 10` via Bash. Then send ONE reply that answers BOTH this message and any '
+      + 'follow-up channel messages you received during the sleep.',
+      { timeoutMs: 150_000, maxTurnMs: 170_000, context: { streamer: noopStreamer, reactor: noopReactor, threadId: null } },
+    );
+    await new Promise((r) => setTimeout(r, 5_000));   // mid-sleep
+    const injected = proc.injectUserMessage({
+      content: 'Mid-turn follow-up: what is 7+5? Include the answer in your reply.',
+      priority: 'next', msgId: 77, source: 'autosteer',
+    });
+    assert.equal(injected, true);
+    const injectedId = [...proc.inputLedger.keys()].find((k) => proc.inputLedger.get(k).source === 'autosteer');
+
+    await sendP;
+    // give the drop-confirm window time to (wrongly) fire if the ack failed
+    await new Promise((r) => setTimeout(r, 12_000));
+
+    const entry = proc.inputLedger.get(injectedId);
+    assert.ok(['resolved', 'seen'].includes(entry?.state),
+      `the folded inject must be acknowledged (consumed_turn_ids) or seen — got state=${entry?.state}. `
+      + `replies=${replies.join(' | ').slice(0, 200)}`);
+    assert.equal(dropped, null, 'a FOLD must never be declared dropped (the A1 base-rate inversion)');
+    assert.match(replies.join(' '), /12/, 'the fold was actually answered in the combined reply');
+  } finally {
+    try { await proc.kill('e2e-done'); } catch {}
+    try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
+  }
+});
+
 // 0.13 edit_message: the FULL round-trip against real claude — claude sends a
 // status via `reply`, READS the message_id we return through the bridge, then
 // calls `edit_message` with that SAME id. Validates the new bridge behavior

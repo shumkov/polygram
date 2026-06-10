@@ -149,7 +149,7 @@ describe('tryAutosteer — full dispatch', () => {
     // Telegram message_id when the TUI dequeues the paste as a fresh
     // user turn. SDK backend ignores msgId — harmless extra field.
     assert.deepEqual(m.pmCalls[0],
-      ['injectUserMessage', 'k', { content: 'follow-up', priority: 'next', msgId: 555 }]);
+      ['injectUserMessage', 'k', { content: 'follow-up', priority: 'next', msgId: 555, source: 'autosteer' }]);   // 0.13 D2: ledger source
     assert.equal(m.refs[0].key, 'k');
     assert.equal(m.refs[0].ref.msgId, 555);
     const evt = m.events.find((e) => e.kind === 'autosteer');

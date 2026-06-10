@@ -69,6 +69,7 @@ const { createEditCorrectionInjector } = require('./lib/handlers/edit-correction
 const { createEditRedelivery } = require('./lib/handlers/edit-redelivery');
 const { createGateInbound } = require('./lib/handlers/gate-inbound');
 const { createRedeliver } = require('./lib/handlers/redeliver');
+const { createDropRedeliverer } = require('./lib/handlers/drop-redeliver');
 const { createSlashCommands } = require('./lib/handlers/slash-commands');
 const { createApprovals } = require('./lib/handlers/approvals');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
@@ -652,6 +653,7 @@ let maybePostTurnEdit = null;
 // dispatcher exists). See lib/handlers/gate-inbound.js / redeliver.js.
 let gateInbound = null;
 let redeliverAsFreshTurn = null;
+let dropRedeliverer = null;   // 0.13 D2→D4 glue; assigned once redeliver exists
 
 // rc.20: approvalCardText + safeParse moved to lib/approvals/ui.js.
 // 0.9.0 commit 29: makeCanUseTool / handleApprovalCallback /
@@ -2404,6 +2406,11 @@ async function main() {
   //                    the verdict back via tmux send-keys "1"/"3"+Enter.
   // makeCanUseTool handles admin card, chat_tool_decisions persistence,
   // and timeout race — all reused from SDK.
+  // 0.13 D2: 'input-dropped' → redeliver once via the D4 tail. Stable wrapper:
+  // pm spread-copies the callbacks object at construction, and the redeliver
+  // tail is wired later in main() — the wrapper late-binds it.
+  sdkCallbacks.onInputDropped = (sessionKey, payload) => dropRedeliverer?.(sessionKey, payload);
+
   sdkCallbacks.onApprovalRequired = async (sessionKey, payload) => {
     const { toolName, toolInput, id, respond } = payload || {};
     if (typeof respond !== 'function') return;
@@ -2503,6 +2510,9 @@ async function main() {
       tg, bot, chatId, msgIds: [msgId], emoji: '👀', botName: BOT_NAME,
     }).catch(() => {}),
     bot, logEvent, logger: console,
+  });
+  dropRedeliverer = createDropRedeliverer({
+    db, redeliver: redeliverAsFreshTurn, logEvent, logger: console,
   });
   ({ pollBot, startPollWatchdog } = createPollLoop({
     db, dbWrite, config, botName: BOT_NAME,
