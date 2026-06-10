@@ -2073,7 +2073,7 @@ function createBot(token) {
     // self-contained boundary fall-through.
     try {
       const injected = maybeInjectEditCorrection?.(ctx.editedMessage);
-      if (!injected) maybePostTurnEdit?.(ctx.editedMessage, oldText);
+      if (!injected) maybePostTurnEdit?.(ctx.editedMessage, oldText, botUsername, mentionRe);
     } catch (err) {
       console.error(`[${BOT_NAME}] edit handler error: ${err.message}`);
     }
@@ -2516,7 +2516,6 @@ async function main() {
   // pre-turn ack for the cold-spawn gap; the synthetic turn's own reactor then takes over the msg.
   maybePostTurnEdit = createEditRedelivery({
     pm, config, getSessionKey, shouldHandle, dispatchHandleMessage, bot,
-    mentionRe, botUsername,
     react: (chatId, msgId) => applyReactionToMessages({
       tg, bot, chatId, msgIds: [msgId], emoji: '👀', botName: BOT_NAME,
     }).catch(() => {}),

@@ -18,18 +18,20 @@ function harness({ inFlight = false, gate = true, optOut = false, chat = true } 
     chats: chat ? { '100': { name: 'X', ...(optOut && { editCorrection: false }) } } : {},
     bot: {},
   };
-  const m = createEditRedelivery({
+  const realM = createEditRedelivery({
     pm, config,
     getSessionKey: (cid, tid) => (tid ? `${cid}:${tid}` : cid),
     shouldHandle: () => gate,
     dispatchHandleMessage: (sk, cid, msg) => dispatched.push({ sk, cid, msg }),
     bot: {},
-    mentionRe: null,
-    botUsername: 'bot',
     react: (cid, mid) => reactions.push({ cid, mid }),
     logEvent: (k, d) => events.push({ k, d }),
     logger: { error: () => {} },
   });
+  // botUsername / mentionRe are CALL-TIME args (resolved async via getMe in prod, and
+  // out of the factory's main() scope — rc.34 boot crash). The harness threads fixed
+  // values so the existing call sites stay m(msg, oldText).
+  const m = (editedMsg, oldText) => realM(editedMsg, oldText, 'bot', null);
   return { m, dispatched, injected, reactions, events };
 }
 
@@ -113,13 +115,41 @@ describe('post-turn edit re-delivery', () => {
   });
 
   test('never throws — degrades to false on an internal error', () => {
-    const H = harness();
     // shouldHandle throwing must not escape
     const m = createEditRedelivery({
       pm: { get: () => null }, config: { chats: { '100': {} }, bot: {} },
       getSessionKey: () => 's', shouldHandle: () => { throw new Error('boom'); },
-      dispatchHandleMessage: () => {}, bot: {}, botUsername: 'bot', logger: { error: () => {} },
+      dispatchHandleMessage: () => {}, bot: {}, logger: { error: () => {} },
     });
-    assert.equal(m(editedMsg({ text: 'new' }), 'old'), false);
+    assert.equal(m(editedMsg({ text: 'new' }), 'old', 'bot', null), false);
+  });
+});
+
+describe('post-turn edit re-delivery — call-time botUsername / mentionRe (rc.35)', () => {
+  // rc.34 boot crash: the factory (built in main()) took botUsername / mentionRe as
+  // construction deps, but those are createBot-scoped locals resolved async via getMe
+  // → ReferenceError at boot. They are now CALL-TIME args. These pin that contract.
+  test('botUsername is forwarded to shouldHandle from the call args, not construction', () => {
+    let seen = 'UNSET';
+    const m = createEditRedelivery({
+      pm: { get: () => null }, config: { chats: { '100': { name: 'X' } }, bot: {} },
+      getSessionKey: () => 's',
+      shouldHandle: (_msg, _cfg, botUsername) => { seen = botUsername; return false; },
+      dispatchHandleMessage: () => {}, bot: {}, logger: { error: () => {} },
+    });
+    m(editedMsg({ text: 'new' }), 'old', 'realbot', null);
+    assert.equal(seen, 'realbot', 'shouldHandle got the call-time botUsername');
+  });
+
+  test('mentionRe passed at call time strips the @mention from the dispatched body', () => {
+    const dispatched = [];
+    const m = createEditRedelivery({
+      pm: { get: () => null }, config: { chats: { '100': { name: 'X' } }, bot: {} },
+      getSessionKey: () => 's', shouldHandle: () => true,
+      dispatchHandleMessage: (sk, cid, msg) => dispatched.push(msg),
+      bot: {}, logger: { error: () => {} },
+    });
+    m(editedMsg({ text: '@bot do the thing' }), 'old', 'bot', /@bot\b/g);
+    assert.equal(dispatched[0].text, 'do the thing');
   });
 });
