@@ -546,3 +546,84 @@ test('stall gate: still fires when the pane RENDERED then froze (real wedge, con
   );
   assert.ok(Date.now() - startedAt < 3_000, 'stall still fires fast once content was seen');
 });
+
+test('trigger with keys ARRAY sends the full sequence in order (session-age → full resume)', async () => {
+  // 2026-06-11 resume-dialog fix (docs/0.13-resume-dialog-fix-spec.md B2):
+  // claude's session-age dialog pre-selects "Resume from summary", which
+  // literally runs /compact on the resumed session. Bare Enter therefore
+  // silently compacts — the gate must navigate Down to "Resume full session
+  // as-is" THEN Enter. `keys: [...]` sends a sequence; `key:` stays the
+  // single-key form for existing triggers.
+  const runner = makeScriptedRunner([
+    'This session is 6h 39m old and 115.8k tokens.\nResuming the full session will consume a substantial portion.\n❯ 1. Resume from summary (recommended)\n  2. Resume full session as-is',
+    'Listening for channel messages from: server:polygram-bridge',
+  ]);
+  const result = await runStartupGate({
+    runner,
+    tmuxName: 'sess',
+    triggers: [
+      { name: 'session-age', regex: /Resuming the full session[\s\S]*Resume from summary/i, keys: ['Down', 'Enter'] },
+    ],
+    readySignal: /Listening for channel messages/i,
+    logger: quietLogger,
+    pollMs: 10,
+    settleMs: 10,
+  });
+  assert.deepEqual(runner.sent, ['Down', 'Enter']);
+  assert.deepEqual(result.matchedTriggers, ['session-age']);
+});
+
+test('single-key trigger form still works unchanged', async () => {
+  const runner = makeScriptedRunner([
+    'WARNING: Loading development channels',
+    'Listening for channel messages from: server:polygram-bridge',
+  ]);
+  const result = await runStartupGate({
+    runner,
+    tmuxName: 'sess',
+    triggers: [
+      { name: 'dev-channels', regex: /WARNING: Loading development channels/i, key: 'Enter' },
+    ],
+    readySignal: /Listening for channel messages/i,
+    logger: quietLogger,
+    pollMs: 10,
+    settleMs: 10,
+  });
+  assert.deepEqual(runner.sent, ['Enter']);
+  assert.deepEqual(result.matchedTriggers, ['dev-channels']);
+});
+
+test('onTrigger fires AT TRIGGER TIME — survives a gate that later dies (review F4)', async () => {
+  // The 2026-06-10 prod incident: the gate matched session-age, answered it,
+  // and THEN threw TMUX_SESSION_GONE ("matched: dev-channels, session-age").
+  // Telemetry hung off the success-path return value would miss exactly that
+  // sequence — the soak signal must fire when the trigger fires.
+  const fired = [];
+  let calls = 0;
+  const runner = {
+    captureWide: async () => {
+      calls += 1;
+      if (calls === 1) return 'Resuming the full session will consume…\n❯ 1. Resume from summary (recommended)';
+      const err = new Error("can't find pane: sess");
+      throw err;
+    },
+    sendControl: async () => {},
+  };
+  await assert.rejects(
+    () => runStartupGate({
+      runner,
+      tmuxName: 'sess',
+      triggers: [
+        { name: 'session-age', regex: /Resuming the full session[\s\S]*Resume from summary/i, keys: ['Down', 'Enter'] },
+      ],
+      onTrigger: (name) => fired.push(name),
+      readySignal: /never-matches/,
+      logger: quietLogger,
+      pollMs: 10,
+      settleMs: 10,
+    }),
+    (err) => err.code === 'TMUX_SESSION_GONE',
+  );
+  assert.deepEqual(fired, ['session-age'],
+    'the trigger fired before the session died — telemetry must reflect that');
+});

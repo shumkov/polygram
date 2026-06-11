@@ -402,3 +402,90 @@ test('T14: drop-redeliverer reconstructs from the DB row and calls the D4 tail (
   await handler('sess-1', { chatId: '100', msgId: 999, source: 'primary', turnId: 'z' });
   assert.equal(calls.redelivered.length, 1, 'no DB row → no redelivery (logged)');
 });
+
+// ─── T15: reply dispatch carries the originating msg (dropped-"4" fix A2) ───
+// docs/0.13-resume-dialog-fix-spec.md. 2026-06-10 19:32 shumorobot Music:
+// claude answered "2+2" with "4"; parse classified it as a solo reaction and
+// the dispatcher DROPPED it (channels-tool-dispatcher-reactions-dropped
+// {"dropped":["4"]}) because _dispatchToolCall never passed sourceMsgId —
+// applyReactions was unconditionally false on the channels backend, so every
+// solo reaction (legit 👍 included) vanished with no target to land on.
+
+test('T15a: reply echoing a ledgered turn_id passes that turn\'s msgId to the dispatcher', async () => {
+  const dispatched = [];
+  const { proc, written } = makeProc({
+    toolDispatcher: async (call) => { dispatched.push(call); return { ok: true, message_id: 7 }; },
+  });
+  const { sendP, turnId } = startTurn(proc, written);
+
+  await proc._dispatchToolCall({
+    name: 'reply', tool_call_id: 'tc-1',
+    args: { chat_id: '12345', turn_id: turnId, text: 'hello' },
+  });
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].sourceMsgId, 1,
+    'the dispatcher must receive the originating TG msg_id (as a NUMBER, like every other delivery call site) so solo-emoji replies can react instead of dropping');
+
+  proc.pendingTurns.forEach(p => p.resolve({}));
+  await sendP.catch(() => {});
+  proc.kill?.();
+});
+
+test('T15b: reply with unknown/absent turn_id falls back to the single pending turn\'s msgId', async () => {
+  const dispatched = [];
+  const { proc, written } = makeProc({
+    toolDispatcher: async (call) => { dispatched.push(call); return { ok: true, message_id: 7 }; },
+  });
+  const { sendP } = startTurn(proc, written);
+
+  await proc._dispatchToolCall({
+    name: 'reply', tool_call_id: 'tc-2',
+    args: { chat_id: '12345', text: 'hello' },   // no turn_id echoed
+  });
+  assert.equal(dispatched[0].sourceMsgId, 1,
+    'single pending turn = unambiguous; mirror _recordReplyForPendingTurn\'s fallback');
+
+  proc.pendingTurns.forEach(p => p.resolve({}));
+  await sendP.catch(() => {});
+  proc.kill?.();
+});
+
+test('T15c: no pending turns + unknown turn_id → null sourceMsgId (never misattribute)', async () => {
+  const dispatched = [];
+  const { proc } = makeProc({
+    toolDispatcher: async (call) => { dispatched.push(call); return { ok: true, message_id: 7 }; },
+  });
+  await proc._dispatchToolCall({
+    name: 'reply', tool_call_id: 'tc-3',
+    args: { chat_id: '12345', turn_id: 'ffffffff-0000-0000-0000-000000000000', text: 'late' },
+  });
+  assert.equal(dispatched[0].sourceMsgId ?? null, null,
+    'an unattributable reply must not react to / quote an unrelated message');
+  proc.kill?.();
+});
+
+test('T15d: only the FIRST delivered reply of a turn carries the quote target (review F1)', async () => {
+  // On SDK, deliverReplies fires once per turn → one quote. On channels the
+  // dispatcher fires once per reply tool call; an N-reply turn must not
+  // produce N bubbles all quote-quoting the same user message.
+  const dispatched = [];
+  const { proc, written } = makeProc({
+    toolDispatcher: async (call) => { dispatched.push(call); return { ok: true, message_id: 7 }; },
+  });
+  const { sendP, turnId } = startTurn(proc, written);
+
+  await proc._dispatchToolCall({
+    name: 'reply', tool_call_id: 'tc-d1',
+    args: { chat_id: '12345', turn_id: turnId, text: 'part one' },
+  });
+  await proc._dispatchToolCall({
+    name: 'reply', tool_call_id: 'tc-d2',
+    args: { chat_id: '12345', turn_id: turnId, text: 'part two' },
+  });
+  assert.equal(dispatched[0].sourceMsgId, 1, 'first reply quotes');
+  assert.equal(dispatched[1].sourceMsgId ?? null, null, 'second reply of the same turn must NOT re-quote');
+
+  proc.pendingTurns.forEach(p => p.resolve({}));
+  await sendP.catch(() => {});
+  proc.kill?.();
+});

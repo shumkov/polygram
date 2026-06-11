@@ -482,3 +482,71 @@ test('e2e: real claude — bg-shell probe detects a detached shell in bypass-per
     try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
   }
 });
+
+// 2026-06-11 dropped-"4" fix (docs/0.13-resume-dialog-fix-spec.md A1+A2).
+// Prod incident: claude answered "2+2" with the single character "4"; the
+// parse layer classified it as a solo-emoji reaction (\p{Emoji} matches
+// digits) and the dispatcher dropped it with no reaction target — the user
+// got NOTHING. This E2E runs the REAL dispatcher pipeline (real parse +
+// sanitize + chunk + process-agent-reply) against a real claude reply,
+// asserting a text bubble reaches the fake Telegram sink.
+test('e2e: real claude — single-digit reply survives the full dispatcher pipeline as TEXT', {
+  skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
+  timeout: 180_000,
+}, async () => {
+  const { createChannelsToolDispatcher } = require('../lib/process/channels-tool-dispatcher');
+  const { parseResponse } = require('../lib/telegram/parse');
+  const { sanitizeAssistantReply } = require('../lib/telegram/sanitize-reply');
+  const { chunkMarkdownText } = require('../lib/telegram/chunk');
+
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-e2e-digit-'));
+  const chatConfig = { cwd, permissionMode: 'bypassPermissions', isolateUserConfig: true };
+
+  const tgCalls = [];   // every method the pipeline would hit Telegram with
+  const fakeSend = async (_bot, method, params) => {
+    tgCalls.push({ method, params });
+    return { message_id: 4242 };
+  };
+  const dispatcher = createChannelsToolDispatcher({
+    bot: {},   // unused by the fake send
+    send: fakeSend,
+    chunkText: chunkMarkdownText,
+    deliverReplies: async ({ chunks, replyToMessageId }) => {
+      for (const c of chunks) tgCalls.push({ method: 'sendMessage', params: { text: c, reply_to_message_id: replyToMessageId } });
+      return { sent: [4242], failed: [] };
+    },
+    parseResponse,
+    sanitizeAssistantReply,
+    logger: { warn: () => {}, error: (...a) => console.error('[e2e:err]', ...a), log: () => {}, debug: () => {} },
+  });
+
+  const proc = new CliProcess({
+    sessionKey: 'e2e-digit:1', chatId: '987654329', threadId: null, label: 'e2e-digit',
+    tmuxRunner: createTmuxRunner(), botName: 'e2etest',
+    claudeBin: resolvePinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION),
+    toolDispatcher: dispatcher,
+    logger: { warn: (...a) => console.error('[e2e:warn]', ...a), error: (...a) => console.error('[e2e:err]', ...a), log: () => {}, debug: () => {} },
+    db: { logEvent: () => {} },
+  });
+
+  try {
+    await proc.start({ cwd, chatConfig, existingSessionId: null });
+    await proc.send(
+      'What is 2+2? Reply via the reply tool with EXACTLY one character: the answer digit. '
+      + 'No words, no punctuation — the single digit only.',
+      { timeoutMs: 120_000, maxTurnMs: 150_000, context: { streamer: noopStreamer, reactor: noopReactor, threadId: null, sourceMsgId: 31337 } },
+    );
+
+    const texts = tgCalls.filter(c => c.method === 'sendMessage').map(c => c.params.text);
+    assert.ok(
+      texts.some(t => /4/.test(t)),
+      `the digit reply MUST arrive as a TEXT bubble (pre-fix it became a dropped "reaction"). tgCalls=${JSON.stringify(tgCalls).slice(0, 400)}`,
+    );
+    const reacted = tgCalls.filter(c => c.method === 'setMessageReaction');
+    assert.equal(reacted.length, 0,
+      `a digit must never go out as a reaction: ${JSON.stringify(reacted)}`);
+  } finally {
+    try { await proc.kill('e2e-done'); } catch {}
+    try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
+  }
+});

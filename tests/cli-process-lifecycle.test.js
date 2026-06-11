@@ -237,7 +237,7 @@ function makeProcWithCapture(paneContent, opts = {}) {
   return { proc, runner, sendCalls, events };
 }
 
-test('F#17: session-age dialog mid-turn → sendControl(Enter) fires', async () => {
+test('F#17: session-age dialog mid-turn → Down,Enter picks FULL resume (2026-06-11 resume-dialog fix)', async () => {
   const paneShowingDialog =
     'Some pre-amble...\n' +
     'This session is 8h 38m old and 117.6k tokens.\n' +
@@ -249,13 +249,15 @@ test('F#17: session-age dialog mid-turn → sendControl(Enter) fires', async () 
 
   await proc._pollMidTurnDialogs();
 
-  assert.equal(
-    sendCalls.length,
-    1,
-    'one sendControl(Enter) must fire on detection',
+  // Resume-dialog fix: bare Enter selected the pre-selected "Resume from
+  // summary" — which literally runs /compact on the resumed session. The
+  // watchdog must navigate to "Resume full session as-is" instead.
+  assert.deepEqual(
+    sendCalls.map(c => c.key),
+    ['Down', 'Enter'],
+    'mid-turn session-age must pick full resume, not the compact default',
   );
   assert.equal(sendCalls[0].name, 'pgr-testbot-channels-abc');
-  assert.equal(sendCalls[0].key, 'Enter');
 });
 
 test('F#17: emits mid-turn-dialog-detected event with pattern name + action', async () => {
@@ -272,7 +274,7 @@ test('F#17: emits mid-turn-dialog-detected event with pattern name + action', as
 
   assert.ok(emitted, 'mid-turn-dialog-detected must fire');
   assert.equal(emitted.name, 'session-age');
-  assert.equal(emitted.action, 'enter');
+  assert.equal(emitted.action, 'keys');   // resume-dialog fix: Down,Enter navigation
   assert.equal(emitted.backend, 'cli');
 
   const logEvt = events.find(e => e.kind === 'cli-mid-turn-dialog-detected');
@@ -319,8 +321,8 @@ test('F#17: dedups within rate-limit window', async () => {
 
   assert.equal(
     sendCalls.length,
-    1,
-    'lingering dialog across multiple polls must not spam sendControl(Enter)',
+    2,   // one Down,Enter sequence — NOT repeated per poll
+    'lingering dialog across multiple polls must not spam key sends',
   );
 });
 
