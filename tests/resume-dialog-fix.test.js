@@ -120,3 +120,33 @@ test('B2-midturn: the mid-turn dialog watchdog also picks FULL resume + emits te
     proc.kill?.();
   }
 });
+
+test('pin 2.1.173: the NEW channels banner resolves the startup gate (old banner still matches)', async () => {
+  // claude 2.1.173 reworked the channels UI: the persistent banner is now
+  // "▎ Channels (experimental) messages from server:polygram-bridge inject
+  // directly in this session · restart without --dangerously-load-development-
+  // channels to stop" (live-captured 2026-06-11). The 2.1.158 text
+  // ("Listening for channel messages from: …") is gone from the binary —
+  // an unchanged readySignal would stall EVERY spawn into
+  // CHANNELS_DIALOG_TIMEOUT.
+  const NEW_BANNER = 'Channels (experimental) messages from server:polygram-bridge inject directly in this session · restart without --dangerously-load-development-channels to stop';
+  for (const banner of [NEW_BANNER, READY_PANE]) {
+    let resolved = false;
+    const proc = new CliProcess({
+      sessionKey: 's', chatId: '1',
+      tmuxRunner: {
+        spawn: async () => {},
+        sendControl: async () => {},
+        killSession: async () => {},
+        captureWide: async () => banner,
+      },
+      botName: 'b', claudeBin: '/usr/bin/false',
+      toolDispatcher: async () => ({ ok: true }),
+      logger: quietLogger,
+    });
+    proc.startupGateStallMs = 500;
+    proc.startupGateDeadlineMs = 1500;
+    await proc._handleStartupDialogs('t').then(() => { resolved = true; }).catch(() => {});
+    assert.ok(resolved, `gate must resolve on banner: ${banner.slice(0, 60)}…`);
+  }
+});
