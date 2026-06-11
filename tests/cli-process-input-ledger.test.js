@@ -489,3 +489,56 @@ test('T15d: only the FIRST delivered reply of a turn carries the quote target (r
   await sendP.catch(() => {});
   proc.kill?.();
 });
+
+// ─── T16: consumed-ack finalization (UMI 2026-06-11 19:49 false ⏱ timeout) ──
+// Prod trace: primary turn seen (UPS 19:37:59) + autosteer fold injected;
+// claude answered BOTH in one reply but echoed only the FOLD's turn_id →
+// late-reply correlation delivered it already_delivered and the PRIMARY
+// pending absorbed nothing. claude's consumed_turn_ids ack named the primary
+// (cli-input-acked 19:39:19) — polygram HAD proof of consumption and still
+// rejected the turn at the idle ceiling 10 min later with the scary ⏱ copy.
+// An acked-consumed turn must count as replied for finalization.
+
+test('T16a: fold-id echo + primary consumed_turn_ids ack → activity-quiet resolves already-delivered (no timeout)', async () => {
+  const { proc, written, events } = makeProc({ activityQuietMs: 90 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));                                  // primary seen
+
+  proc.injectUserMessage({ content: 'follow-up', msgId: 44, source: 'autosteer' });
+  const foldId = written.filter(w => w.kind === 'user_msg').slice(-1)[0].turn_id;
+
+  // claude replies echoing ONLY the fold id, but acks consuming BOTH.
+  await proc._dispatchToolCall({
+    name: 'reply', tool_call_id: 'tc-16a',
+    args: { chat_id: '12345', turn_id: foldId, text: 'combined answer', consumed_turn_ids: [turnId, foldId] },
+  });
+
+  const result = await sendP;   // must RESOLVE via rung 2, not reject at any cap
+  assert.equal(result.alreadyDelivered, true,
+    'the answer went out under the fold id — resolving must not re-deliver');
+  assert.ok(events.some(e => e.kind === 'cli-activity-quiet-finalize'),
+    'rung 2 must be the finalizer for a seen+consumed-acked zero-reply turn');
+  proc.kill?.();
+});
+
+test('T16b: same shape at the idle ceiling → ceiling-RESOLVE, never the ⏱ reject', async () => {
+  const { proc, written, events } = makeProc({ turnTimeoutMs: 120, activityQuietMs: 60_000 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));
+
+  proc.injectUserMessage({ content: 'follow-up', msgId: 45, source: 'autosteer' });
+  const foldId = written.filter(w => w.kind === 'user_msg').slice(-1)[0].turn_id;
+  await proc._dispatchToolCall({
+    name: 'reply', tool_call_id: 'tc-16b',
+    args: { chat_id: '12345', turn_id: foldId, text: 'combined answer', consumed_turn_ids: [turnId, foldId] },
+  });
+
+  const result = await sendP;   // idle cap fires at ~120ms
+  assert.equal(result.alreadyDelivered, true,
+    'a ceiling on a consumed-acked turn resolves — the user already has the answer');
+  assert.ok(events.some(e => e.kind === 'cli-turn-ceiling-resolved'),
+    'must take the ceiling-resolve path, not emit turn-timeout');
+  assert.ok(!events.some(e => e.kind === 'turn-timeout'),
+    'the ⏱ reject after a delivered answer is the kill-criteria bug');
+  proc.kill?.();
+});
