@@ -483,3 +483,60 @@ describe('stripInlineTags — streamer-side pre-processor', () => {
     assert.equal(stripped, parsed.text);
   });
 });
+
+describe('parseResponse — keycap-base chars are TEXT, not reactions (2026-06-10 "2+2 → 4" dropped reply)', () => {
+  // Unicode \p{Emoji} includes 0-9, # and * (keycap bases). claude answered
+  // "2+2" with the single character "4"; parseResponse classified it as a
+  // solo-emoji reaction with text:'' and the channels dispatcher dropped it
+  // (channels-tool-dispatcher-reactions-dropped {"dropped":["4"]}) — the user
+  // saw nothing. A bare digit/hash/asterisk must stay a text reply.
+  for (const ch of ['4', '7', '0', '#', '*']) {
+    test(`solo ${JSON.stringify(ch)} is text, never a reaction`, () => {
+      const r = parseResponse(ch, deps);
+      assert.equal(r.text, ch);
+      assert.equal(r.reaction, null);
+      assert.equal(r.sticker, null);
+    });
+  }
+
+  test('genuine solo emoji still becomes a reaction (👍)', () => {
+    const r = parseResponse('👍', deps);
+    assert.equal(r.reaction, '👍');
+    assert.equal(r.text, '');
+  });
+
+  test('VS16 emoji still becomes a reaction (❤️)', () => {
+    const r = parseResponse('❤️', deps);
+    assert.equal(r.reaction, '❤️');
+    assert.equal(r.text, '');
+  });
+
+  test('bare U+2764 without VS16 keeps its current reaction behavior (❤)', () => {
+    const r = parseResponse('❤', deps);
+    assert.equal(r.reaction, '❤');
+    assert.equal(r.text, '');
+  });
+
+  test('keycap SEQUENCE 4️⃣ stays text (multi-codepoint, unchanged)', () => {
+    const r = parseResponse('4️⃣', deps);
+    assert.equal(r.text, '4️⃣');
+    assert.equal(r.reaction, null);
+  });
+
+  test('multi-digit "42" stays text (unchanged)', () => {
+    const r = parseResponse('42', deps);
+    assert.equal(r.text, '42');
+    assert.equal(r.reaction, null);
+  });
+});
+
+describe('parseResponse — digit+VS16 guard (review F5)', () => {
+  // A stray variation selector on a digit ("4️" = '4'+U+FE0F) is one
+  // copy-paste away from the bare-digit bug: \p{Emoji}️? matches it and the
+  // resulting "reaction" is invalid for Telegram → same silent drop.
+  test('digit followed by VS16 stays text ("4️")', () => {
+    const r = parseResponse('4️', deps);
+    assert.equal(r.text, '4️');
+    assert.equal(r.reaction, null);
+  });
+});
