@@ -205,9 +205,11 @@ test('edit_message edits the target bubble via editMessageText', async () => {
   const { send, sent } = makeRecordingSend();
   const dispatcher = createChannelsToolDispatcher({
     bot: fakeBot, send, chunkText: fakeChunk,
-    deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
+    deliverReplies: async () => ({ sent: [500], failed: [], results: [] }),
     parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
   });
+  // establish ownership of bubble 500 via a reply (the real reply→edit flow)
+  await dispatcher({ sessionKey: 'sess-1', chatId: '12345', threadId: '7', toolName: 'reply', text: 'on it' });
   const result = await dispatcher({
     sessionKey: 'sess-1', chatId: '12345', threadId: '7',
     toolName: 'edit_message', messageId: 500, text: 'Found it — fixing now…',
@@ -256,9 +258,10 @@ test('edit_message applies the same agent-text hygiene as reply (strips inline m
   const stripParse = (text) => ({ text: text.replace(/\s*\[react:[^\]]+\]\s*$/, ''), sticker: null, stickers: [], reaction: '🔥', reactions: [] });
   const dispatcher = createChannelsToolDispatcher({
     bot: fakeBot, send, chunkText: fakeChunk,
-    deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
+    deliverReplies: async () => ({ sent: [5], failed: [], results: [] }),
     parseResponse: stripParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
   });
+  await dispatcher({ sessionKey: 's', chatId: '1', threadId: null, toolName: 'reply', text: 'start' });
   await dispatcher({
     sessionKey: 's', chatId: '1', threadId: null,
     toolName: 'edit_message', messageId: 5, text: 'Done [react:🔥]',
@@ -305,9 +308,10 @@ test('edit_message send failure surfaces ok:false (no throw, no hang)', async ()
   };
   const dispatcher = createChannelsToolDispatcher({
     bot: fakeBot, send, chunkText: fakeChunk,
-    deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
+    deliverReplies: async () => ({ sent: [9], failed: [], results: [] }),
     parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
   });
+  await dispatcher({ sessionKey: 's', chatId: '1', threadId: null, toolName: 'reply', text: 'start' });
   const result = await dispatcher({
     sessionKey: 's', chatId: '1', threadId: null,
     toolName: 'edit_message', messageId: 9, text: 'too late',
@@ -507,4 +511,58 @@ test('file attach upload failure surfaces as ok:false with details (R9)', async 
   } finally {
     try { fs.rmSync(cwdRoot, { recursive: true, force: true }); } catch {}
   }
+});
+
+// ─── 2026-06-12 review post-stable hardening: files[] cap + edit ownership ───
+
+test('reply caps files[] length — a single injected call cannot attach unlimited files', async () => {
+  const { send, sent } = makeRecordingSend();
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pgr-filecap-'));
+  try {
+    // 20 real, allowlisted files — without a cap all 20 upload in one call,
+    // bypassing the per-call rate limit (review finding).
+    const files = [];
+    for (let i = 0; i < 20; i++) {
+      const fp = path.join(tmpRoot, `f${i}.txt`);
+      fs.writeFileSync(fp, 'x');
+      files.push(fp);
+    }
+    const dispatcher = createChannelsToolDispatcher({
+      bot: fakeBot, send, chunkText: fakeChunk,
+      deliverReplies: async () => ({ sent: [1], failed: [], results: [] }),
+      parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
+      attachmentAllowlist: [tmpRoot],
+    });
+    const result = await dispatcher({
+      sessionKey: 's', chatId: '12345', threadId: null, sessionCwd: tmpRoot,
+      toolName: 'reply', text: 'lots of files', files,
+    });
+    const uploads = sent.filter(s => s.method === 'sendDocument' || s.method === 'sendPhoto');
+    assert.ok(uploads.length <= 10, `at most 10 files per reply, got ${uploads.length}`);
+    assert.ok(/too many files|max/i.test(JSON.stringify(result)), 'the excess is surfaced, not silent');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('edit_message only edits a bubble THIS session created (ownership) — review 2026-06-12', async () => {
+  const { send } = makeRecordingSend();
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot, send, chunkText: fakeChunk,
+    deliverReplies: async () => ({ sent: [4242], failed: [], results: [] }),
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
+  });
+  // 1. reply creates bubble 4242 for session A.
+  const r = await dispatcher({ sessionKey: 'A', chatId: '1', threadId: null, toolName: 'reply', text: 'working…' });
+  assert.equal(r.message_id, 4242);
+  // 2. editing 4242 in session A works (progressive status — the legit flow).
+  const okEdit = await dispatcher({ sessionKey: 'A', chatId: '1', threadId: null, toolName: 'edit_message', messageId: 4242, text: 'done' });
+  assert.equal(okEdit.ok, true);
+  // 3. editing a bubble session A NEVER created is rejected (prompt-injection defense).
+  const badEdit = await dispatcher({ sessionKey: 'A', chatId: '1', threadId: null, toolName: 'edit_message', messageId: 999999, text: 'tamper' });
+  assert.equal(badEdit.ok, false);
+  assert.match(badEdit.error, /not (created|owned)|did not (create|send)|can only target a bubble you sent/i);
+  // 4. session B cannot edit session A's bubble.
+  const crossEdit = await dispatcher({ sessionKey: 'B', chatId: '1', threadId: null, toolName: 'edit_message', messageId: 4242, text: 'cross' });
+  assert.equal(crossEdit.ok, false);
 });

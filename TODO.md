@@ -31,19 +31,18 @@ See `docs/0.12.0-stable-release-plan.md`. Open items there:
   call; every polygram-side fix rejected as worse than the symptom.
   `docs/0.12.0-known-issues.md` OPEN #3.
 
-## Post-stable hardening (from the 2026-06-12 pre-stable review — confirmed, triaged post-stable)
+## Hardening from the 2026-06-12 pre-stable review — DONE (rc.43)
 
-- **`reply.files[]` has no length cap** — a single injected reply call can
-  attach many files, bypassing the per-call rate limit
-  (`channels-tool-dispatcher.js`). Cap the array length.
-- **`edit_message` accepts an arbitrary `message_id`** with no per-session
-  ownership check (`channels-tool-dispatcher.js`) — a prompt-injected call
-  could edit a bubble it doesn't own. Track edited/owned message ids per session.
-- **Shared `/tmp` attachment base trust** — the staging parent is world-ish on
-  a multi-user host; consider a per-session 0700 dir (the cross-session read is
-  already closed by the rc.42 allowlist fix; this is defense-in-depth).
-- **Test gaps** (low): `abort.js` probe-*throw* fail-toward-kill branch;
-  `drop-redeliver.js` message reconstruction (thread_id/reply_to/chat.type).
+- ✅ **`reply.files[]` length cap** — capped at 10 per reply; the excess is
+  surfaced as a failed-attachment line (`channels-tool-dispatcher.js`).
+- ✅ **`edit_message` per-session ownership** — a bubble may only be edited by
+  the session that created it (id tracked from reply/edit results, bounded);
+  blocks prompt-injected / cross-session edits. Progressive-status flow
+  re-validated by the real-claude edit_message E2E.
+- ✅ **Staging dir `0700`** — already created `mode:0o700` (cli-process.js:422);
+  with the rc.42 allowlist fix the cross-session read is closed. No change needed.
+- ✅ **Test gaps** — `abort.js` probe-throw fail-toward-kill; `drop-redeliver.js`
+  reconstruction (thread_id/reply_to/chat.type heuristic).
 
 ## Post-stable polish (low severity)
 

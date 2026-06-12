@@ -303,3 +303,19 @@ describe('handleAbortIfRequested — abort path', () => {
     assert.equal(evt.detail.trigger.length, 40);
   });
 });
+
+  test('cli + probeBusyState THROWS → fail-toward-kill (review test-gap)', async () => {
+    const m = makeDeps({
+      proc: {
+        inFlight: true, backend: 'cli',
+        probeBusyState: async () => { throw new Error('capture-pane exploded'); },
+        hasActiveBackgroundWork: () => false,
+      },
+    });
+    const fn = createHandleAbort(m.deps);
+    await fn(makeMsg('stop'), '12345', {}, 'stop');
+    assert.ok(m.pmCalls.find((c) => c[0] === 'kill'), 'a probe throw must fail toward kill, never silently interrupt');
+    assert.ok(!m.pmCalls.find((c) => c[0] === 'interrupt'));
+    const evt = m.events.find((e) => e.kind === 'abort-requested');
+    assert.equal(evt.detail.kill_reason, 'probe-failed');
+  });

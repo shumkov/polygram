@@ -403,6 +403,38 @@ test('T14: drop-redeliverer reconstructs from the DB row and calls the D4 tail (
   assert.equal(calls.redelivered.length, 1, 'no DB row → no redelivery (logged)');
 });
 
+test('T14b: reconstruction carries thread_id, reply_to, and the chat.type heuristic (review test-gap)', async () => {
+  const calls = { redelivered: [] };
+  const handler = createDropRedeliverer({
+    db: {
+      getMessage: () => ({ chat_id: '-1009', msg_id: 88, text: 'q', user: 'Ivan', user_id: 7, ts: 1700000000000, thread_id: '12', reply_to_id: 70 }),
+    },
+    redeliver: async (args) => { calls.redelivered.push(args); return { ok: true }; },
+    logEvent: () => {},
+    logger: quietLogger,
+  });
+  await handler('s', { chatId: '-1009', msgId: 88, source: 'primary', turnId: 't' });
+  const msg = calls.redelivered[0].msg;
+  assert.equal(msg.chat.type, 'supergroup', 'negative chatId → supergroup (forum-topic path)');
+  assert.equal(msg.message_thread_id, 12, 'thread_id reconstructed as a Number');
+  assert.deepEqual(msg.reply_to_message, { message_id: 70 }, 'reply_to_id rebuilt into reply_to_message');
+  assert.equal(msg.from.id, 7);
+  assert.equal(typeof msg.date, 'number');
+
+  // positive chatId → private (no thread/reply fields when row lacks them)
+  const calls2 = { redelivered: [] };
+  const h2 = createDropRedeliverer({
+    db: { getMessage: () => ({ chat_id: '451', msg_id: 5, text: 'hi', user: 'U', user_id: 1, ts: 1000, thread_id: null, reply_to_id: null }) },
+    redeliver: async (args) => { calls2.redelivered.push(args); return { ok: true }; },
+    logEvent: () => {}, logger: quietLogger,
+  });
+  await h2('s', { chatId: '451', msgId: 5, source: 'autosteer', turnId: 't' });
+  const m2 = calls2.redelivered[0].msg;
+  assert.equal(m2.chat.type, 'private', 'positive chatId → private');
+  assert.equal(m2.message_thread_id, undefined, 'no thread_id → field omitted');
+  assert.equal(m2.reply_to_message, undefined, 'no reply_to_id → field omitted');
+});
+
 // ─── T15: reply dispatch carries the originating msg (dropped-"4" fix A2) ───
 // docs/0.13-resume-dialog-fix-spec.md. 2026-06-10 19:32 shumorobot Music:
 // claude answered "2+2" with "4"; parse classified it as a solo reaction and
