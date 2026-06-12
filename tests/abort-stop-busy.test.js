@@ -12,6 +12,8 @@
 // Fix: CliProcess.probeBusyState() reads the TUI "esc to interrupt" hint
 // via capture-pane; the abort handler folds it into hadActive so the ack,
 // the markSessionAborted, and the interrupt all agree with reality.
+// (2026-06-12 cancel-cheap update: the ack is now a 👍 reaction / silence —
+// the busy-DETECTION behavior pinned here is unchanged.)
 
 const { test } = require('node:test');
 const assert = require('node:assert');
@@ -54,7 +56,8 @@ test('Stop while busy (inFlight=false, esc-to-interrupt visible) → "Stopped.",
   const handled = await handler(msg, '-100', {}, 'Stop');
 
   assert.equal(handled, true);
-  assert.equal(calls.sent[0].text, 'Stopped.', 'must NOT say "Nothing to stop" while claude is working');
+  // Locked ack design 2026-06-12: 👍 reaction on the stop message, no text.
+  assert.equal(calls.sent[0].reaction[0].emoji, '👍', 'something WAS running → 👍 ack (never the silent no-op)');
   assert.deepEqual(calls.marked, ['k'], 'session marked aborted so the error-reply is suppressed');
   assert.deepEqual(calls.interrupt, ['k'], 'C-c interrupt sent');
 });
@@ -65,7 +68,7 @@ test('Stop while genuinely idle (inFlight=false, no esc-to-interrupt) → "Nothi
 
   await handler(msg, '-100', {}, 'Stop');
 
-  assert.equal(calls.sent[0].text, 'Nothing to stop.', 'genuinely idle still reports truthfully');
+  assert.equal(calls.sent.length, 0, 'genuinely idle → silence (no lie-👍, no text — locked design 2026-06-12)');
   assert.deepEqual(calls.marked, [], 'nothing to mark when not busy');
 });
 
@@ -76,8 +79,8 @@ test('Stop with a live in-flight turn → "Stopped." (no probe needed)', async (
 
   await handler(msg, '-100', {}, 'Stop');
 
-  assert.equal(calls.sent[0].text, 'Stopped.');
-  assert.equal(probed, false, 'no busy probe when inFlight is already true');
+  assert.equal(calls.sent[0].reaction[0].emoji, '👍');
+  assert.equal(probed, false, 'no busy probe when inFlight is already true (non-cli proc: no bg gate)');
 });
 
 test('forensics: abort-requested event records the raw busy-probe signals', async () => {

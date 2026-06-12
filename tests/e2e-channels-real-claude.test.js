@@ -550,3 +550,85 @@ test('e2e: real claude — single-digit reply survives the full dispatcher pipel
     try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
   }
 });
+
+// 2026-06-12 cancel-cheap (docs/0.13-cancel-efficiency-and-delete-trigger-spec.md).
+// The whole point of the tiered cancel: an interrupted turn must leave claude
+// WARM — the next message reuses the same process (no kill, no --resume, no
+// resume-death-race exposure) — and a cancelled mid-turn autosteer must never
+// be re-delivered by the drop sweep (the review's BLOCKER, live).
+test('e2e: real claude — cancel mid-turn is cheap (warm reuse, no respawn) and re-delivers nothing', {
+  skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
+  timeout: 240_000,
+}, async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-e2e-cancel-'));
+  const chatConfig = { cwd, permissionMode: 'bypassPermissions', isolateUserConfig: true };
+  const replies = [];
+  const droppedInputs = [];
+  let spawnCount = 0;
+
+  const realRunner = createTmuxRunner();
+  const countingRunner = {
+    ...realRunner,
+    spawn: async (o) => { spawnCount += 1; return realRunner.spawn(o); },
+  };
+
+  const proc = new CliProcess({
+    sessionKey: 'e2e-cancel:1', chatId: '987654331', threadId: null, label: 'e2e-cancel',
+    tmuxRunner: countingRunner, botName: 'e2etest',
+    claudeBin: resolvePinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION),
+    toolDispatcher: async ({ toolName, text }) => { if (toolName === 'reply') replies.push(text); return { ok: true, message_id: 1 }; },
+    logger: { warn: (...a) => console.error('[e2e:warn]', ...a), error: (...a) => console.error('[e2e:err]', ...a), log: () => {}, debug: () => {} },
+    db: { logEvent: () => {} },
+  });
+  proc.on('input-dropped', (e) => droppedInputs.push(e));
+
+  try {
+    await proc.start({ cwd, chatConfig, existingSessionId: null });
+    assert.equal(spawnCount, 1, 'precondition: exactly one spawn');
+    const sessionIdAtStart = proc.claudeSessionId;
+
+    // A genuinely long turn, so the cancel lands mid-work.
+    const longTurn = proc.send(
+      'Count slowly from 1 to 200, thinking carefully about each number. Then reply with the full list.',
+      { timeoutMs: 120_000, maxTurnMs: 150_000, context: { streamer: noopStreamer, reactor: noopReactor, threadId: null, sourceMsgId: 41 } },
+    );
+    longTurn.catch(() => {});
+
+    // Give claude time to pick the turn up, steer a follow-up in (the
+    // BLOCKER's setup: a mid-turn autosteer the user then cancels)…
+    await new Promise(r => setTimeout(r, 12_000));
+    proc.injectUserMessage({
+      content: 'also tell me a joke about numbers',
+      priority: 'next', msgId: 42, source: 'autosteer',
+    });
+    await new Promise(r => setTimeout(r, 2_000));
+
+    // …then CANCEL (what /stop now does on the common path).
+    await proc.interrupt();
+    const result = await longTurn;
+    assert.equal(result.metrics.resultSubtype, 'interrupted',
+      `the cancelled turn resolves as interrupted, got: ${JSON.stringify(result.metrics)}`);
+
+    // THE COST ASSERTION — the spec's whole point: the next message runs in
+    // the SAME claude process. No second spawn, same session id, no --resume.
+    const followUp = await proc.send(
+      'Reply with exactly the single word: WARM',
+      { timeoutMs: 120_000, maxTurnMs: 150_000, context: { streamer: noopStreamer, reactor: noopReactor, threadId: null, sourceMsgId: 43 } },
+    );
+    const replyText = replies.join(' ') + ' ' + (followUp?.text || '');
+    assert.match(replyText, /WARM/i, `follow-up answered after the cancel. replies=${JSON.stringify(replies).slice(0, 200)}`);
+    assert.equal(spawnCount, 1,
+      'NO respawn after an interrupt-cancel — the warm proc serves the next turn (kill would have spawned again)');
+    assert.equal(proc.claudeSessionId, sessionIdAtStart, 'same claude session — conversation kept without --resume');
+
+    // The BLOCKER, live: the cancelled autosteer must not be re-delivered.
+    // The follow-up turn's finalize ran the drop sweep; give the confirm
+    // window time to fire if it (wrongly) armed.
+    await new Promise(r => setTimeout(r, 25_000));
+    assert.deepEqual(droppedInputs, [],
+      'the CANCELLED autosteer input must never be declared dropped → re-delivered');
+  } finally {
+    try { await proc.kill('e2e-done'); } catch {}
+    try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
+  }
+});

@@ -150,3 +150,36 @@ test('pin 2.1.173: the NEW channels banner resolves the startup gate (old banner
     assert.ok(resolved, `gate must resolve on banner: ${banner.slice(0, 60)}…`);
   }
 });
+
+test('pin 2.1.173: collapsed notices ("+N more") must not stall the gate — interactive footer counts as ready', async () => {
+  // 2.1.173 renders the channels banner in a COLLAPSIBLE notice list. With
+  // ≥3 notices the pane shows "+2 more · /status" and the banner is hidden —
+  // a banner-only readySignal then stalls 60s into a false
+  // CHANNELS_DIALOG_TIMEOUT (caught live by the cancel-cheap E2E on a cwd
+  // with a settings.json model notice; zero prod hits at fix time). An
+  // interactive prompt footer with no pending dialog IS ready — channel
+  // liveness is separately guaranteed by mcp-ready + the delivery watchdog.
+  const COLLAPSED_PANE = [
+    ' ▎ Using Fable 5 (from .claude/settings.json) · /model',
+    '   +2 more · /status',
+    '────────────',
+    '❯ ',
+    '────────────',
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents',
+  ].join('\n');
+  let resolved = false;
+  const proc = new CliProcess({
+    sessionKey: 's', chatId: '1',
+    tmuxRunner: {
+      spawn: async () => {}, sendControl: async () => {}, killSession: async () => {},
+      captureWide: async () => COLLAPSED_PANE,
+    },
+    botName: 'b', claudeBin: '/usr/bin/false',
+    toolDispatcher: async () => ({ ok: true }),
+    logger: quietLogger,
+  });
+  proc.startupGateStallMs = 400;
+  proc.startupGateDeadlineMs = 1200;
+  await proc._handleStartupDialogs('t').then(() => { resolved = true; }).catch(() => {});
+  assert.ok(resolved, 'an interactive prompt with collapsed notices must resolve the gate');
+});

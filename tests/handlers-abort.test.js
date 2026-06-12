@@ -11,21 +11,29 @@ const { createHandleAbort } = require('../lib/handlers/abort');
 
 const silentLogger = { log: () => {}, error: () => {} };
 
-function makeDeps({ procBackend = 'sdk', ...overrides } = {}) {
+function makeDeps({ procBackend = 'sdk', proc = null, ...overrides } = {}) {
   const events = [];
   const tgCalls = [];
   const pmCalls = [];
   const aborted = [];
+  // Default cli-shaped proc: in-flight, probe says "just thinking, no bg".
+  const defaultProc = {
+    inFlight: true,
+    backend: procBackend,
+    probeBusyState: async () => ({ busy: true, streaming: true, backgroundShell: false, shellCount: 0, inFlight: true, pendingTurns: 1, captured: true, paneTail: '' }),
+    hasActiveBackgroundWork: () => false,
+  };
   return {
     events, tgCalls, pmCalls, aborted,
     deps: {
       pm: {
         has: (k) => true,
-        get: (k) => ({ inFlight: true, backend: procBackend }),
+        get: (k) => (proc !== null ? proc : defaultProc),
         interrupt: async (k) => { pmCalls.push(['interrupt', k]); },
         kill: async (k, reason) => { pmCalls.push(['kill', k, reason]); },
         drainQueue: (k, code) => { pmCalls.push(['drainQueue', k, code]); return 1; },
       },
+      dualProbeDelayMs: 5,
       bot: { mock: true },
       tg: (b, method, params, meta) => {
         tgCalls.push({ method, params, meta });
@@ -73,40 +81,97 @@ describe('handleAbortIfRequested — non-abort messages', () => {
 });
 
 describe('handleAbortIfRequested — abort path', () => {
-  test('"stop" with active session → interrupt + drainQueue + ack EN', async () => {
+  test('"stop" with active session → interrupt + drainQueue + 👍 reaction (no text)', async () => {
     const m = makeDeps();
     const fn = createHandleAbort(m.deps);
     const r = await fn(makeMsg('stop'), '12345', { model: 'sonnet' }, 'stop');
     assert.equal(r, true);
     assert.deepEqual(m.aborted, ['12345'], 'markSessionAborted called BEFORE interrupt');
     const interrupt = m.pmCalls.find((c) => c[0] === 'interrupt');
-    const drain = m.pmCalls.find((c) => c[0] === 'drainQueue');
     assert.ok(interrupt);
-    assert.ok(drain);
-    assert.equal(drain[2], 'INTERRUPTED');
-    assert.equal(m.tgCalls[0].params.text, 'Stopped.');
+    // Locked design 2026-06-12: ack = 👍 reaction on the stop message, NO text.
+    assert.equal(m.tgCalls.length, 1);
+    assert.equal(m.tgCalls[0].method, 'setMessageReaction');
+    assert.equal(m.tgCalls[0].params.message_id, 555);
+    assert.equal(m.tgCalls[0].params.reaction[0].emoji, '👍');
   });
 
-  // 2026-06-04: "/stop said Stopped but reaction+typing kept going, and it should
-  // stop everything including background like the SDK backend." A soft C-c
-  // interrupt on the channels backend leaves detached background shells +
-  // subagents running. Fix: /stop on the cli backend HARD-kills the session
-  // (process tree), respawn fresh next message. (red→green: pre-fix the cli path
-  // called interrupt, not kill.)
-  test('channels (cli) backend + active → HARD kill (not interrupt) + drainQueue + ack', async () => {
+  // Cancel-cheap (docs/0.13-cancel-efficiency-and-delete-trigger-spec.md,
+  // locked 2026-06-12, supersedes the 2026-06-04 always-kill decision):
+  // kill+--resume is the resume-death-race path, so the cli backend now
+  // interrupts IN PLACE by default and kills only when an in-place interrupt
+  // genuinely can't reach the work (detached bg shell / ghost / unverifiable).
+  test('cli + in-flight turn, no background work → cheap INTERRUPT, never kill', async () => {
     const m = makeDeps({ procBackend: 'cli' });
     const fn = createHandleAbort(m.deps);
-    const r = await fn(makeMsg('stop'), '12345', { model: 'sonnet' }, 'stop');
-    assert.equal(r, true);
-    const kill = m.pmCalls.find((c) => c[0] === 'kill');
-    const interrupt = m.pmCalls.find((c) => c[0] === 'interrupt');
-    const drain = m.pmCalls.find((c) => c[0] === 'drainQueue');
-    assert.ok(kill, 'channels /stop must hard-kill the session (process tree → all background work)');
-    assert.equal(kill[2], 'abort');
-    assert.ok(!interrupt, 'channels /stop must NOT use the soft C-c interrupt (it leaves background shells running)');
-    assert.ok(drain, 'queued pendings still drained');
-    assert.equal(drain[2], 'INTERRUPTED');
-    assert.equal(m.tgCalls[0].params.text, 'Stopped.');
+    await fn(makeMsg('stop'), '12345', { model: 'sonnet' }, 'stop');
+    assert.ok(m.pmCalls.find((c) => c[0] === 'interrupt'), 'common case = in-place interrupt (warm proc, no --resume)');
+    assert.ok(!m.pmCalls.find((c) => c[0] === 'kill'), 'kill would force --resume — the resume-death-race path');
+    const evt = m.events.find((e) => e.kind === 'abort-requested');
+    assert.equal(evt.detail.cancel_mode, 'interrupt');
+  });
+
+  test('cli + background shell in the probe → KILL (interrupt cannot reach detached work)', async () => {
+    const m = makeDeps({
+      proc: {
+        inFlight: true, backend: 'cli',
+        probeBusyState: async () => ({ busy: true, streaming: true, backgroundShell: true, shellCount: 1, captured: true }),
+        hasActiveBackgroundWork: () => false,
+      },
+    });
+    const fn = createHandleAbort(m.deps);
+    await fn(makeMsg('stop'), '12345', {}, 'stop');
+    assert.ok(m.pmCalls.find((c) => c[0] === 'kill'), 'detached run_in_background work → stop-everything kill');
+    assert.ok(!m.pmCalls.find((c) => c[0] === 'interrupt'));
+  });
+
+  test('cli + bg-work watchdog says active → KILL (durable signal cross-check)', async () => {
+    const m = makeDeps({
+      proc: {
+        inFlight: true, backend: 'cli',
+        probeBusyState: async () => ({ busy: true, streaming: true, backgroundShell: false, captured: true }),
+        hasActiveBackgroundWork: () => true,   // pane scrape missed it; watchdog didn't
+      },
+    });
+    const fn = createHandleAbort(m.deps);
+    await fn(makeMsg('stop'), '12345', {}, 'stop');
+    assert.ok(m.pmCalls.find((c) => c[0] === 'kill'));
+  });
+
+  test('cli + shell appears only on the SECOND probe → KILL (dual-probe catches the just-spawned shell)', async () => {
+    let probes = 0;
+    const m = makeDeps({
+      proc: {
+        inFlight: true, backend: 'cli',
+        probeBusyState: async () => ({ busy: true, streaming: true, backgroundShell: (++probes) >= 2, captured: true }),
+        hasActiveBackgroundWork: () => false,
+      },
+    });
+    const fn = createHandleAbort(m.deps);
+    await fn(makeMsg('stop'), '12345', {}, 'stop');
+    assert.ok(probes >= 2, 'a second probe must run before trusting backgroundShell:false');
+    assert.ok(m.pmCalls.find((c) => c[0] === 'kill'));
+  });
+
+  test('cli GHOST (no pending turn but still streaming) → KILL (interrupt cannot clear ghost feedback)', async () => {
+    const m = makeDeps({
+      proc: {
+        inFlight: false, backend: 'cli',   // hadActive comes from the busy probe
+        probeBusyState: async () => ({ busy: true, streaming: true, backgroundShell: false, captured: true }),
+        hasActiveBackgroundWork: () => false,
+      },
+    });
+    const fn = createHandleAbort(m.deps);
+    await fn(makeMsg('stop'), '12345', {}, 'stop');
+    assert.ok(m.pmCalls.find((c) => c[0] === 'kill'), 'ghost busy-state must close-drain via kill');
+    assert.ok(!m.pmCalls.find((c) => c[0] === 'interrupt'));
+  });
+
+  test('cli + NO probeBusyState available → KILL (fail toward the stop-everything guarantee)', async () => {
+    const m = makeDeps({ proc: { inFlight: true, backend: 'cli' } });
+    const fn = createHandleAbort(m.deps);
+    await fn(makeMsg('stop'), '12345', {}, 'stop');
+    assert.ok(m.pmCalls.find((c) => c[0] === 'kill'), 'cannot verify no-bg → must not risk leaving work running');
   });
 
   test('GUARD: SDK backend still uses the soft interrupt, never kill', async () => {
@@ -117,21 +182,16 @@ describe('handleAbortIfRequested — abort path', () => {
     assert.ok(!m.pmCalls.find((c) => c[0] === 'kill'), 'SDK Query must NOT be killed');
   });
 
-  test('"стоп" → Russian ack', async () => {
+  test('"стоп" → same 👍 reaction (ack is language-neutral now)', async () => {
     const m = makeDeps();
     const fn = createHandleAbort(m.deps);
     await fn(makeMsg('стоп'), '12345', {}, 'стоп');
-    assert.equal(m.tgCalls[0].params.text, 'Остановлено.');
+    assert.equal(m.tgCalls.length, 1);
+    assert.equal(m.tgCalls[0].method, 'setMessageReaction');
+    assert.equal(m.tgCalls[0].params.reaction[0].emoji, '👍');
   });
 
-  test('"отмена" → Russian ack (Cyrillic detection)', async () => {
-    const m = makeDeps();
-    const fn = createHandleAbort(m.deps);
-    await fn(makeMsg('отмена'), '12345', {}, 'отмена');
-    assert.match(m.tgCalls[0].params.text, /Остановлено|Нечего/);
-  });
-
-  test('no active session → "Nothing to stop." ack', async () => {
+  test('no active session → SILENCE (no reaction, no text — a 👍 would lie)', async () => {
     const m = makeDeps({
       pm: {
         has: () => false,
@@ -142,7 +202,7 @@ describe('handleAbortIfRequested — abort path', () => {
     });
     const fn = createHandleAbort(m.deps);
     await fn(makeMsg('stop'), '12345', {}, 'stop');
-    assert.equal(m.tgCalls[0].params.text, 'Nothing to stop.');
+    assert.equal(m.tgCalls.length, 0, 'nothing stopped → no 👍, and never any text (locked design)');
     assert.equal(m.aborted.length, 0, 'markSessionAborted skipped when nothing active');
   });
 
@@ -167,8 +227,9 @@ describe('handleAbortIfRequested — abort path', () => {
     const fn = createHandleAbort(m.deps);
     await fn(makeMsg('stop'), '12345', {}, 'stop');
     assert.equal(killed, true, 'the background shell is stopped');
-    assert.equal(m.tgCalls[0].params.text, 'Stopped the background task.',
-      'the ack is truthful — NOT the misleading "Nothing to stop."');
+    assert.equal(m.tgCalls[0].method, 'setMessageReaction');
+    assert.equal(m.tgCalls[0].params.reaction[0].emoji, '👍',
+      'something WAS stopped → 👍 (the old misleading "Nothing to stop." text is gone)');
     const evt = m.events.find((e) => e.kind === 'abort-requested');
     assert.equal(evt.detail.had_active, false);
     assert.equal(evt.detail.killed_background_shell, true,
@@ -190,8 +251,8 @@ describe('handleAbortIfRequested — abort path', () => {
     });
     const fn = createHandleAbort(m.deps);
     await fn(makeMsg('stop'), '12345', {}, 'stop');
-    assert.equal(m.tgCalls[0].params.text, 'Nothing to stop.',
-      'with neither a turn nor a background shell, the ack is unchanged');
+    assert.equal(m.tgCalls.length, 0,
+      'with neither a turn nor a background shell → silence (no lie-👍, no text)');
   });
 
   test('logs abort-requested event with had_active flag', async () => {
@@ -205,11 +266,13 @@ describe('handleAbortIfRequested — abort path', () => {
     assert.equal(evt.detail.trigger, 'cancel');
   });
 
-  test('thread context preserved in ack reply', async () => {
+  test('the 👍 lands on the stop message itself (thread implicit in message_id)', async () => {
     const m = makeDeps();
     const fn = createHandleAbort(m.deps);
     await fn(makeMsg('stop', { threadId: 42 }), '12345', {}, 'stop');
-    assert.equal(m.tgCalls[0].params.message_thread_id, '42');
+    assert.equal(m.tgCalls[0].method, 'setMessageReaction');
+    assert.equal(m.tgCalls[0].params.message_id, 555);
+    assert.equal(m.tgCalls[0].params.chat_id, '12345');
   });
 
   test('interrupt failure does NOT throw and still drains + acks', async () => {
@@ -224,7 +287,8 @@ describe('handleAbortIfRequested — abort path', () => {
     const fn = createHandleAbort(m.deps);
     const r = await fn(makeMsg('stop'), '12345', {}, 'stop');
     assert.equal(r, true);
-    assert.equal(m.tgCalls.length, 1, 'ack still sent despite interrupt failure');
+    assert.equal(m.tgCalls.length, 1, '👍 still attempted despite interrupt failure');
+    assert.equal(m.tgCalls[0].method, 'setMessageReaction');
   });
 
   test('trigger text is truncated to 40 chars in the event detail', async () => {
