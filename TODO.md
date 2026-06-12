@@ -31,6 +31,20 @@ See `docs/0.12.0-stable-release-plan.md`. Open items there:
   call; every polygram-side fix rejected as worse than the symptom.
   `docs/0.12.0-known-issues.md` OPEN #3.
 
+## Post-stable hardening (from the 2026-06-12 pre-stable review — confirmed, triaged post-stable)
+
+- **`reply.files[]` has no length cap** — a single injected reply call can
+  attach many files, bypassing the per-call rate limit
+  (`channels-tool-dispatcher.js`). Cap the array length.
+- **`edit_message` accepts an arbitrary `message_id`** with no per-session
+  ownership check (`channels-tool-dispatcher.js`) — a prompt-injected call
+  could edit a bubble it doesn't own. Track edited/owned message ids per session.
+- **Shared `/tmp` attachment base trust** — the staging parent is world-ish on
+  a multi-user host; consider a per-session 0700 dir (the cross-session read is
+  already closed by the rc.42 allowlist fix; this is defense-in-depth).
+- **Test gaps** (low): `abort.js` probe-*throw* fail-toward-kill branch;
+  `drop-redeliver.js` message reconstruction (thread_id/reply_to/chat.type).
+
 ## Post-stable polish (low severity)
 
 - **Format-aware chunker** — `TG_CHUNK_BUDGET=3500` is an approximation for
