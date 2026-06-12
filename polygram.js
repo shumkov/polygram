@@ -2459,7 +2459,7 @@ async function main() {
   });
   handleConfigCallback = createHandleConfigCallback({
     config, db, dbWrite, pm, getSessionKey,
-    formatConfigInfoText, buildConfigKeyboard,
+    formatConfigInfoText, buildConfigKeyboard, saveConfig,
     botName: BOT_NAME, logger: console,
   });
   handleAbortIfRequested = createHandleAbort({
@@ -2532,7 +2532,7 @@ async function main() {
     config, db, dbWrite, pm, pairings, parsePairingTtl,
     contextHintShown, formatContextReply, getClaudeSessionId,
     getOrSpawnForChat, parsePairCodeArgs,
-    modelVersionsDesc: MODEL_VERSIONS_DESC,
+    modelVersionsDesc: MODEL_VERSIONS_DESC, saveConfig,
     botName: BOT_NAME, logEvent, logger: console,
   });
   console.log('[polygram] using SDK ProcessManager');

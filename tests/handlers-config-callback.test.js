@@ -193,3 +193,58 @@ describe('handleConfigCallback — happy path', () => {
     assert.match(ctx._edits[0].text, /Model: sonnet, Effort: max/);
   });
 });
+
+describe('handleConfigCallback — scope + persistence (2026-06-12 "/model in Music does nothing")', () => {
+  function makeTopicDeps() {
+    const saved = [];
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: { '-100': { model: 'sonnet', effort: 'high', topics: { '3': { name: 'Music', agent: 'music-curator' } } } },
+      },
+      getSessionKey: (chatId, threadId) => threadId ? `${chatId}:${threadId}` : String(chatId),
+      saveConfig: () => saved.push(true),
+    });
+    m.saved = saved;
+    return m;
+  }
+  function topicCtx(data) {
+    const c = makeCtx({ data, chatId: '-100' });
+    c.callbackQuery.message.message_thread_id = 3;   // Music topic
+    return c;
+  }
+
+  test('tap in a topic writes the TOPIC override, NOT the chat root', async () => {
+    const m = makeTopicDeps();
+    const fn = createHandleConfigCallback(m.deps);
+    await fn(topicCtx('cfg:model:opus'));
+    assert.equal(m.deps.config.chats['-100'].topics['3'].model, 'opus',
+      'the Music topic must get its own model override');
+    assert.equal(m.deps.config.chats['-100'].model, 'sonnet',
+      'the chat root must NOT change — no leak to General / other topics');
+  });
+
+  test('tap in a topic persists via saveConfig (survives restart)', async () => {
+    const m = makeTopicDeps();
+    const fn = createHandleConfigCallback(m.deps);
+    await fn(topicCtx('cfg:model:opus'));
+    assert.equal(m.saved.length, 1, 'saveConfig MUST be called or the change dies on the next restart');
+  });
+
+  test('tap in a topic logs the REAL thread_id (not null)', async () => {
+    const m = makeTopicDeps();
+    const fn = createHandleConfigCallback(m.deps);
+    await fn(topicCtx('cfg:effort:max'));
+    const log = m.dbCalls.find((c) => c[0] === 'logConfigChange');
+    assert.equal(log[1].thread_id, '3', 'the audit row must record the topic it applied to');
+  });
+
+  test('tap at the chat level (no topic) still writes the chat root + persists', async () => {
+    const saved = [];
+    const m = makeDeps({ saveConfig: () => saved.push(true) });
+    const fn = createHandleConfigCallback(m.deps);
+    await fn(makeCtx({ data: 'cfg:model:opus' }));   // no message_thread_id
+    assert.equal(m.deps.config.chats['12345'].model, 'opus');
+    assert.equal(saved.length, 1);
+  });
+})

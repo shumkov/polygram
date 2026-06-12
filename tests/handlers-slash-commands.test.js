@@ -70,6 +70,7 @@ function fixture(overrides = {}) {
       return { scope: m ? m[1] : 'user', chat: null, ttl: null, note: null };
     },
     modelVersionsDesc: { sonnet: 'sonnet-4-6', opus: 'opus-4-7', haiku: 'haiku-4-5' },
+    saveConfig: overrides.saveConfig || (() => {}),
     botName: 'testbot',
     logEvent: (kind, detail) => calls.events.push({ kind, detail }),
     logger: { log: () => {}, error: () => {} },
@@ -321,5 +322,29 @@ describe('slash-commands — /compact', () => {
     await fx.dispatch(fx.makeCtx({ text: '/compact' }));
     assert.ok(fx.calls.events.some((e) => e.kind === 'compact-spawn-resumed'));
     assert.match(fx.calls.sendReply[0], /Compacting/);
+  });
+});
+
+describe('slash-commands — /model /effort scope + persistence (2026-06-12 topic bug)', () => {
+  test('/model X in a topic writes the TOPIC override + persists, not the chat root', async () => {
+    const saved = [];
+    const fx = fixture({ saveConfig: () => saved.push(true) });
+    const ctx = fx.makeCtx({ text: '/model opus' });
+    ctx.threadIdStr = '3';
+    ctx.chatConfig = { model: 'sonnet', effort: 'high', topics: { '3': { name: 'Music' } } };
+    await fx.dispatch(ctx);
+    assert.equal(ctx.chatConfig.topics['3'].model, 'opus', 'topic gets its own model');
+    assert.equal(ctx.chatConfig.model, 'sonnet', 'chat root unchanged (no leak)');
+    assert.equal(saved.length, 1, 'persisted to disk → survives restart');
+    assert.equal(fx.calls.db.configChanges[0].thread_id, '3', 'audit row records the topic');
+  });
+
+  test('/effort X at the chat level still writes the chat root + persists', async () => {
+    const saved = [];
+    const fx = fixture({ saveConfig: () => saved.push(true) });
+    const ctx = fx.makeCtx({ text: '/effort max' });   // threadIdStr null
+    await fx.dispatch(ctx);
+    assert.equal(ctx.chatConfig.effort, 'max');
+    assert.equal(saved.length, 1);
   });
 });
