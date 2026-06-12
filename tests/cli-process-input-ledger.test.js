@@ -542,3 +542,29 @@ test('T16b: same shape at the idle ceiling → ceiling-RESOLVE, never the ⏱ re
     'the ⏱ reject after a delivered answer is the kill-criteria bug');
   proc.kill?.();
 });
+
+// ─── T17: consumed_turn_ids ack is gated on chat_id (review 2026-06-12) ──────
+// _ledgerAckConsumed ran BEFORE the P1 chat_id security check, so a reply
+// carrying a MISMATCHED chat_id but naming the live turn in consumed_turn_ids
+// still marked that turn resolved/_consumedAcked (and armed the finalizer) —
+// silently "delivered" though nothing reached this chat.
+test('T17: a mismatched-chat_id reply must NOT ack/resolve the live turn via consumed_turn_ids', async () => {
+  const { proc, written } = makeProc();
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));
+
+  await proc._dispatchToolCall({
+    name: 'reply', tool_call_id: 'tc-17',
+    args: { chat_id: '99999', turn_id: turnId, text: 'wrong chat', consumed_turn_ids: [turnId] },
+  });
+
+  const entry = proc.inputLedger.get(turnId);
+  assert.notEqual(entry?.state, 'resolved', 'a foreign-chat reply must not resolve the ledger entry');
+  const pending = proc.pendingTurns.get(turnId);
+  assert.ok(pending && pending._consumedAcked !== true,
+    'a foreign-chat reply must not mark the live turn consumed-acked');
+
+  proc.pendingTurns.forEach(p => p.resolve({}));
+  await sendP.catch(() => {});
+  proc.kill?.();
+});

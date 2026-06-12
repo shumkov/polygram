@@ -159,3 +159,62 @@ test('C3: grace resolution leaves no live turn machinery', async () => {
   assert.deepEqual(late, [], 'no finalizer machinery may fire after the synthetic interrupt resolution');
   proc.kill?.();
 });
+
+test('C4 (BLOCKER): a NEW turn started during the interrupt grace is NOT swallowed as interrupted', async () => {
+  // Multi-agent review 2026-06-12: the grace timer iterated pendingTurns LIVE
+  // and resolved EVERY pending it found — including a fresh turn the user
+  // started after the cancelled one finalized. That silently kills the exact
+  // "stop, then redirect" flow cheap-cancel exists for. The grace must only
+  // resolve the turns that were in flight AT interrupt() time.
+  const { proc, written } = makeProc({ interruptGraceMs: 80, stopGraceMs: 10 });
+  const t0 = startTurn(proc, written, 'first task');
+  proc._handleHookEvent(upsFor(t0.turnId));
+
+  // claude acks the C-c: a reply lands and the turn finalizes cleanly DURING
+  // the grace window (this is the common case — interrupt is graceful).
+  await proc.interrupt();
+  await proc._dispatchToolCall({
+    name: 'reply', tool_call_id: 'tc-c4',
+    args: { chat_id: '12345', turn_id: t0.turnId, text: 'stopped mid-task', consumed_turn_ids: [t0.turnId] },
+  });
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: '' });
+  await sleep(20);                     // t0 settles via stop-grace, still inside the 80ms interrupt grace
+  const r0 = await t0.sendP.catch((e) => ({ thrown: e }));
+
+  // the user now redirects with a brand-new turn — still inside the grace
+  const t1 = startTurn(proc, written, 'actually do THIS instead');
+  proc._handleHookEvent(upsFor(t1.turnId));
+  await proc._dispatchToolCall({
+    name: 'reply', tool_call_id: 'tc-c4b',
+    args: { chat_id: '12345', turn_id: t1.turnId, text: 'on it', consumed_turn_ids: [t1.turnId] },
+  });
+  await sleep(120);                    // let the stale grace fire (and the new turn settle)
+  proc.pendingTurns.forEach(p => p.resolve?.({ metrics: {} }));
+  const r1 = await t1.sendP;
+
+  assert.notEqual(r1?.metrics?.resultSubtype, 'interrupted',
+    'a turn started AFTER the cancel must never be resolved as interrupted by the stale grace');
+  proc.kill?.();
+});
+
+test('C5: a follow-up injected DURING the interrupt grace does not autosteer into cancelled work', async () => {
+  // Review #2: inject can run during the grace (inFlight still true) and add a
+  // fresh 'written' ledger entry the cancel-loop already passed → later
+  // re-delivery. A cancel is in flight: the inject must be refused so the
+  // caller queues it as a fresh turn instead of merging into stopped work.
+  const { proc, written } = makeProc({ interruptGraceMs: 80 });
+  const t0 = startTurn(proc, written, 'task');
+  proc._handleHookEvent(upsFor(t0.turnId));
+
+  await proc.interrupt();
+  const ok = proc.injectUserMessage({ content: 'follow-up during grace', msgId: 71, source: 'autosteer' });
+  assert.equal(ok, false, 'inject must be refused while a cancel grace is in flight');
+
+  await sleep(120);
+  proc.pendingTurns.forEach(p => p.resolve?.({ metrics: {} }));
+  await t0.sendP.catch(() => {});
+  // no autosteer ledger entry should be sitting 'written'
+  const stray = [...proc.inputLedger.values()].filter(e => e.source === 'autosteer' && (e.state === 'written' || e.state === 'seen'));
+  assert.equal(stray.length, 0, 'no during-grace autosteer entry left re-deliverable');
+  proc.kill?.();
+});

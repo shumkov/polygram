@@ -6,7 +6,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { getSessionKey, getChatIdFromKey, getThreadIdFromKey, getTopicConfig, getTopicName } = require('../lib/session-key');
+const { getSessionKey, getChatIdFromKey, getThreadIdFromKey, getTopicConfig, getTopicName, getConfigWriteScope } = require('../lib/session-key');
 
 describe('getSessionKey', () => {
   test('no threadId, no chatConfig → just chatId', () => {
@@ -192,5 +192,44 @@ describe('getThreadIdFromKey (rc.47)', () => {
     assert.equal(getThreadIdFromKey(''), null);
     assert.equal(getThreadIdFromKey(null), null);
     assert.equal(getThreadIdFromKey(undefined), null);
+  });
+});
+
+describe('getConfigWriteScope — write target mirrors getSessionKey isolation (review 2026-06-12)', () => {
+  test('isolated topic → writes the topic override entry (created if missing)', () => {
+    const chatConfig = { model: 'sonnet', isolateTopics: true, topics: { '3': { name: 'Music' } } };
+    const { scope, threadId } = getConfigWriteScope(chatConfig, '3');
+    assert.equal(threadId, '3');
+    scope.model = 'opus';
+    assert.equal(chatConfig.topics['3'].model, 'opus');
+    assert.equal(chatConfig.model, 'sonnet', 'chat root untouched');
+  });
+
+  test('NON-isolated chat + topic → writes the CHAT ROOT, not a no-op topic override', () => {
+    // The running session is keyed by chatId alone (getSessionKey returns the
+    // bare chatId when !isolateTopics), so topics[tid].model would be IGNORED.
+    // Writing chat-root is the only thing that actually applies.
+    const chatConfig = { model: 'sonnet', isolateTopics: false, topics: { '3': { name: 'Music' } } };
+    const { scope, threadId } = getConfigWriteScope(chatConfig, '3');
+    assert.equal(threadId, null, 'audit thread_id reflects chat-level application');
+    scope.model = 'opus';
+    assert.equal(chatConfig.model, 'opus', 'chat root changed (the session that actually runs)');
+    assert.equal(chatConfig.topics['3'].model, undefined, 'no dead topic override written');
+  });
+
+  test('chat-level (no thread) → writes the chat root', () => {
+    const chatConfig = { model: 'sonnet' };
+    const { scope, threadId } = getConfigWriteScope(chatConfig, null);
+    assert.equal(threadId, null);
+    assert.equal(scope, chatConfig);
+  });
+
+  test('isolateTopics undefined (default) behaves as non-isolated → chat root', () => {
+    const chatConfig = { model: 'sonnet', topics: { '5': {} } };
+    const { scope, threadId } = getConfigWriteScope(chatConfig, '5');
+    assert.equal(threadId, null);
+    scope.effort = 'max';
+    assert.equal(chatConfig.effort, 'max');
+    assert.equal(chatConfig.topics['5'].effort, undefined);
   });
 });

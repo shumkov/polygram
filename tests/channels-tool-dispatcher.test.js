@@ -398,11 +398,29 @@ test('buildAllowedRoots includes per-session staging + sessionCwd + extras', () 
     sessionCwd: '/home/agent/workspace',
     extraRoots: ['/opt/data', 'not/absolute/dropped'],
   });
-  assert.ok(roots.includes(DEFAULT_ATTACHMENT_BASE));
   assert.ok(roots.some(r => r.endsWith('polygram-attachments/sess-1')));
   assert.ok(roots.includes('/home/agent/workspace'));
   assert.ok(roots.includes('/opt/data'));
   assert.ok(!roots.includes('not/absolute/dropped'), 'non-absolute extras dropped');
+});
+
+test('buildAllowedRoots does NOT include the shared base — no cross-session exfiltration (review 2026-06-12)', () => {
+  // The shared DEFAULT_ATTACHMENT_BASE as a root let session A read a file
+  // staged under session B (/tmp/polygram-attachments/<B>/secret) since all
+  // claude procs run as the same uid. Only the session's OWN subdir is allowed.
+  const roots = buildAllowedRoots({ sessionKey: 'sess-A' });
+  assert.ok(!roots.includes(DEFAULT_ATTACHMENT_BASE),
+    'the shared parent base must NOT be an allowed root');
+  const otherSessionFile = require('path').join(DEFAULT_ATTACHMENT_BASE, 'sess-B', 'secret.flac');
+  const v = validateAttachmentPath(otherSessionFile, roots);
+  assert.equal(v.ok, false, 'a file under ANOTHER session\'s staging dir must be rejected');
+});
+
+test('buildAllowedRoots with empty/falsy sessionKey does NOT collapse to the shared base', () => {
+  // path.join(BASE, '') === BASE — guard against an unset sessionKey silently
+  // re-opening the entire base.
+  const roots = buildAllowedRoots({ sessionKey: '' });
+  assert.ok(!roots.includes(DEFAULT_ATTACHMENT_BASE), 'empty sessionKey must not allow the base');
 });
 
 test('dispatcher REJECTS Claude reply with files=/etc/passwd (exfiltration defense)', async () => {

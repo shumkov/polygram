@@ -331,7 +331,7 @@ describe('slash-commands — /model /effort scope + persistence (2026-06-12 topi
     const fx = fixture({ saveConfig: () => saved.push(true) });
     const ctx = fx.makeCtx({ text: '/model opus' });
     ctx.threadIdStr = '3';
-    ctx.chatConfig = { model: 'sonnet', effort: 'high', topics: { '3': { name: 'Music' } } };
+    ctx.chatConfig = { model: 'sonnet', effort: 'high', isolateTopics: true, topics: { '3': { name: 'Music' } } };
     await fx.dispatch(ctx);
     assert.equal(ctx.chatConfig.topics['3'].model, 'opus', 'topic gets its own model');
     assert.equal(ctx.chatConfig.model, 'sonnet', 'chat root unchanged (no leak)');

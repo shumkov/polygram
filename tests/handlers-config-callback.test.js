@@ -200,7 +200,7 @@ describe('handleConfigCallback — scope + persistence (2026-06-12 "/model in Mu
     const m = makeDeps({
       config: {
         bot: { allowConfigCommands: true },
-        chats: { '-100': { model: 'sonnet', effort: 'high', topics: { '3': { name: 'Music', agent: 'music-curator' } } } },
+        chats: { '-100': { model: 'sonnet', effort: 'high', isolateTopics: true, topics: { '3': { name: 'Music', agent: 'music-curator' } } } },
       },
       getSessionKey: (chatId, threadId) => threadId ? `${chatId}:${threadId}` : String(chatId),
       saveConfig: () => saved.push(true),
