@@ -1,114 +1,61 @@
 # polygram — TODO / follow-ups
 
-Tracking known-but-deferred work. Anything that surfaced during a release but didn't block shipping. Not a roadmap for new features — see milestones / the design docs for that.
+Known-but-deferred work that didn't block shipping. Not a roadmap — see the
+design docs and `docs/0.12.0-stable-release-plan.md` for the current release.
+
+> Refreshed 2026-06-12 at 0.12.0-rc.41. The pre-0.10 entries (EIO storm — now
+> fixed, the "0.10.0 next milestone" — shipped five milestones ago, the
+> 643→1618 test count) were stale and have been removed/reconciled. Suite is
+> now **2510 tests**.
 
 ---
 
-## Bug class follow-ups (candidates for 0.9.1)
+## Pre-stable (tracked in the release plan)
 
-### `proc.stdin` EIO storm on kickstart (regression from rc.38 fix)
+See `docs/0.12.0-stable-release-plan.md`. Open items there:
+- **Health-monitor tuning** (Phase 1b, host-side `shumabit health` job) — stop
+  paging on auto-recovered transients; alert only on un-recovered / repeated /
+  terminal kinds. The user-facing error copy is already humanized (rc.41).
+- **File the upstream resume-race report** (Phase 2a) — see the OPEN entry in
+  `docs/0.12.0-known-issues.md` (MCP connect-timeout tears down an
+  already-connected transport during `--resume`; 5 samples, root-caused).
+- **Branch/worktree consolidation** (Phase 5) — collapse 6 worktrees back to
+  `/polygram` on `main`; one fast-forward merge of `0.12.0-cli-driver` lands
+  0.11 + 0.12 + 0.13.
 
-**Symptom**: every `launchctl kickstart -k` against shumabit emits ~100 `uncaught-exception: write EIO` events, then `panic-exit` fires (rate-limited bailout). launchd respawns via `Crashed=true`, so the daemon recovers — but the kickstart is noisy.
+## Known upstream (contained, not polygram bugs)
 
-**History**: rc.38 added `proc.stdin.on('error')` to suppress these. Confirmed working in 0.8.0. Something in the 0.9.0-cleanup refactor (commit 19 extracting `lib/sdk/callbacks.js`, or one of the pm-sdk extractions) lost the handler.
+- **Dev-channels resume/MCP-timeout race** — the ~30s startup death; contained
+  by auto-retry + delivery watchdog. `docs/0.12.0-known-issues.md` OPEN #1.
+- **Verbatim re-delivery** — claude occasionally re-emits a prior reply tool
+  call; every polygram-side fix rejected as worse than the symptom.
+  `docs/0.12.0-known-issues.md` OPEN #3.
 
-**Repro**: `launchctl kickstart -k gui/503/com.shumabit.claude-sessions` while shumabit has an in-flight turn with an active SDK subprocess. Check shumabit events table for `uncaught-exception` events emitted in the second around the kickstart.
+## Post-stable polish (low severity)
 
-**Fix direction**: grep for `proc.stdin` / `stdinHandler` in `lib/sdk/process-manager.js` and adjacent. Confirm the error handler is still installed on every spawned subprocess. May need a test that simulates SIGTERM mid-stdin-write.
+- **Format-aware chunker** — `TG_CHUNK_BUDGET=3500` is an approximation for
+  HTML inflation; a formatter-aware chunker measuring post-format size would
+  let the budget return to 4096. Anti-regression test already in
+  `tests/telegram-chunk.test.js`.
+- **`assembleHandlers()` refactor** — polygram.js has ~17 `let X = null`
+  deferred-wire placeholders (a wire-order-bug magnet — cf. the rc.34 boot
+  crash and the 2026-06-12 config-scope bug). Extract a single
+  `assembleHandlers({db, bot, pm, …})`. Boot-smoke test guards the regressions
+  meanwhile.
 
-**Severity**: cosmetic (KeepAlive recovers), but every deploy generates ~100 monitor alerts. Worth fixing for cleanliness.
+## Post-stable features (designs filed, need operator decisions)
 
----
+- **SessionStart cwd auto-pairing** — `/use <cwd>` to pair without editing
+  config.json. `docs/0.12.0-session-start-pair-spec.md` (open questions need a
+  decision). ~4h.
+- **Context/token observability** — `/context`, `/tail`, 85% proactive push.
+  `docs/0.12.0-context-observability-spec.md`. Depends on the pairing infra. ~3h.
+- **Hot-reload agent files** — chokidar watch on agent dirs, invalidate the
+  loader cache (vs the current `/reload`). Minor.
+- **Approval-waiting stub** — a "🕐 waiting on operator approval" line in the
+  requester chat while the approval card is pending. Minor UX.
 
-### Format-aware chunker (true fix for HTML inflation)
+## Doc debt (post-stable)
 
-**Current state**: rc.6 reduced `TG_CHUNK_BUDGET = 3500` (from 4096) to leave HTML headroom for `toTelegramHtml` inflation. Approximation — works for ~99% of natural-language inputs but pathological code-heavy text can still inflate past 4096 even when raw is 3500.
-
-**Real fix**: chunker should accept a `formatter` callback and measure POST-format size when deciding break points. Currently it measures raw markdown length only.
-
-**Anti-regression test**: `tests/telegram-chunk.test.js` has a test pinning the bug class at limit=4096. If a future format-aware chunker passes that test, `TG_CHUNK_BUDGET` can be raised back to 4096.
-
-**Severity**: low — the budget approximation handles real production traffic. Worth doing for correctness + to remove the magic-number 3500.
-
----
-
-### `assembleHandlers()` refactor (eliminate deferred-wire placeholders)
-
-**Current state**: polygram.js has ~17 `let X = null` placeholders for handler factories that get wired late in main() (after `bot = createBot(...)` and `pm = new ProcessManagerSdk(...)` are alive). v4 architecture review flagged this as a code smell — the placeholders are a future-bug magnet (cf. rc.3 boot blocker, rc.7 wedged-session — both wire-order class).
-
-**Real fix**: extract an `assembleHandlers({db, bot, pm, ...})` function that constructs all handlers in one go and returns them, eliminating the `let` placeholders. Boot wire-order becomes structurally enforced.
-
-**Severity**: low — boot-smoke test guards against the regressions this would prevent. Cosmetic cleanup.
-
----
-
-## Feature follow-ups
-
-### SessionStart-driven cwd auto-pairing (design filed)
-
-Operator runs `claude` in a project dir, then types `/use <cwd>` from any new Telegram chat to pair it without editing `config.json`. The SessionStart hook is the proof-of-physical-access credential; replaces (for operator self-serve) the current "hardcoded `pairedChatDefaults.cwd`" model.
-
-Full design + threat model + open questions: [`docs/0.12.0-session-start-pair-spec.md`](docs/0.12.0-session-start-pair-spec.md). Open questions need operator decision before implementation:
-- Operator-only or also guest-usable?
-- Skip or record polygram-spawned-claude SessionStarts in the recent-sessions cache?
-- Install hooks globally in `~/.claude/settings.json`, or offer project-local fallback?
-
-**Effort estimate**: ~4 hr total; ~2 hr without the `/here` picker.
-
----
-
-### Context & token observability via hooks (design filed)
-
-Build on the pairing spec's hook plumbing to surface claude's context-window state in Telegram. `/context` shows tokens used + % of window + last assistant message (read from the session JSONL via tail-read, same pattern moshi-hooks uses). Proactive push at 85% threshold warns before claude's auto-compact fires near 92%.
-
-Two new commands (`/context`, `/tail`) + one new IPC op (`hook-stop`) + transcript tail-reader. Closes two gaps in the current `getContextUsage()`: works for idle sessions (transcript path stashed on SessionStart, survives turn-end) and works for terminal-run claude sessions (not just polygram-spawned).
-
-Full design: [`docs/0.12.0-context-observability-spec.md`](docs/0.12.0-context-observability-spec.md). Depends on the pairing spec shipping first.
-
-**Effort estimate**: ~3 hr total (assumes pairing infra is in place); ~1.5 hr without `/tail` + threshold push.
-
----
-
-### Hot-reload agent files without `/reload`
-
-**Current**: editing `~/.claude/agents/<name>.md` requires `/reload` in chat (or cold spawn) to pick up changes.
-
-**Real fix**: file-watcher on agent dirs (chokidar), invalidate agent-loader cache on change.
-
-**Severity**: minor UX win; current `/reload` is fine.
-
----
-
-### Operator approval-fire-and-forget rejection
-
-When approval card is posted to admin chat and admin doesn't respond, the 5-min sweeper kicks in. But the REQUESTER chat sees nothing in the meantime — the SDK is just paused. A "🕐 waiting on approval from operator" stub in the requester chat would be nice.
-
-**Severity**: minor UX.
-
----
-
-## Doc / promote follow-ups
-
-### README polish
-
-The README is 424 lines and pre-dates the 0.9.0 cleanup. Needs:
-- Test count: 643 → 1618
-- Relation-to-existing-projects table modernized
-- SDK migration mention (0.8.0)
-- Autosteer / edit-correction / wedged-session / status-reactions mentions
-- Pointers to the four new docs (`docs/FEATURES.md`, `docs/COMPETITORS.md`, `docs/VS-OPENCLAW.md`, `docs/VS-OFFICIAL-PLUGIN.md`)
-- Trimmed: the long sections on config / cron / approvals should move to dedicated `docs/CONFIGURATION.md` etc.
-
-### Promote 0.9.0
-
-After the README is polished. Author plans to promote — exact channels TBD.
-
----
-
-## Next milestone
-
-### 0.10.0 — process manager abstraction + tmux backend
-
-See [docs/0.10.0-process-manager-abstraction-plan.md](docs/0.10.0-process-manager-abstraction-plan.md) for the comprehensive spec.
-
-Summary: extract `ProcessManager` interface, keep SDK as default implementation, add `ProcessManagerTmux` that runs Claude Code CLI under tmux sessions. Per-chat / per-topic selection via config.
+- **README rewrite** — 424 lines, pre-0.9.0; needs the channels/cli-backend
+  story, current test count, and the split into `docs/CONFIGURATION.md` etc.

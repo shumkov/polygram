@@ -250,27 +250,33 @@ describe('detectWedgedSessionError', () => {
   });
 });
 
-describe('classify — fall-through to "unknown"', () => {
-  test('unmatched message produces "Hit a snag: ..." reply', () => {
-    const r = classify(new Error('something went totally wrong in flux capacitor'));
+describe('classify — fall-through to "unknown" NEVER leaks raw internals (known-issue #2.2)', () => {
+  // 2026-06-03 incident: the unknown fallthrough echoed the raw error string
+  // into the chat — users saw "Hit a snag: [Shumabit@HOME:startup-gate] tmux
+  // session disappeared … ▰▰▰ 27%". The raw detail belongs in the events log
+  // (handler-error.detail_json), NOT in a user's chat. The user gets a calm,
+  // generic, actionable line; the raw text must NOT appear in userMessage.
+  test('unmatched message → generic calm line, raw text suppressed', () => {
+    const r = classify(new Error('[Shumabit@HOME:startup-gate] tmux session disappeared for polygram-x ▰▰▰ 27%'));
     assert.equal(r.kind, 'unknown');
-    assert.match(r.userMessage, /Hit a snag/);
-    assert.match(r.userMessage, /flux capacitor/);
+    assert.doesNotMatch(r.userMessage, /tmux|startup-gate|Shumabit|▰|polygram-x/,
+      'no internal identifiers may reach the user');
+    assert.match(r.userMessage, /try resending|\/new/i, 'must still tell the user what to do');
   });
 
-  test('unknown reason truncates at 120 chars', () => {
-    const longMsg = 'x'.repeat(500);
-    const r = classify(new Error(longMsg));
+  test('a long/multi-line raw error never bloats or leaks into the reply', () => {
+    const r = classify(new Error('secret internal line\n' + 'x'.repeat(500)));
     assert.equal(r.kind, 'unknown');
-    // The reason snippet is 120 chars max; user message includes
-    // wrapping text ("Hit a snag: " + reason + ". Try resending.")
-    assert.ok(r.userMessage.length < 200);
+    assert.doesNotMatch(r.userMessage, /secret internal line|xxxx/);
+    assert.ok(r.userMessage.length < 160, 'generic line stays short');
   });
 
-  test('unknown takes only first line', () => {
-    const r = classify(new Error('first line\nsecond line\nthird line'));
-    assert.match(r.userMessage, /first line/);
-    assert.doesNotMatch(r.userMessage, /second line/);
+  test('process-exit codes get a friendly transient line, not a leak (observed: code 129)', () => {
+    const r = classify(new Error('Claude Code process exited with code 129'));
+    assert.notEqual(r.kind, 'unknown', 'a recurring kind should be classified, not generic');
+    assert.doesNotMatch(r.userMessage, /129|exited with code/, 'no raw exit detail to the user');
+    assert.match(r.userMessage, /resend|again|moment/i);
+    assert.equal(r.isTransient, true, 'a respawn fixes it → transient');
   });
 });
 
@@ -278,7 +284,7 @@ describe('classify — defensive against weird inputs', () => {
   test('null input returns unknown', () => {
     const r = classify(null);
     assert.equal(r.kind, 'unknown');
-    assert.match(r.userMessage, /Hit a snag/);
+    assert.match(r.userMessage, /Something went wrong/);
   });
   test('undefined input returns unknown', () => {
     const r = classify(undefined);
