@@ -349,3 +349,56 @@ test('L11: reply cap under live hooks defers to activity-quiet instead of resolv
   assert.ok(events.find((e) => e.kind === 'cli-activity-quiet-finalize'));
   await proc.kill('test');
 });
+
+// ─── L12: consumed-ack must NOT suppress a substantive Stop-fallback answer ──
+// Prod 2026-06-13 (Shumabit@UMI/37, msg 2956): two folded inbounds; claude sent a
+// 294-char "Researching now…" ack via reply() AND named the sibling turn in
+// consumed_turn_ids, then produced the REAL 2066-char answer as plain assistant
+// text (no reply tool call) → Stop fallback. _finalizeTurn marked the turn
+// alreadyDelivered (just because _consumedAcked was set) and polygram.js's
+// short-circuit sent NOTHING — the partner waited 5h20m in silence.
+// docs/0.13-consumed-ack-stop-fallback-drop-spec.md
+test('L12: consumed-ack ack ≠ Stop-fallback answer → deliver the rescued answer (no silent drop)', async () => {
+  const { proc, events, written } = makeProc({ stopGraceMs: 40, activityQuietMs: 60_000, turnQuietMs: 60_000 });
+  const { sendP, turnId } = startTurn(proc, written);
+
+  proc._handleHookEvent(upsFor(turnId));                       // pickup → seen, hooks live
+  // A SIBLING reply consumed this turn but delivered only a short ack:
+  proc._ledgerAckConsumed([turnId], 'Researching WhatsApp call options now…');
+  // claude then produced the real answer as plain assistant text (no reply tool call):
+  const answer = 'Research done — SIP mode → self-hosted PBX keeps Chatwoot for chat AND accepts WhatsApp calls. [2066 chars in prod]';
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: answer });
+
+  await sleep(120);   // > stopGrace
+  assert.equal(proc.pendingTurns.size, 0, 'the consumed-acked turn finalizes via the Stop fallback');
+
+  const result = await sendP;
+  assert.equal(result.alreadyDelivered, false,
+    'the ack did NOT deliver this answer → the turn must NOT be marked already-delivered (else polygram short-circuits and drops it)');
+  assert.equal(result.text, answer, 'the rescued Stop-fallback answer is carried for delivery');
+  assert.ok(events.find((e) => e.kind === 'cli-consumed-ack-fallback-rescued'),
+    'the rescue is observable in the events DB (forensic signal the fix fired)');
+  await proc.kill('test');
+});
+
+// ─── L13: genuine fold-echo stays suppressed (no double-delivery regression) ──
+// When the consuming reply DID carry the answer and claude echoed the consumed
+// turn_id, the Stop fallback text equals what was already delivered — re-sending
+// would double-answer. This must remain suppressed before AND after the L12 fix.
+test('L13: consumed-ack ack == Stop-fallback text → stays already-delivered (no duplicate)', async () => {
+  const { proc, written } = makeProc({ stopGraceMs: 40, activityQuietMs: 60_000, turnQuietMs: 60_000 });
+  const { sendP, turnId } = startTurn(proc, written);
+
+  proc._handleHookEvent(upsFor(turnId));
+  const folded = 'Here is the combined answer covering both of your messages.';
+  proc._ledgerAckConsumed([turnId], folded);                  // sibling delivered the full answer
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: folded });   // same text echoes back
+
+  await sleep(120);
+  assert.equal(proc.pendingTurns.size, 0, 'the folded turn finalizes');
+
+  const result = await sendP;
+  assert.equal(result.alreadyDelivered, true,
+    'the consuming reply already delivered this exact text → must stay suppressed (no double-delivery)');
+  await proc.kill('test');
+});
