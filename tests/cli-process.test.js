@@ -478,6 +478,15 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
   // the rich question→Telegram-keyboard feature ships (deliberate, not forgotten).
   assert.match(hint, /NEVER use the AskUserQuestion tool/i,
     'forbids the interactive AskUserQuestion widget (wedge mitigation)');
+  // 0.12.2 autosteer-fold fix (docs/0.13-autosteer-fold-drop-spec.md): the
+  // consumed_turn_ids contract is strengthened to cut the ~8.9% miss rate that
+  // produced false `input-fold-suspected` drops. These assertions fail on the
+  // pre-0.12.2 prompt (which lacked the every-reply / short / two-id emphasis).
+  assert.match(hint, /consumed_turn_ids/, 'states the consumed_turn_ids fold-ack contract');
+  assert.match(hint, /EVERY reply|short one-line/i,
+    'contract emphasizes it applies to EVERY reply incl short ones (the fold-miss case)');
+  assert.match(hint, /both turn_ids/i,
+    'contract gives the two-id fold example so a folded follow-up is not omitted');
 });
 
 // rc.7: --mcp-config must remain the LAST flag in args (variadic <configs...>)
