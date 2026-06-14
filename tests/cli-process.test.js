@@ -487,6 +487,16 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
     'contract emphasizes it applies to EVERY reply incl short ones (the fold-miss case)');
   assert.match(hint, /both turn_ids/i,
     'contract gives the two-id fold example so a folded follow-up is not omitted');
+  // #9 progressive-status restore (docs/0.13-progressive-status-prompt-spec.md):
+  // strengthen the long-task responsiveness contract. Review-corrected: edit_message
+  // is INTERIM-only; the FINAL answer must be a fresh reply (carries consumed_turn_ids
+  // + notifies — an edit does neither, which would re-open the fold-drop bug).
+  assert.match(hint, /INTERIM status ONLY|interim status only/i,
+    'edit_message is scoped to interim status only');
+  assert.match(hint, /FINAL answer as a fresh `?reply/i,
+    'the final answer must be a fresh reply (notifies + carries consumed_turn_ids)');
+  assert.match(hint, /one or two tool calls, just answer/i,
+    'over-trigger guard: quick tasks get one reply, no status bubble');
 });
 
 // rc.7: --mcp-config must remain the LAST flag in args (variadic <configs...>)
