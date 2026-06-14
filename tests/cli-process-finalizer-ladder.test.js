@@ -402,3 +402,25 @@ test('L13: consumed-ack ack == Stop-fallback text → stays already-delivered (n
     'the consuming reply already delivered this exact text → must stay suppressed (no double-delivery)');
   await proc.kill('test');
 });
+
+// ─── L14: a zero-reply ceiling captures the wedge pane (0.12.3 telemetry) ────
+// docs/0.13-turn-wedge-autorecovery-spec.md — characterize-first: when a turn
+// hits a ceiling with no reply (claude wedged — no hooks AND no streaming hint
+// the whole window), capture the TUI pane tail so we learn WHAT state claude is
+// stuck in. Fire-and-forget, never touches the kill path.
+test('L14: zero-reply ceiling emits turn-timeout-pane with the captured wedge pane', async () => {
+  const stuckPane = 'Sautéed for 31m\n  …(truncated)…\n❯  ';   // idle ❯, NO "esc to interrupt" = wedged
+  const { proc, events, written } = makeProc({
+    turnAbsoluteMs: 60, activityQuietMs: 60_000, turnQuietMs: 60_000, pane: stuckPane,
+  });
+  const { sendP } = startTurn(proc, written);
+  await assert.rejects(sendP, (err) => err.code === 'TURN_TIMEOUT',
+    'zero replies → the ceiling still rejects (behavior unchanged)');
+  await sleep(40);   // let the fire-and-forget probeBusyState + log resolve
+  const ev = events.find((e) => e.kind === 'turn-timeout-pane');
+  assert.ok(ev, 'wedge-characterization event is emitted on a zero-reply ceiling');
+  assert.ok(ev.detail.pane_tail && ev.detail.pane_tail.includes('❯'),
+    'captures the TUI pane tail (the stuck-state diagnostic)');
+  assert.equal(ev.detail.streaming, false, 'a wedged turn shows no "esc to interrupt" streaming hint');
+  await proc.kill('test');
+});
