@@ -119,6 +119,42 @@ describe('D5 gateInbound — abort stage (identity-gated)', () => {
   });
 });
 
+describe('D5 gateInbound — operator can always abort (operator-bypass fix)', () => {
+  // Prod gap (chat -1003369922517, 2026-06-15 14:48): the operator's bare "stop"
+  // in the UMI group was abort-identity-blocked because isAddressedIdentity only
+  // recognized @mention / reply-to-bot / pairing — not the bot's own operator.
+  const opCfg = (bot) => ({ deps: { config: { chats: { '100': { name: 'X', requireMention: true } }, bot } } });
+
+  test('G15: operator bare "stop" in a group EXECUTES the abort (adminChatId = user id)', async () => {
+    const { gate, calls } = makeGate(opCfg({ allowConfigCommands: true, adminChatId: 999 }));
+    const res = await gate(groupMsg({ text: 'stop', from: { id: 999, first_name: 'Operator' } }), { tier: 'fresh' });
+    assert.equal(calls.abort.length, 1, 'the bot owner must be able to stop their own bot with a bare "stop" in a group');
+    assert.equal(res.action, 'handled');
+    assert.equal(res.stage, 'abort');
+  });
+
+  test('G16: under the same operator config, a NON-operator bystander "stop" stays BLOCKED (hole stays closed)', async () => {
+    const { gate, calls } = makeGate(opCfg({ allowConfigCommands: true, adminChatId: 999 }));
+    const res = await gate(groupMsg({ text: 'stop', from: { id: 555, first_name: 'Bystander' } }), { tier: 'fresh' });
+    assert.equal(calls.abort.length, 0, 'only the operator gains the bypass — not every group member');
+    assert.equal(res.action, 'blocked');
+    assert.equal(res.stage, 'abort');
+    assert.ok(calls.events.find((e) => e.k === 'abort-identity-blocked'));
+  });
+
+  test('G17: explicit operatorUserId grants bypass; a negative (group) adminChatId never does (fail-safe)', async () => {
+    const g1 = makeGate(opCfg({ operatorUserId: 1234 }));
+    await g1.gate(groupMsg({ text: 'stop', from: { id: 1234 } }), { tier: 'fresh' });
+    assert.equal(g1.calls.abort.length, 1, 'operatorUserId identifies the operator');
+
+    // a group adminChatId is negative — it must never equal a positive sender id
+    const g2 = makeGate(opCfg({ adminChatId: -1003369922517 }));
+    const res = await g2.gate(groupMsg({ text: 'stop', from: { id: 555 } }), { tier: 'fresh' });
+    assert.equal(g2.calls.abort.length, 0, 'a group adminChatId must not grant a bystander the operator bypass');
+    assert.equal(res.action, 'blocked');
+  });
+});
+
 describe('D5 gateInbound — admin/pair stage', () => {
   test('G4: admin command routes through dispatchHandleMessage (the dispatcher wrapper, not bare handleMessage)', async () => {
     const { gate, calls } = makeGate();
