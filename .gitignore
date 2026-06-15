@@ -29,3 +29,7 @@ node_modules/
 *.swp
 .claude/
 .serena/
+
+# Scratch / ad-hoc (do not commit)
+.playwright-mcp/
+.tmp_*
