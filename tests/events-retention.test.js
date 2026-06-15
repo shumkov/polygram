@@ -128,14 +128,44 @@ describe('events-retention: universal per-kind cap (incident-proofing)', () => {
 });
 
 describe('events-retention: safety guards', () => {
-  test('9. clock went backward (now < max ts) → skip, delete nothing', () => {
+  test('9. genuine backward clock (most rows future-dated) → skip, delete nothing', () => {
     const db = freshDb();
-    seed(db, 'autosteer', -2); // a row 2 days in the FUTURE relative to NOW
-    seed(db, 'autosteer', 100); // an ancient row that would normally be pruned
-    const res = pruneEvents(db, NOW, policy());
+    seed(db, 'autosteer', -2, 8); // 8 rows 2d in the FUTURE — clock went back, most data "future"
+    seed(db, 'autosteer', 100, 2); // 2 ancient
+    const res = pruneEvents(db, NOW, policy({ maxDeleteFraction: 0.5 }));
     assert.equal(res.skipped, true);
     assert.match(res.reason, /clock/i);
-    assert.equal(total(db), 2, 'nothing deleted when the clock looks wrong');
+    assert.equal(total(db), 10, 'nothing deleted under a suspect clock');
+  });
+
+  test('9b. a SINGLE future-dated outlier does NOT disable pruning (review finding #3)', () => {
+    const db = freshDb();
+    seed(db, 'autosteer', 100, 20); // 20 ancient, prunable (default 90d)
+    seed(db, 'reactor-state', -2); // 1 outlier row 2d in the future (skew/import)
+    for (let i = 0; i < 30; i++) seed(db, 'r' + i, 1); // recent filler so the prune isn't >50%
+    const res = pruneEvents(db, NOW, policy({ maxDeleteFraction: 0.5 }));
+    assert.equal(res.skipped, undefined, 'one future row must not poison MAX(ts) and skip everything');
+    assert.equal(countKind(db, 'autosteer'), 0, 'the 20 ancient rows were pruned');
+    assert.equal(countKind(db, 'reactor-state'), 1, 'the future row is kept (not old)');
+  });
+
+  test('10b. mass-delete guard does NOT over-count time∩cap overlap (review finding #1)', () => {
+    const db = freshDb();
+    seed(db, 'autosteer', 100, 30); // 30 ancient default-tier rows — ALSO over a small cap
+    for (let i = 0; i < 60; i++) seed(db, 'k' + i, 1); // 60 recent singletons → true delete = 30/90 = 33%
+    const res = pruneEvents(db, NOW, policy({ maxPerKind: 10, maxDeleteFraction: 0.5 }));
+    assert.equal(res.skipped, undefined, 'guard must see 30 (33%), not the double-counted 50 (56%)');
+    assert.equal(countKind(db, 'autosteer'), 0, 'all 30 ancient autosteer pruned');
+    assert.equal(total(db), 60, 'the 60 recent singletons survive');
+  });
+
+  test('batchedDelete iterates multiple batches (25 rows, batchSize 10 → 3 batches)', () => {
+    const db = freshDb();
+    seed(db, 'autosteer', 100, 25); // 25 ancient → deleted across batches
+    for (let i = 0; i < 20; i++) seed(db, 'f' + i, 1); // recent filler so 25/45 < the guard
+    const res = pruneEvents(db, NOW, policy({ batchSize: 10, maxDeleteFraction: 0.99 }));
+    assert.equal(res.deleted.default, 25, '10 + 10 + 5 across three batches');
+    assert.equal(countKind(db, 'autosteer'), 0);
   });
 
   test('10. mass-delete guard: bucket would remove >fraction → refuse, delete nothing', () => {
@@ -244,5 +274,37 @@ describe('events-retention: resolveRetentionPolicy', () => {
     const p = resolveRetentionPolicy(undefined);
     assert.equal(p.defaultDays, DEFAULT_POLICY.defaultDays);
     assert.equal(p.enabled, true);
+  });
+});
+
+describe('events-retention: numeric policy validation (review finding #2)', () => {
+  // An unvalidated batchSize<=0 makes batchedDelete spin forever (DELETE LIMIT 0
+  // deletes 0, never < batchSize) → wedges the synchronous daemon.
+  for (const [label, over] of [
+    ['batchSize 0', { batchSize: 0 }],
+    ['batchSize -1', { batchSize: -1 }],
+    ['batchSize non-int', { batchSize: 2.5 }],
+    ['maxPerKind 0', { maxPerKind: 0 }],
+    ['maxDeleteFraction > 1', { maxDeleteFraction: 1.5 }],
+    ['maxDeleteFraction 0', { maxDeleteFraction: 0 }],
+    ['defaultDays 0', { defaultDays: 0 }],
+    ['diagnosticDays -1', { diagnosticDays: -1 }],
+  ]) {
+    test(`validatePolicy throws on ${label}`, () => {
+      assert.throws(() => validatePolicy(policy(over)), /events_retention/);
+    });
+  }
+
+  test('DEFAULT_POLICY passes numeric validation', () => {
+    assert.doesNotThrow(() => validatePolicy(DEFAULT_POLICY));
+  });
+});
+
+describe('events-retention: dryRun on empty table (review finding #4)', () => {
+  test('returns the dryRun shape, not the deleted shape', () => {
+    const db = freshDb();
+    const res = pruneEvents(db, NOW, policy({ dryRun: true }));
+    assert.equal(res.dryRun, true);
+    assert.deepEqual(res.preview, { default: 0, diagnostic: 0, cap: 0, total: 0 });
   });
 });

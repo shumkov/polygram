@@ -153,6 +153,27 @@ describe('D5 gateInbound — operator can always abort (operator-bypass fix)', (
     assert.equal(g2.calls.abort.length, 0, 'a group adminChatId must not grant a bystander the operator bypass');
     assert.equal(res.action, 'blocked');
   });
+
+  test('G18: string/number coercion — config id as string still matches a numeric sender id (and vice versa)', async () => {
+    // config.json can hold adminChatId as a string; from.id arrives numeric.
+    const a = makeGate(opCfg({ adminChatId: '999' }));
+    await a.gate(groupMsg({ text: 'stop', from: { id: 999 } }), { tier: 'fresh' });
+    assert.equal(a.calls.abort.length, 1, 'string operator id must coerce-match a numeric sender id');
+    // and the reverse (defensive — the Number() on from.id is the point)
+    const b = makeGate(opCfg({ operatorUserId: 999 }));
+    await b.gate(groupMsg({ text: 'stop', from: { id: '999' } }), { tier: 'fresh' });
+    assert.equal(b.calls.abort.length, 1, 'numeric operator id must coerce-match a string sender id');
+  });
+
+  test('G19: operatorUserId takes precedence over adminChatId', async () => {
+    const g = makeGate(opCfg({ operatorUserId: 1234, adminChatId: 999 }));
+    await g.gate(groupMsg({ text: 'stop', from: { id: 1234 } }), { tier: 'fresh' });
+    assert.equal(g.calls.abort.length, 1, 'operatorUserId is the operator when both are set');
+    const g2 = makeGate(opCfg({ operatorUserId: 1234, adminChatId: 999 }));
+    const res = await g2.gate(groupMsg({ text: 'stop', from: { id: 999 } }), { tier: 'fresh' });
+    assert.equal(g2.calls.abort.length, 0, 'adminChatId is ignored for the bypass when operatorUserId is present');
+    assert.equal(res.action, 'blocked');
+  });
 });
 
 describe('D5 gateInbound — admin/pair stage', () => {

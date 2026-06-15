@@ -21,7 +21,14 @@ const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
 
-const history = require('../lib/history');
+// The history helpers live at the PACKAGE ROOT lib/ (one source of truth, shared
+// with the daemon's history-preload) — NOT a skill-local copy. The old
+// `../lib/history` pointed at skills/history/lib/history.js, which has never
+// existed in the repo or the published package, so EVERY `query.js` invocation
+// crashed with MODULE_NOT_FOUND (the history skill was entirely non-functional;
+// found in the 0.12.5–0.12.7 ultra-review). `../../../lib` = <pkg-root>/lib in
+// both the repo and the npm install (which ships skills/ + lib/ as siblings).
+const history = require('../../../lib/history');
 
 const POLYGRAM_DIR = process.env.POLYGRAM_DIR || path.resolve(__dirname, '../../../../polygram');
 const CONFIG_PATH = process.env.POLYGRAM_CONFIG || path.join(POLYGRAM_DIR, 'config.json');
@@ -281,4 +288,8 @@ function main() {
   }
 }
 
-main();
+// Exported for tests (the #4 scope-derivation security boundary needs a
+// regression pin). Only auto-run when invoked as the CLI, not when require()'d.
+module.exports = { deriveBotScope, resolveDbPaths, loadConfig };
+
+if (require.main === module) main();
