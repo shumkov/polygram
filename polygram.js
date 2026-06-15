@@ -110,6 +110,7 @@ const { applyReactionToMessages } = require('./lib/telegram/album-reactions');
 const { classify: classifyError, detectWedgedSessionError, isTransientHttpError } = require('./lib/error/classify');
 const { createAutoResumeTracker, isAutoResumable } = require('./lib/db/auto-resume');
 const { resolveReplayWindowMs } = require('./lib/db/replay-window');
+const { pruneEvents, resolveRetentionPolicy, validatePolicy } = require('./lib/db/events-retention');
 // validateIpcFileParam moved with handleSendOverIpc to
 // lib/handlers/ipc-send.js (commit 36).
 const {
@@ -2193,6 +2194,43 @@ async function main() {
     console.error(`[db] FATAL: ${err.message}`);
     console.error('Bridge cannot run without a DB (Phase 2: DB is source of truth).');
     process.exit(1);
+  }
+
+  // #3 events-table retention. Prune on boot (the primary path — daemons rarely
+  // live to the 24h tick given deploy cadence) + a 24h .unref()'d interval as
+  // insurance for long-uptime daemons. Validation failures DISABLE pruning and
+  // log loud — a retention config typo must never take down the bot, so this
+  // lives outside the DB-fatal try/catch above. pruneEvents writes no event
+  // rows; we emit the audit event here from its result.
+  let eventsRetentionPolicy = null;
+  try {
+    eventsRetentionPolicy = resolveRetentionPolicy(config);
+    validatePolicy(eventsRetentionPolicy);
+  } catch (err) {
+    console.error(`[events-retention] invalid policy — pruning DISABLED: ${err.message}`);
+    eventsRetentionPolicy = null;
+  }
+  const runEventsPrune = (trigger) => {
+    if (!eventsRetentionPolicy) return;
+    try {
+      const res = pruneEvents(db.raw, Date.now(), eventsRetentionPolicy);
+      if (res.skipped) {
+        console.log(`[events-retention] skipped (${trigger}): ${res.reason}`);
+        db.logEvent('events-prune-skipped', { reason: res.reason, trigger });
+      } else if (res.dryRun) {
+        console.log(`[events-retention] DRY-RUN (${trigger}) would delete ${res.preview.total} (default ${res.preview.default}, diag ${res.preview.diagnostic}, cap ${res.preview.cap})`);
+        db.logEvent('events-prune-preview', { ...res.preview, trigger });
+      } else if (res.deleted.total > 0) {
+        console.log(`[events-retention] pruned ${res.deleted.total} (default ${res.deleted.default}, diag ${res.deleted.diagnostic}, cap ${res.deleted.cap}) ${res.before}→${res.after}`);
+        db.logEvent('events-pruned', { ...res.deleted, before: res.before, after: res.after, trigger });
+      }
+    } catch (err) {
+      console.error(`[events-retention] prune failed (${trigger}): ${err.message}`);
+    }
+  };
+  if (eventsRetentionPolicy && eventsRetentionPolicy.enabled) {
+    setImmediate(() => runEventsPrune('boot'));
+    setInterval(() => runEventsPrune('interval'), 24 * 3_600_000).unref?.();
   }
 
   // 0.8.0 Phase 1 step 11 + rc.50: defensive uncaughtException +
