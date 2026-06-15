@@ -8,8 +8,10 @@
  *
  * Opens bridge.db read-only. Bot scope is derived from process.cwd() —
  * each bot's Claude project dir maps to a chat.cwd in config.json, so a
- * partner-spawned skill invocation cannot escape its bot's chat allowlist.
- * Set POLYGRAM_ADMIN=1 for unrestricted queries from unmapped cwd.
+ * partner-spawned skill invocation cannot escape its bot's chat allowlist via
+ * this skill. Scope is cwd-only — no env override (POLYGRAM_ADMIN /
+ * CLAUDE_CHANNEL_BOT were removed as agent-settable backdoors, #4). For an
+ * explicit other file use POLYGRAM_DB=/abs/path.db, or sqlite3 directly.
  *
  * Default output: JSON (one row per message). Pass --format pretty for
  * human-readable lines.
@@ -85,24 +87,17 @@ function deriveBotScope(cfg) {
     };
   }
 
-  // No cwd match. Allow explicit admin override via env var, which polygram
-  // never sets and thus cannot be triggered from a bot-spawned subprocess.
-  if (process.env.POLYGRAM_ADMIN === '1') {
-    return { bot: null, allowedChatIds: null };
-  }
-
-  // Legacy fallback: respect CLAUDE_CHANNEL_BOT ONLY if it matches a known bot
-  // in the config. This preserves manual shumabit/umi-assistant invocation via
-  // polygram env var without opening an admin-by-default hole.
-  const envBot = process.env.CLAUDE_CHANNEL_BOT;
-  if (envBot && cfg.bots?.[envBot]) {
-    const allowed = Object.entries(cfg.chats || {})
-      .filter(([, c]) => c.bot === envBot)
-      .map(([id]) => id);
-    if (allowed.length) return { bot: envBot, allowedChatIds: allowed };
-  }
-
-  die(`cannot determine bot scope for cwd ${cwd}; set POLYGRAM_ADMIN=1 for unrestricted access`);
+  // No cwd match. SECURITY (#4, review 2026-06-15): scope derives ONLY from the
+  // spawn-time cwd. The old POLYGRAM_ADMIN=1 / CLAUDE_CHANNEL_BOT env overrides
+  // assumed "polygram never sets these, so a bot can't trigger them" — but a
+  // bot-spawned agent's Bash CAN set arbitrary env on a subprocess
+  // (`POLYGRAM_ADMIN=1 node query.js …`), making them an agent-reachable
+  // cross-chat/cross-bot read backdoor. Removed. Operators who need a specific
+  // other file use the explicit `POLYGRAM_DB=/abs/path.db` override or sqlite3
+  // directly on the box. (NOTE: this is best-effort against ACCIDENTAL over-reads
+  // via the sanctioned skill — a determined same-uid agent can still `cd` to
+  // another chat's cwd or raw-`sqlite3` the file until denyRead/privsep lands.)
+  die(`cannot determine bot scope for cwd ${cwd}; run from a mapped chat cwd, or use POLYGRAM_DB=/abs/path.db for an explicit file`);
 }
 
 function openDbReadOnly(dbPath) {

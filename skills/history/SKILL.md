@@ -9,9 +9,9 @@ Invoke via: `node skills/history/scripts/query.js <subcmd> [args]`
 
 Subcommands return JSON unless `--format pretty`. All chat IDs and thread IDs are strings.
 
-Bot scope: the skill filters results to the current bot's chat allowlist. Scope is derived from `process.cwd()` — each bot's Claude project dir maps to a chat.cwd in `config.json`. When invoked from an unmapped cwd the skill refuses to run unless `POLYGRAM_ADMIN=1` is set (admin-only override).
+Bot scope: the skill filters results to the current bot's chat allowlist. Scope is derived **only** from `process.cwd()` — each bot's Claude project dir maps to a chat.cwd in `config.json`, and polygram sets that cwd when it spawns the agent, so a prompt-injected agent can't escape its bot's allowlist via this skill. When invoked from an unmapped cwd the skill **fails closed** (refuses to run). There is no env override for scope — the old `POLYGRAM_ADMIN` / `CLAUDE_CHANNEL_BOT` overrides were removed (#4) because a bot-spawned agent's Bash can set arbitrary env on a subprocess, which made them a cross-chat read backdoor.
 
-DB resolution (post Phase 8): the skill reads the bot's own `<bot>.db` file when scope is known. With `POLYGRAM_ADMIN=1` it opens every `<bot>.db` that exists and unions results (sorted by ts desc, re-capped at `--limit`). If no per-bot DB is found the skill falls back to a legacy `bridge.db` (pre-cutover). Override the resolution with `POLYGRAM_DB=/abs/path.db` for one-off queries against an archived file.
+DB resolution (post Phase 8): the skill reads the bot's own `<bot>.db` file (resolved from scope). If no per-bot DB is found it falls back to a legacy `bridge.db` (pre-cutover). For an explicit other file (an archived DB, or a cross-bot read an operator runs **on the box, not via an agent**) use `POLYGRAM_DB=/abs/path.db`.
 
 ## recent <chat_id> [thread_id]
 Last N messages. Default limit 20, hard cap 500.
