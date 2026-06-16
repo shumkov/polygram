@@ -88,7 +88,7 @@ const agentLoader = require('./lib/agents/loader');
 const { createSender } = require('./lib/telegram/api');
 const { createAsyncLock } = require('./lib/async-lock');
 const { sweepInbox } = require('./lib/db/inbox');
-const { parseBotArg, parseDbArg, filterConfigToBot } = require('./lib/config-scope');
+const { parseBotArg, parseDbArg, filterConfigToBot, activeBotConfig } = require('./lib/config-scope');
 const { createStore: createPairingsStore, parseTtl: parsePairingTtl } = require('./lib/db/pairings');
 const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/telegram/voice');
 const { createStreamer } = require('./lib/telegram/streamer');
@@ -2136,10 +2136,12 @@ async function main() {
   }
   try {
     config = filterConfigToBot(config, BOT_NAME);
-    // Convenience: config.bot is the current bot's config block. After the
-    // filter, config.bots has exactly one entry; this alias keeps call sites
-    // from re-indexing by name.
-    config.bot = config.bots[BOT_NAME];
+    // Convenience: config.bot is the current bot's EFFECTIVE config — the
+    // per-bot block layered over the shared top-level `bot` block (so shared
+    // fields like apiRoot survive; per-bot fields win). A plain
+    // `= config.bots[BOT_NAME]` silently dropped top-level shared fields and
+    // orphaned apiRoot (both bots ran on cloud, not the 2GB local server).
+    config.bot = activeBotConfig(config, BOT_NAME);
   } catch (err) {
     console.error(`[fatal] ${err.message}`);
     process.exit(2);

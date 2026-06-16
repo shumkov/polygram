@@ -6,7 +6,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { parseBotArg, filterConfigToBot } = require('../lib/config-scope');
+const { parseBotArg, filterConfigToBot, activeBotConfig } = require('../lib/config-scope');
 
 const fullConfig = {
   bots: {
@@ -85,5 +85,40 @@ describe('filterConfigToBot', () => {
     assert.throws(() => filterConfigToBot(null, 'x'), /must have bots and chats/);
     assert.throws(() => filterConfigToBot({}, 'x'), /must have bots and chats/);
     assert.throws(() => filterConfigToBot({ bots: {} }, 'x'), /must have bots and chats/);
+  });
+});
+
+describe('activeBotConfig — per-bot layered over shared top-level bot', () => {
+  test('top-level shared field (apiRoot) survives when per-bot lacks it', () => {
+    const cfg = { bot: { apiRoot: 'http://localhost:8082' }, bots: { shumabit: { token: 't' } } };
+    const r = activeBotConfig(cfg, 'shumabit');
+    assert.equal(r.apiRoot, 'http://localhost:8082');
+    assert.equal(r.token, 't');
+  });
+
+  test('per-bot field wins over a same-named top-level field', () => {
+    const cfg = { bot: { apiRoot: 'http://shared:1', maxFileBytes: 5 }, bots: { shumabit: { apiRoot: 'http://perbot:2' } } };
+    const r = activeBotConfig(cfg, 'shumabit');
+    assert.equal(r.apiRoot, 'http://perbot:2', 'per-bot apiRoot overrides shared');
+    assert.equal(r.maxFileBytes, 5, 'unshadowed shared field still present');
+  });
+
+  test('no top-level bot block → just the per-bot block', () => {
+    const cfg = { bots: { shumabit: { token: 't', apiRoot: 'x' } } };
+    assert.deepEqual(activeBotConfig(cfg, 'shumabit'), { token: 't', apiRoot: 'x' });
+  });
+
+  test('missing per-bot entry → top-level shared only (no throw)', () => {
+    const cfg = { bot: { apiRoot: 'shared' }, bots: {} };
+    assert.deepEqual(activeBotConfig(cfg, 'ghost'), { apiRoot: 'shared' });
+  });
+
+  test('regression: a plain alias would have dropped apiRoot — merge keeps it', () => {
+    // This is the 2026-06-16 orphaned-apiRoot bug: config.bot = config.bots[name]
+    // dropped the top-level apiRoot, so createBot saw none and used cloud.
+    const cfg = { bot: { apiRoot: 'http://localhost:8082' }, bots: { shumabit: { token: 't' } } };
+    const plainAlias = cfg.bots.shumabit;            // the OLD behavior
+    assert.equal(plainAlias.apiRoot, undefined, 'old alias drops apiRoot (the bug)');
+    assert.equal(activeBotConfig(cfg, 'shumabit').apiRoot, 'http://localhost:8082', 'merge fixes it');
   });
 });
