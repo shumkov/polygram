@@ -265,10 +265,13 @@ describe('slash-commands — /pair (open)', () => {
     assert.match(fx.calls.sendReply[0], /Paired. You can use me in chat 111/);
   });
 
-  test('successful claim: any-chat scope', async () => {
+  test('successful claim: defensive fallback when result has no chat', async () => {
+    // claimCode no longer returns a null chat_id — pairings are always chat-scoped
+    // now (the all-chats footgun is closed) — so this exercises the handler's
+    // defensive fallback wording rather than the old "every chat" message.
     const fx = fixture({ claimResult: { ok: true, chat_id: null } });
     await fx.dispatch(fx.makeCtx({ text: '/pair CODE-123', chatId: '111' }));
-    assert.match(fx.calls.sendReply[0], /every chat testbot is in/);
+    assert.match(fx.calls.sendReply[0], /this chat/);
   });
 
   test('rate-limited claim: distinct UX message', async () => {

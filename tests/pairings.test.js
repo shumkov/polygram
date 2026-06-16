@@ -220,12 +220,26 @@ describe('claimCode', () => {
     assert.equal(res.reason, 'wrong-chat');
   });
 
-  test('code usable in any chat when not chat-scoped', () => {
+  test('an unscoped code is claimable and scopes the pairing to the CLAIM chat (never all-chats)', () => {
     const { code } = store.issueCode({ bot_name: 'shumabit', issued_by_user_id: 1 });
     const res = store.claimCode({
       code, claimer_user_id: 2, chat_id: '-999', bot_name: 'shumabit',
     });
     assert.equal(res.ok, true);
+    assert.equal(res.chat_id, '-999', 'scoped to where redeemed, not all-chats (no global pairing footgun)');
+  });
+
+  test('refuses to create a pairing when no chat can be determined — no global pairings', () => {
+    // The Lin/UMI footgun (2026-06-16): an unscoped /pair-code claimed produced a
+    // chat_id=NULL pairing that bypassed requireMention in EVERY group.
+    const { code } = store.issueCode({ bot_name: 'shumabit', issued_by_user_id: 1 });
+    const res = store.claimCode({ code, claimer_user_id: 3, chat_id: null, bot_name: 'shumabit' });
+    assert.equal(res.ok, false);
+    assert.match(res.reason, /chat/);
+    // a refused claim must NOT consume the code — it's still redeemable properly
+    const ok = store.claimCode({ code, claimer_user_id: 3, chat_id: '-5', bot_name: 'shumabit' });
+    assert.equal(ok.ok, true);
+    assert.equal(ok.chat_id, '-5');
   });
 
   test('normalises whitespace/case in user input', () => {
@@ -292,11 +306,12 @@ describe('hasLivePairing', () => {
   beforeEach(setup);
   afterEach(cleanup);
 
-  test('any-chat pairing is live for every chat in the bot', () => {
+  test('an unscoped code claimed in a chat is live ONLY in that chat (not all chats)', () => {
     const { code } = store.issueCode({ bot_name: 'shumabit', issued_by_user_id: 1 });
     store.claimCode({ code, claimer_user_id: 77, chat_id: '-1', bot_name: 'shumabit' });
     assert.equal(store.hasLivePairing({ bot_name: 'shumabit', user_id: 77, chat_id: '-1' }), true);
-    assert.equal(store.hasLivePairing({ bot_name: 'shumabit', user_id: 77, chat_id: '-2' }), true);
+    assert.equal(store.hasLivePairing({ bot_name: 'shumabit', user_id: 77, chat_id: '-2' }), false,
+      'pairing scopes to the redeem chat — must NOT bypass requireMention elsewhere');
   });
 
   test('chat-scoped pairing is only live in that chat', () => {
@@ -330,12 +345,15 @@ describe('revokeByUser + listActive', () => {
   afterEach(cleanup);
 
   test('revoke returns number of rows touched', () => {
+    // Two pairings in DIFFERENT chats (unscoped code redeemed in -1, scoped code
+    // in -2). Same-chat claims now collapse to one row (chat-scoped, idempotent),
+    // so distinct rows require distinct chats.
     const c1 = store.issueCode({ bot_name: 'shumabit', issued_by_user_id: 1 });
     const c2 = store.issueCode({
-      bot_name: 'shumabit', chat_id: '-1', scope: 'chat', issued_by_user_id: 1,
+      bot_name: 'shumabit', chat_id: '-2', scope: 'chat', issued_by_user_id: 1,
     });
     store.claimCode({ code: c1.code, claimer_user_id: 5, chat_id: '-1', bot_name: 'shumabit' });
-    store.claimCode({ code: c2.code, claimer_user_id: 5, chat_id: '-1', bot_name: 'shumabit' });
+    store.claimCode({ code: c2.code, claimer_user_id: 5, chat_id: '-2', bot_name: 'shumabit' });
     assert.equal(store.revokeByUser({ bot_name: 'shumabit', user_id: 5 }), 2);
     assert.equal(store.revokeByUser({ bot_name: 'shumabit', user_id: 5 }), 0);
   });
