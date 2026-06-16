@@ -497,6 +497,16 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
     'the final answer must be a fresh reply (notifies + carries consumed_turn_ids)');
   assert.match(hint, /one or two tool calls, just answer/i,
     'over-trigger guard: quick tasks get one reply, no status bubble');
+  // File-send directive (2026-06-16): the agent was curling the Bot API to send
+  // files (it has the token), landing them in the WRONG topic — because the old
+  // wording claimed curl "fails" (false: it succeeds, just wrong-topic), so the
+  // agent disproved it and ignored it. The instruction must give the TRUE reason
+  // (wrong topic) and pre-empt the "but the upload returned 200" rationalization.
+  assert.match(hint, /reply\(files/i, 'names reply(files) as the file-send tool');
+  assert.match(hint, /wrong topic/i,
+    'file-send directive states the TRUE consequence (wrong topic), not the false "those fail"');
+  assert.doesNotMatch(hint, /to send files — those fail/i,
+    'the disprovable "those fail" rationale must not return (agent empirically ignores it)');
 });
 
 // rc.7: --mcp-config must remain the LAST flag in args (variadic <configs...>)
