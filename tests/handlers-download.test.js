@@ -148,6 +148,46 @@ describe('downloadAttachments — happy path', () => {
     assert.equal(out[0].error, null);
     assert.equal(fetchCalled, 0, 'no network fetch when on-disk file is reused');
   });
+
+  test('local-api: linkSync EPERM falls back to copyFileSync (Docker bot-api volume)', async () => {
+    // Reproduces the 2026-06-16 inbound-file failure: with the local Bot API
+    // server (getFile returns an ABSOLUTE path), polygram hard-links the file
+    // into the inbox — but the bot-api Docker volume refuses a cross-fs/owner
+    // link with EPERM. The old code only fell back to copy on EXDEV → threw →
+    // every inbound file failed. The fix copies on any non-EEXIST link error.
+    const srcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-volume-'));
+    const srcPath = path.join(srcDir, 'file_4.jpg');
+    fs.writeFileSync(srcPath, 'photo-bytes');
+    const dbCalls = [];
+    const origLink = fs.linkSync;
+    fs.linkSync = () => { const e = new Error('operation not permitted, link'); e.code = 'EPERM'; throw e; };
+    try {
+      const fn = createDownloadAttachments({
+        config: { bot: { apiRoot: 'http://localhost:8082' } },  // → local-api branch
+        db: {
+          markAttachmentDownloaded: (id, args) => dbCalls.push(['downloaded', id, args]),
+          markAttachmentFailed: (id, reason) => dbCalls.push(['failed', id, reason]),
+        },
+        dbWrite: (f) => f(),
+        inboxDir: tmpDir,
+        logger: silentLogger,
+        fetchImpl: async () => { throw new Error('must not HTTP-fetch in local-api mode'); },
+      });
+      const bot = { api: { getFile: async () => ({ file_path: srcPath }) } };  // absolute path
+      const out = await fn(bot, 'tok', '12345', { message_id: 901 }, [
+        { id: 9, file_id: 'CAA', file_unique_id: 'u9', kind: 'photo', name: 'file_4.jpg', size_bytes: 11 },
+      ]);
+      assert.equal(out.length, 1);
+      assert.equal(out[0].error, null, 'copy fallback succeeded — no error');
+      assert.ok(fs.existsSync(out[0].path), 'file copied into the inbox');
+      assert.equal(fs.readFileSync(out[0].path, 'utf8'), 'photo-bytes');
+      assert.ok(dbCalls.find((c) => c[0] === 'downloaded'), 'marked downloaded');
+      assert.ok(!dbCalls.find((c) => c[0] === 'failed'), 'not marked failed');
+    } finally {
+      fs.linkSync = origLink;
+      fs.rmSync(srcDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('downloadAttachments — failure handling', () => {
