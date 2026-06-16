@@ -28,7 +28,7 @@ const {
   migrateJsonToDb, getClaudeSessionId, resolveSessionForSpawn,
 } = require('./lib/db/sessions');
 const { buildPrompt } = require('./lib/prompt');
-const { filterAttachments, resolveFileCaps, MAX_TOTAL_BYTES } = require('./lib/attachments');
+const { filterAttachments, resolveFileCaps, resolveMaxFileOverride, MAX_TOTAL_BYTES } = require('./lib/attachments');
 // 0.9.0: SDK ProcessManager is the only pm. CLI pm
 // (lib/process-manager.js) deleted in commit 6.
 // Both implementations expose the same public API (constructor +
@@ -475,10 +475,12 @@ function buildSpawnContext(sessionKey) {
     threadId: threadId || null,
     label: getSessionLabel(chatConfig, threadId),
     existingSessionId,
-    // File-send outbound cap inputs: localApi (bot-level) so CliProcess can
-    // resolve the per-chat/topic outbound cap (resolveFileCaps) the same way
-    // it resolves cwd/agent. Override itself lives in chatConfig/topic.
+    // File-send outbound cap inputs: localApi (backend ceiling) + the resolved
+    // per-file override (topic → chat → bot → default) from the SAME resolver
+    // the inbound filter and the send() choke point use, so CliProcess's
+    // pre-check + system-prompt line can't drift from actual enforcement.
     localApi: !!config.bot?.apiRoot,
+    outboundCapOverride: resolveMaxFileOverride(config, chatId, threadId || null),
   };
 }
 
@@ -788,14 +790,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const sessionCtx = !pm.has(sessionKey) ? await readSessionContext(sessionKey, chatConfig.cwd) : '';
 
   const rawAtts = extractAttachments(msg);
-  // Backend-derived inbound cap with per-topic/chat override. Cloud → 20MB;
-  // a local Bot API server (config.bot.apiRoot) → 2GB; override via
-  // chats[id].maxFileBytes or topics[t].maxFileBytes, clamped to the
-  // backend ceiling. Bytes-valued config; resolveFileCaps does the clamp.
-  const _inTopicCfg = getTopicConfig(chatConfig, threadIdStr || null);
+  // Backend-derived inbound cap with override (topic → chat → bot → default),
+  // clamped to the backend ceiling (cloud 20MB / local Bot API server 2GB).
+  // resolveMaxFileOverride is the single precedence source shared with the
+  // outbound send() cap and the download path; resolveFileCaps does the clamp.
   const _fileCaps = resolveFileCaps({
     localApi: !!config.bot?.apiRoot,
-    override: _inTopicCfg.maxFileBytes ?? chatConfig.maxFileBytes ?? null,
+    override: resolveMaxFileOverride(config, chatId, threadIdStr || null),
   });
   const { accepted, rejected } = filterAttachments(rawAtts, {
     maxFileBytes: _fileCaps.inBytes,
@@ -2174,7 +2175,7 @@ async function main() {
   try {
     db = dbClient.open(DB_PATH);
     console.log(`[db] opened ${DB_PATH}`);
-    tg = createSender(db, console);
+    tg = createSender(db, console, config);
     pairings = createPairingsStore(db.raw);
     approvals = createApprovalsStore(db.raw);
     const migration = migrateJsonToDb(db, SESSIONS_JSON_PATH, config.chats);
