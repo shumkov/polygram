@@ -67,8 +67,9 @@ const { createHandleAbort } = require('./lib/handlers/abort');
 const { createAutosteerHandlers } = require('./lib/handlers/autosteer');
 const { createEditCorrectionInjector } = require('./lib/handlers/edit-correction');
 const { createEditRedelivery } = require('./lib/handlers/edit-redelivery');
-const { createGateInbound } = require('./lib/handlers/gate-inbound');
+const { createGateInbound, ADMIN_CMD_RE, PAIR_CLAIM_RE } = require('./lib/handlers/gate-inbound');
 const { createRedeliver } = require('./lib/handlers/redeliver');
+const { classifyReplay, executeReplayPlan } = require('./lib/handlers/replay-disposition');
 const { createDropRedeliverer } = require('./lib/handlers/drop-redeliver');
 const { createSessionFeedback } = require('./lib/feedback/session-feedback');
 const { createSlashCommands } = require('./lib/handlers/slash-commands');
@@ -2650,28 +2651,29 @@ async function main() {
     let remaining = 0;
     for (const n of inFlightHandlers.values()) remaining += n;
 
-    // 3. Anything still in-flight → mark in DB as replay-pending so the
-    //    next polygram boot re-dispatches it. User never sees an error.
-    if (remaining > 0 && db) {
+    // 3. This handler only runs on a DELIBERATE shutdown (SIGINT/SIGTERM/SIGHUP);
+    //    a crash (SIGKILL/OOM/panic) never reaches here. Record a clean-shutdown
+    //    marker AND mark any still-in-flight rows replay-pending, atomically, on
+    //    EVERY clean shutdown (not just when in-flight>0) — boot uses the marker
+    //    to SKIP re-answering stale messages on a deliberate restart while still
+    //    recovering everything on a crash (0.14, §H1). markReplayPending alone
+    //    (the old behavior) couldn't distinguish the two, so every deploy
+    //    re-answered. A stale replay-pending row from a prior life would also be
+    //    crash-recovered on a deliberate restart without the unconditional marker.
+    if (db) {
       try {
-        const res = db.markReplayPending({ botName: BOT_NAME });
+        const res = db.recordCleanShutdown({ botName: BOT_NAME });
         logEvent('shutdown-drain', {
           bot: BOT_NAME,
           in_flight: remaining,
-          replay_marked: res?.changes ?? 0,
+          replay_marked: res?.replayMarked ?? 0,
           elapsed_ms: drainElapsed,
+          clean: true,
         });
-        console.log(`[shutdown] drained ${drainElapsed}ms, ${remaining} still in-flight, ${res?.changes ?? 0} rows marked replay-pending`);
+        console.log(`[shutdown] clean shutdown recorded; drained ${drainElapsed}ms, ${remaining} in-flight, ${res?.replayMarked ?? 0} marked replay-pending`);
       } catch (err) {
-        console.error(`[shutdown] markReplayPending failed: ${err.message}`);
+        console.error(`[shutdown] recordCleanShutdown failed: ${err.message}`);
       }
-    } else if (db) {
-      logEvent('shutdown-drain', {
-        bot: BOT_NAME,
-        in_flight: 0,
-        elapsed_ms: drainElapsed,
-      });
-      console.log(`[shutdown] clean drain in ${drainElapsed}ms`);
     }
 
     // 4. Remaining shutdown: approvals sweeper, IPC, resolve hook waiters,
@@ -2752,34 +2754,52 @@ async function main() {
     const chatIds = Object.keys(config.chats);
     if (chatIds.length > 0) {
       const replayWindowMs = resolveReplayWindowMs(config);
+
+      // 0.14: classify by RESTART INTENT. Read-and-clear the clean-shutdown
+      // marker FIRST, in its own try/catch — ANY error => treat as crash
+      // (recover), never skip-all (fail toward recovery). A deliberate restart
+      // skips re-answering stale messages and posts one visibility notice; a
+      // crash recovers everything (unchanged rc.57 behavior).
+      let cleanShutdown = false;
+      try {
+        const maxAgeMs = 2 * (replayWindowMs || 3 * 60 * 1000);
+        cleanShutdown = db.consumeCleanShutdownMarker({ botName: BOT_NAME, maxAgeMs }).clean;
+      } catch (err) {
+        console.error(`[replay] clean-shutdown marker read failed (-> crash recover): ${err.message}`);
+        cleanShutdown = false;
+      }
+
       const candidates = db.getReplayCandidates({ chatIds, ...(replayWindowMs && { olderThanMs: replayWindowMs }) });
-      let replayed = 0;
-      let skipped = 0;
+
+      // Cleanup pass: a candidate with a COMPLETED turn (turn_metrics, not just
+      // an ack-bubble — rc.51, the rc.50 msg-12158 lesson) was already answered.
+      // Mark it terminal 'replied' and exclude it from the plan (recovered nor
+      // announced). Single pass → reuse the result as the dedup predicate.
+      const completed = new Set();
       for (const row of candidates) {
-        // rc.51: dedupe on turn_metrics (definitive turn completion),
-        // NOT just on hasOutboundReplyTo. The latter trips on
-        // intermediate ack-bubbles (e.g. "Catching up on history…",
-        // "I'll write a quick inline script…") and silently skips the
-        // replay even when the actual answer never arrived. The rc.50
-        // EIO-orphan incident lost Ivan DM msg 12158 this way: an ack
-        // bubble was sent at 13:20:36, the turn was killed mid-flight,
-        // boot-replay saw the ack and assumed "answered."
-        //
-        // turn_metrics is only inserted by the SDK pm's onResult
-        // callback, which fires only when the turn definitively
-        // completes. No row → no completion → re-dispatch.
         if (db.hasCompletedTurnFor({ chat_id: row.chat_id, msg_id: row.msg_id })) {
-          db.setInboundHandlerStatus({
-            chat_id: row.chat_id, msg_id: row.msg_id, status: 'replied',
-          });
-          skipped += 1;
-          continue;
+          completed.add(`${row.chat_id}/${row.msg_id}`);
+          db.setInboundHandlerStatus({ chat_id: row.chat_id, msg_id: row.msg_id, status: 'replied' });
         }
-        // Reconstruct a minimal grammy-like Message object. Enough for
-        // dispatchRegularMessage (mention detect, abort, admin cmds,
-        // shouldHandle, enqueue). Attachments carry file_ids so the
-        // normal download path re-fetches on replay.
-        const reconstructed = {
+      }
+      const hasCompletedTurn = (row) => completed.has(`${row.chat_id}/${row.msg_id}`);
+
+      // Notice eligibility (H5): never announce admin/slash or abort-shaped rows
+      // (the crash path's redelivery gate never re-executes them either). An
+      // attachment-only message (no text, e.g. a screenshot) IS announceable.
+      const announceable = (row) => {
+        const t = (row.text || '').trim();
+        if (!t) return true;
+        if (typeof isAbortRequest === 'function' && isAbortRequest(t)) return false;
+        if (ADMIN_CMD_RE.test(t) || PAIR_CLAIM_RE.test(t)) return false;
+        return true;
+      };
+
+      // Reconstruct a minimal grammy-like Message for the crash-path
+      // re-dispatch (the shape dispatchRegularMessage expects; attachments via
+      // the media-group shortcut so the normal download path re-fetches).
+      const reconstruct = (row) => {
+        const msg = {
           chat: { id: Number(row.chat_id), type: row.chat_id.startsWith('-') ? 'supergroup' : 'private' },
           message_id: row.msg_id,
           from: { id: row.user_id, first_name: row.user },
@@ -2788,36 +2808,54 @@ async function main() {
           ...(row.thread_id && { message_thread_id: Number(row.thread_id) }),
           ...(row.reply_to_id && { reply_to_message: { message_id: row.reply_to_id } }),
         };
-        // Attach already-recorded attachments via the media-group shortcut
-        // field so extractAttachments picks them up without re-parsing
-        // grammy fields that don't exist on this reconstructed object.
         const attRows = db.getAttachmentsByMessage(row.id);
         if (attRows.length) {
-          reconstructed._mergedAttachments = attRows.map((a) => ({
+          msg._mergedAttachments = attRows.map((a) => ({
             kind: a.kind, name: a.name, mime_type: a.mime_type,
             size: a.size_bytes, file_id: a.file_id, file_unique_id: a.file_unique_id,
           }));
         }
-        const chatConfig = config.chats[row.chat_id];
-        if (!chatConfig) { skipped += 1; continue; }
-        // 0.13 D4: through the unified redelivery tail — _isReplay tag (error
-        // reply suppressed, not replay-eligible), 'replay-attempted' pre-mark
-        // (one-shot: even if THIS attempt dies mid-turn, the next boot won't
-        // loop), the D5 gate at tier 'redelivery' (abort/admin-shaped rows are
-        // never auto-re-executed; a row whose chat lost its pairing since is
-        // re-checked), a 👀 ack so the recovery is visible, then dispatch.
-        // eslint-disable-next-line no-await-in-loop
-        const r = await redeliverAsFreshTurn({
-          chatId: row.chat_id, msg: reconstructed,
-          source: 'boot-replay', preMark: 'replay-attempted',
-        });
-        if (r.ok) replayed += 1;
-        else skipped += 1;
-      }
+        return msg;
+      };
+
+      const plan = classifyReplay({ candidates, cleanShutdown, hasCompletedTurn, announceable });
+
+      const result = await executeReplayPlan({
+        plan,
+        deps: {
+          // CRASH path — unchanged: through the unified redelivery tail (D5 gate
+          // at tier 'redelivery', 'replay-attempted' one-shot pre-mark, ack).
+          recover: async (row) => {
+            const chatConfig = config.chats[row.chat_id];
+            if (!chatConfig) return { ok: false };
+            return redeliverAsFreshTurn({
+              chatId: row.chat_id, msg: reconstruct(row),
+              source: 'boot-replay', preMark: 'replay-attempted',
+            });
+          },
+          // CLEAN path — one visibility notice per (chat, thread). plainText so
+          // no markdown/HTML parse on a boot send.
+          sendNotice: async (g) => {
+            const n = g.items.length;
+            const text = `↺ Restarted — I didn't auto-resume ${n} message${n > 1 ? 's' : ''} you sent just before. If any still need a reply, send it again.`;
+            const res = await tg(bot, 'sendMessage', {
+              chat_id: Number(g.chat_id), text,
+              ...(g.thread_id ? { message_thread_id: Number(g.thread_id) } : {}),
+            }, { source: 'boot-replay-notice', plainText: true });
+            return { ok: true, messageId: res?.message_id };
+          },
+          markSkipped: (row) => db.setInboundHandlerStatus({ chat_id: row.chat_id, msg_id: row.msg_id, status: 'replay-skipped' }),
+          logEvent,
+        },
+      });
+
       if (candidates.length > 0) {
-        console.log(`[replay] ${replayed} turns re-dispatched, ${skipped} skipped (already replied or no chat config)`);
+        console.log(`[replay] ${cleanShutdown ? 'clean restart' : 'crash'} — recovered ${result.recovered}, skipped ${result.skipped}, noticed ${result.noticed}${result.noticeFailed ? `, notice-failed ${result.noticeFailed}` : ''}`);
         logEvent('replay-on-boot', {
-          bot: BOT_NAME, replayed, skipped, total: candidates.length,
+          bot: BOT_NAME, clean: cleanShutdown,
+          recovered: result.recovered, skipped: result.skipped,
+          noticed: result.noticed, notice_failed: result.noticeFailed,
+          total: candidates.length,
         });
       }
     }
