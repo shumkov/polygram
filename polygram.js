@@ -112,6 +112,7 @@ const { classify: classifyError, detectWedgedSessionError, isTransientHttpError 
 const { createAutoResumeTracker, isAutoResumable } = require('./lib/db/auto-resume');
 const { resolveReplayWindowMs } = require('./lib/db/replay-window');
 const { pruneEvents, resolveRetentionPolicy, validatePolicy } = require('./lib/db/events-retention');
+const { sweepSecrets, resolveSecretSweepConfig } = require('./lib/db/secret-sweep');
 // validateIpcFileParam moved with handleSendOverIpc to
 // lib/handlers/ipc-send.js (commit 36).
 const {
@@ -284,6 +285,17 @@ async function getReactionAllowlist(bot, chatId) {
 // semantics; never throws.
 function logEvent(kind, detail) {
   dbWrite(() => db.logEvent(kind, detail), `log ${kind}`);
+}
+
+// 0.15 secret redaction (agent-flagged path): the agent marks a secret it saw
+// in the user's message with `[redact:<secret>]`. parseResponse / stripInlineTags
+// strip the marker so nothing leaks to the user; here we wipe the literal from
+// the stored inbound row(s). `db` is the module-level singleton (assigned in
+// main() before any dispatcher/callback can fire), so this is safe to thread
+// into createSdkCallbacks + createChannelsToolDispatcher at construction time.
+function redactInbound(secret, ctx = {}) {
+  if (!db || typeof db.redactSecretInChat !== 'function') return { redacted: 0 };
+  return db.redactSecretInChat({ chat_id: ctx.chat_id, thread_id: ctx.thread_id, secret });
 }
 
 // recordInbound extracted to lib/handlers/record-inbound.js. Wired
@@ -1413,6 +1425,35 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     }
 
     const parsed = parseResponse(result.text);
+    // 0.15: redact any agent-flagged secrets ([redact:<secret>]) from the
+    // stored inbound BEFORE the reply lands. The markers are already stripped
+    // from parsed.text (parseResponse) and from the streamed bubble
+    // (stripInlineTags at chunk-time), so nothing leaked to the user. The
+    // CLI-channels path short-circuits above at `alreadyDelivered`, so its
+    // redaction fires inside the dispatcher instead — this covers the main
+    // streamed-reply path (SDK + non-channels CLI).
+    if (parsed.redactions && parsed.redactions.length) {
+      let wiped = 0;
+      for (const secret of parsed.redactions) {
+        try { wiped += (redactInbound(secret, { chat_id: chatId, thread_id: threadId })?.redacted || 0); }
+        catch (e) { console.error(`[${label}] [redact] agent-flagged redaction failed: ${e.message}`); }
+      }
+      if (wiped > 0) {
+        logEvent('secret-redacted-by-agent', {
+          chat_id: chatId, thread_id: threadId, msg_id: msg.message_id,
+          count: wiped, backend: result?.backend || null,
+        });
+      } else {
+        // Fail-loud: the agent flagged a secret but we found NO stored inbound
+        // containing it (paraphrased value, secret older than the scan window,
+        // or it lived in an attachment). Surface so it isn't a silent non-wipe.
+        console.warn(`[${label}] [redact] agent flagged ${parsed.redactions.length} secret(s) but matched 0 stored rows`);
+        logEvent('secret-redact-requested-no-match', {
+          chat_id: chatId, thread_id: threadId, msg_id: msg.message_id,
+          requested: parsed.redactions.length, backend: result?.backend || null,
+        });
+      }
+    }
     // rc.39: intercept CLI-context canned-string leaks (`No response
     // requested.` etc.) before they reach the streamer/deliver path.
     // Replaces with an honest brief message; logs the substitution
@@ -2237,6 +2278,36 @@ async function main() {
     setInterval(() => runEventsPrune('interval'), 24 * 3_600_000).unref?.();
   }
 
+  // #5 secret redaction — background sweep (deterministic floor). Conservative:
+  // DISABLED unless config.defaults.secret_sweep.enabled; dryRun defaults ON, so
+  // the first deploy logs what it WOULD redact for review before enforcement.
+  // Boot + interval, like events-retention. Failures log loud, never fatal.
+  const secretSweepCfg = resolveSecretSweepConfig(config);
+  const runSecretSweep = (trigger) => {
+    if (!secretSweepCfg.enabled) return;
+    try {
+      const res = sweepSecrets(db.raw, {
+        now: Date.now(), batchSize: secretSweepCfg.batchSize,
+        maxPerRun: secretSweepCfg.maxPerRun, dryRun: secretSweepCfg.dryRun,
+      });
+      // Log every run that actually processed messages (so the polygram log
+      // shows how many were scanned + how many secrets wiped/flagged); after the
+      // backfill, idle interval runs scan 0 new rows and stay quiet.
+      if (res.scanned > 0) {
+        const cap = res.reachedCap ? ` | HIT maxPerRun cap — ${res.remaining} row(s) still unscanned past this run` : '';
+        console.log(`[secret-sweep] ${secretSweepCfg.dryRun ? 'DRY-RUN ' : ''}(${trigger}) scanned ${res.scanned} msg, WIPED ${res.redactions} secret(s) in ${res.redactedMsgs} msg, flagged ${res.flagged} ${JSON.stringify(res.ruleCounts)}${cap}`);
+        db.logEvent('secret-sweep', { ...res, trigger });
+      }
+    } catch (err) {
+      console.error(`[secret-sweep] FAILED (${trigger}): ${err.message}`);
+      try { db.logEvent('secret-sweep-failed', { trigger, error: err.message }); } catch {}
+    }
+  };
+  if (secretSweepCfg.enabled) {
+    setImmediate(() => runSecretSweep('boot'));
+    setInterval(() => runSecretSweep('interval'), secretSweepCfg.intervalMs).unref?.();
+  }
+
   // 0.8.0 Phase 1 step 11 + rc.50: defensive uncaughtException +
   // unhandledRejection handlers. The new pm wraps every Query
   // iteration in try/catch so SDK throws never leak — but if a
@@ -2320,6 +2391,9 @@ async function main() {
     // `[react:EMOJI]`, `No response requested.` all leaked as literal text.
     parseResponse, sanitizeAssistantReply, chunkMarkdownText, deliverReplies,
     processAndDeliverAgentText,
+    // 0.15: wipe agent-flagged secrets ([redact:<secret>]) from the stored
+    // inbound on the autonomous-wakeup path too.
+    redactInbound,
     // 0.12 interactive questions: 'question-asked' (claude called the ask tool)
     // → render the Telegram keyboard. Late-bound; questionHandlers is assigned below.
     renderQuestion: (payload) => questionHandlers?.renderAsk(payload),
@@ -2429,6 +2503,10 @@ async function main() {
     // (`No response requested.`) protections fire on channels replies too.
     parseResponse,
     sanitizeAssistantReply,
+    // 0.15: wipe agent-flagged secrets ([redact:<secret>]) from the stored
+    // inbound on the CLI-channels reply path (handleMessage short-circuits at
+    // `alreadyDelivered` before its own redact block, so it must fire here).
+    redactInbound,
     logEvent,
     logger: console,
   });

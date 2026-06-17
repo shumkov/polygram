@@ -25,8 +25,8 @@ describe('clean-shutdown marker', () => {
   beforeEach(() => { ({ db, dbPath } = freshDb('clean-shutdown-marker')); });
   afterEach(() => cleanupDb(dbPath, db));
 
-  test('migration applied: schema is v13 and polling_state.clean_shutdown_at exists', () => {
-    assert.equal(db.raw.pragma('user_version', { simple: true }), 13);
+  test('migration applied: schema >= v13 and polling_state.clean_shutdown_at exists', () => {
+    assert.ok(db.raw.pragma('user_version', { simple: true }) >= 13);
     const cols = db.raw.prepare("PRAGMA table_info(polling_state)").all().map((c) => c.name);
     assert.ok(cols.includes('clean_shutdown_at'), 'clean_shutdown_at column present');
   });

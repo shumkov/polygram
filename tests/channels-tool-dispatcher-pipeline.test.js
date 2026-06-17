@@ -308,3 +308,117 @@ test('F#3: reply with no turn_id + multiple pending turns does NOT auto-attribut
     `Expected orphan/ambiguous event. Got events: ${JSON.stringify(events)}`,
   );
 });
+
+// ─── 0.15: agent-flagged secret redaction through the dispatcher ────────────
+//
+// When the agent emits `[redact:<secret>]`, the dispatcher's deliverAgent path
+// (processAndDeliverAgentText) must (a) keep the secret out of the delivered
+// text and (b) call redactInbound(secret, {chat_id, thread_id}) so the stored
+// inbound is wiped. Uses the REAL parseResponse so the extraction is exercised
+// end-to-end (the fake stub above doesn't surface redactions[]).
+const { parseResponse: realParseResponse } = require('../lib/telegram/parse');
+const { sanitizeAssistantReply: realSanitize } = require('../lib/telegram/sanitize-reply');
+
+test('0.15: dispatcher strips [redact:SECRET] from text AND calls redactInbound', async () => {
+  const { deliverReplies, calls: deliverCalls } = makeDeliverCapture();
+  const { send } = makeSendCapture();
+  const redactCalls = [];
+  const redactInbound = (secret, ctx) => { redactCalls.push({ secret, ctx }); return { redacted: 1 }; };
+
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot,
+    send,
+    chunkText: (text) => [text],
+    deliverReplies,
+    parseResponse: realParseResponse,
+    sanitizeAssistantReply: realSanitize,
+    redactInbound,
+    logger: quietLogger,
+  });
+
+  const result = await dispatcher({
+    sessionKey: 'sess-1',
+    chatId: '12345',
+    threadId: 77,
+    toolName: 'reply',
+    text: 'Done — wiped that key for you. [redact:sk-ant-secret123]',
+    files: null,
+    sourceMsgId: 5,
+  });
+
+  assert.equal(result.ok, true);
+  const allDelivered = deliverCalls.flatMap(c => c.chunks).join('\n');
+  assert.ok(!allDelivered.includes('sk-ant-secret123'), `secret leaked into delivered text: ${JSON.stringify(allDelivered)}`);
+  assert.ok(!allDelivered.includes('[redact:'), 'redact marker leaked into delivered text');
+  assert.equal(redactCalls.length, 1, 'redactInbound called exactly once');
+  assert.equal(redactCalls[0].secret, 'sk-ant-secret123');
+  assert.equal(redactCalls[0].ctx.chat_id, '12345');
+  assert.equal(redactCalls[0].ctx.thread_id, 77);
+});
+
+test('0.15: dispatcher delivers normally + does NOT call redactInbound when no [redact:] marker', async () => {
+  const { deliverReplies } = makeDeliverCapture();
+  const { send } = makeSendCapture();
+  const redactCalls = [];
+  const redactInbound = (secret, ctx) => { redactCalls.push({ secret, ctx }); return { redacted: 0 }; };
+
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot,
+    send,
+    chunkText: (text) => [text],
+    deliverReplies,
+    parseResponse: realParseResponse,
+    sanitizeAssistantReply: realSanitize,
+    redactInbound,
+    logger: quietLogger,
+  });
+
+  const result = await dispatcher({
+    sessionKey: 'sess-1', chatId: '12345', threadId: null,
+    toolName: 'reply', text: 'just a normal reply', files: null, sourceMsgId: 5,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(redactCalls.length, 0, 'redactInbound must not fire without a marker');
+});
+
+test('0.15: dispatcher emits secret-redact-requested-no-match when redaction matched 0 rows (fail-loud)', async () => {
+  const { deliverReplies } = makeDeliverCapture();
+  const { send } = makeSendCapture();
+  const events = [];
+  const logEvent = (kind, detail) => events.push({ kind, detail });
+  // redactInbound reports nothing matched (secret older than window / paraphrased).
+  const redactInbound = () => ({ redacted: 0 });
+
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot, send, chunkText: (text) => [text], deliverReplies,
+    parseResponse: realParseResponse, sanitizeAssistantReply: realSanitize,
+    redactInbound, logEvent, logger: quietLogger,
+  });
+
+  await dispatcher({
+    sessionKey: 'sess-1', chatId: '12345', threadId: null,
+    toolName: 'reply', text: 'Wiped it. [redact:sk-ant-gone]', files: null, sourceMsgId: 5,
+  });
+
+  const miss = events.find((e) => e.kind === 'secret-redact-requested-no-match');
+  assert.ok(miss, `expected fail-loud no-match event. Got: ${JSON.stringify(events.map((e) => e.kind))}`);
+  assert.equal(miss.detail.requested, 1);
+});
+
+test('0.15: dispatcher without redactInbound wired still delivers (graceful no-op)', async () => {
+  const { deliverReplies, calls: deliverCalls } = makeDeliverCapture();
+  const { send } = makeSendCapture();
+  // redactInbound intentionally omitted — legacy/test callers.
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot, send, chunkText: (text) => [text], deliverReplies,
+    parseResponse: realParseResponse, sanitizeAssistantReply: realSanitize, logger: quietLogger,
+  });
+  const result = await dispatcher({
+    sessionKey: 'sess-1', chatId: '12345', threadId: null,
+    toolName: 'reply', text: 'Done. [redact:sk-ant-xyz]', files: null, sourceMsgId: 5,
+  });
+  assert.equal(result.ok, true);
+  const allDelivered = deliverCalls.flatMap(c => c.chunks).join('\n');
+  // Even with no redactInbound, the marker is still stripped from the visible text.
+  assert.ok(!allDelivered.includes('sk-ant-xyz'), 'marker must still be stripped even when redactInbound absent');
+});

@@ -540,3 +540,103 @@ describe('parseResponse — digit+VS16 guard (review F5)', () => {
     assert.equal(r.reaction, null);
   });
 });
+
+// 0.15 secret redaction: the agent marks a credential it saw in the user's
+// message with `[redact:<secret>]`. parseResponse must (a) surface the secret
+// in `redactions[]` so polygram can wipe the stored inbound, and (b) strip the
+// marker from the visible text so the secret never reaches the chat. WHY this
+// matters: the whole feature is a no-op if the marker leaks — a redacted secret
+// re-printed inside the agent's own reply defeats the purpose.
+describe('parseResponse — 0.15 [redact:SECRET] extraction', () => {
+  test('inline [redact:secret] surfaced in redactions[] and stripped from text', () => {
+    const r = parseResponse('Got it, I removed that key [redact:sk-ant-abc123]', {});
+    assert.deepEqual(r.redactions, ['sk-ant-abc123']);
+    assert.doesNotMatch(r.text, /sk-ant-abc123/);
+    assert.match(r.text, /Got it, I removed that key/);
+  });
+
+  test('multiple [redact:] markers all collected', () => {
+    const r = parseResponse('Wiped both [redact:AKIAIOSFODNN7EXAMPLE] and [redact:ghp_secrettoken]', {});
+    assert.deepEqual(r.redactions, ['AKIAIOSFODNN7EXAMPLE', 'ghp_secrettoken']);
+    assert.doesNotMatch(r.text, /AKIA|ghp_/);
+  });
+
+  test('redactions[] always present (consistent shape) and empty when no marker', () => {
+    assert.deepEqual(parseResponse('plain reply', {}).redactions, []);
+    assert.deepEqual(parseResponse('Done [react:👍]', {}).redactions, []);
+  });
+
+  test('whitespace tidied after the marker is removed', () => {
+    const r = parseResponse('Removed it.\n\n[redact:topsecretvalue]\n\nAll set.', {});
+    assert.deepEqual(r.redactions, ['topsecretvalue']);
+    assert.doesNotMatch(r.text, /\n{3,}/);
+    assert.doesNotMatch(r.text, /topsecretvalue/);
+  });
+
+  test('blank/whitespace-only [redact:] is ignored (no empty secret pushed)', () => {
+    const r = parseResponse('weird [redact:   ] tag', {});
+    assert.deepEqual(r.redactions, []);
+  });
+});
+
+// The leak-guard is the security-critical half: a secret forming ACROSS a
+// stream chunk boundary must never flash to the user. stripInlineTags runs at
+// chunk-time, so it has to strip both the complete `[redact:…]` AND a trailing
+// UNCLOSED `[redact:partial` that hasn't received its `]` yet.
+describe('stripInlineTags — 0.15 [redact:] leak-guard', () => {
+  test('strips a complete [redact:secret] from a streamed chunk', () => {
+    const out = stripInlineTags('I wiped it [redact:sk-ant-abc123] for you', {});
+    assert.doesNotMatch(out, /sk-ant-abc123|redact/);
+    assert.match(out, /I wiped it/);
+  });
+
+  test('strips a TRAILING UNCLOSED [redact:partial mid-stream (no leak before `]` arrives)', () => {
+    // The streamer emits "Got it [redact:sk-ant-ab" before the closing "]"
+    // lands in the next chunk. Without the incomplete-tag guard the partial
+    // secret would render in the live bubble.
+    const out = stripInlineTags('Got it [redact:sk-ant-ab', {});
+    assert.doesNotMatch(out, /sk-ant-ab|redact/);
+    assert.match(out, /Got it/);
+  });
+
+  test('strips multiple complete redact markers in one chunk', () => {
+    const out = stripInlineTags('both gone [redact:AAAA] [redact:BBBB]', {});
+    assert.doesNotMatch(out, /AAAA|BBBB|redact/);
+  });
+
+  test('does NOT strip non-marker bracket text like [redact something]', () => {
+    const out = stripInlineTags('see [redact later] note', {});
+    assert.equal(out, 'see [redact later] note');
+  });
+
+  // The REAL streaming guarantee (security reviewer): the SDK re-renders the
+  // full accumulated buffer on every chunk, so the invariant is "for EVERY
+  // prefix of `<text>[redact:<secret>]`, stripInlineTags(prefix) contains no
+  // byte of <secret>". A regression that dropped the colon anchor or the `$`
+  // from REDACT_TAG_INCOMPLETE_RE would silently reopen the leak; this pins it.
+  test('SECURITY: no prefix of a streamed [redact:SECRET] buffer ever leaks a secret byte', () => {
+    const secret = 'sk-ant-SECRET123';
+    const full = `Got it, removing that key. [redact:${secret}]`;
+    for (let i = 1; i <= full.length; i++) {
+      const prefix = full.slice(0, i);
+      const rendered = stripInlineTags(prefix, {});
+      // No contiguous run of the secret (>=4 chars) may appear in any render.
+      for (let L = secret.length; L >= 4; L--) {
+        for (let s = 0; s + L <= secret.length; s++) {
+          const frag = secret.slice(s, s + L);
+          assert.ok(
+            !rendered.includes(frag),
+            `LEAK at prefix len ${i}: rendered ${JSON.stringify(rendered)} contains secret fragment ${JSON.stringify(frag)}`,
+          );
+        }
+      }
+    }
+  });
+
+  test('SECURITY: a [redact: that never closes is fully stripped (no dangling secret)', () => {
+    // Agent emitted the marker but the turn ended / stream cut before `]`.
+    const out = stripInlineTags('Done. [redact:sk-ant-neverClosed', {});
+    assert.doesNotMatch(out, /sk-ant|neverClosed|redact/);
+    assert.match(out, /Done\./);
+  });
+});
