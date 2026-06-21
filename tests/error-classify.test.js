@@ -96,6 +96,46 @@ describe('classify — typed-code short-circuit', () => {
     assert.equal(r.kind, 'turnTimeout');
     assert.ok(r.userMessage && r.userMessage.length > 0);
   });
+
+  // 0.16 busy-aware ceiling: a turn that kept extending while working but hit
+  // the hard wall-clock backstop gets a DISTINCT code + message from a
+  // went-quiet TURN_TIMEOUT, so the user knows it ran long vs stalled.
+  test('0.16: TURN_MAX_EXCEEDED has its own kind + message, distinct from TURN_TIMEOUT', () => {
+    const maxed = classify(Object.assign(new Error('turn timeout (5400000ms, reason=hard-max)'), { code: 'TURN_MAX_EXCEEDED' }));
+    assert.equal(maxed.kind, 'turnMaxExceeded');
+    assert.ok(maxed.userMessage && maxed.userMessage.length > 0);
+    assert.equal(maxed.isTransient, false);
+    const quiet = classify(Object.assign(new Error('turn timeout'), { code: 'TURN_TIMEOUT' }));
+    assert.notEqual(maxed.userMessage, quiet.userMessage, 'max-exceeded copy must differ from went-quiet copy');
+  });
+});
+
+describe('classifyTurnEndError — streamer suffix + reactor state for turn-end errors', () => {
+  const { classifyTurnEndError } = require('../lib/error/classify');
+  test('TURN_TIMEOUT (went quiet) → stream-interrupted suffix + TIMEOUT reactor', () => {
+    const r = classifyTurnEndError(Object.assign(new Error('turn timeout'), { code: 'TURN_TIMEOUT' }));
+    assert.equal(r.errorSuffix, 'stream interrupted');
+    assert.equal(r.reactorState, 'TIMEOUT');
+  });
+  test('TURN_MAX_EXCEEDED (hit hard cap) → TIMEOUT reactor (not generic ERROR)', () => {
+    const r = classifyTurnEndError(Object.assign(new Error('hard max'), { code: 'TURN_MAX_EXCEEDED' }));
+    assert.equal(r.reactorState, 'TIMEOUT');
+  });
+  test('an unrelated error → generic ERROR reactor', () => {
+    const r = classifyTurnEndError(new Error('something else blew up'));
+    assert.equal(r.reactorState, 'ERROR');
+  });
+  // Regression (0.16 code review finding #1): SDK + tmux backends reject with a
+  // MESSAGE and NO err.code. Without the legacy regex fallback their timeouts
+  // flip from the calm ⏱ TIMEOUT reactor to the scary ERROR one.
+  test('SDK-shaped wall-clock timeout (message, NO code) → TIMEOUT reactor', () => {
+    const r = classifyTurnEndError(new Error('Turn exceeded 1800s wall-clock ceiling'));
+    assert.equal(r.reactorState, 'TIMEOUT');
+  });
+  test('SDK-shaped idle timeout (message, NO code) → TIMEOUT reactor', () => {
+    const r = classifyTurnEndError(new Error('Timeout: 600s idle with no Claude activity'));
+    assert.equal(r.reactorState, 'TIMEOUT');
+  });
 });
 
 describe('classify — PATTERNS coverage (one sample per kind)', () => {

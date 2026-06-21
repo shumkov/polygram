@@ -108,7 +108,7 @@ const { startTyping } = require('./lib/telegram/typing');
 const { createReactionManager, classifyToolName } = require('./lib/telegram/reactions');
 const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
 const { applyReactionToMessages } = require('./lib/telegram/album-reactions');
-const { classify: classifyError, detectWedgedSessionError, isTransientHttpError } = require('./lib/error/classify');
+const { classify: classifyError, classifyTurnEndError, detectWedgedSessionError, isTransientHttpError } = require('./lib/error/classify');
 const { createAutoResumeTracker, isAutoResumable } = require('./lib/db/auto-resume');
 const { resolveReplayWindowMs } = require('./lib/db/replay-window');
 const { pruneEvents, resolveRetentionPolicy, validatePolicy } = require('./lib/db/events-retention');
@@ -510,6 +510,10 @@ async function sendToProcess(sessionKey, prompt, context = {}, { onDispatched } 
   const chatConfig = config.chats[chatId];
   const timeoutMs = (chatConfig.timeout || config.defaults.timeout) * 1000;
   const maxTurnMs = (chatConfig.maxTurn || config.defaults?.maxTurn || 1800) * 1000;
+  // 0.16 busy-aware ceiling: hard wall-clock backstop for a turn that keeps
+  // extending while provably working (cli backend). Per-chat → default →
+  // 90 min. The checkpoint never extends a turn past this.
+  const maxTurnHardMs = (chatConfig.maxTurnHard || config.defaults?.maxTurnHard || 5400) * 1000;
 
   // 0.12 Phase 2.1: HeartbeatReactor binding removed for CliProcess.
   // 0.11.0-channels needed a random-cycling working-pool reactor because
@@ -540,7 +544,7 @@ async function sendToProcess(sessionKey, prompt, context = {}, { onDispatched } 
   // starts, which is the correct UX (and what the user already expects).
   const release = await stdinLock.acquire(sessionKey);
   try {
-    const turnP = pm.send(sessionKey, prompt, { timeoutMs, maxTurnMs, context });
+    const turnP = pm.send(sessionKey, prompt, { timeoutMs, maxTurnMs, maxTurnHardMs, context });
     // Phase 3 §4: pm.send synchronously kicks off the turn — the
     // process is now inFlight. Signal the committed-intent latch so
     // it can release; a concurrent handler will then correctly see
@@ -1711,12 +1715,14 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // On shutdown, leave the reactor state as-is — boot-replay's
       // fresh dispatch will set its own reactor.
     } else {
-      await streamer.finalize('', { errorSuffix: 'stream interrupted' }).catch(() => {});
-      if (/wall-clock ceiling|idle with no Claude activity/i.test(err?.message || '')) {
-        reactor.setState('TIMEOUT');
-      } else {
-        reactor.setState('ERROR');
-      }
+      // 0.16: branch the bubble suffix + reactor on err.code via the pure
+      // classifyTurnEndError helper (the cli TURN_TIMEOUT message is
+      // `turn timeout (...)`, which does NOT match the legacy regex — branch on
+      // code, not text). TURN_TIMEOUT (went quiet) / TURN_MAX_EXCEEDED (hit hard
+      // cap) → TIMEOUT reactor; anything else → ERROR.
+      const { errorSuffix, reactorState } = classifyTurnEndError(err);
+      await streamer.finalize('', errorSuffix ? { errorSuffix } : {}).catch(() => {});
+      reactor.setState(reactorState);
     }
     throw err;
   } finally {
