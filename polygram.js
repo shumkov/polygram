@@ -2484,12 +2484,16 @@ async function main() {
   // 0.11.0: binCheck reused for channels backend wiring below.
   let pinnedClaudeBin = null;
   {
-    const { CLAUDE_CLI_PINNED_VERSION } = require('./lib/claude-bin');
-    const { verifyPinnedClaudeBin } = require('./lib/claude-bin');
-    const binCheck = verifyPinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION);
+    // 0.17: vendor a polygram-owned copy of the pinned binary so claude's
+    // auto-pruner (keeps only ~3 newest, deletes the rest) can't take cli chats
+    // down. Spawns from ~/.local/share/polygram/claude-bin/<version>, immune to
+    // pruning. Self-heals on boot (copy from the system install, else install).
+    const { CLAUDE_CLI_PINNED_VERSION, ensureVendoredClaudeBin } = require('./lib/claude-bin');
+    const binCheck = ensureVendoredClaudeBin(CLAUDE_CLI_PINNED_VERSION, { logger: console });
     if (binCheck.ok) {
       console.log(
-        `[polygram] CliProcess pinned to claude CLI v${CLAUDE_CLI_PINNED_VERSION}: ${binCheck.path}`,
+        `[polygram] CliProcess pinned to claude CLI v${CLAUDE_CLI_PINNED_VERSION}: ${binCheck.path}`
+        + `${binCheck.vendored ? ' (vendored)' : ''}`,
       );
       pinnedClaudeBin = binCheck.path;
     } else {
