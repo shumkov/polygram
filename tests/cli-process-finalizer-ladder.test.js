@@ -566,3 +566,100 @@ test('L11: stop-grace DEFERS while a sub-agent is in flight; finalizes + deliver
   assert.equal(result.alreadyDelivered, false);
   await proc.kill('test');
 });
+
+// ─── L15-L17: the stop-grace cancel race — a NO-REPLY turn must not be orphaned ──
+// A reply-less turn's only finalizer is its attributed Stop grace. When the pane
+// heartbeat (the turn's OWN residual "esc to interrupt") fires _noteActivity at the
+// instant the real Stop lands, it cancels the grace — and rung 2 used to require a
+// delivered reply, so the no-reply turn fell back to NOTHING and dangled to the
+// 60-min idle ceiling, dropping the answer. Field-confirmed: shumabit@UMI root topic
+// 2026-06-23 (cli-stop-grace-cancelled source:"pane-thinking", answer dropped).
+// docs/stop-grace-cancel-race-spec.md
+
+test('L15: no-reply turn — pane-thinking cancels the Stop grace, rung 2 still delivers the answer', async () => {
+  const { proc, events, written } = makeProc({ stopGraceMs: 40, activityQuietMs: 120, turnTimeoutMs: 60_000 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));                                    // pickup → seen, hooks live
+  // claude finishes with NO reply tool call; the Stop carries the answer (begins grace, sets _stopHookData)…
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'THE CHROME ANSWER' });
+  // …but the pane still shows "esc to interrupt" from this turn's OWN final render → the
+  // heartbeat fires _noteActivity('pane-thinking') 39ms later, cancelling the grace (the race).
+  proc._noteActivity('pane-thinking');
+  // no further activity (the idle pane's unknown-prompt poll does NOT note activity).
+  await sleep(220);   // > activityQuietMs (120)
+
+  assert.equal(proc.pendingTurns.size, 0,
+    'the no-reply turn finalized via the rung-2 backstop instead of orphaning to the ceiling');
+  const result = await sendP;
+  assert.equal(result.text, 'THE CHROME ANSWER', 'the Stop-captured answer is delivered, not dropped');
+  assert.equal(result.alreadyDelivered, false, 'never sent via the reply tool — deliver it');
+  assert.ok(events.find((e) => e.kind === 'cli-noreply-stop-rescued'),
+    'the rescue is observable in the events DB for the soak watcher');
+  await proc.kill('test');
+});
+
+test('L16: no-reply backstop does NOT finalize stale text when the turn resumes work after the Stop', async () => {
+  // Audit MEDIUM: a Stop can capture text early (foreign/lagged, or a boundary Stop),
+  // then claude RESUMES into a long silent tool — no streaming hint, so pane-thinking
+  // can't re-arm. Without the hook-recency guard, rung 2 would fire on the STALE text and
+  // kill a still-working turn. A resume emits a work hook (PreToolUse) that bumps
+  // _lastHookEventAt past the Stop capture → eligibility withdrawn → no premature finalize.
+  const { proc, written } = makeProc({ stopGraceMs: 40, activityQuietMs: 120, turnTimeoutMs: 60_000 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'STALE PARTIAL' });   // early Stop captures partial
+  proc._noteActivity('pane-thinking');                                              // cancels the grace
+  proc._handleHookEvent({ type: 'PreToolUse', toolName: 'Bash' });                  // claude RESUMES → work hook AFTER the Stop
+  await sleep(220);   // > activityQuietMs — a silent tool shows no streaming hint, so pane-thinking can't re-arm
+
+  assert.equal(proc.pendingTurns.size, 1,
+    'a resumed turn keeps working — rung 2 must NOT finalize it on the stale captured text');
+
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'THE REAL ANSWER' });  // real end-of-work Stop, no hook after
+  await sleep(120);   // > stopGraceMs → grace fires
+  const result = await sendP;
+  assert.equal(proc.pendingTurns.size, 0, 'finalizes on the real Stop');
+  assert.equal(result.text, 'THE REAL ANSWER', 'delivers the real end-of-work answer, not the stale partial');
+  await proc.kill('test');
+});
+
+test('L17: a no-reply turn with NO Stop yet is never finalized by the rung-2 backstop', async () => {
+  // The backstop is gated on a CAPTURED Stop. A seen, no-reply turn still thinking (no
+  // Stop) has no captured answer → ineligible → a pane-thinking heartbeat can't finalize
+  // it; only the ceiling applies, exactly as before.
+  const { proc, written } = makeProc({ stopGraceMs: 40, activityQuietMs: 120, turnTimeoutMs: 60_000 });
+  const { sendP, turnId } = startTurn(proc, written);
+  sendP.catch(() => {});
+  proc._handleHookEvent(upsFor(turnId));        // pickup → seen, but NO Stop, NO reply
+  proc._noteActivity('pane-thinking');          // heartbeat
+  await sleep(220);                             // > activityQuietMs
+  assert.equal(proc.pendingTurns.size, 1,
+    'still working (no Stop captured) → not eligible for rung 2 → not finalized');
+  await proc.kill('test');
+});
+
+test('L18: a sub-agent work hook after a boundary Stop withdraws rung-2 eligibility (no stale finalize)', async () => {
+  // Pins the claim that lets us drop an explicit sub-agent gate: a top-level Stop fired
+  // while a sub-agent is in flight is ALWAYS followed by a sub-agent work hook (its
+  // SubagentStop), which bumps _workHookSeq past the capture and withdraws the stale
+  // Stop's eligibility. pane-thinking arms the timer FIRST (while still eligible) → this
+  // also exercises the fire-time eligibility RE-check.
+  const { proc, written } = makeProc({ stopGraceMs: 40, activityQuietMs: 120, turnTimeoutMs: 60_000 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));
+  proc._pendingSubagentStarts = [{ agentType: 'g', toolUseId: 'a1' }];                // a sub-agent is running
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'boundary/partial' });  // boundary Stop captures stale text
+  proc._noteActivity('pane-thinking');                                                // cancels the deferred grace; arms while eligible
+  proc._handleHookEvent({ type: 'SubagentStop', agentType: 'g' });                    // the sub-agent's work hook → bumps the seq
+  await sleep(220);   // > activityQuietMs — the armed timer must re-check and bail
+
+  assert.equal(proc.pendingTurns.size, 1,
+    'the sub-agent work hook withdrew eligibility — rung 2 must NOT finalize on the boundary text');
+
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'The sub-agent analysis.' });   // real end-of-work Stop
+  await sleep(120);   // > stopGraceMs → grace fires
+  const result = await sendP;
+  assert.equal(proc.pendingTurns.size, 0, 'finalizes on the real Stop');
+  assert.equal(result.text, 'The sub-agent analysis.', 'delivers the real answer, not the boundary partial');
+  await proc.kill('test');
+});
