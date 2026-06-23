@@ -218,21 +218,29 @@ test('L5b: absolute ceiling on a ZERO-reply turn still rejects TURN_TIMEOUT', as
   await proc.kill('test');
 });
 
-// ─── L6: the ceiling resolves open questions {timedout} FIRST ───────────────
-// (S9's second half: today the absolute cap rejects the turn while the
-// question keyboard stays live and claude hangs blocked on the ask.)
-
-test('L6: open questions are answered {timedout} when the ceiling fires', async () => {
-  const { proc, written } = makeProc({ turnAbsoluteMs: 120, activityQuietMs: 60_000, turnQuietMs: 60_000 });
+// ─── L6: a question WAITS for the user — the ceiling does NOT time it out ────
+// 0.17.4: pre-fix the absolute cap force-answered the ask {timedout} at ~30 min and
+// killed the turn. A question should wait for the answer however long it takes; the
+// turn ceiling now defers while a question is open. docs/progress-is-not-turn-end-spec.md
+test('L6: a question is NOT timed out at the ceiling — the turn WAITS for the answer', async () => {
+  const { proc, events, written } = makeProc({ turnAbsoluteMs: 50, activityQuietMs: 60_000, turnQuietMs: 60_000 });
   const { sendP, turnId } = startTurn(proc, written);
+  sendP.catch(() => {});
   proc._handleHookEvent(upsFor(turnId));
   await proc._dispatchToolCall({ name: 'ask', tool_call_id: 'qq', args: ASK_ARGS });
 
-  await assert.rejects(sendP);   // zero replies → rejection is correct (L5b semantics)
-  const qa = written.find((w) => w.kind === 'question_answer' && w.tool_call_id === 'qq');
-  assert.ok(qa, 'the blocking ask must be unblocked at the ceiling — claude must never stay hung');
-  assert.equal(qa.result.timedout, true);
-  assert.equal(proc._openQuestions.size, 0, 'open-question bookkeeping cleared');
+  await sleep(220);   // >> turnAbsoluteMs — pre-fix the ceiling would have timed the question out
+  assert.equal(proc.pendingTurns.size, 1, 'the turn stays alive — a question waits for the user');
+  assert.equal(proc._openQuestions.size, 1, 'the question stays open (NOT force-answered {timedout})');
+  assert.ok(!written.find((w) => w.kind === 'question_answer' && w.result?.timedout),
+    'the ask must NOT be force-answered {timedout} at the ceiling');
+  assert.ok(events.find((e) => e.kind === 'cli-question-wait-extended'),
+    'the wait-extension is observable; cli-question-timedout-at-ceiling must NOT fire');
+  assert.ok(!events.find((e) => e.kind === 'cli-question-timedout-at-ceiling'), 'no ceiling timeout');
+
+  // answering it resolves the question normally
+  proc.writeQuestionAnswer('qq', { answers: [{ header: 'Pick', selected: ['a'] }] });
+  assert.equal(proc._openQuestions.size, 0, 'answered → the question clears and the turn resumes');
   await proc.kill('test');
 });
 

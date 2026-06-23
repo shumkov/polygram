@@ -203,6 +203,31 @@ describe('onQuestionResumed — re-lights the turn reactor after a question is a
   });
 });
 
+describe('onQuestionAsked/Resumed — hold the reaction through a question wait (no 😨)', () => {
+  test('asked holds work-in-flight; resumed releases it', async () => {
+    const h = baseDeps();
+    const work = [];
+    const entry = { pendingQueue: [{ context: {
+      reactor: { setState: () => {}, setWorkInFlight: (a) => work.push(a) },
+      typing: { pause: () => {}, resume: () => {} },
+    } }] };
+    const cbs = createSdkCallbacks(h.deps);
+    await cbs.onQuestionAsked('12345:7', { questions: [] }, entry);
+    assert.deepEqual(work, [true], 'a question wait holds the reaction — no decay to 🥱/😨 while waiting on the user');
+    cbs.onQuestionResumed('12345:7', entry);
+    assert.deepEqual(work, [true, false], 'answering releases the hold so the normal cascade resumes');
+  });
+
+  test('reactor without setWorkInFlight → safe no-op', async () => {
+    const h = baseDeps();
+    const entry = { pendingQueue: [{ context: { reactor: { setState: () => {} }, typing: { pause: () => {}, resume: () => {} } } }] };
+    const cbs = createSdkCallbacks(h.deps);
+    await cbs.onQuestionAsked('12345:7', { questions: [] }, entry);
+    cbs.onQuestionResumed('12345:7', entry);
+    assert.ok(true, 'never throws on the old reactor shape');
+  });
+});
+
 describe('onSubagentStart/Done — B3 holds a "working" reactor face while sub-agents run', () => {
   test('start holds work-in-flight; only the LAST done releases it', () => {
     const h = baseDeps();

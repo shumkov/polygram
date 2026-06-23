@@ -44,7 +44,7 @@ describe('pending_questions store', () => {
     assert.ok(row.id);
     assert.equal(row.status, 'pending');
     assert.ok(row.callback_token && row.callback_token.length >= 16, '128-bit-ish token');
-    assert.equal(row.timeout_ts, 1000 + 30 * 60 * 1000, 'default timeout aligned to the 30-min turn absolute cap (Option A)');
+    assert.equal(row.timeout_ts, 1000 + 24 * 60 * 60 * 1000, 'default is the long 24h safety backstop (the turn no longer caps a question — it waits for the user)');
     assert.deepEqual(JSON.parse(row.questions_json)[0].header, 'H');
   });
 

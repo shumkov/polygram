@@ -248,4 +248,20 @@ describe('B3: work-in-flight suppresses the stall/freeze cascade', () => {
     await new Promise((r) => setTimeout(r, 45));    // > stallMs from release
     assert.equal(m.currentEmoji, '🥱', 'after work drains, the normal stall cascade resumes');
   });
+
+  // Review MUST-FIX: two concurrent owners (a sub-agent AND an open question) must
+  // not stomp each other — releasing one while the other still holds must NOT
+  // resume the decay (a boolean latch did; owner-scoped doesn't).
+  test('two owners do not stomp — the hold survives until the LAST owner releases', async () => {
+    const { m } = makeR({ stallMs: 20, freezeMs: 10_000 });
+    m.setState('CODING');
+    m.setWorkInFlight(true, 'subagent');
+    m.setWorkInFlight(true, 'question');
+    m.setWorkInFlight(false, 'question');           // question answered, sub-agent still running
+    await new Promise((r) => setTimeout(r, 50));    // > stallMs
+    assert.equal(m.currentEmoji, '👨‍💻', 'still held — the sub-agent owner remains, no decay');
+    m.setWorkInFlight(false, 'subagent');           // last owner releases
+    await new Promise((r) => setTimeout(r, 45));
+    assert.equal(m.currentEmoji, '🥱', 'only after the LAST owner releases does the cascade resume');
+  });
 });
