@@ -209,3 +209,43 @@ describe('createReactionManager — stall timers (item A)', () => {
     assert.ok(applied.includes('👍'));
   });
 });
+
+// ─── B3: show progress while sub-agents run — suppress the stall/freeze cascade ──
+// A working turn can sit quiet for minutes while a sub-agent does one long thing.
+// The reactor was parked in a STALL_PROMOTABLE state (CODING/WEB/TOOL) and decayed
+// to 🥱 (STALL) → 😨 (TIMEOUT), so a working turn looked dead. While work is in
+// flight the silence is EXPECTED — hold the working face, don't decay.
+// docs/progress-is-not-turn-end-spec.md (B3)
+describe('B3: work-in-flight suppresses the stall/freeze cascade', () => {
+  function makeR({ stallMs, freezeMs }) {
+    const applied = [];
+    const m = createReactionManager({
+      availableEmojis: new Set(['👨‍💻', '🥱', '😨', '👾']),
+      throttleMs: 5, stallMs, freezeMs,
+      apply: async (e) => { applied.push(e); },
+    });
+    return { m, applied };
+  }
+
+  test('a working state does NOT decay to 🥱/😨 while a sub-agent runs', async () => {
+    const { m, applied } = makeR({ stallMs: 20, freezeMs: 40 });
+    m.setState('CODING');                 // 👨‍💻 — a STALL_PROMOTABLE state
+    m.setWorkInFlight(true);              // a sub-agent is running
+    await new Promise((r) => setTimeout(r, 70));   // > freezeMs
+    assert.equal(m.currentEmoji, '👨‍💻',
+      'a working turn must NOT show the stalled/frozen face while a sub-agent runs');
+    assert.ok(!applied.includes('🥱') && !applied.includes('😨'),
+      'the stall/freeze cascade is suppressed while work is in flight');
+  });
+
+  test('the normal cascade resumes once work drains', async () => {
+    const { m } = makeR({ stallMs: 20, freezeMs: 10_000 });
+    m.setState('CODING');
+    m.setWorkInFlight(true);
+    await new Promise((r) => setTimeout(r, 50));    // would have stalled if not suppressed
+    assert.equal(m.currentEmoji, '👨‍💻', 'held working while in flight');
+    m.setWorkInFlight(false);                       // sub-agent done — resume cascade
+    await new Promise((r) => setTimeout(r, 45));    // > stallMs from release
+    assert.equal(m.currentEmoji, '🥱', 'after work drains, the normal stall cascade resumes');
+  });
+});

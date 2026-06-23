@@ -424,3 +424,106 @@ test('L14: zero-reply ceiling emits turn-timeout-pane with the captured wedge pa
   assert.equal(ev.detail.streaming, false, 'a wedged turn shows no "esc to interrupt" streaming hint');
   await proc.kill('test');
 });
+
+// ─── L9: a status (interim) reply is NOT the turn's answer ──────────────────
+// Field incident (shumabit@UMI "conversion" topic, 2026-06-22): claude replied
+// "Loading… give me a couple min", did the work in a sub-agent, then ENDED the
+// turn — and polygram dropped the produced answer because a reply tool call had
+// fired (the status). The real answer sat undelivered for 19 min until the user
+// prodded. A status reply must not count as the answer; the produced final must
+// be delivered. docs/progress-is-not-turn-end-spec.md
+
+test('L9: interim-only turn → the produced final answer is DELIVERED (not the status)', async () => {
+  const { proc, events, written } = makeProc({ stopGraceMs: 30 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));                          // pickup → seen, hooks live
+  // claude posts a STATUS (interim) reply, then ends the turn with no final reply…
+  proc._recordReplyForPendingTurn('📱 Loading your product page… give me a couple min', turnId, true);
+  // …but it DID produce the real answer as its last assistant message.
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'Both answered with data: the real analysis.' });
+  await sleep(90);   // > stopGraceMs
+
+  const result = await sendP;
+  assert.equal(proc.pendingTurns.size, 0, 'turn finalized');
+  assert.equal(result.text, 'Both answered with data: the real analysis.',
+    'the produced final answer is delivered — not the interim status promise');
+  assert.equal(result.alreadyDelivered, false,
+    'the final was never sent via the reply tool (only the status was) — polygram MUST deliver it');
+  assert.ok(events.find((e) => e.kind === 'cli-interim-only-final-rescued'),
+    'the rescue is observable in the events DB');
+  await proc.kill('test');
+});
+
+test('L9b: a real (non-interim) reply still suppresses the stop-fallback (no regression)', async () => {
+  const { proc, written } = makeProc({ stopGraceMs: 30 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));
+  proc._recordReplyForPendingTurn('hello', turnId);              // FINAL reply (no interim flag)
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'ignored-when-a-final-reply-exists' });
+  await sleep(90);
+
+  const result = await sendP;
+  assert.equal(result.text, 'hello', 'uses the reply-tool text');
+  assert.equal(result.alreadyDelivered, true, 'already delivered incrementally — must not re-send');
+  await proc.kill('test');
+});
+
+test('L9c: interim-only with NO produced answer → status stays, nothing re-sent (no double-send)', async () => {
+  const { proc, written } = makeProc({ stopGraceMs: 30 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));
+  proc._recordReplyForPendingTurn('⏳ on it…', turnId, true);    // interim only
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: '' });   // no answer produced
+  await sleep(90);
+
+  const result = await sendP;
+  assert.equal(result.alreadyDelivered, true,
+    'only a status was delivered and no answer was produced — do NOT re-send the status');
+  await proc.kill('test');
+});
+
+test('L9d: interim:true threads through the reply tool args (full dispatch path)', async () => {
+  const { proc, written } = makeProc({ stopGraceMs: 30 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));
+  await proc._dispatchToolCall({
+    name: 'reply', tool_call_id: 's1',
+    args: { chat_id: '12345', turn_id: turnId, text: 'Working on it…', interim: true },
+  });
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'The final result.' });
+  await sleep(90);
+
+  const result = await sendP;
+  assert.equal(result.text, 'The final result.',
+    'interim:true via tool args → the status is not the answer; the produced final is delivered');
+  assert.equal(result.alreadyDelivered, false);
+  await proc.kill('test');
+});
+
+// L9e: the SAME rescue must apply when an interim-only turn resolves at a CEILING
+// (idle / hard-max) instead of via Stop — else the produced answer is dropped there
+// instead (the M1 review finding: the fix was complete for the Stop path but the
+// fireTimeout ceiling-resolve still delivered the status). docs/progress-is-not-turn-end-spec.md
+test('L9e: interim-only turn resolving at the CEILING also delivers the produced answer', async () => {
+  const { proc, events, written } = makeProc({
+    stopGraceMs: 300, turnQuietMs: 5000, activityQuietMs: 5000, turnTimeoutMs: 80,
+  });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));                          // pickup → seen, hooks live
+  proc._recordReplyForPendingTurn('⏳ give me a couple min', turnId, true);   // interim only
+  // claude's Stop lands carrying the real produced answer (begins the grace, sets _stopHookData)…
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'THE REAL PRODUCED ANSWER' });
+  // …but same-session activity cancels the grace (stale/lagged Stop); _stopHookData stays set.
+  proc._handleHookEvent(upsFor(turnId, 'still working'));
+  // now the idle ceiling fires (no further activity) → the fireTimeout resolve path.
+  await sleep(180);   // > turnTimeoutMs (80)
+
+  const result = await sendP;
+  assert.equal(proc.pendingTurns.size, 0, 'turn resolved at the ceiling');
+  assert.equal(result.text, 'THE REAL PRODUCED ANSWER',
+    'the produced final answer is delivered at the CEILING too — not the status promise');
+  assert.equal(result.alreadyDelivered, false, 'the answer was never sent via the reply tool — deliver it');
+  assert.ok(events.find((e) => e.kind === 'cli-interim-only-final-rescued'),
+    'the rescue fires on the ceiling path, not just the Stop path');
+  await proc.kill('test');
+});

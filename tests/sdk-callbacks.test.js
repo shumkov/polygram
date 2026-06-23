@@ -203,6 +203,35 @@ describe('onQuestionResumed — re-lights the turn reactor after a question is a
   });
 });
 
+describe('onSubagentStart/Done — B3 holds a "working" reactor face while sub-agents run', () => {
+  test('start holds work-in-flight; only the LAST done releases it', () => {
+    const h = baseDeps();
+    const states = [];
+    const work = [];
+    const entry = { pendingQueue: [{ context: { reactor: {
+      setState: (s) => states.push(s),
+      setWorkInFlight: (a) => work.push(a),
+      heartbeat: () => {},
+    } } }] };
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onSubagentStart('12345:7', { agentType: 'general', inFlight: 1 }, entry);
+    assert.deepEqual(states, ['SUBAGENT'], 'shows the distinct 👾 sub-agent state');
+    assert.deepEqual(work, [true], 'a starting sub-agent holds the working face');
+    cbs.onSubagentDone('12345:7', { inFlight: 1 }, entry);   // a nested one ends, another remains
+    cbs.onSubagentDone('12345:7', { inFlight: 0 }, entry);   // the LAST one ends → release
+    assert.deepEqual(work, [true, true, false], 'released only once the last sub-agent finishes');
+  });
+
+  test('reactor without setWorkInFlight (degenerate shape) → safe no-op', () => {
+    const h = baseDeps();
+    const entry = { pendingQueue: [{ context: { reactor: { setState: () => {}, heartbeat: () => {} } } }] };
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onSubagentStart('12345:7', { inFlight: 1 }, entry);
+    cbs.onSubagentDone('12345:7', { inFlight: 0 }, entry);
+    assert.ok(true, 'never throws when the reactor lacks setWorkInFlight');
+  });
+});
+
 describe('onStreamChunk — routes to head pending streamer + heartbeats reactor', () => {
   test('forwards partial to streamer.onChunk', () => {
     const h = baseDeps();

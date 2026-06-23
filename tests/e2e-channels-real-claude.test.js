@@ -170,6 +170,176 @@ test('e2e: real claude — ask tool round-trip (question emitted, answer flows b
   }
 });
 
+// 0.12 interactive questions — the RENDER path against real claude (the blind
+// spot in the ask round-trip above, which answers via writeQuestionAnswer and
+// never exercises renderAsk → the Telegram card). This drives the FULL
+// production wiring: real claude calls `ask` → the daemon emits 'question-asked'
+// → the REAL createQuestionHandlers.renderAsk renders the card through a
+// capturing `tg` → we assert the Telegram sendMessage actually carries an
+// inline_keyboard with a tap-button per option + a q:<id>:<token>:opt:<i>
+// callback_data. This is the "buttons show in Telegram" guarantee that no other
+// test covers (unit tests cover renderCurrent in isolation; this proves the
+// real question-asked payload flows through renderAsk into a real keyboard).
+test('e2e: real claude — ask renders a Telegram inline keyboard with a button per option', {
+  skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
+  timeout: 180_000,
+}, async () => {
+  const Database = require('better-sqlite3');
+  const { createQuestionStore } = require('../lib/questions/store');
+  const { createQuestionHandlers } = require('../lib/handlers/questions');
+
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-e2e-askkbd-'));
+  const chatConfig = { cwd, permissionMode: 'bypassPermissions', isolateUserConfig: true };
+
+  // Real migrated DB + real question store (migration 012 = pending_questions).
+  const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-e2e-askkbd-db-'));
+  const rawDb = new Database(path.join(dbDir, 't.db'));
+  rawDb.pragma('journal_mode = WAL');
+  const migDir = path.join(__dirname, '..', 'migrations');
+  for (const f of fs.readdirSync(migDir).filter((x) => x.endsWith('.sql')).sort()) {
+    rawDb.exec(fs.readFileSync(path.join(migDir, f), 'utf8'));
+  }
+  const questionStore = createQuestionStore(rawDb);
+
+  // Capturing `tg` — records every Telegram call the handler makes (the card
+  // send carries reply_markup) and hands back a fake message_id so renderAsk's
+  // sendCurrent treats the send as successful and persists message_ids.
+  const tgCalls = [];
+  let fakeMsgId = 9000;
+  const tg = async (_bot, method, params /* , meta */) => {
+    tgCalls.push({ method, params });
+    return { message_id: ++fakeMsgId, date: Math.floor(Date.now() / 1000) };
+  };
+
+  const replies = [];
+  const askedEvents = [];
+  let renderErr = null;
+
+  const proc = new CliProcess({
+    sessionKey: 'e2e-askkbd:1', chatId: '987654340', threadId: null, label: 'e2e-askkbd',
+    tmuxRunner: createTmuxRunner(), botName: 'e2etest',
+    claudeBin: resolvePinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION),
+    toolDispatcher: async ({ toolName, text }) => { if (toolName === 'reply') replies.push(text); return { ok: true }; },
+    logger: { warn: (...a) => console.error('[e2e:warn]', ...a), error: (...a) => console.error('[e2e:err]', ...a), log: () => {}, debug: () => {} },
+    db: { logEvent: () => {} },
+  });
+
+  // The EXACT production wiring: createQuestionHandlers with the real store +
+  // the capturing tg; answerQuestion late-bound to the proc so claude continues.
+  const questionHandlers = createQuestionHandlers({
+    questions: questionStore, tg, bot: {}, botName: 'e2etest',
+    logEvent: () => {},
+    answerQuestion: (sk, tc, result) => proc.writeQuestionAnswer(tc, result),
+    logger: { error: (...a) => console.error('[e2e:qh]', ...a) },
+  });
+
+  // Production path: 'question-asked' → renderQuestion → renderAsk (renders the
+  // keyboard). Then hand an answer back so claude finishes the turn.
+  proc.on('question-asked', async (ev) => {
+    askedEvents.push(ev);
+    try {
+      await questionHandlers.renderAsk({
+        sessionKey: ev.sessionKey, chatId: ev.chatId, threadId: ev.threadId,
+        turnId: ev.turnId, toolCallId: ev.toolCallId, questions: ev.questions,
+      });
+    } catch (e) { renderErr = e; }
+    const q = ev.questions?.[0];
+    const label = q?.options?.[0]?.label || 'Cats';
+    proc.writeQuestionAnswer(ev.toolCallId, { answers: [{ header: q?.header || '', selected: [label] }] });
+  });
+
+  try {
+    await proc.start({ cwd, chatConfig, existingSessionId: null });
+
+    await proc.send(
+      'Use the `mcp__polygram-bridge__ask` tool to ask me ONE question: "Cats or dogs?" with exactly two '
+      + 'options labelled "Cats" and "Dogs". After I answer, reply (via the reply tool) with EXACTLY: '
+      + '"You picked: <the label I chose>".',
+      { timeoutMs: 150_000, maxTurnMs: 170_000, context: { streamer: noopStreamer, reactor: noopReactor, threadId: null } },
+    );
+
+    assert.equal(renderErr, null, `renderAsk must not throw: ${renderErr && renderErr.stack}`);
+    assert.ok(askedEvents.length >= 1, `claude must call the ask tool. asked=${JSON.stringify(askedEvents).slice(0, 200)}`);
+
+    // THE CRUX: the Telegram card sent for the question MUST carry an inline
+    // keyboard with a tap-button per option — this is "buttons show in Telegram."
+    const cardSends = tgCalls.filter((c) => c.method === 'sendMessage' && /Cats or dogs/i.test(c.params.text || ''));
+    assert.ok(cardSends.length >= 1,
+      `renderAsk must send the question as a Telegram sendMessage. tgCalls=${JSON.stringify(tgCalls).slice(0, 400)}`);
+    const kb = cardSends[0].params.reply_markup && cardSends[0].params.reply_markup.inline_keyboard;
+    assert.ok(Array.isArray(kb) && kb.length >= 1,
+      `the question card MUST carry an inline_keyboard (the tap buttons). reply_markup=${JSON.stringify(cardSends[0].params.reply_markup)}`);
+    const buttons = kb.flat();
+    assert.ok(buttons.length >= 2,
+      `there must be a tap-button per option (≥2 for Cats/Dogs). buttons=${JSON.stringify(buttons)}`);
+    for (const b of buttons) {
+      assert.ok(typeof b.text === 'string' && b.text.length > 0, `button has a label: ${JSON.stringify(b)}`);
+      assert.match(b.callback_data, /^q:\d+:[A-Za-z0-9_-]+:(opt:\d+|submit|other)$/,
+        `button has a valid q:<id>:<token>:action callback_data: ${JSON.stringify(b)}`);
+    }
+    const labels = buttons.map((b) => b.text).join(' | ');
+    assert.match(labels, /Cats/i, `the option labels render on the buttons: ${labels}`);
+    assert.match(labels, /Dogs/i, `the option labels render on the buttons: ${labels}`);
+  } finally {
+    try { await proc.kill('e2e-done'); } catch {}
+    try { rawDb.close(); } catch {}
+    try { fs.rmSync(dbDir, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
+  }
+});
+
+// progress-is-not-turn-end (conversion-topic incident, 2026-06-22): claude posts
+// a status ("give me a couple min"), does multi-step work, then must DELIVER the
+// result in the SAME turn — not end on the promise. Validates the hardened prompt
+// (status ≠ turn end) + the `interim:true` flag end-to-end against real claude:
+// a status reply is marked interim, and a substantive final answer still arrives,
+// with NO second user message. docs/progress-is-not-turn-end-spec.md
+test('e2e: real claude — interim status then a delivered final answer (no prod needed)', {
+  skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
+  timeout: 180_000,
+}, async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-e2e-interim-'));
+  const chatConfig = { cwd, permissionMode: 'bypassPermissions', isolateUserConfig: true };
+  const replies = [];   // { text, interim }
+
+  const proc = new CliProcess({
+    sessionKey: 'e2e-interim:1', chatId: '987654350', threadId: null, label: 'e2e-interim',
+    tmuxRunner: createTmuxRunner(), botName: 'e2etest',
+    claudeBin: resolvePinnedClaudeBin(CLAUDE_CLI_PINNED_VERSION),
+    toolDispatcher: async ({ toolName, text, interim }) => {
+      if (toolName === 'reply') replies.push({ text, interim: interim === true });
+      return { ok: true, message_id: 100 + replies.length };
+    },
+    logger: { warn: (...a) => console.error('[e2e:warn]', ...a), error: (...a) => console.error('[e2e:err]', ...a), log: () => {}, debug: () => {} },
+    db: { logEvent: () => {} },
+  });
+
+  try {
+    await proc.start({ cwd, chatConfig, existingSessionId: null });
+
+    const result = await proc.send(
+      'Do this as ONE turn: first send a brief interim status reply (set interim:true) like '
+      + '"Working on it…". Then run a couple of Bash commands (e.g. `echo step1`, `echo step2`). '
+      + 'Then deliver your FINAL answer as a normal reply (interim omitted) that ends with EXACTLY '
+      + 'the token: RESULT-DELIVERED-7788.',
+      { timeoutMs: 150_000, maxTurnMs: 170_000, context: { streamer: noopStreamer, reactor: noopReactor, threadId: null } },
+    );
+
+    const finals = replies.filter((r) => !r.interim);
+    const interims = replies.filter((r) => r.interim);
+    const allText = replies.map((r) => r.text).join(' | ') + ' | ' + (result?.text || '');
+    assert.ok(interims.length >= 1,
+      `claude must mark the status reply interim:true. replies=${JSON.stringify(replies).slice(0, 300)}`);
+    assert.ok(finals.length >= 1,
+      `claude must deliver a FINAL (non-interim) reply, not end on the status. replies=${JSON.stringify(replies).slice(0, 300)}`);
+    assert.match(allText, /RESULT-DELIVERED-7788/,
+      `the real result must be delivered in the same turn — no prod. got: ${allText.slice(0, 300)}`);
+  } finally {
+    try { await proc.kill('e2e-done'); } catch {}
+    try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
+  }
+});
+
 // 0.13 D1 (P1): the reply-then-ask shape against REAL claude — the prod bug-#2
 // flow that was previously untested (the ask E2E above answers synchronously,
 // so the WAIT never spans the old reply-quiet window). Claude replies FIRST,
