@@ -171,6 +171,14 @@ describe('slash-commands — /new + /reset', () => {
     await fx.dispatch(fx.makeCtx({ text: '/reset' }));
     assert.ok(fx.calls.pmCalls.some((c) => c.kind === 'reset' && c.opts.reason === 'reset'));
   });
+
+  test('/clear is a synonym for /new — resets the session (reason=clear) and acks', async () => {
+    const fx = fixture();
+    await fx.dispatch(fx.makeCtx({ text: '/clear' }));
+    assert.ok(fx.calls.pmCalls.some((c) => c.kind === 'reset' && c.opts.reason === 'clear'));
+    assert.match(fx.calls.sendReply[0], /fresh session/);
+    assert.ok(fx.calls.events.some((e) => e.kind === 'session-reset-command'));
+  });
 });
 
 describe('slash-commands — /model', () => {
