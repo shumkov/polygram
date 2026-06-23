@@ -527,3 +527,34 @@ test('L9e: interim-only turn resolving at the CEILING also delivers the produced
     'the rescue fires on the ceiling path, not just the Stop path');
   await proc.kill('test');
 });
+
+// L10: a Stop that fires while a sub-agent is still running must NOT finalize the
+// turn (clearing the reaction mid-work). It DEFERS until the sub-agent drains, then
+// finalizes + delivers the produced answer. Field: return topic 2026-06-23 — the
+// turn resolved-by-stop at 14:31:03 while sub-agents ran to 14:33:26, clearing the
+// 👾 reaction while work continued. docs/progress-is-not-turn-end-spec.md
+test('L11: stop-grace DEFERS while a sub-agent is in flight; finalizes + delivers when it drains', async () => {
+  const { proc, events, written } = makeProc({ stopGraceMs: 25, turnTimeoutMs: 5000 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));                                       // pickup → seen
+  proc._recordReplyForPendingTurn('Processing your comments…', turnId, true);  // status (interim)
+  proc._pendingSubagentStarts = [{ agentType: 'g', toolUseId: 'a1' }];         // a sub-agent is running
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'boundary/partial' });   // boundary Stop
+  await sleep(100);   // >> stopGraceMs — pre-fix this finalized + cleared the reaction
+  assert.equal(proc.pendingTurns.size, 1,
+    'turn must stay alive (reaction held by B3) while the sub-agent runs — NOT finalized');
+  assert.ok(events.find((e) => e.kind === 'cli-stop-grace-deferred-subagent'),
+    'the defer is observable in the events DB');
+
+  // claude's real end-of-work Stop carries the produced answer (refreshes _stopHookData)…
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'The final analysis.' });
+  proc._pendingSubagentStarts = [];                                            // …and the sub-agent drains
+  await sleep(100);                                                            // next grace fire → no work → finalize
+
+  const result = await sendP;
+  assert.equal(proc.pendingTurns.size, 0, 'finalizes once the sub-agent drains');
+  assert.equal(result.text, 'The final analysis.',
+    'delivers the produced final answer (latest Stop), not the status promise');
+  assert.equal(result.alreadyDelivered, false);
+  await proc.kill('test');
+});
