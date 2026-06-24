@@ -600,3 +600,22 @@ test('T17: a mismatched-chat_id reply must NOT ack/resolve the live turn via con
   await sendP.catch(() => {});
   proc.kill?.();
 });
+
+// ─── Bridge env: the `ask` backstop must track the daemon question timeout ──────
+// Regression (0.17.5): the bridge hardcoded a 32-min ask timeout that fired long
+// before the daemon's 24h question wait, resolving {timedout} on a question the
+// user answered an hour later — Claude then said "the question timed out" and moved
+// on. The daemon now passes its question timeout to the bridge so the bridge's
+// last-resort backstop sits ABOVE it instead of undercutting it.
+test('bridge env carries the daemon question timeout (no 32-min ask-timeout regression)', () => {
+  const { DEFAULT_TIMEOUT_MS } = require('../lib/questions/store');
+  const { proc } = makeProc();
+  const env = proc._bridgeEnv();
+  assert.equal(env.POLYGRAM_QUESTION_TIMEOUT_MS, String(DEFAULT_TIMEOUT_MS),
+    'the bridge is told the daemon question timeout so its ask backstop aligns above it');
+  // Pin the 0.17.4 intent: the wait is generous (a real user answering hours later
+  // is never cut off), not the old ~30-min cap that the bridge silently re-imposed.
+  assert.ok(DEFAULT_TIMEOUT_MS >= 24 * 60 * 60 * 1000,
+    'the question wait is at least a full day — a question is not a 30-min deadline');
+  proc.kill?.();
+});
