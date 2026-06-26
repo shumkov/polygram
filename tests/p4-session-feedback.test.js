@@ -59,6 +59,39 @@ describe('P4-A: session feedback controller — autonomous cycle visuals', () =>
     assert.equal(actions.length, n, 'typing stops at cycle end');
   });
 
+  // The autonomous cycle's typing used to stop only at endCycle (Process idle =
+  // SESSION idle), so a later turn delayed teardown and typing spun minutes past the
+  // delivered answer (field: Ivan DM 2026-06-26, answer 07:06:57 → typing-off 07:16:41).
+  // Fix: stop the cycle's typing the moment IT delivers, decoupled from session idle.
+  // docs/typing-tracks-activity-spec.md
+  test('stopCycleTyping stops the typing loop at delivery — before endCycle', async () => {
+    const { fb, actions, reactions } = makeController();
+    fb.startAutonomousCycle('100', { anchorMsgId: 42 });
+    await sleep(70);
+    assert.ok(actions.length >= 2, 'typing running during the cycle');
+    fb.stopCycleTyping('100');                       // the cycle delivered its answer
+    const n = actions.length;
+    await sleep(70);
+    assert.equal(actions.length, n, 'typing stopped at delivery, NOT held until endCycle/session-idle');
+    fb.endCycle('100');                              // teardown still clears the anchor
+    await sleep(10);
+    assert.ok(reactions.find((r) => r.message_id === 42 && Array.isArray(r.reaction) && r.reaction.length === 0),
+      'anchor still cleared at endCycle after stopCycleTyping');
+  });
+
+  test('stopCycleTyping is idempotent and a no-op on an unknown session', async () => {
+    const { fb, actions } = makeController();
+    fb.startAutonomousCycle('100');
+    await sleep(50);
+    fb.stopCycleTyping('100');
+    fb.stopCycleTyping('100');   // idempotent
+    fb.stopCycleTyping('999');   // unknown — must not throw
+    const n = actions.length;
+    await sleep(50);
+    assert.equal(actions.length, n, 'stays stopped');
+    fb.endCycle('100');
+  });
+
   test('anchored cycle: 🤔 lands on the anchor message and clears at end', async () => {
     const { fb, reactions } = makeController();
     fb.startAutonomousCycle('100', { anchorMsgId: 42 });
@@ -125,6 +158,19 @@ describe('P4-B: callbacks wiring', () => {
     cbs.onIdle('sk', {});
     cbs.onClose('sk', 0, { label: 'x', chatId: '1', pendingQueue: [] });
     assert.deepEqual(calls, ['sk', 'sk']);
+  });
+
+  test('onAutonomousAssistantMessage stops the cycle typing at delivery (not at session idle)', () => {
+    const calls = [];
+    const cbs = makeCallbacks({
+      sessionFeedback: { stopCycleTyping: (sk) => calls.push(sk) },
+    });
+    assert.equal(typeof cbs.onAutonomousAssistantMessage, 'function');
+    // cli/channels shape: the dispatcher already shipped the text (alreadyDelivered)
+    cbs.onAutonomousAssistantMessage('sk', { text: 'the answer', alreadyDelivered: true });
+    assert.deepEqual(calls, ['sk'], 'the delivered cycle stops its typing immediately');
+    cbs.onAutonomousAssistantMessage('sk', { text: '', alreadyDelivered: true });
+    assert.deepEqual(calls, ['sk'], 'an empty (no-text) message delivers nothing → does not stop typing');
   });
 
   test('voice-ack fix: onThinking promotes a NEVER-SET reactor to THINKING (heartbeat alone left 👂 forever)', () => {
