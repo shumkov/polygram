@@ -232,6 +232,40 @@ describe('createDispatcher — auto-resume gating', () => {
     assert.ok(fx.calls.events.some((e) => e.kind === 'auto-resume-success'));
   });
 
+  // Field: shumabit@umi WhatsApp topic 2026-06-27 — a bridge-disconnect mid-turn
+  // triggered an auto-resume; the cli REPLY TOOL delivered the answer DURING the
+  // re-run turn (result.alreadyDelivered=true), and attemptAutoResume ALSO re-sent
+  // result.text at the end → the SAME answer delivered twice. The resume path must
+  // honor alreadyDelivered just like the main dispatch path does.
+  test('already-delivered (cli reply-tool) resume → does NOT re-send result.text (no double-answer)', async () => {
+    const fx = fixture({
+      isAutoResumable: true,
+      sendToProcessResult: { text: 'Fixed. ✅ It was the WhatsApp channel.', alreadyDelivered: true },
+    });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(new Error('bridge disconnected'));
+    await nextTick(); await nextTick(); await nextTick(); await nextTick();
+    assert.equal(fx.calls.sendToProcess.length, 1, 'the turn was re-run');
+    assert.equal(fx.calls.deliverReplies.length, 0,
+      'the reply tool already delivered → auto-resume must NOT re-send the same answer');
+    assert.ok(fx.calls.events.some((e) => e.kind === 'auto-resume-already-delivered'));
+    assert.ok(fx.calls.events.some((e) => e.kind === 'auto-resume-success'));
+  });
+
+  test('NOT already-delivered (SDK / no-reply turn) → auto-resume DOES deliver result.text', async () => {
+    const fx = fixture({
+      isAutoResumable: true,
+      sendToProcessResult: { text: 'the SDK answer' },   // no alreadyDelivered → must be delivered
+    });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(new Error('300s no activity'));
+    await nextTick(); await nextTick(); await nextTick(); await nextTick();
+    assert.equal(fx.calls.deliverReplies.length, 1,
+      'no reply-tool delivery → auto-resume still delivers the answer (unchanged behavior)');
+  });
+
   test('resumable + IN cooldown → no resume attempt, fall through to error reply', async () => {
     const fx = fixture({ isAutoResumable: true, inCooldown: true });
     fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
