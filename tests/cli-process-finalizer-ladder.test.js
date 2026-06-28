@@ -663,3 +663,23 @@ test('L18: a sub-agent work hook after a boundary Stop withdraws rung-2 eligibil
   assert.equal(result.text, 'The sub-agent analysis.', 'delivers the real answer, not the boundary partial');
   await proc.kill('test');
 });
+
+// L19: the 0.17.8 characterization instrument — _resolveTurnDelivery emits a
+// cli-resolve-delivery event tagging the branch + counts, so a channels
+// double-delivery (reply tool + daemon re-send) can be pinned to WHY alreadyDelivered
+// was false. docs note: shumorobot Music dup, 2026-06-28.
+test('L19: _resolveTurnDelivery emits cli-resolve-delivery tagging the branch', async () => {
+  const { proc, events, written } = makeProc({ stopGraceMs: 40 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));
+  proc._recordReplyForPendingTurn('the final answer', turnId);          // a FINAL reply
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'the final answer' });
+  await sleep(90);
+  await sendP;
+  const ev = events.find((e) => e.kind === 'cli-resolve-delivery');
+  assert.ok(ev, 'resolution emits a cli-resolve-delivery characterization event');
+  assert.equal(ev.detail.branch, 'final-reply');
+  assert.equal(ev.detail.already_delivered, true);
+  assert.equal(ev.detail.reply_count, 1);
+  await proc.kill('test');
+});
