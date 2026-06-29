@@ -232,4 +232,21 @@ describe('getConfigWriteScope — write target mirrors getSessionKey isolation (
     assert.equal(chatConfig.effort, 'max');
     assert.equal(chatConfig.topics['5'].effort, undefined);
   });
+
+  test('isolated topic stored as a legacy name string → coerced to object, write succeeds', () => {
+    // Hand-edited / legacy configs store a topic as a bare name string
+    // (topics["329"] = "Advertising") instead of { name: "Advertising" }.
+    // getTopicConfig / getTopicName already tolerate that form; the write
+    // path did not — `scope.model = ...` on a string throws under strict
+    // mode, which silently killed every /model + /effort button tap in that
+    // topic (the model button "showed process" then stayed put). Coerce to
+    // the object form, preserving the name.
+    const chatConfig = { model: 'sonnet', isolateTopics: true, topics: { '329': 'Advertising' } };
+    const { scope, threadId } = getConfigWriteScope(chatConfig, '329');
+    assert.equal(threadId, '329');
+    scope.model = 'opus'; // would throw TypeError on a string scope (unfixed)
+    assert.equal(chatConfig.topics['329'].model, 'opus');
+    assert.equal(chatConfig.topics['329'].name, 'Advertising', 'topic name preserved');
+    assert.equal(chatConfig.model, 'sonnet', 'chat root untouched');
+  });
 });
