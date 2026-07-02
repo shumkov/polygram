@@ -199,3 +199,231 @@ double-answer reports; no premature-finalize regressions.
 
 Related: `docs/lost-stop-wedge-rescue-spec.md` (superseded root cause),
 `docs/0.13-turn-wedge-autorecovery-spec.md`, `docs/progress-is-not-turn-end-spec.md`.
+
+---
+
+# Follow-up — the rung-2 rescue is defeated by a trailing `SubagentStop`
+
+**Status:** BUILT · CLI/channels backend (`lib/process/cli-process.js`,
+the `_handleHookEvent` work-hook counter — orphan-`SubagentStop` conditional). Tests L20-L22
+in `tests/cli-process-finalizer-ladder.test.js` (L18 matched-case + L16 resume-guard stay
+green). Field-confirmed by production forensics
+(shumabit@UMI group "return" topic `-1003369922517:37`, 2026-06-29 18:48 Europe/Madrid),
+with the loss corroborated against Claude's own session transcript.
+
+## Problem (one sentence)
+
+The rung-2 no-reply backstop this spec shipped (0.17.5) has **never once fired in
+production** — `cli-noreply-stop-rescued = 0` across all of shumabit's history despite 73
+`cli-stop-grace-cancelled` events — because a `SubagentStop` hook that *trails* the
+attributed Stop bumps `_workHookSeq` past the Stop's snapshot, so `_activityQuietEligible`
+rules the turn "claude resumed work" and the rescue stands down; the no-reply turn then
+orphans to the idle ceiling exactly as before and the captured answer is dropped.
+
+## Evidence (the "return"-topic incident, both sides)
+
+User said "merged" → turn `3af907f5` (picked up 18:45:02, `seen=true`), **zero replies**.
+
+Polygram side (events DB):
+```
+18:48:45  hook Stop fires        → _captureStopHookData: _stopHookDataSeq = _workHookSeq (=N)
+18:48:45  cli-stop-grace-cancelled source:"pane-thinking"   ← grace killed (the race this spec fixes)
+          → _armActivityQuiet armed (eligible at this instant: _workHookSeq N == _stopHookDataSeq N)
+18:48:49  hook SubagentStop      → _workHookSeq = N+1  (a NON-Stop hook) AND _noteActivity re-arms idle ceiling
+          → rung-2 fire re-checks _activityQuietEligible: N+1 != N → INELIGIBLE → stands down
+18:48:49→18:58:20  cli-mid-turn-unknown-prompt ×20 (idle pane, no _noteActivity)
+18:58:49  idle ceiling fires (18:48:49 + idle window, exact) → "⏱ went quiet", answer DROPPED
+```
+
+Claude side (transcript `7bb3ee2c-…jsonl`): Claude ran the full turn (checked PR #62/#63,
+acknowledged "changing with js bad idea", stripped the JS, committed/pushed, re-synced
+#63, verified the live site) and **produced a complete final assistant message at
+18:48:44** ("Two things to flag: 1. JS removed — H1 can't change cleanly…") — one second
+before the Stop. **No `Agent`/Task tool was used in this turn**, so the 18:48:49
+`SubagentStop` was a *late / orphan* teardown hook, not this turn's work. There is no
+Claude-side failure: it answered; polygram dropped the answer.
+
+Systemic, not a one-off (shumabit, all-time):
+- 73 `cli-stop-grace-cancelled`; **62 % (45)** have a `subagent-done` within 10 s *after*
+  the cancel — the exact poison window.
+- **46 %** of the last 200 stop-resolved turns have a `subagent-done` within 10 s after —
+  trailing `SubagentStop` is a routine teardown artifact, not rare.
+- `cli-noreply-stop-rescued = 0`; `turn-timeout = 66`.
+
+## Root cause
+
+`_handleHookEvent` (`cli-process.js` ~2956) splits hooks into "terminal" and "work":
+
+```js
+if (ev.type === 'Stop') {
+  this._lastHookEventAt = Date.now();                 // terminal: not work, not activity
+} else if (ev.type && ev.type !== 'parse-error' && ev.type !== 'unknown') {
+  this._lastHookEventAt = Date.now();
+  this._workHookSeq = (this._workHookSeq || 0) + 1;   // ← SubagentStop lands HERE
+  this._noteActivity(`hook:${ev.type}`);              // ← and cancels an in-flight Stop grace
+}
+```
+
+Only `Stop` is excluded. `SubagentStop` is *also* a terminal signal ("a sub-agent
+finished") — the opposite of "claude resumed work" — yet it (1) increments `_workHookSeq`,
+withdrawing rung-2 eligibility, and (2) calls `_noteActivity`, which `_cancelStopGrace`
+would use to kill a legitimate attributed Stop grace (rung-1) the same way `pane-thinking`
+does.
+
+**But the classification is context-dependent (the spec-review correction).** A naive
+"`SubagentStop` is always terminal" is *wrong* — and would break the existing L18 test
+(`tests/cli-process-finalizer-ladder.test.js:641`). There are two distinct `SubagentStop`
+shapes, distinguished by `_pendingSubagentStarts` at the moment the hook is processed
+(i.e. before the switch-case splice at `:3076-3079`):
+
+- **Matched** (`_pendingSubagentStarts.length > 0`): this cycle's sub-agent really
+  finished. A *boundary* Stop can be captured while a sub-agent is in flight (the main
+  agent's `Task` await is interrupted by a lagged/boundary Stop — `_beginAttributedStopGrace`
+  defers on exactly this, `:1905-1927`). Here the captured text **is** stale and the
+  `SubagentStop` legitimately withdraws rung-2 eligibility — *especially* for a **tool-less
+  sub-agent** that emits no inner `PreToolUse`/`PostToolUse`, where `SubagentStop` is the
+  only post-boundary signal. This must keep bumping `_workHookSeq` + noting activity. (L18.)
+- **Orphan** (`_pendingSubagentStarts.length === 0`): a late / lagged / foreign teardown
+  hook with **no matching in-flight start** — the production "return" incident. It is *not*
+  this cycle's work and must be terminal: no `_workHookSeq` bump (else it withdraws a valid
+  rescue), no `_noteActivity` (else it cancels a valid Stop grace).
+
+So the **ordering argument is narrower** than first stated: a `SubagentStop` after the main
+agent's *real terminal* Stop (no sub-agent in flight, count 0) is always lagged/foreign and
+is correctly terminal; a `SubagentStop` after a *boundary* Stop (count > 0) is this turn's
+real work completing and must still block. The discriminator is `_pendingSubagentStarts`.
+
+**Empirical confirmation (shumabit, the incident's session):** at the "merged" Stop-capture
+(18:48:45) `_pendingSubagentStarts` count was **0**; the 18:48:49 `SubagentStop` carried
+`agent_type=""` with no matching start — a textbook orphan. Real sub-agents in that session
+appear as `type="general-purpose"` start/done **pairs** (17:44→17:49, 18:01→18:04); orphan
+`type=""` `SubagentStop`s (count never leaving 0) fire routinely after turns (~11 in the
+17:40–18:49 window). Separately verified: sub-agent **inner** tool hooks DO reach this
+stream and bump `_workHookSeq` (`lib/sdk/callbacks.js:582-587`, no agent_id filter in the
+work branch) — so a *tool-using* in-flight sub-agent is already protected by its own
+hooks; only the *tool-less* in-flight case relies on the matched-`SubagentStop` bump, which
+this design preserves.
+
+## Design — classify `SubagentStop` by whether a sub-agent is in flight
+
+```js
+if (ev.type === 'Stop') {
+  this._lastHookEventAt = Date.now();
+} else if (ev.type === 'SubagentStop' && !(this._pendingSubagentStarts?.length)) {
+  // ORPHAN SubagentStop — a late/lagged/foreign teardown hook with no matching in-flight
+  // start (the prod "return" incident: agent_type="", count 0). It is NOT this cycle's
+  // work: terminal, like Stop. It must not bump the work-hook counter (the rung-2 no-reply
+  // backstop reads a bump as "claude resumed", withdrawing the captured Stop's delivery)
+  // nor count as activity (which would cancel a legitimate attributed Stop grace).
+  this._lastHookEventAt = Date.now();
+} else if (ev.type && ev.type !== 'parse-error' && ev.type !== 'unknown') {
+  // Genuine work hooks (UserPromptSubmit / PreToolUse / PostToolUse) AND a MATCHED
+  // SubagentStop (count > 0 — this cycle's sub-agent finishing; keeps withdrawing rung-2
+  // eligibility on a boundary Stop, incl. a tool-less sub-agent — see L18).
+  this._lastHookEventAt = Date.now();
+  this._workHookSeq = (this._workHookSeq || 0) + 1;
+  this._noteActivity(`hook:${ev.type}`);
+}
+```
+
+The `switch (ev.type)` below is unchanged — `case 'SubagentStop'` still splices
+`_pendingSubagentStarts` and emits `subagent-done` for the reactor; only the
+activity/counter bookkeeping moves, and only for the orphan shape.
+
+### Trace through the fix (the "return" incident — orphan, count 0)
+```
+18:48:45  Stop captures answer (_stopHookDataSeq = N); pane-thinking cancels grace, arms rung-2 (N==N)
+18:48:49  SubagentStop, _pendingSubagentStarts empty → ORPHAN → terminal: seq stays N, grace untouched
+~18:49:03 _activityQuietFinalize → eligible (N==N) → delivers "Two things to flag…",
+          emits cli-noreply-stop-rescued
+```
+Idle-ceiling dead-air + dropped answer → ~18 s resolution that delivers what Claude said.
+
+## Why this is safe (no regressions)
+
+- **In-flight sub-agent still blocks the rescue — both shapes.** A *tool-using* sub-agent
+  bumps `_workHookSeq` via its own inner `PreToolUse`/`PostToolUse` (verified on-stream); a
+  *tool-less* sub-agent is covered by its **matched** `SubagentStop` still bumping. L18
+  (matched, boundary Stop) stays green; L16's resume-into-tool guard (`PreToolUse`) is
+  untouched.
+- **Reviewer-2 foreign-grace-defer race handled.** `_beginAttributedStopGrace.fire()`
+  re-arms while `_pendingSubagentStarts > 0`; the `SubagentStop` that drains that count is
+  by definition **matched** → it still `_noteActivity`s (cancelling the deferred
+  foreign/stale grace) AND bumps `_workHookSeq` (rung-2 ineligible) → the foreign text is
+  neither grace-delivered nor rescue-delivered; the real Stop delivers. Only the *orphan*
+  shape (count 0, never deferring) skips `_noteActivity`, where there is no deferred grace
+  to protect.
+- **Rung-1 for the orphan case (two-directional — the honest trade).** A trailing orphan
+  `SubagentStop` no longer cancels an attributed Stop grace. For a *legitimate* grace this
+  is the win (L22: rung-1 delivers). The counter-case: pre-fix, an orphan that chanced to
+  land inside the 2 s grace window *incidentally* cancelled a **foreign/lagged** attributed
+  Stop grace on a still-thinking `seen` turn; post-fix it doesn't, so in that narrow window
+  a foreign answer can be rung-1-delivered where before it was rejected. LOW severity and
+  largely pre-existing — that foreign-Stop rejection was best-effort anyway (pane-thinking
+  ticks ~5 s, the grace fires at 2 s, so a pure-thinking turn is unprotected in that gap
+  regardless). Accepted; the correct-for-legit-graces behavior is worth it.
+- **No double-deliver.** Unchanged: `_armActivityQuiet`/`_activityQuietFinalize` early-return
+  while `_stopGracePending`; `_finalizeTurn` is idempotent (`pendingTurns.delete`).
+- **`_pendingSubagentStarts` defer (L11) unaffected** — that path keys on the start counter,
+  which this design reads but does not mutate (the splice stays in the switch case).
+
+### Residual limitation (accepted, noted)
+
+The discriminator is `_pendingSubagentStarts.length`. If a prior cycle **lost** its
+`SubagentStop`, a stale entry can stick the counter `> 0` (a pre-existing fragility the
+0.17.5 spec already named), which would misclassify a later orphan as matched → bump → the
+false timeout persists for that turn. This fix is a **strict improvement** over today (today
+*every* `SubagentStop` bumps) and is no worse in the stuck-counter case. The stuck-counter
+root cause is out of scope; a `_pendingSubagentStarts` reset on turn finalize is a candidate
+follow-up.
+
+## Rejected / deferred alternatives
+
+- **Blanket "`SubagentStop` is terminal"** (the first draft): breaks L18 and reopens the
+  tool-less in-flight stale-finalize regression (L16's failure mode). Rejected by review.
+- **Eligibility-side fix** (special-case in `_activityQuietEligible`): spreads the
+  SubagentStop special-case across read sites and leaves `_noteActivity` cancelling rung-1.
+  The producer-side classification is one place.
+- **Allowlist the work hooks** (bump `_workHookSeq` only on
+  `UserPromptSubmit`/`PreToolUse`/`PostToolUse`): the structurally-correct class fix, but it
+  *also* drops the matched-`SubagentStop` bump that L18 needs, so it can't stand alone here.
+  Tracked as a follow-up if more terminal/passive hooks are shown to poison.
+- **`Notification` (idle-attention variant)** (`cli-process.js:3190-3216`, `toolName` null):
+  a *passive* signal that nonetheless `_noteActivity`s, resetting the idle ceiling — an
+  "idle" hook cancelling the idle timeout. No production evidence yet (and bypassPermissions
+  suppresses the permission variant); deferred, but named here. (`PreCompact`/`PostCompact`
+  same lifecycle class. `SessionStart` is **not** in `KNOWN_EVENT_NAMES` → normalizes to
+  `'unknown'` → already excluded; only relevant if upstream adds it.)
+
+## Test / verification plan (TDD — red→green)
+
+`tests/cli-process-finalizer-ladder.test.js`. Note L18/L19 are taken — the new test is
+**L20**; existing L18 must stay green (it is the matched-`SubagentStop` guard).
+
+1. **L20 — headline red→green (orphan).** Pickup (`seen`) → no reply → `Stop`
+   (`lastAssistantMessage`) → `_noteActivity('pane-thinking')` (cancels grace, arms rung-2)
+   → `_handleHookEvent({ type: 'SubagentStop' })` with `_pendingSubagentStarts` **empty** →
+   `sleep(> activityQuietMs)`. **Before:** `pendingTurns.size === 1` (orphaned), no
+   `cli-noreply-stop-rescued`. **After:** finalized, delivers `lastAssistantMessage`
+   (`alreadyDelivered:false`), emits `cli-noreply-stop-rescued`.
+2. **Existing L18 (matched) must stay green.** `_pendingSubagentStarts = [{agentType:'g'}]`,
+   boundary `Stop`, pane-thinking cancel, `SubagentStop {agentType:'g'}` → eligibility
+   withdrawn → NOT finalized on the boundary text; the real Stop delivers. (Pins the
+   matched branch.)
+3. **L16 regression guard (must stay green).** `PreToolUse` after the Stop → still
+   ineligible → no stale finalize. Confirms genuine work hooks still bump.
+4. **Reactor unaffected.** Assert an orphan `SubagentStop` still emits `subagent-done`
+   (the switch case must keep running after the bookkeeping branch).
+5. **Rung-1 protection (orphan).** An orphan `SubagentStop` during an undisturbed attributed
+   Stop grace must NOT cancel it — the grace finalizes and delivers normally.
+
+Real-claude E2E is hard to force deterministically; rely on the unit repros, plus a VPS
+soak watcher: `cli-noreply-stop-rescued` should go from 0 → catching the wedges, and
+zero-reply `turn-timeout` should fall.
+
+## Rollout
+
+Patch bump (bug fix). shumabit + shumorobot. Soak: `cli-noreply-stop-rescued > 0`,
+zero-reply `turn-timeout` ↓; no new double-answer reports; no premature-finalize
+regressions. (Mode B — the busy-aware single-probe absolute checkpoint, shumorobot Music
+2026-06-28 — is tracked separately and out of scope here.)

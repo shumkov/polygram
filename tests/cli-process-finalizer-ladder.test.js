@@ -683,3 +683,70 @@ test('L19: _resolveTurnDelivery emits cli-resolve-delivery tagging the branch', 
   assert.equal(ev.detail.reply_count, 1);
   await proc.kill('test');
 });
+
+// L20-L22: an ORPHAN SubagentStop (a late/lagged/foreign teardown hook with NO matching
+// in-flight sub-agent start) must be treated as TERMINAL, not work. Field-confirmed:
+// umi/shumabit "return" topic 2026-06-29 — a trailing SubagentStop (agent_type="", no
+// start) bumped _workHookSeq past the Stop capture, withdrew rung-2 eligibility, and the
+// no-reply turn orphaned to the idle ceiling → false "⏱ went quiet", answer dropped.
+// (73 grace-cancels → 0 rescues in prod because ~62% had this trailing SubagentStop.)
+// docs/stop-grace-cancel-race-spec.md (follow-up). The MATCHED case stays green in L18.
+
+test('L20: orphan SubagentStop after a pane-thinking grace-cancel must NOT poison the rescue', async () => {
+  const { proc, events, written } = makeProc({ stopGraceMs: 40, activityQuietMs: 120, turnTimeoutMs: 60_000 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._handleHookEvent(upsFor(turnId));                                       // pickup → seen, hooks live
+  // claude finishes with NO reply tool call; the Stop carries the answer (begins grace, sets _stopHookData)…
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'THE PAYMENT INFO ANSWER' });
+  // …the pane heartbeat cancels the grace and arms rung-2 (eligible at this instant)…
+  proc._noteActivity('pane-thinking');
+  // …then a late / orphan SubagentStop lands with NO matching in-flight start (prod: agent_type="",
+  // _pendingSubagentStarts empty — earlier sub-agents already drained; start() init'd it to []).
+  proc._pendingSubagentStarts = [];
+  assert.equal(proc._pendingSubagentStarts.length, 0, 'precondition: no in-flight sub-agent (orphan)');
+  proc._handleHookEvent({ type: 'SubagentStop', agentType: '' });
+  await sleep(220);   // > activityQuietMs (120), no further activity
+
+  assert.equal(proc.pendingTurns.size, 0,
+    'orphan SubagentStop is terminal → rung-2 stays eligible → finalized, not orphaned to the ceiling');
+  const result = await sendP;
+  assert.equal(result.text, 'THE PAYMENT INFO ANSWER', 'the Stop-captured answer is delivered, not dropped');
+  assert.equal(result.alreadyDelivered, false, 'never sent via the reply tool — deliver it');
+  assert.ok(events.find((e) => e.kind === 'cli-noreply-stop-rescued'),
+    'the rescue is observable in the events DB for the soak watcher');
+  await proc.kill('test');
+});
+
+test('L21: orphan SubagentStop still emits subagent-done (reactor path unaffected)', async () => {
+  const { proc, written } = makeProc({ activityQuietMs: 5000, turnTimeoutMs: 60_000 });
+  const dones = [];
+  proc.on('subagent-done', (d) => dones.push(d));
+  const { sendP, turnId } = startTurn(proc, written);
+  sendP.catch(() => {});
+  proc._handleHookEvent(upsFor(turnId));
+  proc._pendingSubagentStarts = [];                                  // orphan (no in-flight start)
+  proc._handleHookEvent({ type: 'SubagentStop', agentType: '' });
+  assert.equal(dones.length, 1,
+    'the switch-case still emits subagent-done — only the activity/counter bookkeeping moved');
+  await proc.kill('test');
+});
+
+test('L22: orphan SubagentStop does NOT cancel an undisturbed attributed Stop grace (rung 1 delivers)', async () => {
+  const { proc, events, written } = makeProc({ stopGraceMs: 80, activityQuietMs: 5000, turnTimeoutMs: 60_000 });
+  const { sendP, turnId } = startTurn(proc, written);
+  proc._pendingSubagentStarts = [];                                  // no in-flight sub-agent
+  proc._handleHookEvent(upsFor(turnId));
+  // claude finishes with NO reply; the Stop begins an attributed grace (rung 1).
+  proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'GRACE ANSWER' });
+  // an orphan SubagentStop lands DURING the grace — pre-fix its _noteActivity cancelled the grace
+  // (source: hook:SubagentStop); as terminal it must leave the grace untouched.
+  proc._handleHookEvent({ type: 'SubagentStop', agentType: '' });
+  await sleep(160);   // > stopGraceMs (80), << activityQuietMs — only rung 1 can fire here
+
+  assert.equal(proc.pendingTurns.size, 0, 'the undisturbed grace finalized (orphan did not cancel it)');
+  assert.ok(!events.find((e) => e.kind === 'cli-stop-grace-cancelled'),
+    'the orphan SubagentStop did not cancel the attributed Stop grace');
+  const result = await sendP;
+  assert.equal(result.text, 'GRACE ANSWER', 'rung 1 delivered the captured answer');
+  await proc.kill('test');
+});
