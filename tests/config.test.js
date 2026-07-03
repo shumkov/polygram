@@ -16,6 +16,7 @@ const {
   loadConfig,
   saveConfig,
   loadStickers,
+  resolveStickersPath,
   isWellFormedMessage,
   isWellFormedCallbackQuery,
 } = require('../lib/config');
@@ -163,6 +164,46 @@ describe('loadStickers', () => {
     fs.writeFileSync(p, JSON.stringify({ stickers: {} }));
     const { stickerMap } = loadStickers(p, { logger: silentLogger });
     assert.deepEqual(stickerMap, {});
+  });
+});
+
+describe('resolveStickersPath — per-bot sticker set selection', () => {
+  const DATA = '/data';
+
+  test('default: no per-bot config, no env → shared <dataDir>/stickers.json', () => {
+    assert.equal(resolveStickersPath({ dataDir: DATA }), '/data/stickers.json');
+  });
+
+  test('per-bot RELATIVE stickersPath resolves against dataDir (the umi-assistant case)', () => {
+    assert.equal(
+      resolveStickersPath({ botConfig: { stickersPath: 'umi-assistant-stickers.json' }, dataDir: DATA }),
+      '/data/umi-assistant-stickers.json',
+    );
+  });
+
+  test('per-bot ABSOLUTE stickersPath is used as-is', () => {
+    assert.equal(
+      resolveStickersPath({ botConfig: { stickersPath: '/opt/umi/stickers.json' }, dataDir: DATA }),
+      '/opt/umi/stickers.json',
+    );
+  });
+
+  test('per-bot config WINS over the env override', () => {
+    assert.equal(
+      resolveStickersPath({ botConfig: { stickersPath: 'umi.json' }, dataDir: DATA, envPath: '/env/x.json' }),
+      '/data/umi.json',
+    );
+  });
+
+  test('env override applies when no per-bot stickersPath', () => {
+    assert.equal(
+      resolveStickersPath({ botConfig: { model: 'sonnet' }, dataDir: DATA, envPath: '/env/x.json' }),
+      '/env/x.json',
+    );
+  });
+
+  test('empty/falsy per-bot stickersPath falls through to env/default (no accidental cwd)', () => {
+    assert.equal(resolveStickersPath({ botConfig: { stickersPath: '' }, dataDir: DATA }), '/data/stickers.json');
   });
 });
 

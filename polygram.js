@@ -137,8 +137,6 @@ const DB_DIR = DATA_DIR;
 // DB_PATH is resolved in main() from --db or <bot>.db default.
 let DB_PATH = null;
 let PID_PATH = null;          // rc.50: orphan-detection PID file
-const STICKERS_PATH = process.env.POLYGRAM_STICKERS
-  || path.join(DATA_DIR, 'stickers.json');
 const INBOX_DIR = process.env.POLYGRAM_INBOX || path.join(DATA_DIR, 'inbox');
 const CLAUDE_BIN = process.env.POLYGRAM_CLAUDE_BIN
   || path.join(process.env.HOME || '', '.npm-global/bin/claude');
@@ -195,7 +193,15 @@ function saveConfig() {
   configIO.saveConfig({ configPath: CONFIG_PATH, botName: BOT_NAME, config });
 }
 function loadStickers() {
-  const { stickerMap: m, emojiToSticker: e } = configIO.loadStickers(STICKERS_PATH);
+  // Per-bot sticker set: config.bots.<bot>.stickersPath wins, else POLYGRAM_STICKERS,
+  // else the shared <DATA_DIR>/stickers.json. Resolved from config.bot, so this must
+  // run AFTER activeBotConfig() populates it.
+  const stickersPath = configIO.resolveStickersPath({
+    botConfig: config && config.bot,
+    dataDir: DATA_DIR,
+    envPath: process.env.POLYGRAM_STICKERS || null,
+  });
+  const { stickerMap: m, emojiToSticker: e } = configIO.loadStickers(stickersPath);
   Object.assign(stickerMap, m);
   Object.assign(emojiToSticker, e);
 }
@@ -385,6 +391,9 @@ function formatPrompt(msg, sessionCtx, attachments = [], { sessionKey = null } =
     attachments,
     replyTo: resolveReplyTo(msg),
     polygramHistory,
+    // Only advertise stickers this bot actually has — empty for a bot with no
+    // sticker set, so its prompt never mentions stickers.
+    stickerEmojis: Object.keys(emojiToSticker),
   });
 }
 
@@ -2168,7 +2177,6 @@ let startPollWatchdog = null;
 
 async function main() {
   loadConfig();
-  loadStickers();
 
   let dbOverride;
   try {
@@ -2194,6 +2202,8 @@ async function main() {
     console.error(`[fatal] ${err.message}`);
     process.exit(2);
   }
+  // After config.bot is set, so a per-bot stickersPath is honored.
+  loadStickers();
   DB_PATH = dbOverride || path.join(DB_DIR, `${BOT_NAME}.db`);
   console.log(`[polygram] bot: ${BOT_NAME} (${Object.keys(config.chats).length} chats) db: ${DB_PATH}`);
 
