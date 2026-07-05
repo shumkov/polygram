@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const childProcess = require('child_process');
 const {
   createTmuxRunner, sessionName, debugLogPath, sanitize, MULTILINE_SEPARATOR,
-} = require('../lib/tmux/tmux-runner');
+} = require('@shumkov/orchestra');
 
 // ── Mock runFn ──────────────────────────────────────────────────────
 

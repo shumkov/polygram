@@ -16,8 +16,8 @@
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { ProcessManager } = require('../lib/process-manager');
-const { createProcessFactory } = require('../lib/process/factory');
+const { ProcessManager } = require('@shumkov/orchestra');
+const { createProcessFactory } = require('@shumkov/orchestra');
 const {
   extractAssistantText,
   sumUsage,

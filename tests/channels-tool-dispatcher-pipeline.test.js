@@ -208,7 +208,7 @@ test('F#1: dispatcher applies `[react:EMOJI]` reactions when target msg id prese
 // _resolveTurn result shape.
 
 function makeMinimalChannelsProc(extra = {}) {
-  const { CliProcess } = require('../lib/process/cli-process');
+  const { CliProcess } = require('@shumkov/orchestra');
   const events = [];
   const fakeDb = {
     logEvent: (kind, detail) => { events.push({ kind, detail }); },

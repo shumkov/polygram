@@ -27,9 +27,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { CliProcess } = require('../lib/process/cli-process');
-const { createTmuxRunner } = require('../lib/tmux/tmux-runner');
-const { resolvePinnedClaudeBin, CLAUDE_CLI_PINNED_VERSION } = require('../lib/claude-bin');
+const { CliProcess } = require('@shumkov/orchestra');
+const { createTmuxRunner } = require('@shumkov/orchestra');
+const { resolvePinnedClaudeBin, CLAUDE_CLI_PINNED_VERSION } = require('@shumkov/orchestra').claudeBin;
 
 const RUN = process.env.E2E_REAL_CLAUDE === '1';
 

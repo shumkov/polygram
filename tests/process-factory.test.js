@@ -10,7 +10,7 @@ if (!process.env.POLYGRAM_CLAUDE_BIN) {
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const factory = require('../lib/process/factory');
+const factory = require('@shumkov/orchestra');
 const { createProcessFactory, pickBackend } = factory;
 const { SdkProcess } = require('../lib/process/sdk-process');
 

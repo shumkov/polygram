@@ -24,7 +24,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { CliProcess } = require('../lib/process/cli-process');
+const { CliProcess } = require('@shumkov/orchestra');
 
 const quietLogger = { warn: () => {}, error: () => {}, log: () => {}, debug: () => {} };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

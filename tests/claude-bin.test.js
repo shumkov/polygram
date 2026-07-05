@@ -6,7 +6,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 
-const { resolvePinnedClaudeBin, verifyPinnedClaudeBin } = require('../lib/claude-bin');
+const { resolvePinnedClaudeBin, verifyPinnedClaudeBin } = require('@shumkov/orchestra').claudeBin;
 
 const ORIGINAL_OVERRIDE = process.env.POLYGRAM_CLAUDE_BIN;
 
@@ -76,7 +76,7 @@ describe('claude-bin — verifyPinnedClaudeBin', () => {
 // 0.17: vendor the pinned binary so claude's auto-pruner can't delete it out
 // from under the cli backend.
 describe('claude-bin — ensureVendoredClaudeBin', () => {
-  const { ensureVendoredClaudeBin } = require('../lib/claude-bin');
+  const { ensureVendoredClaudeBin } = require('@shumkov/orchestra').claudeBin;
   const quiet = { log: () => {}, warn: () => {}, error: () => {} };
   const VER = '2.1.173';
   const SAVE = ['POLYGRAM_CLAUDE_BIN', 'POLYGRAM_CLAUDE_VENDOR_DIR', 'POLYGRAM_CLAUDE_VERSIONS_DIR', 'POLYGRAM_CLAUDE_INSTALL_BIN'];

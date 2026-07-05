@@ -19,7 +19,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 
 const { createHandleAbort } = require('../lib/handlers/abort');
-const { CliProcess } = require('../lib/process/cli-process');
+const { CliProcess } = require('@shumkov/orchestra');
 
 // ── abort-handler harness ───────────────────────────────────────────
 function makeHandler({ proc, isAbort = true } = {}) {

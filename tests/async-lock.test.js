@@ -1,7 +1,7 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { createAsyncLock } = require('../lib/async-lock');
+const { createAsyncLock } = require('@shumkov/orchestra');
 
 describe('createAsyncLock', () => {
   test('single acquire/release works', async () => {

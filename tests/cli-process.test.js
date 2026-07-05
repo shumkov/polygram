@@ -3,8 +3,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { CliProcess } = require('../lib/process/cli-process');
-const factory = require('../lib/process/factory');
+const { CliProcess } = require('@shumkov/orchestra');
+const factory = require('@shumkov/orchestra');
 const { createProcessFactory, pickBackend } = factory;
 
 // Minimal fakes so we can construct without touching tmux / claude.

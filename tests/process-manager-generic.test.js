@@ -2,8 +2,8 @@
 
 const { test, describe, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
-const { ProcessManager } = require('../lib/process-manager');
-const { Process, UnsupportedOperationError } = require('../lib/process/process');
+const { ProcessManager } = require('@shumkov/orchestra');
+const { Process, UnsupportedOperationError } = require('@shumkov/orchestra');
 
 // ── Mock Process ─────────────────────────────────────────────────────
 

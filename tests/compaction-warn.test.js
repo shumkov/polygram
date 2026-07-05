@@ -13,7 +13,7 @@ const {
   resolveCompactionWarnConfig,
   createCompactionWarnTracker,
   DEFAULT_THRESHOLD_PCT,
-} = require('../lib/compaction-warn');
+} = require('@shumkov/orchestra').compactionWarn;
 
 test('resolveCompactionWarnConfig: default OFF when unset', () => {
   assert.deepEqual(resolveCompactionWarnConfig({}), { enabled: false, thresholdPct: DEFAULT_THRESHOLD_PCT });

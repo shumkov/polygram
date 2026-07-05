@@ -17,7 +17,7 @@ const assert = require('node:assert');
 const os = require('node:os');
 const path = require('node:path');
 
-const { CliProcess } = require('../lib/process/cli-process');
+const { CliProcess } = require('@shumkov/orchestra');
 const { STATES } = require('../lib/telegram/reactions');
 const { createSdkCallbacks } = require('../lib/sdk/callbacks');
 
@@ -100,7 +100,7 @@ test('L6: bridge-disconnect drain clears _interruptGraceTimer', () => {
 
 test('L8: multibyte char at the 64KB read boundary is not corrupted', async () => {
   const fs = require('node:fs');
-  const { LogTail } = require('../lib/tmux/log-tail');
+  const { LogTail } = require('@shumkov/orchestra').logTail;
   const CHUNK = 64 * 1024;
   // Pad so the 😀's first 2 bytes end chunk 1 and its last 2 bytes begin chunk 2.
   const content = 'A'.repeat(CHUNK - 2) + String.fromCodePoint(0x1F600) + '\n';

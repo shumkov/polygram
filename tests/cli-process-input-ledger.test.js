@@ -28,8 +28,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { CliProcess } = require('../lib/process/cli-process');
-const { CALLBACK_TO_EVENT } = require('../lib/process-manager');
+const { CliProcess } = require('@shumkov/orchestra');
+const { CALLBACK_TO_EVENT } = require('@shumkov/orchestra');
 const { createDropRedeliverer } = require('../lib/handlers/drop-redeliver');
 
 const quietLogger = { warn: () => {}, error: () => {}, log: () => {}, debug: () => {} };

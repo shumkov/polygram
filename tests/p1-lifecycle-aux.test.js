@@ -126,7 +126,7 @@ describe('P1-B: question lifecycle drives the head turn typing controller', () =
 
 // ─── C. LRU eviction pin for open questions ─────────────────────────────────
 
-const { ProcessManager } = require('../lib/process-manager');
+const { ProcessManager } = require('@shumkov/orchestra');
 
 describe('P1-C: open-question sessions are pinned from LRU eviction (S9)', () => {
   function fakeProc({ key, lastUsedTs, openQuestions = false }) {

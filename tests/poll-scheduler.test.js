@@ -2,7 +2,7 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { PollScheduler } = require('../lib/tmux/poll-scheduler');
+const { PollScheduler } = require('@shumkov/orchestra').pollScheduler;
 
 async function settle(ms) { return new Promise((r) => setTimeout(r, ms)); }
 

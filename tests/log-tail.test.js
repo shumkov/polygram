@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { LogTail } = require('../lib/tmux/log-tail');
+const { LogTail } = require('@shumkov/orchestra').logTail;
 
 function tmpfile() {
   return path.join(os.tmpdir(), `tail-test-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.log`);

@@ -15,7 +15,7 @@ const {
   buildHookSettings,
   writeHookFiles,
   removeHookFiles,
-} = require('../lib/process/hook-settings');
+} = require('@shumkov/orchestra').hookSettings;
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'hook-settings-'));

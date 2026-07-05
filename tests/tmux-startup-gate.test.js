@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { runStartupGate } = require('../lib/tmux/startup-gate');
+const { runStartupGate } = require('@shumkov/orchestra').startupGate;
 
 const quietLogger = { warn: () => {}, error: () => {}, log: () => {}, debug: () => {} };
 

@@ -22,7 +22,7 @@ const assert = require('node:assert/strict');
 const net = require('node:net');
 const fs = require('node:fs');
 
-const { CliProcess } = require('../lib/process/cli-process');
+const { CliProcess } = require('@shumkov/orchestra');
 
 const READY_BANNER = 'Listening for channel messages from: server:polygram-bridge';
 const quietLogger = { warn: () => {}, error: () => {}, log: () => {}, debug: () => {} };
