@@ -2,7 +2,7 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { sweepTmuxOrphans } = require('../lib/tmux/orphan-sweep');
+const { sweepTmuxOrphans } = require('@shumkov/orchestra').orphanSweep;
 
 const SILENT = { log: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
 

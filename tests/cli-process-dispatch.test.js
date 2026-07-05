@@ -8,7 +8,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { CliProcess } = require('../lib/process/cli-process');
+const { CliProcess } = require('@shumkov/orchestra');
 
 const fakeRunner = {
   spawn: async () => {},

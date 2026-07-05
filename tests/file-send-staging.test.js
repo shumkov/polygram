@@ -10,7 +10,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
-const { CliProcess } = require('../lib/process/cli-process');
+const { CliProcess } = require('@shumkov/orchestra');
 const { DEFAULT_ATTACHMENT_BASE, validateAttachmentPath, buildAllowedRoots }
   = require('../lib/process/channels-tool-dispatcher');
 

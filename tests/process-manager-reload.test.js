@@ -2,8 +2,8 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { ProcessManager } = require('../lib/process-manager');
-const { Process } = require('../lib/process/process');
+const { ProcessManager } = require('@shumkov/orchestra');
+const { Process } = require('@shumkov/orchestra');
 
 // Minimal cli-like proc whose wouldReloadFor mirrors the real one: reload when
 // the spawnContext's resolved model differs from this proc's spawn-time model.

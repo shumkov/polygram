@@ -4,7 +4,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   Process, UnsupportedOperationError,
-} = require('../lib/process/process');
+} = require('@shumkov/orchestra');
 
 describe('Process — abstract base', () => {
   test('constructor requires sessionKey', () => {

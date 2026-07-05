@@ -48,7 +48,7 @@ const {
   releasePidFile,
   _makeUncaughtHandler,
   guardStdio,
-} = require('../lib/process-guard');
+} = require('@shumkov/orchestra').processGuard;
 
 describe('claimPidFile', () => {
   let tmp;

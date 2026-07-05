@@ -22,7 +22,7 @@
 const { Bot } = require('grammy');
 const fs = require('fs');
 const path = require('path');
-const processGuard = require('./lib/process-guard');
+const processGuard = require('@shumkov/orchestra').processGuard;
 const dbClient = require('./lib/db');
 const {
   migrateJsonToDb, getClaudeSessionId, resolveSessionForSpawn,
@@ -39,9 +39,9 @@ const { filterAttachments, resolveFileCaps, resolveMaxFileOverride, MAX_TOTAL_BY
 // Process subclasses (SdkProcess now, TmuxProcess in Phase 2) provide
 // per-session mechanics. The pre-0.10.0 monolithic ProcessManagerSdk
 // is deleted; SdkProcess inherits its per-entry guts.
-const { ProcessManager } = require('./lib/process-manager');
-const { createProcessFactory, pickBackend } = require('./lib/process/factory');
-const { extractAssistantText } = require('./lib/process/sdk-process');
+const { ProcessManager } = require('@shumkov/orchestra');
+const { createProcessFactory, pickBackend } = require('@shumkov/orchestra');
+const { extractAssistantText } = require('@shumkov/orchestra');
 // 0.11.0: channels backend tool dispatcher — adapts CliProcess's reply
 // tool callback into polygram's existing chunkText + deliverReplies primitives.
 // ADV-14: chunkMarkdownText (fence-aware) is imported once below (~line 88)
@@ -49,8 +49,8 @@ const { extractAssistantText } = require('./lib/process/sdk-process');
 // containing code blocks or HTML-style tags aren't split mid-element by the
 // size cap.
 const { createChannelsToolDispatcher } = require('./lib/process/channels-tool-dispatcher');
-const { createTmuxRunner } = require('./lib/tmux/tmux-runner');
-const { sweepTmuxOrphans } = require('./lib/tmux/orphan-sweep');
+const { createTmuxRunner } = require('@shumkov/orchestra');
+const { sweepTmuxOrphans } = require('@shumkov/orchestra').orphanSweep;
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
 // (pm.injectUserMessage) replaces the buffer + PostToolBatch detour.
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
@@ -87,7 +87,7 @@ const { formatContextReply, maybeContextFullHint } = require('./lib/context-form
 const { createAbortGrace } = require('./lib/abort-grace');
 const agentLoader = require('./lib/agents/loader');
 const { createSender } = require('./lib/telegram/api');
-const { createAsyncLock } = require('./lib/async-lock');
+const { createAsyncLock } = require('@shumkov/orchestra');
 const { sweepInbox } = require('./lib/db/inbox');
 const { parseBotArg, parseDbArg, filterConfigToBot, activeBotConfig } = require('./lib/config-scope');
 const { createStore: createPairingsStore, parseTtl: parsePairingTtl } = require('./lib/db/pairings');
@@ -473,7 +473,7 @@ function buildSpawnContext(sessionKey) {
     const resolved = {
       agent: topicConfig.agent || chatConfig.agent || null,
       cwd: topicConfig.cwd || chatConfig.cwd || null,
-      backend: pickBackend({ config, chatId, threadId: threadId || null }),
+      backend: pickBackend({ config, chatId, threadId: threadId || null, pmDefault: 'sdk' }),
     };
     const r = resolveSessionForSpawn(db, sessionKey, resolved);
     existingSessionId = r.existingSessionId;
@@ -502,7 +502,15 @@ function buildSpawnContext(sessionKey) {
     // the inbound filter and the send() choke point use, so CliProcess's
     // pre-check + system-prompt line can't drift from actual enforcement.
     localApi: !!config.bot?.apiRoot,
-    outboundCapOverride: resolveMaxFileOverride(config, chatId, threadId || null),
+    // Pre-resolve through the SAME backend-aware resolver origin's CliProcess used, so
+    // orchestra (which now uses opts.outboundCapOverride verbatim, without its own
+    // resolveFileCaps clamp) gets the backend default (2GB local / 50MB cloud) AND the
+    // ceiling clamp — not a flat 100MB. resolveFileCaps always returns a number, so this
+    // is always non-null and orchestra's injected fallback never fires.
+    outboundCapOverride: resolveFileCaps({
+      localApi: !!config.bot?.apiRoot,
+      override: resolveMaxFileOverride(config, chatId, threadId || null),
+    }).outBytes,
   };
 }
 
@@ -2224,7 +2232,14 @@ async function main() {
   // TmuxProcess.start() hits EEXIST on session spawn for any chat
   // routed to pm:'tmux'. See lib/tmux/orphan-sweep.js for rationale.
   try {
-    const sweep = await sweepTmuxOrphans({ botName: BOT_NAME, logger: console });
+    // Sweep must look for polygram's session prefix — orchestra's default runner
+    // filters 'orchestra-<bot>-', which would never match our 'polygram-<bot>-'
+    // sessions (dead safety net + EEXIST on cli respawn of a leaked session).
+    const sweep = await sweepTmuxOrphans({
+      botName: BOT_NAME,
+      runner: createTmuxRunner({ logger: console, sessionPrefix: 'polygram' }),
+      logger: console,
+    });
     if (sweep.swept.length > 0) {
       console.log(`[orphan-sweep] killed ${sweep.swept.length} stale tmux session(s)`);
     }
@@ -2482,7 +2497,7 @@ async function main() {
   // tmux backend runner — one per daemon, shared across all TmuxProcess
   // instances. Construction is cheap (no system call until first
   // spawn/send). Only used if any chat in config has pm:'tmux'.
-  const tmuxRunner = createTmuxRunner({ logger: console });
+  const tmuxRunner = createTmuxRunner({ logger: console, sessionPrefix: 'polygram' });
   // Verify the pinned claude CLI binary is present. The tmux
   // backend spawns this exact binary by absolute path (see
   // lib/claude-bin.js + TmuxProcess.start) — it never resolves
@@ -2498,7 +2513,13 @@ async function main() {
     // auto-pruner (keeps only ~3 newest, deletes the rest) can't take cli chats
     // down. Spawns from ~/.local/share/polygram/claude-bin/<version>, immune to
     // pruning. Self-heals on boot (copy from the system install, else install).
-    const { CLAUDE_CLI_PINNED_VERSION, ensureVendoredClaudeBin } = require('./lib/claude-bin');
+    // orchestra's claude-bin defaults its vendor dir to ~/.local/share/orchestra;
+    // point it at polygram's EXISTING vendored dir so boot reuses the pinned binary
+    // that's already there (no 223 MB re-vendor / `claude install` network call).
+    if (!process.env.ORCHESTRA_CLAUDE_VENDOR_DIR) {
+      process.env.ORCHESTRA_CLAUDE_VENDOR_DIR = require('node:path').join(require('node:os').homedir(), '.local', 'share', 'polygram', 'claude-bin');
+    }
+    const { CLAUDE_CLI_PINNED_VERSION, ensureVendoredClaudeBin } = require('@shumkov/orchestra').claudeBin;
     const binCheck = ensureVendoredClaudeBin(CLAUDE_CLI_PINNED_VERSION, { logger: console });
     if (binCheck.ok) {
       console.log(
@@ -2542,6 +2563,23 @@ async function main() {
     // channels backend
     toolDispatcher: channelsToolDispatcher,
     channelsClaudeBin,
+    // orchestra identity — polygram's names so behavior is byte-identical to the
+    // copied engine. bridge/tmux/hook/attachment prefixes, product/surface prose,
+    // the SDK backend (injected), and the default backend all match polygram's.
+    sessionPrefix: 'polygram',
+    bridgeServerName: 'polygram-bridge',
+    appDataDir: require('node:path').join(require('node:os').homedir(), '.polygram'),
+    attachmentBase: require('node:path').join(require('node:os').tmpdir(), 'polygram-attachments'),
+    productName: 'polygram',
+    surfaceName: 'Telegram',
+    pmDefault: 'sdk',
+    // The CLI append-system-prompt's FIRST block — origin hard-required this into every
+    // CliProcess. Without it, cli chats lose the Telegram table/markdown display rules.
+    displayHint: require('./lib/telegram/display-hint').POLYGRAM_DISPLAY_HINT,
+    // Backend-default outbound cap fallback (per-spawn buildSpawnContext override
+    // normally supersedes this; kept so any context-less spawn still gets the backend
+    // default rather than orchestra's neutral 100MB).
+    maxOutboundFileBytes: resolveFileCaps({ localApi: !!config.bot?.apiRoot }).outBytes,
   });
   // Route in-process approval prompts through the SAME canUseTool plumbing
   // that SDK chats use:

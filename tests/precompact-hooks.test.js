@@ -13,8 +13,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { HOOK_EVENTS } = require('../lib/process/hook-settings');
-const { normalizeHookEvent } = require('../lib/process/hook-event-tail');
+const { HOOK_EVENTS } = require('@shumkov/orchestra').hookSettings;
+const { normalizeHookEvent } = require('@shumkov/orchestra').hookEventTail;
 
 test('HOOK_EVENTS registers PreCompact + PostCompact (claude must emit them to the ndjson)', () => {
   assert.ok(HOOK_EVENTS.includes('PreCompact'), 'PreCompact must be registered');

@@ -11,7 +11,7 @@ const {
   normalizeHookEvent,
   pipeHookParser,
   createHookTail,
-} = require('../lib/process/hook-event-tail');
+} = require('@shumkov/orchestra').hookEventTail;
 
 // ─── normalizeHookEvent — typed parsing per event ───────────────────
 

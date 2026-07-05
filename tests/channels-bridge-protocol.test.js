@@ -6,7 +6,7 @@ const assert = require('node:assert/strict');
 const {
   parseBridgeToDaemonMessage,
   parseDaemonToBridgeMessage,
-} = require('../lib/process/channels-bridge-protocol');
+} = require('@shumkov/orchestra').bridgeProtocol;
 
 test('parseBridgeToDaemonMessage accepts well-formed hello', () => {
   const r = parseBridgeToDaemonMessage({ kind: 'hello', session_key: 'sess', secret: 'sec' });

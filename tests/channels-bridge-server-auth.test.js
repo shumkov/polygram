@@ -22,7 +22,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { ChannelsBridgeServer } = require('../lib/process/channels-bridge-server');
+const { ChannelsBridgeServer } = require('@shumkov/orchestra');
 
 const quietLogger = { warn: () => {}, error: () => {}, log: () => {}, debug: () => {} };
 

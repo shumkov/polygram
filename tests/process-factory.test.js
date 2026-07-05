@@ -10,20 +10,20 @@ if (!process.env.POLYGRAM_CLAUDE_BIN) {
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const factory = require('../lib/process/factory');
+const factory = require('@shumkov/orchestra');
 const { createProcessFactory, pickBackend } = factory;
-const { SdkProcess } = require('../lib/process/sdk-process');
+const { SdkProcess } = require('@shumkov/orchestra');
 
 const SILENT = { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} };
 
 // ─── pickBackend ────────────────────────────────────────────────────
 
 describe('pickBackend', () => {
-  test('returns "sdk" when no chatId', () => {
-    assert.equal(pickBackend({ config: {} }), 'sdk');
+  test('returns "sdk" when no chatId (polygram default via pmDefault)', () => {
+    assert.equal(pickBackend({ config: {}, pmDefault: 'sdk' }), 'sdk');
   });
-  test('returns "sdk" by default', () => {
-    assert.equal(pickBackend({ config: { chats: { 100: {} } }, chatId: '100' }), 'sdk');
+  test('returns "sdk" by default (polygram passes pmDefault:"sdk")', () => {
+    assert.equal(pickBackend({ config: { chats: { 100: {} } }, chatId: '100', pmDefault: 'sdk' }), 'sdk');
   });
   test('chatConfig.pm overrides default — pm:"cli" resolves directly', () => {
     factory._resetAliasWarnings?.();
@@ -73,10 +73,23 @@ describe('createProcessFactory routing', () => {
   // tests/cli-process.test.js. Alias resolution from pm:"tmux"/"channels"
   // to pm:"cli" is covered above in the pickBackend describe block.
 
-  test('createProcessFactory throws without spawnFn', () => {
-    assert.throws(
-      () => createProcessFactory({ config: {} }),
-      /spawnFn required/,
-    );
+  test('createProcessFactory no longer requires spawnFn (optional for cli-only consumers)', () => {
+    // orchestra made spawnFn optional so cli-only consumers (water) can build a factory
+    // without the SDK wiring; a missing SDK surfaces only if a chat actually selects sdk.
+    assert.equal(typeof createProcessFactory({ config: {} }), 'function');
+  });
+});
+
+// Pin polygram's PRODUCTION factory wiring — orchestra's neutral defaults are cli/no-hint,
+// so a silent drop of these would regress every live chat (caught by the migration review).
+describe('polygram production factory wiring', () => {
+  const src = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'polygram.js'), 'utf8');
+  test('createProcessFactory is called with pmDefault:"sdk"', () => {
+    assert.match(src, /createProcessFactory\(\{[\s\S]*?pmDefault:\s*'sdk'/,
+      "polygram must pass pmDefault:'sdk' (orchestra defaults to 'cli')");
+  });
+  test('createProcessFactory is called with the Telegram displayHint', () => {
+    assert.match(src, /displayHint:\s*require\([^)]*display-hint[^)]*\)\.POLYGRAM_DISPLAY_HINT/,
+      'polygram must inject POLYGRAM_DISPLAY_HINT (orchestra defaults to empty)');
   });
 });

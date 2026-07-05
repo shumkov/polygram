@@ -15,7 +15,7 @@ const assert = require('node:assert');
 const os = require('node:os');
 const path = require('node:path');
 
-const { CliProcess } = require('../lib/process/cli-process');
+const { CliProcess } = require('@shumkov/orchestra');
 const { createSdkCallbacks } = require('../lib/sdk/callbacks');
 
 const fakeRunner = {

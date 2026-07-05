@@ -23,7 +23,7 @@ const assert = require('node:assert/strict');
 
 const { createSessionFeedback } = require('../lib/feedback/session-feedback');
 const { createSdkCallbacks } = require('../lib/sdk/callbacks');
-const { CALLBACK_TO_EVENT } = require('../lib/process-manager');
+const { CALLBACK_TO_EVENT } = require('@shumkov/orchestra');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -211,7 +211,7 @@ describe('P4-C: process-manager forwarding', () => {
 
 describe('P4-D: cli-process turn-start payload', () => {
   test("the 'turn-start' emit carries hasPending + the picked-up anchor msgId", async () => {
-    const { CliProcess } = require('../lib/process/cli-process');
+    const { CliProcess } = require('@shumkov/orchestra');
     const proc = new CliProcess({
       sessionKey: 's', chatId: '12345',
       tmuxRunner: { sendControl: async () => {}, killSession: async () => {}, captureWide: async () => '' },

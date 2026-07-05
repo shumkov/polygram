@@ -30,7 +30,7 @@
 'use strict';
 
 const { makeFakeQuery } = require('./fake-query');
-const { SdkProcess } = require('../../lib/process/sdk-process');
+const { SdkProcess } = require('@shumkov/orchestra');
 
 const SILENT = { warn: () => {}, error: () => {}, info: () => {}, debug: () => {}, log: () => {} };
 
@@ -144,7 +144,7 @@ function makeSdkBackend({ sessionKey = 'chat:100', chatId = '100', threadId = nu
 // ─── CLI driver ──────────────────────────────────────────────────────
 
 const net = require('net');
-const { CliProcess } = require('../../lib/process/cli-process');
+const { CliProcess } = require('@shumkov/orchestra');
 
 const CHANNELS_READY_BANNER = 'Listening for channel messages from: server:polygram-bridge';
 

@@ -28,8 +28,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { CliProcess } = require('../lib/process/cli-process');
-const { CALLBACK_TO_EVENT } = require('../lib/process-manager');
+const { CliProcess } = require('@shumkov/orchestra');
+const { CALLBACK_TO_EVENT } = require('@shumkov/orchestra');
 const { createDropRedeliverer } = require('../lib/handlers/drop-redeliver');
 
 const quietLogger = { warn: () => {}, error: () => {}, log: () => {}, debug: () => {} };
@@ -369,7 +369,10 @@ test('T12: the spawn system prompt carries the consumed_turn_ids contract', asyn
 
 test('T13: bridge reply schema declares consumed_turn_ids; pm forwards input-dropped', () => {
   const fs = require('node:fs');
-  const bridgeSrc = fs.readFileSync(require.resolve('../lib/process/channels-bridge.mjs'), 'utf8');
+  const path = require('node:path');
+  // the channels bridge now ships in @shumkov/orchestra
+  const orchDir = path.dirname(require.resolve('@shumkov/orchestra'));
+  const bridgeSrc = fs.readFileSync(path.join(orchDir, 'lib/process/channels-bridge.mjs'), 'utf8');
   assert.match(bridgeSrc, /consumed_turn_ids/, 'reply tool schema carries the contract field');
   assert.equal(CALLBACK_TO_EVENT.onInputDropped, 'input-dropped', 'pm forwards the drop event to polygram');
 });
@@ -611,7 +614,7 @@ test('bridge env carries the daemon question timeout (no 32-min ask-timeout regr
   const { DEFAULT_TIMEOUT_MS } = require('../lib/questions/store');
   const { proc } = makeProc();
   const env = proc._bridgeEnv();
-  assert.equal(env.POLYGRAM_QUESTION_TIMEOUT_MS, String(DEFAULT_TIMEOUT_MS),
+  assert.equal(env.ORCHESTRA_QUESTION_TIMEOUT_MS, String(DEFAULT_TIMEOUT_MS),
     'the bridge is told the daemon question timeout so its ask backstop aligns above it');
   // Pin the 0.17.4 intent: the wait is generous (a real user answering hours later
   // is never cut off), not the old ~30-min cap that the bridge silently re-imposed.
