@@ -41,7 +41,7 @@ const { filterAttachments, resolveFileCaps, resolveMaxFileOverride, MAX_TOTAL_BY
 // is deleted; SdkProcess inherits its per-entry guts.
 const { ProcessManager } = require('@shumkov/orchestra');
 const { createProcessFactory, pickBackend } = require('@shumkov/orchestra');
-const { extractAssistantText, SdkProcess } = require('./lib/process/sdk-process');
+const { extractAssistantText } = require('@shumkov/orchestra');
 // 0.11.0: channels backend tool dispatcher — adapts CliProcess's reply
 // tool callback into polygram's existing chunkText + deliverReplies primitives.
 // ADV-14: chunkMarkdownText (fence-aware) is imported once below (~line 88)
@@ -2558,7 +2558,6 @@ async function main() {
     productName: 'polygram',
     surfaceName: 'Telegram',
     pmDefault: 'sdk',
-    SdkProcess,
   });
   // Route in-process approval prompts through the SAME canUseTool plumbing
   // that SDK chats use:

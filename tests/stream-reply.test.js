@@ -7,7 +7,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { createStreamer } = require('../lib/telegram/streamer');
-const { extractAssistantText } = require('../lib/process/sdk-process');
+const { extractAssistantText } = require('@shumkov/orchestra');
 
 const silent = { error: () => {} };
 

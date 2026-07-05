@@ -30,7 +30,7 @@
 'use strict';
 
 const { makeFakeQuery } = require('./fake-query');
-const { SdkProcess } = require('../../lib/process/sdk-process');
+const { SdkProcess } = require('@shumkov/orchestra');
 
 const SILENT = { warn: () => {}, error: () => {}, info: () => {}, debug: () => {}, log: () => {} };
 

@@ -22,7 +22,7 @@ const {
   extractAssistantText,
   sumUsage,
   makeInputController,
-} = require('../lib/process/sdk-process');
+} = require('@shumkov/orchestra');
 const { makeFakeQuery } = require('./_helpers/fake-query');
 
 // Helper: build the pm the same way polygram.js does. Accepts both

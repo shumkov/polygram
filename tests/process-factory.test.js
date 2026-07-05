@@ -12,7 +12,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const factory = require('@shumkov/orchestra');
 const { createProcessFactory, pickBackend } = factory;
-const { SdkProcess } = require('../lib/process/sdk-process');
+const { SdkProcess } = require('@shumkov/orchestra');
 
 const SILENT = { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} };
 
