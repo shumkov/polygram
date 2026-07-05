@@ -79,3 +79,17 @@ describe('createProcessFactory routing', () => {
     assert.equal(typeof createProcessFactory({ config: {} }), 'function');
   });
 });
+
+// Pin polygram's PRODUCTION factory wiring — orchestra's neutral defaults are cli/no-hint,
+// so a silent drop of these would regress every live chat (caught by the migration review).
+describe('polygram production factory wiring', () => {
+  const src = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'polygram.js'), 'utf8');
+  test('createProcessFactory is called with pmDefault:"sdk"', () => {
+    assert.match(src, /createProcessFactory\(\{[\s\S]*?pmDefault:\s*'sdk'/,
+      "polygram must pass pmDefault:'sdk' (orchestra defaults to 'cli')");
+  });
+  test('createProcessFactory is called with the Telegram displayHint', () => {
+    assert.match(src, /displayHint:\s*require\([^)]*display-hint[^)]*\)\.POLYGRAM_DISPLAY_HINT/,
+      'polygram must inject POLYGRAM_DISPLAY_HINT (orchestra defaults to empty)');
+  });
+});

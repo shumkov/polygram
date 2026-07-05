@@ -502,7 +502,15 @@ function buildSpawnContext(sessionKey) {
     // the inbound filter and the send() choke point use, so CliProcess's
     // pre-check + system-prompt line can't drift from actual enforcement.
     localApi: !!config.bot?.apiRoot,
-    outboundCapOverride: resolveMaxFileOverride(config, chatId, threadId || null),
+    // Pre-resolve through the SAME backend-aware resolver origin's CliProcess used, so
+    // orchestra (which now uses opts.outboundCapOverride verbatim, without its own
+    // resolveFileCaps clamp) gets the backend default (2GB local / 50MB cloud) AND the
+    // ceiling clamp — not a flat 100MB. resolveFileCaps always returns a number, so this
+    // is always non-null and orchestra's injected fallback never fires.
+    outboundCapOverride: resolveFileCaps({
+      localApi: !!config.bot?.apiRoot,
+      override: resolveMaxFileOverride(config, chatId, threadId || null),
+    }).outBytes,
   };
 }
 
@@ -2224,7 +2232,14 @@ async function main() {
   // TmuxProcess.start() hits EEXIST on session spawn for any chat
   // routed to pm:'tmux'. See lib/tmux/orphan-sweep.js for rationale.
   try {
-    const sweep = await sweepTmuxOrphans({ botName: BOT_NAME, logger: console });
+    // Sweep must look for polygram's session prefix — orchestra's default runner
+    // filters 'orchestra-<bot>-', which would never match our 'polygram-<bot>-'
+    // sessions (dead safety net + EEXIST on cli respawn of a leaked session).
+    const sweep = await sweepTmuxOrphans({
+      botName: BOT_NAME,
+      runner: createTmuxRunner({ logger: console, sessionPrefix: 'polygram' }),
+      logger: console,
+    });
     if (sweep.swept.length > 0) {
       console.log(`[orphan-sweep] killed ${sweep.swept.length} stale tmux session(s)`);
     }
@@ -2558,6 +2573,13 @@ async function main() {
     productName: 'polygram',
     surfaceName: 'Telegram',
     pmDefault: 'sdk',
+    // The CLI append-system-prompt's FIRST block — origin hard-required this into every
+    // CliProcess. Without it, cli chats lose the Telegram table/markdown display rules.
+    displayHint: require('./lib/telegram/display-hint').POLYGRAM_DISPLAY_HINT,
+    // Backend-default outbound cap fallback (per-spawn buildSpawnContext override
+    // normally supersedes this; kept so any context-less spawn still gets the backend
+    // default rather than orchestra's neutral 100MB).
+    maxOutboundFileBytes: resolveFileCaps({ localApi: !!config.bot?.apiRoot }).outBytes,
   });
   // Route in-process approval prompts through the SAME canUseTool plumbing
   // that SDK chats use:

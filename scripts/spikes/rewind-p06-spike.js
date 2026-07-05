@@ -14,7 +14,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const { CliProcess } = require('../../lib/process/cli-process');
-const { createTmuxRunner } = require('../../lib/tmux/tmux-runner');
+const { createTmuxRunner } = require('@shumkov/orchestra');
 const { resolvePinnedClaudeBin, CLAUDE_CLI_PINNED_VERSION } = require('../../lib/claude-bin');
 
 const noopStreamer = { onChunk: async () => {}, forceNewMessage: () => {}, finalize: async () => ({ streamed: false }), flushDraft: async () => {}, discard: async () => {} };
