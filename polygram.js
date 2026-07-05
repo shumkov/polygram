@@ -473,7 +473,7 @@ function buildSpawnContext(sessionKey) {
     const resolved = {
       agent: topicConfig.agent || chatConfig.agent || null,
       cwd: topicConfig.cwd || chatConfig.cwd || null,
-      backend: pickBackend({ config, chatId, threadId: threadId || null }),
+      backend: pickBackend({ config, chatId, threadId: threadId || null, pmDefault: 'sdk' }),
     };
     const r = resolveSessionForSpawn(db, sessionKey, resolved);
     existingSessionId = r.existingSessionId;
