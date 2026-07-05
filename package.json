@@ -63,7 +63,7 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.2.123",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@shumkov/orchestra": "git+https://github.com/shumkov/orchestra.git#4bade45",
+    "@shumkov/orchestra": "https://github.com/shumkov/orchestra/archive/4bade45870c1c4204c405a87f1b465ecc2b63ec8.tar.gz",
     "better-sqlite3": "^12.9.0",
     "grammy": "^1.42.0",
     "markdown-it": "^14.1.1",
