@@ -19,7 +19,7 @@ describe('detectSecrets — HIGH rules match their shapes', () => {
     // provider-key-shaped literal exists in source — otherwise GitHub push
     // protection blocks the push on these (entirely fake) fixtures.
     'anthropic': `key sk-ant-${'a'.repeat(28)} here`,
-    'openai': `key sk-${'a'.repeat(26)} here`,
+    'openai': `key sk-${'a'.repeat(48)} here`,
     'slack': `tok xoxb-${'1'.repeat(12)}-${'a'.repeat(12)} here`,
     'gcp-api': `AIza${'A'.repeat(35)} here`,
     'stripe': `key sk_live_${'a'.repeat(24)} here`,
@@ -44,9 +44,21 @@ describe('detectSecrets — no false positives on ordinary prose', () => {
     'the meeting is at 3pm, bring the slides',
     'error code 1234567 happened in the parser',
     'https://example.com/path?x=1 is the link',
+    // sk--prefixed hyphenated slugs are ordinary identifiers, not OpenAI keys
+    // (real keys are sk- + long base62, or sk-proj- + token). The old loose
+    // /sk-[A-Za-z0-9_-]{20,}/ auto-redacted these IN PLACE — irreversible
+    // destruction of user/bot text in the enforcing fleet-wide sweep.
+    'check out my branch sk-refactor-the-database-layer-today',
+    'the k8s secret sk-production-database-connection-string is rotated',
+    'run task sk-2024-migrate-all-users-to-new-schema next',
   ]) {
     test(`clean: ${t.slice(0, 30)}`, () => assert.deepEqual(detectSecrets(t), []));
   }
+
+  test('real OpenAI shapes still detected after the tighten', () => {
+    assert.ok(names(`key sk-proj-${'aB1_'.repeat(8)}-x here`).includes('openai'), 'project key');
+    assert.ok(names(`key sk-${'aB1'.repeat(16)} here`).includes('openai'), 'legacy 48-char base62 key');
+  });
 });
 
 describe('detectSecrets — group rules redact only the value', () => {
