@@ -436,6 +436,10 @@ describe('chunkMarkdownText — defensive post-pass enforces limit', () => {
     ['post-fence long no-whitespace text', () => '```\nint x = 1;\n```\n' + 'y'.repeat(8000)],
     ['long underscore_separated identifiers in fence', () => '```python\n' + 'verylongidentifierwithoutanybreaks_'.repeat(500) + '\n```'],
     ['3000 emoji surrogate pairs', () => '😀'.repeat(3000)],
+    // Odd alignment: the leading 'x' shifts every surrogate pair so a hard
+    // cut at any even offset lands MID-pair — a lone high surrogate ends one
+    // chunk and a lone low surrogate starts the next (renders as � twice).
+    ['odd-aligned emoji run (x + 3000 😀)', () => 'x' + '😀'.repeat(3000)],
     ['five 1500-char fences in sequence', () => ('```\n' + 'a'.repeat(1500) + '\n```\n').repeat(5)],
     ['8000-char URL inside markdown-link parens', () => '[label](http://example.com/' + 'p'.repeat(8000) + ')'],
     ['~8190 chars no whitespace at all', () => 'x'.repeat(8190)],
@@ -449,6 +453,11 @@ describe('chunkMarkdownText — defensive post-pass enforces limit', () => {
           c.length <= 4096,
           `[${label}] produced chunk of length ${c.length} > 4096`,
         );
+        // A cut between the two units of a surrogate pair corrupts BOTH
+        // sides to U+FFFD when rendered — chunks must never end on a lone
+        // high surrogate or start on a lone low one.
+        assert.ok(!/[\uD800-\uDBFF]$/.test(c), `[${label}] chunk ends with a lone high surrogate`);
+        assert.ok(!/^[\uDC00-\uDFFF]/.test(c), `[${label}] chunk starts with a lone low surrogate`);
       }
     });
   }
