@@ -825,18 +825,25 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // classifier, and the turn degrades to a silent "⏱ went quiet" across every
   // topic. Refuse up-front with a clear message + a loud log instead of
   // spawning a doomed turn. Slash commands above don't need claude, so they
-  // still work. Free check (reads the credentials file, no API call).
+  // still work. Free check (reads the credentials file, no API call). Guarded
+  // (fail-open to 'unknown' on throw): this sits on every turn's hot path, so
+  // a broken health check must never itself become the silent wedge this gate
+  // exists to catch.
   if (!msg._isReplay) {
-    const auth = checkClaudeAuthHealth();
+    let auth;
+    try {
+      auth = checkClaudeAuthHealth();
+    } catch (err) {
+      console.error(`[auth] health check failed: ${err.message}`);
+      auth = { state: 'unknown' };
+    }
     if (auth.state === 'expired') {
       const expIso = new Date(auth.refreshTokenExpiresAt).toISOString();
       console.error(`[auth] Claude login EXPIRED (refresh token ${expIso}) — refusing turn for ${label}; re-login on the host.`);
-      try {
-        db.logEvent('auth-expired', {
-          session_key: sessionKey, chat_id: chatId, source: 'dispatch-gate',
-          refresh_token_expires_at: auth.refreshTokenExpiresAt,
-        });
-      } catch { /* logging is best-effort */ }
+      logEvent('auth-expired', {
+        session_key: sessionKey, chat_id: chatId, source: 'dispatch-gate',
+        refresh_token_expires_at: auth.refreshTokenExpiresAt,
+      });
       await sendReply('🔑 Claude login has expired and needs to be re-authenticated. Messages can\'t be processed until the login is refreshed on the host.');
       return;
     }
@@ -2373,10 +2380,10 @@ async function main() {
       const expIso = auth.refreshTokenExpiresAt ? new Date(auth.refreshTokenExpiresAt).toISOString() : 'n/a';
       if (auth.state === 'expired') {
         console.error(`[auth] (${trigger}) Claude login EXPIRED (refresh token ${expIso}) — turns are being refused; re-login on the host.`);
-        db.logEvent('auth-expired', { source: 'monitor', trigger, refresh_token_expires_at: auth.refreshTokenExpiresAt });
+        logEvent('auth-expired', { source: 'monitor', trigger, refresh_token_expires_at: auth.refreshTokenExpiresAt });
       } else if (auth.state === 'expiring') {
         console.warn(`[auth] (${trigger}) Claude login expires in ${auth.daysLeft}d (${expIso}) — re-login soon.`);
-        db.logEvent('auth-expiring', { source: 'monitor', trigger, days_left: auth.daysLeft, refresh_token_expires_at: auth.refreshTokenExpiresAt });
+        logEvent('auth-expiring', { source: 'monitor', trigger, days_left: auth.daysLeft, refresh_token_expires_at: auth.refreshTokenExpiresAt });
       } else if (auth.state === 'unknown') {
         console.warn(`[auth] (${trigger}) Claude credentials check inconclusive: ${auth.reason}`);
       }
