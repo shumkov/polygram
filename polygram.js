@@ -69,6 +69,7 @@ const { createAutosteerHandlers } = require('./lib/handlers/autosteer');
 const { createEditCorrectionInjector } = require('./lib/handlers/edit-correction');
 const { createEditRedelivery } = require('./lib/handlers/edit-redelivery');
 const { createGateInbound, ADMIN_CMD_RE, PAIR_CLAIM_RE } = require('./lib/handlers/gate-inbound');
+const { createShouldHandle } = require('./lib/handlers/should-handle');
 const { createRedeliver } = require('./lib/handlers/redeliver');
 const { classifyReplay, executeReplayPlan } = require('./lib/handlers/replay-disposition');
 const { createDropRedeliverer } = require('./lib/handlers/drop-redeliver');
@@ -170,6 +171,8 @@ let ipcCloser = null;
 // single-valued), we keep them as plain module-level variables — not a map.
 let BOT_NAME = null;  // string, frozen after boot
 let bot = null;       // grammy Bot for BOT_NAME
+let mediaBuffer = null; // media-group coalescing buffer, created in createBot;
+                        // module-level so shutdown can replay-mark buffered albums
 // 0.4.8 note: streamer + reactor are per-turn, not per-session. They live
 // on the pending's `context` object in the pm pendingQueue, keyed to the
 // specific turn (not the session). The old per-session Maps were a bug
@@ -1793,34 +1796,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
 
 // ─── Bot setup ──────────────────────────────────────────────────────
 
-function shouldHandle(msg, chatConfig, botUsername) {
-  const hasAttachment = !!(msg.document || msg.photo || msg.voice || msg.audio || msg.video);
-  if (!msg.text && !msg.caption && !hasAttachment) return false;
-  const chatId = msg.chat.id.toString();
-  if (!config.chats[chatId]) return false;
-
-  if (chatConfig.requireMention && msg.chat.type !== 'private') {
-    const text = msg.text || msg.caption || '';
-    const isReplyToBot = msg.reply_to_message?.from?.username === botUsername;
-    const hasMention = text.includes(`@${botUsername}`);
-    // A reply targeting some other user (not the bot) is a strong signal
-    // "this message is for that person, not me". Paired users normally
-    // bypass requireMention, but not in this case — without the guard a
-    // paired user saying "Gotcha!" to a teammate gets processed by the
-    // bot just because the user is paired, which is what bit us in
-    // UMI Group on 0.5.9 (bot leaked reasoning as a reply to "Gotcha!").
-    const repliesToOtherUser = !!msg.reply_to_message
-      && msg.reply_to_message.from?.username !== botUsername;
-    // Paired users bypass requireMention — operator-trusted, no @ needed
-    // every time. Skipped when they're replying to a non-bot user (above).
-    const paired = !repliesToOtherUser && pairings && msg.from?.id
-      ? pairings.hasLivePairing({ bot_name: BOT_NAME, user_id: msg.from.id, chat_id: chatId })
-      : false;
-    if (!isReplyToBot && !hasMention && !paired) return false;
-  }
-
-  return true;
-}
+const shouldHandle = createShouldHandle({
+  getConfig: () => config,
+  getPairings: () => pairings,
+  getBotName: () => BOT_NAME,
+});
 
 function createBot(token) {
   // Optional self-hosted Telegram Bot API server. When config.bot.apiRoot is
@@ -1985,7 +1965,7 @@ function createBot(token) {
   // a single synthetic turn with all attachments merged. Timer resets on
   // every new sibling, so as long as messages arrive faster than the
   // DEFAULT_FLUSH_MS window apart they stay in the same bundle.
-  const mediaBuffer = createMediaGroupBuffer({
+  mediaBuffer = createMediaGroupBuffer({
     onFlush: (messages) => {
       if (!messages || messages.length === 0) return;
       // Primary = the (usually first) message with text/caption; that's
@@ -2830,6 +2810,53 @@ async function main() {
       }
     } catch (err) {
       console.error(`[shutdown] question expiry failed: ${err.message}`);
+    }
+
+    // 1.6 Album siblings still buffered (arrived <flushMs before shutdown,
+    //     never dispatched) sit at handler_status NULL — invisible to both
+    //     the drain below (not in inFlightHandlers) and recordCleanShutdown
+    //     (only re-marks dispatched/processing). Mark them replay-pending so
+    //     boot treats them like any interrupted turn: crash → recovered,
+    //     deliberate restart → the visible skip notice.
+    //
+    //     takeAllForShutdown() (not peekAll()) atomically cancels each
+    //     group's pending flush timer as it reads it (review: adversarial)
+    //     — a live timer firing during the drain below could otherwise
+    //     self-flush a group already marked replay-pending here, double-
+    //     processing it. Each group is coalesced onto ONE primary row,
+    //     mirroring onFlush's own primary-selection + attachment-reassign
+    //     logic above (review: correctness) — marking every sibling
+    //     individually meant a crash recovered an album as N fragmented
+    //     single-photo turns instead of the one multi-photo turn the live
+    //     path guarantees.
+    try {
+      const groups = mediaBuffer?.takeAllForShutdown() || [];
+      let markedCount = 0;
+      for (const { messages } of groups) {
+        if (!messages || messages.length === 0) continue;
+        const primary = messages.find((m) => m.text || m.caption) || messages[0];
+        const chatId = String(primary.chat.id);
+        const siblingMsgIds = messages
+          .filter((m) => m.message_id !== primary.message_id)
+          .map((m) => m.message_id);
+        if (siblingMsgIds.length) {
+          const primaryDbId = db.getInboundMessageId({ chat_id: chatId, msg_id: primary.message_id });
+          if (primaryDbId) {
+            dbWrite(() => db.reassignAttachmentsToMessage({
+              chat_id: chatId, msg_ids: siblingMsgIds, target_message_id: primaryDbId,
+            }), 'shutdown-media-buffer-reassign');
+          }
+        }
+        dbWrite(() => db.setInboundHandlerStatus({
+          chat_id: chatId, msg_id: primary.message_id, status: 'replay-pending',
+        }), 'shutdown-media-buffer');
+        markedCount += 1;
+      }
+      if (markedCount) {
+        logEvent('shutdown-media-buffer-marked', { count: markedCount });
+      }
+    } catch (err) {
+      console.error(`[shutdown] media-buffer replay-mark failed: ${err.message}`);
     }
 
     // 2. Drain in-flight handlers. Wait for inFlightHandlers to empty or

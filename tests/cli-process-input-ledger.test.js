@@ -438,6 +438,55 @@ test('T14b: reconstruction carries thread_id, reply_to, and the chat.type heuris
   assert.equal(m2.reply_to_message, undefined, 'no reply_to_id → field omitted');
 });
 
+test('T14c: reconstruction carries persisted attachments as _mergedAttachments (attachment-only drop recovery)', async () => {
+  // recordInbound persisted the attachments in the attachments table; the
+  // reconstructed message can't restore native photo/voice fields, so they
+  // must ride _mergedAttachments (same contract as boot-replay reconstruct)
+  // or an attachment-only drop is blocked by the presence gate — and even a
+  // text+media drop loses its attachments on redelivery.
+  const calls = { redelivered: [] };
+  const handler = createDropRedeliverer({
+    db: {
+      getMessage: () => ({ id: 901, chat_id: '100', msg_id: 50, text: '', user: 'U', user_id: 1, ts: 1000, thread_id: null, reply_to_id: null }),
+      getAttachmentsByMessage: (id) => (id === 901
+        ? [{ kind: 'voice', name: null, mime_type: 'audio/ogg', size_bytes: 123, file_id: 'f1', file_unique_id: 'u1' }]
+        : []),
+    },
+    redeliver: async (args) => { calls.redelivered.push(args); return { ok: true }; },
+    logEvent: () => {},
+    logger: quietLogger,
+  });
+  await handler('s', { chatId: '100', msgId: 50, source: 'primary', turnId: 't' });
+  assert.equal(calls.redelivered.length, 1);
+  const msg = calls.redelivered[0].msg;
+  assert.ok(Array.isArray(msg._mergedAttachments), '_mergedAttachments rebuilt from the attachments table');
+  assert.equal(msg._mergedAttachments.length, 1);
+  assert.equal(msg._mergedAttachments[0].file_id, 'f1');
+  assert.equal(msg._mergedAttachments[0].size, 123, 'size mapped from size_bytes (boot-replay parity)');
+});
+
+test('T14d: attachment lookup throwing degrades to text-only redelivery instead of abandoning the drop (review: reliability+adversarial)', async () => {
+  // drop-redeliver only fires ONCE per its own docstring — losing the whole
+  // redelivery because the attachments table lookup blew up (e.g. a locked
+  // DB, a corrupt row) is strictly worse than delivering the text without
+  // its attachments.
+  const calls = { redelivered: [] };
+  const handler = createDropRedeliverer({
+    db: {
+      getMessage: () => ({ id: 901, chat_id: '100', msg_id: 50, text: 'hello', user: 'U', user_id: 1, ts: 1000, thread_id: null, reply_to_id: null }),
+      getAttachmentsByMessage: () => { throw new Error('db locked'); },
+    },
+    redeliver: async (args) => { calls.redelivered.push(args); return { ok: true }; },
+    logEvent: () => {},
+    logger: quietLogger,
+  });
+  await handler('s', { chatId: '100', msgId: 50, source: 'primary', turnId: 't' });
+  assert.equal(calls.redelivered.length, 1, 'redelivery must still happen despite the attachment-lookup failure');
+  const msg = calls.redelivered[0].msg;
+  assert.equal(msg.text, 'hello');
+  assert.equal(msg._mergedAttachments, undefined, 'no attachments were recovered, but that alone must not block redelivery');
+});
+
 // ─── T15: reply dispatch carries the originating msg (dropped-"4" fix A2) ───
 // docs/0.13-resume-dialog-fix-spec.md. 2026-06-10 19:32 shumorobot Music:
 // claude answered "2+2" with "4"; parse classified it as a solo reaction and

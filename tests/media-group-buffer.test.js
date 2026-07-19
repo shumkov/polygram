@@ -132,6 +132,62 @@ describe('media-group-buffer', () => {
     assert.equal(buf.size, 0);
   });
 
+  test('peekAll returns buffered messages without flushing (shutdown replay-marking)', () => {
+    // Shutdown marks still-buffered album siblings replay-pending in the DB;
+    // it needs to SEE them without triggering onFlush (a flush at exit would
+    // race the 100ms process.exit and lose the album anyway).
+    const t = makeFakeTimer();
+    const flushed = [];
+    const buf = createMediaGroupBuffer({
+      flushMs: 10000,
+      onFlush: (msgs) => flushed.push(msgs),
+      timerFn: t.timerFn,
+      clearTimerFn: t.clearTimerFn,
+    });
+    buf.add('a', { id: 1 });
+    buf.add('a', { id: 2 });
+    buf.add('b', { id: 3 });
+    const peeked = buf.peekAll();
+    assert.deepEqual(peeked.map((m) => m.id).sort(), [1, 2, 3]);
+    assert.equal(flushed.length, 0, 'peek must not flush');
+    assert.equal(buf.size, 2, 'peek must not drain the buffer');
+  });
+
+  test('takeAllForShutdown cancels every pending timer and drains the buffer without flushing (review: adversarial race)', () => {
+    // peekAll() alone leaves each group's flush timer live: if it fires
+    // during the shutdown drain window (after shutdown has already read and
+    // DB-marked the group replay-pending), onFlush runs normally and the
+    // group gets processed twice. takeAllForShutdown() must atomically
+    // cancel the timer AND remove the group in the same pass, so nothing
+    // can self-flush after shutdown has taken ownership of it.
+    const t = makeFakeTimer();
+    const flushed = [];
+    const buf = createMediaGroupBuffer({
+      flushMs: 500,
+      onFlush: (msgs, key) => flushed.push({ msgs, key }),
+      timerFn: t.timerFn,
+      clearTimerFn: t.clearTimerFn,
+    });
+    buf.add('a', { id: 1 });
+    buf.add('a', { id: 2 });
+    buf.add('b', { id: 3 });
+    assert.equal(t.pending.length, 2, 'sanity: two groups, two live timers');
+
+    const groups = buf.takeAllForShutdown();
+
+    assert.equal(t.pending.length, 0, 'every group timer must be cancelled');
+    assert.equal(buf.size, 0, 'buffer must be fully drained');
+    assert.equal(flushed.length, 0, 'must not flush — shutdown owns the groups now, not a live dispatch');
+
+    // Advance the clock well past flushMs — if any timer survived, it would
+    // fire here and flush. It must not.
+    t.advance(10000);
+    assert.equal(flushed.length, 0, 'no group must self-flush after being taken for shutdown');
+
+    const byKey = Object.fromEntries(groups.map((g) => [g.key, g.messages.map((m) => m.id)]));
+    assert.deepEqual(byKey, { a: [1, 2], b: [3] });
+  });
+
   test('onFlush throwing does not break the buffer', () => {
     const t = makeFakeTimer();
     let calls = 0;

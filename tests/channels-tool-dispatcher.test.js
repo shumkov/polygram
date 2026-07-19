@@ -566,3 +566,41 @@ test('edit_message only edits a bubble THIS session created (ownership) — revi
   const crossEdit = await dispatcher({ sessionKey: 'B', chatId: '1', threadId: null, toolName: 'edit_message', messageId: 4242, text: 'cross' });
   assert.equal(crossEdit.ok, false);
 });
+
+test('outer per-session ownership map is LRU-bounded — daemon is long-lived and multi-chat, sessionKeys are never evicted on session kill', async () => {
+  let counter = 0;
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot,
+    send: async () => ({ ok: true }),
+    chunkText: fakeChunk,
+    deliverReplies: async () => {
+      counter += 1;
+      return { sent: [counter], failed: [], results: [] };
+    },
+    parseResponse: fakeParse, sanitizeAssistantReply: fakeSanitize, logger: quietLogger,
+  });
+
+  const OWNED_SESSION_CAP = 128;
+  const messageIdFor = {};
+  for (let i = 0; i < OWNED_SESSION_CAP + 1; i++) {
+    const sessionKey = `sess-${i}`;
+    const r = await dispatcher({ sessionKey, chatId: '1', threadId: null, toolName: 'reply', text: `hi ${i}` });
+    messageIdFor[sessionKey] = r.message_id;
+  }
+
+  // Creating the 129th session should evict the oldest (sess-0) from the
+  // outer sessionKey map — without a bound this map grows forever.
+  const evicted = await dispatcher({
+    sessionKey: 'sess-0', chatId: '1', threadId: null,
+    toolName: 'edit_message', messageId: messageIdFor['sess-0'], text: 'still there?',
+  });
+  assert.equal(evicted.ok, false, 'oldest sessionKey should have been LRU-evicted from the outer map at the 128 cap');
+
+  // The most recently created session must remain resident.
+  const recentKey = `sess-${OWNED_SESSION_CAP}`;
+  const stillOwned = await dispatcher({
+    sessionKey: recentKey, chatId: '1', threadId: null,
+    toolName: 'edit_message', messageId: messageIdFor[recentKey], text: 'yes',
+  });
+  assert.equal(stillOwned.ok, true, 'the most recently used session must stay resident');
+});

@@ -133,6 +133,40 @@ test('F#1: dispatcher strips `[sticker:NAME]` tags from delivered text', async (
   assert.ok(stickerSent, `Expected sendSticker(file-id-pumped). Calls: ${JSON.stringify(sendCalls)}`);
 });
 
+test('stickers follow the topic when threadId is a string (cli backend passes strings)', async () => {
+  // CliProcess normalizes threadId to a String ("77"); deliver.js treats it
+  // as opaque so reply TEXT lands in the right topic, but the sticker paths
+  // gated on Number.isInteger(threadId) — always false for strings — so the
+  // sticker silently went to the group's General topic instead.
+  const { deliverReplies } = makeDeliverCapture();
+  const { send, calls: sendCalls } = makeSendCapture();
+
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot,
+    send,
+    chunkText: (text) => [text],
+    deliverReplies,
+    parseResponse: makeFakeParseResponse(),
+    sanitizeAssistantReply: makeFakeSanitizer(),
+    logger: quietLogger,
+  });
+
+  const result = await dispatcher({
+    sessionKey: 'sess-1',
+    chatId: '12345',
+    threadId: '77',
+    toolName: 'reply',
+    text: 'Hello! [sticker:pumped]',
+    files: null,
+  });
+
+  assert.equal(result.ok, true);
+  const stickerCall = sendCalls.find(c => c.method === 'sendSticker');
+  assert.ok(stickerCall, 'sticker was sent');
+  assert.equal(String(stickerCall.params?.message_thread_id ?? ''), '77',
+    `sticker must carry message_thread_id into the topic. Params: ${JSON.stringify(stickerCall.params)}`);
+});
+
 test('F#1: dispatcher swaps canned `No response requested.` via sanitizer', async () => {
   const { deliverReplies, calls: deliverCalls } = makeDeliverCapture();
   const { send } = makeSendCapture();

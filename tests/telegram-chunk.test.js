@@ -436,6 +436,15 @@ describe('chunkMarkdownText — defensive post-pass enforces limit', () => {
     ['post-fence long no-whitespace text', () => '```\nint x = 1;\n```\n' + 'y'.repeat(8000)],
     ['long underscore_separated identifiers in fence', () => '```python\n' + 'verylongidentifierwithoutanybreaks_'.repeat(500) + '\n```'],
     ['3000 emoji surrogate pairs', () => '😀'.repeat(3000)],
+    // Odd alignment: the leading 'x' shifts every surrogate pair so a hard
+    // cut at any even offset lands MID-pair — a lone high surrogate ends one
+    // chunk and a lone low surrogate starts the next (renders as � twice).
+    ['odd-aligned emoji run (x + 3000 😀)', () => 'x' + '😀'.repeat(3000)],
+    // Review (testing): the fence-splitting sub-logic's own "give up and
+    // hard-cut" fallbacks (no safe newline found inside the fence body)
+    // were NOT surrogate-safe — a fenced body with no internal newlines and
+    // an odd-aligned emoji run forces exactly that fallback.
+    ['fenced body, no internal newlines, odd-aligned emoji run', () => '```\n' + 'x' + '😀'.repeat(3000) + '\n```'],
     ['five 1500-char fences in sequence', () => ('```\n' + 'a'.repeat(1500) + '\n```\n').repeat(5)],
     ['8000-char URL inside markdown-link parens', () => '[label](http://example.com/' + 'p'.repeat(8000) + ')'],
     ['~8190 chars no whitespace at all', () => 'x'.repeat(8190)],
@@ -449,6 +458,13 @@ describe('chunkMarkdownText — defensive post-pass enforces limit', () => {
           c.length <= 4096,
           `[${label}] produced chunk of length ${c.length} > 4096`,
         );
+        // A cut between the two units of a surrogate pair corrupts BOTH
+        // sides to U+FFFD when rendered. Unanchored (review: testing) so a
+        // lone surrogate is caught anywhere in the chunk — not just at its
+        // literal start/end — e.g. right before an appended fence-close
+        // marker mid-chunk, which an anchored check would miss.
+        assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(c), `[${label}] chunk has a lone high surrogate`);
+        assert.ok(!/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(c), `[${label}] chunk has a lone low surrogate`);
       }
     });
   }
