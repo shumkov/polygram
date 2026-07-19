@@ -41,6 +41,7 @@ const { filterAttachments, resolveFileCaps, resolveMaxFileOverride, MAX_TOTAL_BY
 // is deleted; SdkProcess inherits its per-entry guts.
 const { ProcessManager } = require('@shumkov/orchestra');
 const { createProcessFactory, pickBackend } = require('@shumkov/orchestra');
+const { checkClaudeAuthHealth } = require('@shumkov/orchestra').claudeBin;
 const { extractAssistantText } = require('@shumkov/orchestra');
 // 0.11.0: channels backend tool dispatcher — adapts CliProcess's reply
 // tool callback into polygram's existing chunkText + deliverReplies primitives.
@@ -818,6 +819,28 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     text, sessionKey, chatId, threadIdStr, chatConfig,
     cmdUser, cmdUserId, label, sendReply,
   })) return;
+
+  // Claude-auth gate: if the CLI login has expired, every claude turn wedges
+  // INVISIBLY — the 401 fires inside the subprocess, never reaches the
+  // classifier, and the turn degrades to a silent "⏱ went quiet" across every
+  // topic. Refuse up-front with a clear message + a loud log instead of
+  // spawning a doomed turn. Slash commands above don't need claude, so they
+  // still work. Free check (reads the credentials file, no API call).
+  if (!msg._isReplay) {
+    const auth = checkClaudeAuthHealth();
+    if (auth.state === 'expired') {
+      const expIso = new Date(auth.refreshTokenExpiresAt).toISOString();
+      console.error(`[auth] Claude login EXPIRED (refresh token ${expIso}) — refusing turn for ${label}; re-login on the host.`);
+      try {
+        db.logEvent('auth-expired', {
+          session_key: sessionKey, chat_id: chatId, source: 'dispatch-gate',
+          refresh_token_expires_at: auth.refreshTokenExpiresAt,
+        });
+      } catch { /* logging is best-effort */ }
+      await sendReply('🔑 Claude login has expired and needs to be re-authenticated. Messages can\'t be processed until the login is refreshed on the host.');
+      return;
+    }
+  }
 
   const t0 = Date.now();
 
@@ -2338,6 +2361,31 @@ async function main() {
     setImmediate(() => runSecretSweep('boot'));
     setInterval(() => runSecretSweep('interval'), secretSweepCfg.intervalMs).unref?.();
   }
+
+  // Claude-auth health monitor — a FREE credentials-file check (no API call, no
+  // model spawn). An expired refresh token makes the CLI 401 silently and wedges
+  // every channels turn; the handleMessage gate refuses turns + tells the user,
+  // and this surfaces the same state loudly in the operator logs at boot + every
+  // 30 min, warning a few days ahead so re-login happens before it breaks.
+  const runAuthCheck = (trigger) => {
+    try {
+      const auth = checkClaudeAuthHealth();
+      const expIso = auth.refreshTokenExpiresAt ? new Date(auth.refreshTokenExpiresAt).toISOString() : 'n/a';
+      if (auth.state === 'expired') {
+        console.error(`[auth] (${trigger}) Claude login EXPIRED (refresh token ${expIso}) — turns are being refused; re-login on the host.`);
+        db.logEvent('auth-expired', { source: 'monitor', trigger, refresh_token_expires_at: auth.refreshTokenExpiresAt });
+      } else if (auth.state === 'expiring') {
+        console.warn(`[auth] (${trigger}) Claude login expires in ${auth.daysLeft}d (${expIso}) — re-login soon.`);
+        db.logEvent('auth-expiring', { source: 'monitor', trigger, days_left: auth.daysLeft, refresh_token_expires_at: auth.refreshTokenExpiresAt });
+      } else if (auth.state === 'unknown') {
+        console.warn(`[auth] (${trigger}) Claude credentials check inconclusive: ${auth.reason}`);
+      }
+    } catch (err) {
+      console.error(`[auth] health check failed (${trigger}): ${err.message}`);
+    }
+  };
+  runAuthCheck('boot');
+  setInterval(() => runAuthCheck('interval'), 30 * 60_000).unref?.();
 
   // 0.8.0 Phase 1 step 11 + rc.50: defensive uncaughtException +
   // unhandledRejection handlers. The new pm wraps every Query
