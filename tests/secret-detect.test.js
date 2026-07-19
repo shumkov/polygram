@@ -59,6 +59,15 @@ describe('detectSecrets — no false positives on ordinary prose', () => {
     assert.ok(names(`key sk-proj-${'aB1_'.repeat(8)}-x here`).includes('openai'), 'project key');
     assert.ok(names(`key sk-${'aB1'.repeat(16)} here`).includes('openai'), 'legacy 48-char base62 key');
   });
+
+  // Review (security + adversarial, independently corroborated): the tighten
+  // to sk-proj-/legacy-only reopened a false-NEGATIVE gap — real OpenAI
+  // service-account and admin key shapes use the same hyphenated-prefix
+  // pattern as sk-proj- but weren't covered, so they'd slip past undetected.
+  test('sk-svcacct- and sk-admin- key shapes are detected (review: security+adversarial)', () => {
+    assert.ok(names(`key sk-svcacct-${'aB1_'.repeat(8)}-x here`).includes('openai'), 'service-account key');
+    assert.ok(names(`key sk-admin-${'aB1_'.repeat(8)}-x here`).includes('openai'), 'admin key');
+  });
 });
 
 describe('detectSecrets — group rules redact only the value', () => {

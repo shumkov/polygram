@@ -2761,15 +2761,42 @@ async function main() {
     //     (only re-marks dispatched/processing). Mark them replay-pending so
     //     boot treats them like any interrupted turn: crash → recovered,
     //     deliberate restart → the visible skip notice.
+    //
+    //     takeAllForShutdown() (not peekAll()) atomically cancels each
+    //     group's pending flush timer as it reads it (review: adversarial)
+    //     — a live timer firing during the drain below could otherwise
+    //     self-flush a group already marked replay-pending here, double-
+    //     processing it. Each group is coalesced onto ONE primary row,
+    //     mirroring onFlush's own primary-selection + attachment-reassign
+    //     logic above (review: correctness) — marking every sibling
+    //     individually meant a crash recovered an album as N fragmented
+    //     single-photo turns instead of the one multi-photo turn the live
+    //     path guarantees.
     try {
-      const buffered = mediaBuffer?.peekAll() || [];
-      for (const m of buffered) {
+      const groups = mediaBuffer?.takeAllForShutdown() || [];
+      let markedCount = 0;
+      for (const { messages } of groups) {
+        if (!messages || messages.length === 0) continue;
+        const primary = messages.find((m) => m.text || m.caption) || messages[0];
+        const chatId = String(primary.chat.id);
+        const siblingMsgIds = messages
+          .filter((m) => m.message_id !== primary.message_id)
+          .map((m) => m.message_id);
+        if (siblingMsgIds.length) {
+          const primaryDbId = db.getInboundMessageId({ chat_id: chatId, msg_id: primary.message_id });
+          if (primaryDbId) {
+            dbWrite(() => db.reassignAttachmentsToMessage({
+              chat_id: chatId, msg_ids: siblingMsgIds, target_message_id: primaryDbId,
+            }), 'shutdown-media-buffer-reassign');
+          }
+        }
         dbWrite(() => db.setInboundHandlerStatus({
-          chat_id: String(m.chat.id), msg_id: m.message_id, status: 'replay-pending',
+          chat_id: chatId, msg_id: primary.message_id, status: 'replay-pending',
         }), 'shutdown-media-buffer');
+        markedCount += 1;
       }
-      if (buffered.length) {
-        logEvent('shutdown-media-buffer-marked', { count: buffered.length });
+      if (markedCount) {
+        logEvent('shutdown-media-buffer-marked', { count: markedCount });
       }
     } catch (err) {
       console.error(`[shutdown] media-buffer replay-mark failed: ${err.message}`);
