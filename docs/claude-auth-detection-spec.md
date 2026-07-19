@@ -1,12 +1,10 @@
 # Detect expired Claude auth instead of wedging silently
 
-**Status:** BUILT + code-reviewed, **NOT YET DEPLOYABLE** · orchestra `lib/claude-bin.js`
-(`checkClaudeAuthHealth`) + polygram `handleMessage` gate + boot/interval monitor.
-Field-driven: shumabit@UMI, 2026-07-15. Blocked on the ORCHESTRA FIRST rollout step
-below: the only `@shumkov/orchestra` version published to npm (0.2.0) does not export
-`checkClaudeAuthHealth` yet — it exists solely as uncommitted work in the orchestra
-source repo. `tests/orchestra-dependency-contract.test.js` pins this and fails until
-orchestra publishes and this branch's dependency is bumped to that release.
+**Status:** BUILT + code-reviewed + DEPLOYABLE · orchestra `lib/claude-bin.js`
+(`checkClaudeAuthHealth`) shipped in `@shumkov/orchestra@0.3.0` + polygram
+`handleMessage` gate (covers replays/redeliveries too) + boot/interval monitor.
+Field-driven: shumabit@UMI, 2026-07-15. `package.json` bumped to `^0.3.0`;
+`tests/orchestra-dependency-contract.test.js` is green (2383 pass, 0 fail).
 
 ## Problem
 
