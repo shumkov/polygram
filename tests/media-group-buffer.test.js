@@ -132,6 +132,27 @@ describe('media-group-buffer', () => {
     assert.equal(buf.size, 0);
   });
 
+  test('peekAll returns buffered messages without flushing (shutdown replay-marking)', () => {
+    // Shutdown marks still-buffered album siblings replay-pending in the DB;
+    // it needs to SEE them without triggering onFlush (a flush at exit would
+    // race the 100ms process.exit and lose the album anyway).
+    const t = makeFakeTimer();
+    const flushed = [];
+    const buf = createMediaGroupBuffer({
+      flushMs: 10000,
+      onFlush: (msgs) => flushed.push(msgs),
+      timerFn: t.timerFn,
+      clearTimerFn: t.clearTimerFn,
+    });
+    buf.add('a', { id: 1 });
+    buf.add('a', { id: 2 });
+    buf.add('b', { id: 3 });
+    const peeked = buf.peekAll();
+    assert.deepEqual(peeked.map((m) => m.id).sort(), [1, 2, 3]);
+    assert.equal(flushed.length, 0, 'peek must not flush');
+    assert.equal(buf.size, 2, 'peek must not drain the buffer');
+  });
+
   test('onFlush throwing does not break the buffer', () => {
     const t = makeFakeTimer();
     let calls = 0;
