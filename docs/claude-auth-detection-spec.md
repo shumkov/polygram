@@ -47,8 +47,10 @@ detects the exact failure with **no API call, no spawn**, and can warn ahead.
 1. **Dispatch gate** (`handleMessage`, after slash-command dispatch, before the turn):
    on `expired`, log `[auth] Claude login EXPIRED …`, emit an `auth-expired` event, and
    **reply to the chat**: *"🔑 Claude login has expired and needs to be re-authenticated…"* —
-   then return without spawning the doomed turn. Slash commands (no claude) still work;
-   replays are skipped.
+   then return without spawning the doomed turn. Slash commands (no claude) still work.
+   Applies to replays/redeliveries too (boot-replay, drop-redeliver, edit-redelivery) —
+   the check is a cheap stateless file read, and a token can expire between an original
+   dispatch and its later redelivery.
 2. **Boot + 30-min monitor** — logs `[auth]` ERROR on `expired`, WARN on `expiring`
    (with `daysLeft`), emits `auth-expired`/`auth-expiring` events, so the operator sees it
    in the logs even with no traffic, days before it breaks.

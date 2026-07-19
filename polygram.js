@@ -828,25 +828,27 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // still work. Free check (reads the credentials file, no API call). Guarded
   // (fail-open to 'unknown' on throw): this sits on every turn's hot path, so
   // a broken health check must never itself become the silent wedge this gate
-  // exists to catch.
-  if (!msg._isReplay) {
-    let auth;
-    try {
-      auth = checkClaudeAuthHealth();
-    } catch (err) {
-      console.error(`[auth] health check failed: ${err.message}`);
-      auth = { state: 'unknown' };
-    }
-    if (auth.state === 'expired') {
-      const expIso = new Date(auth.refreshTokenExpiresAt).toISOString();
-      console.error(`[auth] Claude login EXPIRED (refresh token ${expIso}) — refusing turn for ${label}; re-login on the host.`);
-      logEvent('auth-expired', {
-        session_key: sessionKey, chat_id: chatId, source: 'dispatch-gate',
-        refresh_token_expires_at: auth.refreshTokenExpiresAt,
-      });
-      await sendReply('🔑 Claude login has expired and needs to be re-authenticated. Messages can\'t be processed until the login is refreshed on the host.');
-      return;
-    }
+  // exists to catch. Applies to replays/redeliveries too (boot-replay,
+  // drop-redeliver, edit-redelivery) — the check is a cheap stateless file
+  // read, and a token can expire between an original dispatch and its later
+  // redelivery, so skipping it there would silently re-wedge exactly the
+  // messages most likely to hit an expired-auth window (post-restart backlog).
+  let auth;
+  try {
+    auth = checkClaudeAuthHealth();
+  } catch (err) {
+    console.error(`[auth] health check failed: ${err.message}`);
+    auth = { state: 'unknown' };
+  }
+  if (auth.state === 'expired') {
+    const expIso = new Date(auth.refreshTokenExpiresAt).toISOString();
+    console.error(`[auth] Claude login EXPIRED (refresh token ${expIso}) — refusing turn for ${label}; re-login on the host.`);
+    logEvent('auth-expired', {
+      session_key: sessionKey, chat_id: chatId, source: 'dispatch-gate',
+      refresh_token_expires_at: auth.refreshTokenExpiresAt,
+    });
+    await sendReply('🔑 Claude login has expired and needs to be re-authenticated. Messages can\'t be processed until the login is refreshed on the host.');
+    return;
   }
 
   const t0 = Date.now();
