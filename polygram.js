@@ -112,6 +112,8 @@ const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
 const { applyReactionToMessages } = require('./lib/telegram/album-reactions');
 const { classify: classifyError, classifyTurnEndError, detectWedgedSessionError, isTransientHttpError } = require('./lib/error/classify');
 const { createAutoResumeTracker, isAutoResumable } = require('./lib/db/auto-resume');
+const { createAuthDisabledGate } = require('./lib/ops/auth-disabled-gate');
+const { createHeartbeat } = require('./lib/ops/heartbeat');
 const { resolveReplayWindowMs } = require('./lib/db/replay-window');
 const { pruneEvents, resolveRetentionPolicy, validatePolicy } = require('./lib/db/events-retention');
 const { sweepSecrets, resolveSecretSweepConfig } = require('./lib/db/secret-sweep');
@@ -606,6 +608,14 @@ let attemptAutoResume = null;
 let errorReplyText = null;
 let queueWarnThreshold = null;
 let inFlightHandlers = null;
+
+// AUTH_DISABLED (docs/AUTH_DISABLED_HANDLING_SPEC.md): dedupe/re-arm gate for
+// the operator notification (dispatcher.js) + Netdata-visibility heartbeat
+// counter, both process-scoped like autoResumeTracker/contextHintShown above.
+// heartbeat.start() is called in main() once DATA_DIR is settled; the gate
+// needs no runtime config, so it's constructed here directly.
+const authDisabledGate = createAuthDisabledGate();
+const authDisabledHeartbeat = createHeartbeat({ dataDir: DATA_DIR, authDisabledGate });
 
 // rc.59: once-per-cycle gate for the contextHint. A session is added
 // to this Set when the hint fires, removed when the SDK emits
@@ -1350,6 +1360,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       const chatCtxHint = chatConfig.contextHint != null
         ? chatConfig.contextHint
         : config.bot?.contextHint;
+      // AUTH_DISABLED re-arm (docs/AUTH_DISABLED_HANDLING_SPEC.md): only a
+      // genuine, non-error turn result counts as "recovered" — slash
+      // commands and other early-returns in handleMessage never reach this
+      // branch, so they can't falsely clear an ongoing outage and cause the
+      // operator to be re-paged before it's actually fixed.
+      try { authDisabledGate.noteSuccess(); } catch (e) { console.error(`[auth] authDisabledGate.noteSuccess failed: ${e.message}`); }
       // rc.59: gate the hint to once-per-cycle. Pre-rc.59 the hint
       // fired on EVERY turn that landed over threshold — so a user
       // saw "📚 70% full…" then "71% full…" then "72% full…"
@@ -2376,6 +2392,13 @@ async function main() {
   runAuthCheck('boot');
   setInterval(() => runAuthCheck('interval'), 30 * 60_000).unref?.();
 
+  // AUTH_DISABLED Netdata-visibility heartbeat (docs/AUTH_DISABLED_HANDLING_SPEC.md,
+  // Layer 3.3) — writes <DATA_DIR>/heartbeat.json every 60s with the
+  // authDisabledGate's occurrence counter. File-only (no HTTP server in this
+  // repo to hang a /healthz route on); wiring the file into an actual Netdata
+  // alert is a separate VPS-side ops change, out of scope here.
+  authDisabledHeartbeat.start();
+
   // 0.8.0 Phase 1 step 11 + rc.50: defensive uncaughtException +
   // unhandledRejection handlers. The new pm wraps every Query
   // iteration in try/catch so SDK throws never leak — but if a
@@ -2708,6 +2731,7 @@ async function main() {
     chunkMarkdownText, deliverReplies,
     chunkBudget: TG_CHUNK_BUDGET,
     getIsShuttingDown: () => isShuttingDown,
+    authDisabledGate,
     logger: console,
   }));
   // 0.12.0 post-turn edit re-delivery: constructed AFTER dispatchHandleMessage is assigned (above).
@@ -2899,6 +2923,7 @@ async function main() {
     // 4. Remaining shutdown: approvals sweeper, IPC, resolve hook waiters,
     //    kill pm subprocesses, close DB.
     if (approvalSweepTimer) clearInterval(approvalSweepTimer);
+    authDisabledHeartbeat.stop();
     if (ipcCloser) ipcCloser.close().catch(() => {});
     try { fs.unlinkSync(ipcServer.secretPathFor(BOT_NAME)); } catch {}
     // Reject every parked canUseTool waiter so the SDK doesn't
