@@ -49,6 +49,21 @@ describe('classify — typed-code short-circuit', () => {
     assert.match(r.userMessage, /operator has been notified/);
   });
 
+  // AUTH_DISABLED (docs/AUTH_DISABLED_HANDLING_SPEC.md): Anthropic disabled
+  // Claude Code access on the account (e.g. non-payment). Unlike AUTH_EXPIRED
+  // this is an infra/billing condition on our end, not something the user can
+  // fix by re-login — so userMessage is null (suppress the chat reply; the
+  // operator is notified separately by dispatcher.js) instead of a friendly
+  // string.
+  test('AUTH_DISABLED suppresses the chat reply and is non-transient/non-recoverable', () => {
+    const err = Object.assign(new Error('Claude subscription access disabled'), { code: 'AUTH_DISABLED' });
+    const r = classify(err);
+    assert.equal(r.kind, 'authDisabled');
+    assert.equal(r.userMessage, null);
+    assert.equal(r.isTransient, false);
+    assert.equal(r.autoRecover, null);
+  });
+
   test('typed code wins over pattern even when message would also match', () => {
     // A QUEUE_OVERFLOW error whose message ALSO mentions 429 — code
     // takes priority so we never accidentally surface "rate-limited"

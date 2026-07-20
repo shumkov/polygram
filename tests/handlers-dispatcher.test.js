@@ -11,6 +11,8 @@
  *   - error-reply suppression in shutdown / abort-grace / replay
  *   - auto-resume gating (cooldown + isAutoResumable)
  *   - errorReplyText null-suppression
+ *   - AUTH_DISABLED handling (docs/AUTH_DISABLED_HANDLING_SPEC.md): operator
+ *     notify + dedupe, loud logging, no chat reply, safe-by-default gate
  */
 
 'use strict';
@@ -18,6 +20,8 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const { createDispatcher, CONCURRENT_WARN_THRESHOLD_DEFAULT } = require('../lib/handlers/dispatcher');
+const { createAuthDisabledGate } = require('../lib/ops/auth-disabled-gate');
+const { classify: realClassify } = require('../lib/error/classify');
 
 function nextTick() {
   return new Promise((r) => setImmediate(r));
@@ -34,6 +38,7 @@ function fixture(overrides = {}) {
     autoResumeClears: [],
     clearSessionId: [],
     deliverReplies: [],
+    loggerErrors: [],
   };
 
   let handleResolver;
@@ -45,7 +50,12 @@ function fixture(overrides = {}) {
   });
 
   const dispatcher = createDispatcher({
-    config: { bot: { queueWarnThreshold: overrides.queueWarnThreshold ?? 3 } },
+    config: {
+      bot: {
+        queueWarnThreshold: overrides.queueWarnThreshold ?? 3,
+        ...(overrides.adminChatId !== undefined ? { approvals: { adminChatId: overrides.adminChatId } } : {}),
+      },
+    },
     db: {
       setInboundHandlerStatus: (row) => calls.setInboundStatus.push(row),
       clearSessionId: (sk) => calls.clearSessionId.push(sk),
@@ -62,12 +72,12 @@ function fixture(overrides = {}) {
       calls.sendToProcess.push({ sessionKey: sk, prompt, ctx });
       return overrides.sendToProcessResult || { text: 'auto-resume reply text' };
     },
-    classifyError: (err) => ({
+    classifyError: overrides.classifyError || ((err) => ({
       kind: overrides.classifyKind || 'unknown',
       userMessage: overrides.userMessage === undefined ? `error: ${err.message}` : overrides.userMessage,
       isTransient: false,
       autoRecover: false,
-    }),
+    })),
     isAutoResumable: () => overrides.isAutoResumable === true,
     abortGrace: {
       isRecent: (sk) => overrides.abortRecent === true,
@@ -84,7 +94,8 @@ function fixture(overrides = {}) {
     chunkBudget: 4096,
     startupRetryDelayMs: overrides.startupRetryDelayMs,
     getIsShuttingDown: () => overrides.shuttingDown === true,
-    logger: { log: () => {}, error: () => {} },
+    ...(overrides.authDisabledGate !== undefined ? { authDisabledGate: overrides.authDisabledGate } : {}),
+    logger: { log: () => {}, error: (m) => calls.loggerErrors.push(m) },
   });
 
   return { dispatcher, calls, getResolver: () => handleResolver };
@@ -518,5 +529,178 @@ describe('createDispatcher — startup auto-retry (silent recovery from TMUX_SES
 
     assert.equal(handled.length, 1, 'only TMUX_SESSION_GONE triggers the startup retry');
     assert.ok(!fx.calls.events.some((e) => e.kind === 'startup-auto-retry'));
+  });
+});
+
+describe('createDispatcher — AUTH_DISABLED handling (docs/AUTH_DISABLED_HANDLING_SPEC.md)', () => {
+  function authDisabledErr() {
+    return Object.assign(new Error('Claude subscription access disabled'), { code: 'AUTH_DISABLED' });
+  }
+  async function settle() { for (let i = 0; i < 4; i++) await nextTick(); }
+  function notifyCalls(calls) {
+    return calls.tg.filter((c) => c.meta?.source === 'auth-disabled-notify');
+  }
+
+  test('first occurrence notifies the operator via tg() targeting approvals.adminChatId', async () => {
+    const gate = createAuthDisabledGate();
+    const fx = fixture({ authDisabledGate: gate, adminChatId: '999', userMessage: null });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(authDisabledErr());
+    await settle();
+
+    const notified = notifyCalls(fx.calls);
+    assert.equal(notified.length, 1);
+    assert.equal(notified[0].params.chat_id, '999');
+    assert.match(notified[0].params.text, /DISABLED/);
+  });
+
+  test('a second occurrence before any success does NOT re-notify', async () => {
+    const gate = createAuthDisabledGate();
+    const fx = fixture({ authDisabledGate: gate, adminChatId: '999', userMessage: null });
+
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(authDisabledErr());
+    await settle();
+
+    fx.dispatcher.dispatchHandleMessage('sk', 100, { ...baseMsg, message_id: 2 }, {});
+    await nextTick();
+    fx.getResolver().reject(authDisabledErr());
+    await settle();
+
+    assert.equal(notifyCalls(fx.calls).length, 1, 'deduped — only the first occurrence pages');
+  });
+
+  test('logEvent("auth-disabled", ...) fires on every occurrence, even when the DM is deduped', async () => {
+    const gate = createAuthDisabledGate();
+    const fx = fixture({ authDisabledGate: gate, adminChatId: '999', userMessage: null });
+
+    for (let i = 0; i < 2; i++) {
+      fx.dispatcher.dispatchHandleMessage('sk', 100, { ...baseMsg, message_id: i }, {});
+      await nextTick();
+      fx.getResolver().reject(authDisabledErr());
+      await settle();
+    }
+
+    const events = fx.calls.events.filter((e) => e.kind === 'auth-disabled');
+    assert.equal(events.length, 2, 'logging is never deduped, only the operator DM is');
+  });
+
+  test('no chat-facing reply is ever sent for AUTH_DISABLED', async () => {
+    const gate = createAuthDisabledGate();
+    const fx = fixture({ authDisabledGate: gate, adminChatId: '999', userMessage: null });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(authDisabledErr());
+    await settle();
+
+    const chatReplies = fx.calls.tg.filter((c) => c.meta?.source === 'error-reply');
+    assert.equal(chatReplies.length, 0, 'userMessage: null must suppress the chat reply (classify.js contract)');
+  });
+
+  test('missing approvals.adminChatId logs a warning and does not throw', async () => {
+    const gate = createAuthDisabledGate();
+    const fx = fixture({ authDisabledGate: gate, userMessage: null }); // no adminChatId override
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(authDisabledErr());
+    await settle();
+
+    assert.equal(notifyCalls(fx.calls).length, 0);
+    assert.ok(fx.calls.loggerErrors.some((m) => /AUTH_DISABLED fired but no.*adminChatId/.test(m)));
+  });
+
+  test('a throwing authDisabledGate.noteFailure() is caught — dispatch still completes normally', async () => {
+    const throwingGate = {
+      noteFailure: () => { throw new Error('gate exploded'); },
+      noteSuccess: () => {},
+      snapshot: () => ({ count: 0, lastAt: null, armed: true }),
+    };
+    const fx = fixture({ authDisabledGate: throwingGate, adminChatId: '999', userMessage: null });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    await assert.doesNotReject(async () => {
+      fx.getResolver().reject(authDisabledErr());
+      await settle();
+    });
+
+    // Normal terminal-status bookkeeping still ran (the gate failure didn't
+    // abort the rest of the catch handler), and no false-positive DM was sent.
+    assert.equal(fx.calls.setInboundStatus.length, 1);
+    assert.equal(notifyCalls(fx.calls).length, 0);
+  });
+
+  test('omitting authDisabledGate uses a safe default instead of throwing', async () => {
+    const fx = fixture({ adminChatId: '999', userMessage: null }); // authDisabledGate NOT passed
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    await assert.doesNotReject(async () => {
+      fx.getResolver().reject(authDisabledErr());
+      await settle();
+    });
+    // Default gate starts armed, so the DM still fires — just proving the
+    // missing DI param degrades gracefully instead of crashing.
+    assert.equal(notifyCalls(fx.calls).length, 1);
+  });
+
+  // Found in code review: the pre-existing rc.55 replay-failure block
+  // (below, gated only on isReplay/!wasAborted/!isShuttingDown — NOT on
+  // err.code) is a SEPARATE unconditional `if` in the same catch handler.
+  // Without an explicit exclusion, an AUTH_DISABLED failure on a replayed
+  // message (boot-replay after a restart) falls through into it and gets a
+  // hardcoded "interrupted, please resend" chat reply — contradicting the
+  // "chat is never told" contract classify.js establishes via
+  // userMessage: null.
+  test('a replayed message failing with AUTH_DISABLED still gets NO chat reply', async () => {
+    const gate = createAuthDisabledGate();
+    const fx = fixture({ authDisabledGate: gate, adminChatId: '999', userMessage: null });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, { ...baseMsg, _isReplay: true }, {});
+    await nextTick();
+    fx.getResolver().reject(authDisabledErr());
+    await settle();
+
+    const chatReplies = fx.calls.tg.filter((c) => c.meta?.source === 'error-reply');
+    assert.equal(chatReplies.length, 0,
+      'the rc.55 replay-failure reply must not fire for AUTH_DISABLED — the operator is notified, the chat is not, replay or not');
+    assert.equal(notifyCalls(fx.calls).length, 1, 'the operator DM must still fire on replay dispatch');
+  });
+
+  // Cross-session dedupe: the gate is a single process-wide instance shared
+  // across every chat (AUTH_DISABLED is account-wide, not per-chat), so a
+  // burst of concurrently-failing chats during a real outage must still page
+  // the operator only once, not once per chat.
+  test('dedupe is global across sessionKeys, not per-session', async () => {
+    const gate = createAuthDisabledGate();
+    const fx = fixture({ authDisabledGate: gate, adminChatId: '999', userMessage: null });
+
+    fx.dispatcher.dispatchHandleMessage('sk-a', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(authDisabledErr());
+    await settle();
+
+    fx.dispatcher.dispatchHandleMessage('sk-b', 200, { ...baseMsg, message_id: 2 }, {});
+    await nextTick();
+    fx.getResolver().reject(authDisabledErr());
+    await settle();
+
+    assert.equal(notifyCalls(fx.calls).length, 1,
+      'a different chat failing during the same outage must NOT trigger a second page');
+  });
+
+  test('a real AUTH_DISABLED error run through the actual classify.js is suppressed end-to-end', async () => {
+    const gate = createAuthDisabledGate();
+    // Use the REAL classify() instead of the fixture's configurable stub —
+    // proves the dispatcher-level suppression actually depends on
+    // classify.js's CODES.AUTH_DISABLED.userMessage being null, not just on
+    // whatever the test tells the stub to return.
+    const fx = fixture({ authDisabledGate: gate, adminChatId: '999', classifyError: realClassify });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(authDisabledErr());
+    await settle();
+
+    const chatReplies = fx.calls.tg.filter((c) => c.meta?.source === 'error-reply');
+    assert.equal(chatReplies.length, 0);
   });
 });
