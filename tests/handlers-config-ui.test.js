@@ -11,9 +11,9 @@ const {
 } = require('../lib/handlers/config-ui');
 
 describe('buildConfigKeyboard', () => {
-  test('show=all renders both rows with current values marked', () => {
+  test('show=all renders model + effort + rich-text rows with current values marked', () => {
     const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high' }, 'all');
-    assert.equal(kb.inline_keyboard.length, 2);
+    assert.equal(kb.inline_keyboard.length, 3);
     const modelRow = kb.inline_keyboard[0];
     assert.equal(modelRow.length, MODEL_OPTIONS.length);
     const sonnet = modelRow.find((b) => b.callback_data === 'cfg:model:sonnet');
@@ -24,6 +24,46 @@ describe('buildConfigKeyboard', () => {
     const effortRow = kb.inline_keyboard[1];
     const high = effortRow.find((b) => b.callback_data === 'cfg:effort:high');
     assert.match(high.text, /^✓ high$/);
+
+    const richTextRow = kb.inline_keyboard[2];
+    assert.equal(richTextRow.length, 1);
+    assert.equal(richTextRow[0].callback_data, 'cfg:richtext:on');
+    assert.match(richTextRow[0].text, /off$/);
+  });
+
+  test('rich-text row toggles: on when set, callback flips to off', () => {
+    const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high', richText: true }, 'all');
+    const richTextRow = kb.inline_keyboard[2];
+    assert.equal(richTextRow[0].callback_data, 'cfg:richtext:off');
+    assert.match(richTextRow[0].text, /^✓ Rich text: on$/);
+  });
+
+  test('rich-text row is NOT shown for show=model or show=effort (no new command surface)', () => {
+    const kbModel = buildConfigKeyboard({ model: 'opus', effort: 'low' }, 'model');
+    const kbEffort = buildConfigKeyboard({ model: 'opus', effort: 'low' }, 'effort');
+    assert.equal(kbModel.inline_keyboard.length, 1);
+    assert.equal(kbEffort.inline_keyboard.length, 1);
+  });
+
+  test('a topic-level richText override takes precedence over chat-level for the ✓ marker', () => {
+    const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high', richText: false }, 'all', { richText: true });
+    assert.match(kb.inline_keyboard[2][0].text, /^✓ Rich text: on$/);
+  });
+
+  test('an inherited effective rich-text value shows ✓ on the card', () => {
+    const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high' }, 'all', null, true);
+    assert.match(kb.inline_keyboard[2][0].text, /^✓ Rich text: on$/);
+  });
+
+  test('an explicit effective false overrides local values in the card', () => {
+    const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high', richText: true }, 'all', null, false);
+    assert.match(kb.inline_keyboard[2][0].text, /off$/);
+    assert.equal(kb.inline_keyboard[2][0].callback_data, 'cfg:richtext:on');
+  });
+
+  test('no effective value passed falls back to chat/topic only, defaults to off', () => {
+    const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high' }, 'all');
+    assert.match(kb.inline_keyboard[2][0].text, /off$/);
   });
 
   test('show=model only renders the model row', () => {
@@ -41,7 +81,7 @@ describe('buildConfigKeyboard', () => {
 
   test('default show is all', () => {
     const kb = buildConfigKeyboard({ model: 'haiku', effort: 'medium' });
-    assert.equal(kb.inline_keyboard.length, 2);
+    assert.equal(kb.inline_keyboard.length, 3);
   });
 
   test('every model option produces a button with cfg:model:* callback_data', () => {
@@ -94,6 +134,24 @@ describe('createFormatConfigInfoText', () => {
     const fmt = buildFormat({ savedSessionId: null });
     const out = fmt({ model: 'opus', effort: 'low', agent: 'x' }, 'all', 'sk');
     assert.match(out, /Session: new/);
+  });
+
+  test('richText line reflects an inherited effective value', () => {
+    const fmt = buildFormat();
+    const out = fmt({ model: 'sonnet', effort: 'high', agent: 'x' }, 'all', 'sk', null, true);
+    assert.match(out, /^Rich text: on/m);
+  });
+
+  test('an explicit effective false overrides local values in the info text', () => {
+    const fmt = buildFormat();
+    const out = fmt({ model: 'sonnet', effort: 'high', agent: 'x', richText: true }, 'all', 'sk', null, false);
+    assert.match(out, /^Rich text: off/m);
+  });
+
+  test('no effective value passed defaults to off without crashing', () => {
+    const fmt = buildFormat();
+    const out = fmt({ model: 'sonnet', effort: 'high', agent: 'x' }, 'all', 'sk');
+    assert.match(out, /^Rich text: off/m);
   });
 
   test('show=model omits effort help block', () => {

@@ -247,4 +247,148 @@ describe('handleConfigCallback — scope + persistence (2026-06-12 "/model in Mu
     assert.equal(m.deps.config.chats['12345'].model, 'opus');
     assert.equal(saved.length, 1);
   });
-})
+});
+
+describe('handleConfigCallback — richtext toggle', () => {
+  test('card re-renderers receive the effective inherited value as a boolean', async () => {
+    const received = [];
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true, richText: true },
+        chats: { '12345': { model: 'sonnet', effort: 'high' } },
+      },
+      formatConfigInfoText: (...args) => {
+        received.push(['info', args[4]]);
+        return 'updated config';
+      },
+      buildConfigKeyboard: (...args) => {
+        received.push(['keyboard', args[3]]);
+        return { inline_keyboard: [] };
+      },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    await fn(makeCtx({ data: 'cfg:model:opus', existingRows: 3 }));
+    assert.deepEqual(received, [['info', true], ['keyboard', true]]);
+  });
+
+  test('turning off an inherited value records the effective old value', async () => {
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true, richText: true },
+        chats: { '12345': { model: 'sonnet', effort: 'high' } },
+      },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    await fn(makeCtx({ data: 'cfg:richtext:off', existingRows: 3 }));
+    const log = m.dbCalls.find((c) => c[0] === 'logConfigChange');
+    assert.equal(log[1].old_value, true);
+    assert.equal(log[1].new_value, false);
+  });
+
+  test('cfg:richtext:on writes a real boolean true, not the string "on"', async () => {
+    const saved = [];
+    const m = makeDeps({ saveConfig: () => saved.push(true) });
+    const fn = createHandleConfigCallback(m.deps);
+    await fn(makeCtx({ data: 'cfg:richtext:on', existingRows: 3 }));
+    assert.strictEqual(m.deps.config.chats['12345'].richText, true);
+    assert.equal(saved.length, 1);
+  });
+
+  test('cfg:richtext:off writes a real boolean false', async () => {
+    const m = makeDeps({
+      config: { bot: { allowConfigCommands: true }, chats: { '12345': { model: 'sonnet', richText: true } } },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    await fn(makeCtx({ data: 'cfg:richtext:off', existingRows: 3 }));
+    assert.strictEqual(m.deps.config.chats['12345'].richText, false);
+  });
+
+  test('does not call pm.applyFlagSettings or pm.setModel — richText is not spawn-time', async () => {
+    const m = makeDeps();
+    const fn = createHandleConfigCallback(m.deps);
+    await fn(makeCtx({ data: 'cfg:richtext:on', existingRows: 3 }));
+    assert.equal(m.pmCalls.length, 0);
+  });
+
+  test('ack text distinguishes live delivery from the next-spawn authoring lag', async () => {
+    const m = makeDeps();
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:on', existingRows: 3 });
+    await fn(ctx);
+    assert.match(ctx._acks[0].text, /next session/i);
+  });
+
+  test('ack text for turning off is plain, no session-lag caveat', async () => {
+    const m = makeDeps({
+      config: { bot: { allowConfigCommands: true }, chats: { '12345': { model: 'sonnet', richText: true } } },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:off', existingRows: 3 });
+    await fn(ctx);
+    assert.equal(ctx._acks[0].text, 'Rich text → off');
+  });
+
+  test('tapping the already-current value acks "Already X" without a duplicate write', async () => {
+    const m = makeDeps({
+      config: { bot: { allowConfigCommands: true }, chats: { '12345': { model: 'sonnet', richText: true } } },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:on', existingRows: 3 });
+    await fn(ctx);
+    assert.match(ctx._acks[0].text, /Already on/);
+    assert.equal(m.dbCalls.length, 0, 'no logConfigChange for a no-op toggle');
+  });
+
+  test('invalid richtext value → ack with error, no mutation', async () => {
+    const m = makeDeps();
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:maybe', existingRows: 3 });
+    await fn(ctx);
+    assert.match(ctx._acks[0].text, /Invalid richtext/);
+    assert.equal(m.deps.config.chats['12345'].richText, undefined);
+  });
+
+  test('a topic tap writes the TOPIC override, matching /model\'s scoping rule', async () => {
+    const saved = [];
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: { '-100': { model: 'sonnet', isolateTopics: true, topics: { '3': { name: 'Music' } } } },
+      },
+      getSessionKey: (chatId, threadId) => threadId ? `${chatId}:${threadId}` : String(chatId),
+      saveConfig: () => saved.push(true),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:on', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+    assert.strictEqual(m.deps.config.chats['-100'].topics['3'].richText, true);
+    assert.equal(m.deps.config.chats['-100'].richText, undefined, 'chat root must not change');
+  });
+
+  test('a non-isolated topic toggle updates the topic value that delivery resolves', async () => {
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: { '3': { name: 'General', richText: true } },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:off', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    assert.equal(m.deps.config.chats['-100'].topics['3'].richText, false);
+    assert.equal(m.deps.config.chats['-100'].richText, undefined, 'the topic toggle must not alter every topic');
+    const log = m.dbCalls.find((c) => c[0] === 'logConfigChange');
+    assert.equal(log[1].thread_id, '3');
+    assert.equal(ctx._acks[0].text, 'Rich text → off');
+  });
+});

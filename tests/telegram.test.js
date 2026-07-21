@@ -173,6 +173,61 @@ describe('send — failure path', () => {
   });
 });
 
+describe('send — editMessageText with rich_message', () => {
+  beforeEach(() => { ({ db, dbPath } = freshDb('telegram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  test('rich_message payload is NOT rejected by the plain-text emptiness guard', async () => {
+    const bot = makeFakeBot({ result: { message_id: 5, date: 1 } });
+    await send({
+      bot, method: 'editMessageText',
+      params: { chat_id: '1', message_id: 5, rich_message: { blocks: [{ type: 'paragraph', text: 'hi' }] } },
+      db, logger: silentLogger(),
+    });
+    assert.equal(bot.calls.length, 1);
+    assert.equal(bot.calls[0].method, 'editMessageText');
+    assert.ok(bot.calls[0].params.rich_message);
+  });
+
+  test('editMessageText with neither text nor rich_message still throws "text is empty"', async () => {
+    const bot = makeFakeBot({ result: { message_id: 5, date: 1 } });
+    await assert.rejects(() => send({
+      bot, method: 'editMessageText',
+      params: { chat_id: '1', message_id: 5 },
+      db, logger: silentLogger(),
+    }), /text is empty/);
+  });
+
+  test('editMessageText with an empty rich_message.blocks array throws before hitting the API', async () => {
+    const bot = makeFakeBot({ result: { message_id: 5, date: 1 } });
+    await assert.rejects(() => send({
+      bot, method: 'editMessageText',
+      params: { chat_id: '1', message_id: 5, rich_message: { blocks: [] } },
+      db, logger: silentLogger(),
+    }), /rich_message\.blocks is empty/);
+    assert.equal(bot.calls.length, 0, 'must fail BEFORE the API call, like the plain-text guard does');
+  });
+
+  test('editMessageText with rich_message.blocks not an array throws', async () => {
+    const bot = makeFakeBot({ result: { message_id: 5, date: 1 } });
+    await assert.rejects(() => send({
+      bot, method: 'editMessageText',
+      params: { chat_id: '1', message_id: 5, rich_message: {} },
+      db, logger: silentLogger(),
+    }), /rich_message\.blocks is empty/);
+  });
+
+  test('a plain editMessageText call (no rich_message) is unaffected — still requires text', async () => {
+    const bot = makeFakeBot({ result: { message_id: 5, date: 1 } });
+    await send({
+      bot, method: 'editMessageText',
+      params: { chat_id: '1', message_id: 5, text: 'plain edit' },
+      db, logger: silentLogger(),
+    });
+    assert.equal(bot.calls[0].params.text, 'plain edit');
+  });
+});
+
 describe('send — reactions skip DB row', () => {
   beforeEach(() => { ({ db, dbPath } = freshDb('telegram-test')); });
   afterEach(() => cleanupDb(dbPath, db));

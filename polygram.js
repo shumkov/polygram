@@ -96,6 +96,11 @@ const { createStore: createPairingsStore, parseTtl: parsePairingTtl } = require(
 const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/telegram/voice');
 const { createStreamer } = require('./lib/telegram/streamer');
 const { chunkMarkdownText } = require('./lib/telegram/chunk');
+const {
+  toTelegramRichBlocks, resolveRichTextEnabled, isRichCapabilityError, isRichContentError,
+} = require('./lib/telegram/rich');
+const { createRichEditor } = require('./lib/telegram/rich-edit');
+const { redactBotToken, stripUrlCredentials } = require('./lib/error/net');
 // F#23: shared agent-reply helper. parseResponse + sanitizer + chunked
 // delivery + inline sticker/react in one place. Wired into both the
 // channels dispatcher (F#1) and the autonomous-wakeup handler (F#23).
@@ -298,6 +303,23 @@ async function getReactionAllowlist(bot, chatId) {
 function logEvent(kind, detail) {
   dbWrite(() => db.logEvent(kind, detail), `log ${kind}`);
 }
+
+// One bot runs per process, so rich-message capability can be represented
+// by one process-wide boolean rather than a per-connection map. Set once by
+// isRichCapabilityError (endpoint missing/404) and never cleared for the
+// process lifetime — retrying a permanently-missing endpoint on every
+// future send is wasteful. Transient errors must not set the latch.
+let richKnownUnsupported = false;
+
+// Extracted to lib/telegram/rich-edit.js so the capability/content/
+// transient error-classification + fallback wiring is directly unit-
+// testable. Constructed in main() (like `tg` itself, just below),
+// NOT here at module load time — BOT_NAME/config are `let`s still
+// `null`/`undefined` at this point; capturing them by destructuring now
+// would bake in stale values permanently, unlike `logEvent`, which is
+// safe to reference early because it's a stable function that does its
+// own live lookups internally when called.
+let richEditMessageText;
 
 // 0.15 secret redaction (agent-flagged path): the agent marks a secret it saw
 // in the user's message with `[redact:<secret>]`. parseResponse / stripInlineTags
@@ -819,8 +841,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // showed "Agent: shumabit" instead of music-curation:music-curator
     // (2026-06-03). getTopicConfig returns {} when there's no active topic.
     const _cardTopicCfg = getTopicConfig(chatConfig, threadIdStr || null);
-    const info = formatConfigInfoText(chatConfig, show, sessionKey, _cardTopicCfg);
-    const reply_markup = buildConfigKeyboard(chatConfig, show, _cardTopicCfg);
+    const effectiveRichText = resolveRichTextEnabled(config, chatId, threadIdStr || null);
+    const info = formatConfigInfoText(chatConfig, show, sessionKey, _cardTopicCfg, effectiveRichText);
+    const reply_markup = buildConfigKeyboard(chatConfig, show, _cardTopicCfg, effectiveRichText);
     await sendReply(info, { params: { reply_markup } });
     return;
   }
@@ -981,11 +1004,35 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // eliminates the "stuck at 15min typing" complaint from the non-streaming
   // code path. For short responses the streamer stays idle and we fall
   // through to the normal send path via finalize() returning streamed=false.
+  // Gate rich delivery on the per-chat/topic opt-in and the process-wide
+  // capability latch. Returning null forces the streamer's plain-text
+  // path — same contract for "not opted in", "capability known
+  // unsupported", and "content doesn't need it" (needsRichRendering
+  // inside toTelegramRichBlocks handles the last one).
+  // Rich delivery is limited to this interactive streamer instance.
+  // A reply that never crosses minChars (stays idle → delivered via
+  // deliverReplies) and any non-streaming send path — autonomous-wakeup/
+  // auto-resume/autosteer via lib/telegram/process-agent-reply.js, cron/
+  // IPC sends — never render rich even when richText is on and the
+  // content qualifies. Those delivery paths intentionally remain plain.
+  // Re-read both controls for every flush so a config change or a
+  // capability result applies to the turn already in progress.
+  const toRichPayload = (text, opts) => {
+    if (richKnownUnsupported || !resolveRichTextEnabled(config, chatId, threadId)) return null;
+    return toTelegramRichBlocks(text, opts);
+  };
+
   const streamer = createStreamer({
     // rc.67: pre-process every chunk to strip recognised
     // [sticker:NAME] / [react:EMOJI] tags BEFORE the bubble or DB row
     // captures them. See stripInlineTagsForStreamer above.
     transformText: stripInlineTagsForStreamer,
+    toRichPayload,
+    onRichUpgrade: () => {
+      // Record the visible transition when an existing plain bubble
+      // becomes rich during streaming.
+      logEvent('rich-streaming-upgrade', { chat_id: chatId, thread_id: threadId, bot: BOT_NAME });
+    },
     send: async (text) => {
       const params = {
         chat_id: chatId, text,
@@ -1001,7 +1048,17 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       }
       return tg(bot, 'sendMessage', params, outMetaBase);
     },
-    edit: async (messageId, text) => {
+    edit: async (messageId, payload) => {
+      // The streamer emits either a plain string or a rich payload with
+      // blocks and their source Markdown. Rich error classification and
+      // fallback live in rich-edit.js so this wiring stays focused.
+      if (payload && typeof payload === 'object' && payload.rich) {
+        return richEditMessageText({
+          bot, chatId, threadId, messageId,
+          blocks: payload.blocks, sourceText: payload.sourceText,
+        });
+      }
+      const text = payload;
       try {
         // Route edits through tg() so applyFormatting runs (MarkdownV2
         // + escape). Going direct to bot.api.editMessageText would
@@ -2279,6 +2336,18 @@ async function main() {
     db = dbClient.open(DB_PATH);
     console.log(`[db] opened ${DB_PATH}`);
     tg = createSender(db, console, config);
+    richEditMessageText = createRichEditor({
+      tg,
+      botName: BOT_NAME,
+      logEvent,
+      redactBotToken,
+      isRichCapabilityError,
+      isRichContentError,
+      getRichKnownUnsupported: () => richKnownUnsupported,
+      setRichKnownUnsupported: () => { richKnownUnsupported = true; },
+      getApiRoot: () => config.bot?.apiRoot || null,
+      stripUrlCreds: stripUrlCredentials,
+    });
     pairings = createPairingsStore(db.raw);
     approvals = createApprovalsStore(db.raw);
     const migration = migrateJsonToDb(db, SESSIONS_JSON_PATH, config.chats);

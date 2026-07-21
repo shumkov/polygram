@@ -92,6 +92,37 @@ describe('toTelegramHtml — nested lists', () => {
   });
 });
 
+describe('toTelegramHtml — task lists (checkboxes)', () => {
+  // Marked's default checkbox renderer emits `<input type="checkbox">`.
+  // Telegram's parse_mode=HTML rejects <input> outright (400: Unsupported
+  // start tag), which would force the whole message through the plain
+  // fallback. Task items must therefore render as literal glyphs.
+  test('unchecked task item renders as a literal glyph, never <input>', () => {
+    const r = toTelegramHtml('- [ ] first task');
+    assert.doesNotMatch(r.text, /<input/);
+    assert.match(r.text, /☐ first task/);
+  });
+
+  test('checked task item renders as a literal glyph, never <input>', () => {
+    const r = toTelegramHtml('- [x] second done');
+    assert.doesNotMatch(r.text, /<input/);
+    assert.match(r.text, /☑ second done/);
+  });
+
+  test('mixed checked/unchecked list has no <input> anywhere', () => {
+    const r = toTelegramHtml('- [ ] first task\n- [x] second done');
+    assert.doesNotMatch(r.text, /<input/);
+    assert.match(r.text, /☐ first task/);
+    assert.match(r.text, /☑ second done/);
+  });
+
+  test('task list nested under a plain list item stays input-free', () => {
+    const r = toTelegramHtml('- parent\n  - [ ] child task');
+    assert.doesNotMatch(r.text, /<input/);
+    assert.match(r.text, /☐ child task/);
+  });
+});
+
 describe('toTelegramHtml — tables', () => {
   test('table wrapped in <pre> with aligned columns', () => {
     const r = toTelegramHtml(

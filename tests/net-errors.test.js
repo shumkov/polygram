@@ -6,6 +6,7 @@ const {
   isTransientNetworkError,
   extractCode,
   redactBotToken,
+  stripUrlCredentials,
 } = require('../lib/error/net');
 
 function codeErr(code) {
@@ -159,3 +160,27 @@ describe('redactBotToken', () => {
   });
 });
 
+describe('stripUrlCredentials — apiRoot basic auth', () => {
+  test('strips user:pass@ from an http(s) URL', () => {
+    assert.equal(stripUrlCredentials('https://user:pass@localhost:8082'), 'https://localhost:8082');
+    assert.equal(stripUrlCredentials('http://admin:s3cr3t@10.0.0.1:8082/x'), 'http://10.0.0.1:8082/x');
+  });
+
+  test('a URL with no credentials passes through unchanged', () => {
+    assert.equal(stripUrlCredentials('http://localhost:8082'), 'http://localhost:8082');
+  });
+
+  test('null/undefined/empty pass through', () => {
+    assert.equal(stripUrlCredentials(null), null);
+    assert.equal(stripUrlCredentials(undefined), undefined);
+    assert.equal(stripUrlCredentials(''), '');
+  });
+
+  test('the literal "cloud" fallback label used for unset apiRoot passes through unchanged', () => {
+    assert.equal(stripUrlCredentials('cloud'), 'cloud');
+  });
+
+  test('does not touch a bare host:port with no scheme (no @ to strip)', () => {
+    assert.equal(stripUrlCredentials('localhost:8082'), 'localhost:8082');
+  });
+});

@@ -140,6 +140,49 @@ describe('buildSdkOptions — basic shape', () => {
   });
 });
 
+describe('buildSdkOptions — richText-aware display hint', () => {
+  test('richText off (default): systemPrompt gets the plain-mode hint, tables discouraged', () => {
+    const fn = createBuildSdkOptions(baseDeps());
+    const out = fn('chat-12345', baseCtx());
+    assert.match(out.systemPrompt.append, /MUST NOT emit a table/);
+    assert.doesNotMatch(out.systemPrompt.append, /Rich formatting is available/);
+  });
+
+  test('richText on at the chat level: systemPrompt gets the rich-mode hint instead', () => {
+    const deps = baseDeps({
+      config: { defaults: {}, bot: {}, chats: { '12345': { richText: true } } },
+    });
+    const fn = createBuildSdkOptions(deps);
+    const out = fn('chat-12345', baseCtx());
+    assert.match(out.systemPrompt.append, /Rich formatting is available/);
+    assert.match(out.systemPrompt.append, /checkbox list/);
+    assert.doesNotMatch(out.systemPrompt.append, /MUST NOT emit a table/);
+  });
+
+  test('richText resolves through topic → chat → bot → default, same as delivery', () => {
+    const deps = baseDeps({
+      config: {
+        defaults: {},
+        bot: {},
+        chats: { '12345': { richText: false, topics: { '3': { richText: true } } } },
+      },
+    });
+    const fn = createBuildSdkOptions(deps);
+    const out = fn('chat-12345:3', baseCtx({ threadId: '3' }));
+    assert.match(out.systemPrompt.append, /Rich formatting is available/);
+  });
+
+  test('the hard NEVER-canned-strings rule survives unchanged in both modes', () => {
+    const plainOut = createBuildSdkOptions(baseDeps())('chat-1', baseCtx());
+    const richOut = createBuildSdkOptions(baseDeps({
+      config: { defaults: { richText: true }, bot: {}, chats: {} },
+    }))('chat-1', baseCtx());
+    for (const out of [plainOut, richOut]) {
+      assert.match(out.systemPrompt.append, /NEVER emit shell-context canned strings/);
+    }
+  });
+});
+
 describe('buildSdkOptions — permissionMode + canUseTool', () => {
   test('no approvals.gatedTools → bypassPermissions + allowDangerouslySkipPermissions', () => {
     const fn = createBuildSdkOptions(baseDeps());
