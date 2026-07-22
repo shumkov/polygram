@@ -1078,7 +1078,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         // want the failure path specifically surfaced). Log to events.
         logEvent('telegram-edit-failed', {
           chat_id: chatId, msg_id: messageId,
-          api_error: err.message?.slice(0, 200),
+          // Network errors can embed the request URL, which carries the
+          // bot token — redact before persisting, matching rich-edit.js
+          // and api.js's handling of the same error class.
+          api_error: redactBotToken(err.message)?.slice(0, 200),
           bot: BOT_NAME,
         });
         throw err;
