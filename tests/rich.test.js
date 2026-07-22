@@ -99,6 +99,27 @@ describe('needsRichRendering — the content-adaptive gate', () => {
   test('a single dash in prose does not false-positive as a task item', () => {
     assert.equal(needsRichRendering('This - that, and more.'), false);
   });
+
+  test('a blockquote triggers rich', () => {
+    assert.equal(needsRichRendering('> a quoted aside'), true);
+    assert.equal(needsRichRendering('Some text.\n\n> caveat here\n\nMore text.'), true);
+  });
+
+  test('a bare ">" with no following content does not false-positive as a blockquote', () => {
+    assert.equal(needsRichRendering('score > 5 and rising'), false);
+    assert.equal(needsRichRendering('>'), false);
+  });
+
+  test('a divider (---) on its own line triggers rich', () => {
+    assert.equal(needsRichRendering('Section one.\n\n---\n\nSection two.'), true);
+    assert.equal(needsRichRendering('***'), true);
+    assert.equal(needsRichRendering('___'), true);
+  });
+
+  test('a single dash line does not false-positive as a divider', () => {
+    assert.equal(needsRichRendering('-'), false);
+    assert.equal(needsRichRendering('--'), false);
+  });
 });
 
 describe('needsRichRendering — fenced code blocks never count as structure', () => {
@@ -162,6 +183,16 @@ describe('needsRichRendering — fenced code blocks never count as structure', (
 
   test('content with no backtick or tilde at all skips the fence scan entirely (fast path)', () => {
     assert.equal(needsRichRendering('# Just a heading, no code anywhere'), true);
+  });
+
+  test('a ">" quote-looking line inside a fenced code block is not a blockquote', () => {
+    const md = '```\n> not a real blockquote, just quoted shell output\n```';
+    assert.equal(needsRichRendering(md), false);
+  });
+
+  test('a "---" divider-looking line inside a fenced code block is not a divider', () => {
+    const md = '```\n---\n```';
+    assert.equal(needsRichRendering(md), false);
   });
 });
 
