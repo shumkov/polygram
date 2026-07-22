@@ -49,7 +49,7 @@ const { extractAssistantText } = require('@shumkov/orchestra');
 // and reused by createChannelsToolDispatcher inside main() — Claude replies
 // containing code blocks or HTML-style tags aren't split mid-element by the
 // size cap.
-const { createChannelsToolDispatcher } = require('./lib/process/channels-tool-dispatcher');
+const { createChannelsToolDispatcher, buildAllowedRoots } = require('./lib/process/channels-tool-dispatcher');
 const { createTmuxRunner } = require('@shumkov/orchestra');
 const { sweepTmuxOrphans } = require('@shumkov/orchestra').orphanSweep;
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
@@ -98,7 +98,9 @@ const { createStreamer } = require('./lib/telegram/streamer');
 const { chunkMarkdownText } = require('./lib/telegram/chunk');
 const {
   toTelegramRichBlocks, resolveRichTextEnabled, isRichCapabilityError, isRichContentError,
+  stripMediaMarkdown,
 } = require('./lib/telegram/rich');
+const { createRichMediaResolver, PHOTO_UPLOAD_CEILING } = require('./lib/telegram/rich-media');
 const { createRichEditor } = require('./lib/telegram/rich-edit');
 const { buildPolygramDisplayHint } = require('./lib/telegram/display-hint');
 const { redactBotToken, stripUrlCredentials } = require('./lib/error/net');
@@ -1018,9 +1020,48 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // content qualifies. Those delivery paths intentionally remain plain.
   // Re-read both controls for every flush so a config change or a
   // capability result applies to the turn already in progress.
+  // Media (photo/collage/slideshow) resolution for rich replies. Same
+  // trust boundary as reply(files): roots are the per-session staging
+  // dir plus the session's spawn cwd (topic override wins, mirroring
+  // getSessionSpawnIdentity) — path-set parity with the channels
+  // dispatcher, which builds its roots from the same inputs. URL media
+  // is disabled when a self-hosted Bot API server is configured (its
+  // URL-fetch origin is unverified — see lib/telegram/rich-media.js).
+  const _mediaTopicCfg = getTopicConfig(chatConfig, threadIdStr || null);
+  const resolveRichMedia = createRichMediaResolver({
+    allowedRoots: buildAllowedRoots({
+      sessionKey,
+      sessionCwd: _mediaTopicCfg.cwd || chatConfig.cwd || null,
+    }),
+    maxPhotoBytes: Math.min(
+      PHOTO_UPLOAD_CEILING,
+      resolveMaxFileOverride(config, chatId, threadId) ?? PHOTO_UPLOAD_CEILING,
+    ),
+    allowUrlMedia: !config.bot?.apiRoot,
+    logEvent: (kind, detail) => logEvent(kind, {
+      chat_id: chatId, thread_id: threadId, bot: BOT_NAME, ...detail,
+    }),
+  });
   const toRichPayload = (text, opts) => {
     if (richKnownUnsupported || !resolveRichTextEnabled(config, chatId, threadId)) return null;
-    return toTelegramRichBlocks(text, opts);
+    return toTelegramRichBlocks(text, { ...opts, resolveMedia: resolveRichMedia });
+  };
+  // Plain-path text hygiene for rich-enabled chats: the live preview
+  // streams PLAIN until the rich gate trips (and stays plain if the
+  // capability latch fires), so a reply's image markdown — including a
+  // still-incomplete trailing "![shot](/abs/pa…" fragment — would
+  // otherwise render its raw local path into the visible bubble.
+  // Degrade media markdown to caption text on every plain send/edit.
+  // The streamer's internal dedup state keeps the UNsanitized text on
+  // both sides of its comparisons, so this stays a display-only
+  // transform (same class as tg()'s markdown→HTML conversion).
+  const sanitizeLiveText = (text) => {
+    if (!resolveRichTextEnabled(config, chatId, threadId)) return text;
+    const clean = stripMediaMarkdown(text);
+    // An image-only chunk can sanitize to nothing; keep the bubble
+    // alive with a minimal placeholder rather than tripping tg()'s
+    // empty-text guard.
+    return clean.trim() ? clean : '…';
   };
 
   const streamer = createStreamer({
@@ -1036,7 +1077,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     },
     send: async (text) => {
       const params = {
-        chat_id: chatId, text,
+        chat_id: chatId, text: sanitizeLiveText(text),
         ...(threadId && { message_thread_id: threadId }),
       };
       if (!firstBubbleSent) {
@@ -1070,7 +1111,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         return await tg(bot, 'editMessageText', {
           chat_id: chatId,
           message_id: messageId,
-          text,
+          text: sanitizeLiveText(text),
         }, { source: 'bot-reply-stream-edit', botName: BOT_NAME });
       } catch (err) {
         // Stream-edit failures would otherwise be invisible — edits
@@ -1696,7 +1737,14 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         // send the body as proper chunks.
         try { await streamer.discard(); }
         catch (err) { console.error(`[${label}] discard failed: ${err.message}`); }
-        const chunks = chunkMarkdownText(parsed.text, TG_CHUNK_BUDGET);
+        // Rich-enabled chats may carry media markdown; the plain
+        // redelivery can't upload it, and a raw `![cap](/abs/path)`
+        // would render the local path into the chat. Degrade images to
+        // their captions (images are not delivered on this path).
+        const redeliverText = resolveRichTextEnabled(config, chatId, threadId)
+          ? stripMediaMarkdown(parsed.text)
+          : parsed.text;
+        const chunks = chunkMarkdownText(redeliverText, TG_CHUNK_BUDGET);
         const r = await deliverReplies({
           bot,
           send: (b, method, params, m) => tg(b, method, params, m),
@@ -1774,7 +1822,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // 0.7.0: use markdown-aware chunker + deliverReplies primitive.
       // The old chunkText was newline/byte-only; chunkMarkdownText also
       // respects code-fence boundaries (closes + reopens across chunks).
-      const chunks = chunkMarkdownText(parsed.text, TG_CHUNK_BUDGET);
+      // Short replies never went live-rich, so image markdown from a
+      // rich-enabled chat degrades to caption text here too — never a
+      // raw local path in the bubble.
+      const shortText = resolveRichTextEnabled(config, chatId, threadId)
+        ? stripMediaMarkdown(parsed.text)
+        : parsed.text;
+      const chunks = chunkMarkdownText(shortText, TG_CHUNK_BUDGET);
       await deliverReplies({
         bot,
         send: (b, method, params, m) => tg(b, method, params, m),
@@ -2348,6 +2402,7 @@ async function main() {
       setRichKnownUnsupported: () => { richKnownUnsupported = true; },
       getApiRoot: () => config.bot?.apiRoot || null,
       stripUrlCreds: stripUrlCredentials,
+      sanitizeFallbackText: stripMediaMarkdown,
     });
     pairings = createPairingsStore(db.raw);
     approvals = createApprovalsStore(db.raw);

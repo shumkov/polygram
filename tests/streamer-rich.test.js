@@ -572,3 +572,39 @@ describe('streamer — wentRich fallback contract', () => {
     assert.equal(h.streamer.isRichMode, false, 'but the streamer must know the final bubble is actually plain');
   });
 });
+
+describe('streamer — media resolution across the streaming→finalize boundary', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { createRichMediaResolver } = require('../lib/telegram/rich-media');
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'streamer-media-'));
+  const okPng = path.join(tmp, 'a.png');
+  fs.writeFileSync(okPng, Buffer.alloc(64, 1));
+  const resolver = createRichMediaResolver({ allowedRoots: [tmp] });
+  const toRichPayload = (text, opts) => toTelegramRichBlocks(text, { ...opts, resolveMedia: resolver });
+
+  test('finalize resolves media placeholders to envelope blocks; the dedup key differs from the streamed tick', async () => {
+    const h = makeHarness({ toRichPayload });
+    const body = `# Report\n\n![shot](${okPng})\n\ntail text here`;
+    await h.streamer.onChunk('# Report');        // initial plain send
+    await h.advance(500);
+    await h.streamer.onChunk(body);              // streaming flush: partial:true → placeholder
+    await h.advance(500);
+    const mid = h.edits[h.edits.length - 1];
+    assert.equal(typeof mid.payload, 'object');
+    const midJson = JSON.stringify(mid.payload.blocks);
+    assert.ok(!midJson.includes('"source"'), 'the resolver must not run during streaming (no envelope leak)');
+    assert.ok(midJson.includes('🖼'), 'the streamed tick shows a placeholder, not a photo');
+
+    const result = await h.streamer.finalize(body);
+    assert.equal(result.finalEditOk, true);
+    const final = h.edits[h.edits.length - 1];
+    const photo = final.payload.blocks.find((b) => b.type === 'photo');
+    assert.ok(photo, 'finalize must emit a real photo block');
+    assert.equal(photo.photo.media.source, fs.realpathSync(okPng));
+    assert.notEqual(JSON.stringify(final.payload.blocks), midJson,
+      'finalize dedup key must differ from the placeholder tick, or the edit is suppressed as a no-op');
+  });
+});
