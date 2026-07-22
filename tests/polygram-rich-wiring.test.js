@@ -33,4 +33,15 @@ describe('polygram rich-message wiring', () => {
     assert.match(wiring, /formatConfigInfoText\([^\n]+effectiveRichText\)/);
     assert.match(wiring, /buildConfigKeyboard\([^\n]+effectiveRichText\)/);
   });
+
+  test('the CLI-backend display hint is resolved per chat, not a fixed constant', () => {
+    // Regression guard: cli-backed chats (pm:'cli') get their system-prompt
+    // display hint from createProcessFactory's displayHint option, which
+    // orchestra >=0.4.2 supports as a per-spawn resolver function. A static
+    // string here means every cli chat is silently stuck in plain mode
+    // regardless of its own richText config (the bug this test pins).
+    const wiring = sectionBetween('const processFactory = createProcessFactory({', ');');
+    assert.match(wiring, /displayHint:\s*\(chatId, threadId\)\s*=>\s*buildPolygramDisplayHint\(resolveRichTextEnabled\(config, chatId, threadId\)\)/);
+    assert.doesNotMatch(wiring, /displayHint:\s*require\('\.\/lib\/telegram\/display-hint'\)\.POLYGRAM_DISPLAY_HINT/);
+  });
 });

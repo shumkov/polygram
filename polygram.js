@@ -100,6 +100,7 @@ const {
   toTelegramRichBlocks, resolveRichTextEnabled, isRichCapabilityError, isRichContentError,
 } = require('./lib/telegram/rich');
 const { createRichEditor } = require('./lib/telegram/rich-edit');
+const { buildPolygramDisplayHint } = require('./lib/telegram/display-hint');
 const { redactBotToken, stripUrlCredentials } = require('./lib/error/net');
 // F#23: shared agent-reply helper. parseResponse + sanitizer + chunked
 // delivery + inline sticker/react in one place. Wired into both the
@@ -2704,7 +2705,9 @@ async function main() {
     pmDefault: 'sdk',
     // The CLI append-system-prompt's FIRST block — origin hard-required this into every
     // CliProcess. Without it, cli chats lose the Telegram table/markdown display rules.
-    displayHint: require('./lib/telegram/display-hint').POLYGRAM_DISPLAY_HINT,
+    // A resolver (not a static string) so each cli-backed chat gets its own richText
+    // state — orchestra's factory calls this per spawn with the spawning chat/topic.
+    displayHint: (chatId, threadId) => buildPolygramDisplayHint(resolveRichTextEnabled(config, chatId, threadId)),
     // Backend-default outbound cap fallback (per-spawn buildSpawnContext override
     // normally supersedes this; kept so any context-less spawn still gets the backend
     // default rather than orchestra's neutral 100MB).
