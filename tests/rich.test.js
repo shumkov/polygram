@@ -315,6 +315,43 @@ describe('toTelegramRichBlocks — block shapes', () => {
     assert.match(details.blocks[0].text, /hidden text/);
   });
 
+  test('prose on the line after </details> (no blank line) is not dropped', () => {
+    // marked folds "</details>\ntrailing prose" into ONE html token (an
+    // HTML block runs until a blank line), so the close-token scan must
+    // emit the content after the close tag, not skip the whole token.
+    const md = '<details>\n<summary>Logs</summary>\n\nlog content here\n\n</details>\nAnd here is my conclusion.';
+    const r = toTelegramRichBlocks(md);
+    const details = r.blocks.find((b) => b.type === 'details');
+    assert.ok(details);
+    const flat = JSON.stringify(r.blocks);
+    assert.match(flat, /And here is my conclusion\./, 'content after </details> must survive');
+  });
+
+  test('text after a single-token <details>...</details> is not dropped', () => {
+    const r = toTelegramRichBlocks('<details><summary>S</summary>hidden</details>Trailing conclusion.');
+    const details = r.blocks.find((b) => b.type === 'details');
+    assert.ok(details);
+    assert.match(JSON.stringify(r.blocks), /Trailing conclusion\./);
+  });
+
+  test('content preceding </details> inside the close token stays in the details body', () => {
+    // "<hr>\nnote text\n</details>" arrives as one html token; the note
+    // text before the close tag belongs inside the collapsible body.
+    const md = '<details>\n<summary>S</summary>\n\nbody\n\n<hr>\nnote text\n</details>';
+    const r = toTelegramRichBlocks(md);
+    const details = r.blocks.find((b) => b.type === 'details');
+    assert.ok(details);
+    assert.match(JSON.stringify(details.blocks), /note text/);
+  });
+
+  test('two <details> blocks in one html token both render', () => {
+    const r = toTelegramRichBlocks('<details><summary>A</summary>one</details><details><summary>B</summary>two</details>');
+    const all = r.blocks.filter((b) => b.type === 'details');
+    assert.equal(all.length, 2);
+    assert.equal(all[0].summary, 'A');
+    assert.equal(all[1].summary, 'B');
+  });
+
   test('non-details raw HTML is stripped to plain text, never passed through', () => {
     const r = toTelegramRichBlocks('# h\n\n<div class="x"><script>alert(1)</script>hello</div>');
     const flat = JSON.stringify(r.blocks);
