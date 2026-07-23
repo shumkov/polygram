@@ -29,7 +29,21 @@ const path = require('node:path');
 
 const { CliProcess } = require('@shumkov/orchestra');
 const { createTmuxRunner } = require('@shumkov/orchestra');
-const { resolvePinnedClaudeBin, CLAUDE_CLI_PINNED_VERSION } = require('@shumkov/orchestra').claudeBin;
+
+// Same resolution as polygram.js boot: point orchestra at polygram's vendored
+// claude-bin dir BEFORE resolving. Bare resolvePinnedClaudeBin points at
+// claude's own version store, which claude's auto-pruner empties — the spawn
+// then dies instantly (TMUX_SESSION_GONE in ~8ms, no pane content).
+if (!process.env.ORCHESTRA_CLAUDE_VENDOR_DIR) {
+  process.env.ORCHESTRA_CLAUDE_VENDOR_DIR = path.join(os.homedir(), '.local', 'share', 'polygram', 'claude-bin');
+}
+const { ensureVendoredClaudeBin, CLAUDE_CLI_PINNED_VERSION } = require('@shumkov/orchestra').claudeBin;
+
+function resolvePinnedClaudeBin() {
+  const r = ensureVendoredClaudeBin(CLAUDE_CLI_PINNED_VERSION, { logger: console });
+  if (!r.ok) throw new Error(`pinned claude bin unavailable: ${r.reason}`);
+  return r.path;
+}
 
 const RUN = process.env.E2E_REAL_CLAUDE === '1';
 
@@ -107,7 +121,12 @@ test('e2e: real claude channels round-trip — reply delivered, NO false bridge-
     );
   } finally {
     try { await proc.kill('e2e-done'); } catch {}
-    try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {}
+    // NEVER rm this cwd: it is NOT a temp dir — it's Rekordbox's own data
+    // directory (the git repo that once lived there moved to
+    // ~/Projects/shumkov/engineering-music-curation; the path now belongs to
+    // the Rekordbox app on this case-insensitive filesystem). An earlier
+    // version of this test rmSync'd it in this finally, which would have
+    // deleted the operator's music library.
   }
 });
 
