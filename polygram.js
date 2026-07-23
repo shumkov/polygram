@@ -100,7 +100,14 @@ const {
   toTelegramRichBlocks, resolveRichTextEnabled, isRichCapabilityError, isRichContentError,
   stripMediaMarkdown,
 } = require('./lib/telegram/rich');
-const { createRichMediaResolver, PHOTO_UPLOAD_CEILING } = require('./lib/telegram/rich-media');
+const {
+  createRichMediaResolver,
+  createMediaDeliveryContext,
+  createMediaFileIdCache,
+  collectMediaRescueEntries,
+  PHOTO_UPLOAD_CEILING,
+  OTHER_MEDIA_UPLOAD_CEILING,
+} = require('./lib/telegram/rich-media');
 const { createRichEditor } = require('./lib/telegram/rich-edit');
 const { buildPolygramDisplayHint } = require('./lib/telegram/display-hint');
 const { redactBotToken, stripUrlCredentials } = require('./lib/error/net');
@@ -323,6 +330,7 @@ let richKnownUnsupported = false;
 // safe to reference early because it's a stable function that does its
 // own live lookups internally when called.
 let richEditMessageText;
+let richMediaFileIdCache;
 
 // 0.15 secret redaction (agent-flagged path): the agent marks a secret it saw
 // in the user's message with `[redact:<secret>]`. parseResponse / stripInlineTags
@@ -994,7 +1002,6 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     effort: chatConfig.effort,
     ...(linkPreview === false ? { linkPreview: false } : {}),
   };
-
   // 0.7.2: only the FIRST bubble in a turn quotes the user's message
   // via reply_parameters. When a tool-heavy turn produces multiple
   // assistant messages (each spawning its own bubble via
@@ -1020,7 +1027,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // content qualifies. Those delivery paths intentionally remain plain.
   // Re-read both controls for every flush so a config change or a
   // capability result applies to the turn already in progress.
-  // Media (photo/collage/slideshow) resolution for rich replies. Same
+  // Typed media resolution for rich replies. Same
   // trust boundary as reply(files): roots are the per-session staging
   // dir plus the session's spawn cwd (topic override wins, mirroring
   // getSessionSpawnIdentity) — path-set parity with the channels
@@ -1028,14 +1035,21 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // is disabled when a self-hosted Bot API server is configured (its
   // URL-fetch origin is unverified — see lib/telegram/rich-media.js).
   const _mediaTopicCfg = getTopicConfig(chatConfig, threadIdStr || null);
+  const mediaAllowedRoots = buildAllowedRoots({
+    sessionKey,
+    sessionCwd: _mediaTopicCfg.cwd || chatConfig.cwd || null,
+  });
+  const maxMediaOverride = resolveMaxFileOverride(config, chatId, threadId);
   const resolveRichMedia = createRichMediaResolver({
-    allowedRoots: buildAllowedRoots({
-      sessionKey,
-      sessionCwd: _mediaTopicCfg.cwd || chatConfig.cwd || null,
-    }),
+    allowedRoots: mediaAllowedRoots,
+    fileIdCache: richMediaFileIdCache,
     maxPhotoBytes: Math.min(
       PHOTO_UPLOAD_CEILING,
-      resolveMaxFileOverride(config, chatId, threadId) ?? PHOTO_UPLOAD_CEILING,
+      maxMediaOverride ?? PHOTO_UPLOAD_CEILING,
+    ),
+    maxOtherMediaBytes: Math.min(
+      OTHER_MEDIA_UPLOAD_CEILING,
+      maxMediaOverride ?? OTHER_MEDIA_UPLOAD_CEILING,
     ),
     allowUrlMedia: !config.bot?.apiRoot,
     logEvent: (kind, detail) => logEvent(kind, {
@@ -1044,8 +1058,30 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   });
   const toRichPayload = (text, opts) => {
     if (richKnownUnsupported || !resolveRichTextEnabled(config, chatId, threadId)) return null;
-    return toTelegramRichBlocks(text, { ...opts, resolveMedia: resolveRichMedia });
+    const payload = toTelegramRichBlocks(text, { ...opts, resolveMedia: resolveRichMedia });
+    if (!opts.partial && payload?.usedRich) {
+      return {
+        ...payload,
+        rescueEntries: collectMediaRescueEntries(payload.blocks),
+      };
+    }
+    return payload;
   };
+  const mediaContext = createMediaDeliveryContext({
+    allowedRoots: mediaAllowedRoots,
+    fileIdCache: richMediaFileIdCache,
+    tg,
+    bot,
+    chatId,
+    threadId,
+    replyToMessageId: msg.message_id,
+    botName: BOT_NAME,
+    logEvent: (kind, detail) => logEvent(kind, {
+      chat_id: chatId, thread_id: threadId, bot: BOT_NAME, ...detail,
+    }),
+    setDeliveryError: () => reactor?.setState('ERROR'),
+    logger: { warn: (m) => console.error(`[${label}] ${m}`) },
+  });
   // Plain-path text hygiene for rich-enabled chats: the live preview
   // streams PLAIN until the rich gate trips (and stays plain if the
   // capability latch fires), so a reply's image markdown — including a
@@ -1076,6 +1112,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       logEvent('rich-streaming-upgrade', { chat_id: chatId, thread_id: threadId, bot: BOT_NAME });
     },
     send: async (text) => {
+      const hadReplyAnchor = !firstBubbleSent;
       const params = {
         chat_id: chatId, text: sanitizeLiveText(text),
         ...(threadId && { message_thread_id: threadId }),
@@ -1088,7 +1125,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         params.reply_parameters = { message_id: msg.message_id, allow_sending_without_reply: true };
         firstBubbleSent = true;
       }
-      return tg(bot, 'sendMessage', params, outMetaBase);
+      const res = await tg(bot, 'sendMessage', params, outMetaBase);
+      return res && typeof res === 'object'
+        ? { ...res, _hadReplyAnchor: hadReplyAnchor }
+        : res;
     },
     edit: async (messageId, payload) => {
       // The streamer emits either a plain string or a rich payload with
@@ -1098,6 +1138,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         return richEditMessageText({
           bot, chatId, threadId, messageId,
           blocks: payload.blocks, sourceText: payload.sourceText,
+          phase: payload.phase,
+          mediaContext,
+          hadReplyAnchor: payload.hadReplyAnchor,
         });
       }
       const text = payload;
@@ -1718,6 +1761,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         if (fin.finalEditOk) {
           // Preview was successfully edited to the final text.
           // No follow-up messages needed.
+          await mediaContext.flushPartialDeliveryWarning(outMetaBase);
           await sendInlineStickers();
           await sendInlineReactions();
           await cleanupArchivedBubbles();
@@ -1729,7 +1773,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           // stuck. reactor.stop() in the finally only kills timers,
           // not the visible reaction. Clear here, mirroring the
           // rc.10 block — AFTER delivery so there's no visual gap.
-          reactor.clear().catch(() => {});
+          if (!mediaContext.deliveryIncomplete) {
+            reactor.clear().catch(() => {});
+          }
           clearAutosteeredReactions(sessionKey).catch(() => {});
           console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
           markReplied();
@@ -1738,12 +1784,16 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         // Preview can't hold the final body (overflow OR last edit
         // failed even after our HTML→plain fallback). Delete it and
         // send the body as proper chunks.
-        try { await streamer.discard(); }
+        let discarded = { msgId: fin.msgId, deleted: false };
+        try { discarded = await streamer.discard(); }
         catch (err) { console.error(`[${label}] discard failed: ${err.message}`); }
-        // Rich-enabled chats may carry media markdown; the plain
-        // redelivery can't upload it, and a raw `![cap](/abs/path)`
-        // would render the local path into the chat. Degrade images to
-        // their captions (images are not delivered on this path).
+        if (discarded.msgId != null && !discarded.deleted) {
+          mediaContext.recordDeletionFailures(1);
+        }
+        // Rich-enabled chats may carry media markdown; plain chunks cannot
+        // render it, and a raw `![cap](/abs/path)` would leak a local path.
+        // Degrade the chunk text to captions before the validated media
+        // entries are redelivered as ordered sidecars below.
         const redeliverText = resolveRichTextEnabled(config, chatId, threadId)
           ? stripMediaMarkdown(parsed.text)
           : parsed.text;
@@ -1759,29 +1809,20 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           logger: { error: (m) => console.error(`[${label}] ${m}`) },
         });
         const reason = fin.overflow ? 'overflow' : 'edit-failed';
+        mediaContext.recordTextFailures(r.failed.length);
+        const mediaResult = await mediaContext.rescueEntries(fin.rescueEntries, {
+          trigger: reason,
+          anchorFirst: chunks.length === 0 && discarded.deleted && fin.hadReplyAnchor,
+          meta: outMeta,
+        });
         logEvent('telegram-stream-redeliver', {
           chat_id: chatId, msg_id: msg.message_id,
           reason, chunks: chunks.length,
           delivered: r.sent.length, failed: r.failed.length,
+          media_delivered: mediaResult.sent, media_failed: mediaResult.failed,
           bot: BOT_NAME,
         });
-        // 0.7.1: surface partial-failure to the user. Without this,
-        // a chunk-3-of-5 failure leaves a coherent-looking reply with
-        // a silent gap (the user reads chunks 1, 2, 4, 5 unaware
-        // that chunk 3 was dropped). Append a warning + flip the
-        // reactor to ERROR so something visible signals "look here".
-        if (r.failed.length > 0) {
-          reactor.setState('ERROR');
-          try {
-            await tg(bot, 'sendMessage', {
-              chat_id: chatId,
-              text: `⚠️ ${r.failed.length} of ${chunks.length} message parts failed to deliver. The reply may be incomplete — please retry.`,
-              ...(threadId && { message_thread_id: threadId }),
-            }, { ...outMetaBase, source: 'partial-delivery-warning' });
-          } catch (warnErr) {
-            console.error(`[${label}] partial-delivery warning failed: ${warnErr.message}`);
-          }
-        }
+        await mediaContext.flushPartialDeliveryWarning(outMetaBase);
         await sendInlineStickers();
           await sendInlineReactions();
         await cleanupArchivedBubbles();
@@ -1790,10 +1831,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         // the rc.10 deferred-clear block, so the reactor would stay
         // stuck. Clear it (and autosteered ✍) here, after delivery —
         // but ONLY on a clean delivery. When r.failed.length>0 the
-        // ERROR state (😨) was set above as the "look here" signal
-        // for the partial-delivery failure; clearing it would wipe
-        // that signal, so leave the reactor as-is in that case.
-        if (r.failed.length === 0) {
+        // The aggregate warning sets ERROR as the "look here" signal
+        // for any text, media, or cleanup failure. Clearing it would
+        // wipe that signal, so leave the reactor as-is in that case.
+        if (!mediaContext.deliveryIncomplete) {
           reactor.clear().catch(() => {});
         }
         clearAutosteeredReactions(sessionKey).catch(() => {});
@@ -1844,8 +1885,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       });
     }
 
+    await mediaContext.flushPartialDeliveryWarning(outMetaBase);
     await sendInlineStickers();
           await sendInlineReactions();
+    await cleanupArchivedBubbles();
     // rc.10: clear progress reactions AFTER the reply has been
     // delivered so the user doesn't see a "reactions cleared, then
     // ~1-3s of nothing, then reply bubble" gap. The reply bubble
@@ -1853,7 +1896,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // with the delivery completion is the smooth UX path. Both
     // fire-and-forget — these are best-effort cleanups, not part of
     // the reply contract.
-    reactor.clear().catch(() => {});
+    if (!mediaContext.deliveryIncomplete) {
+      reactor.clear().catch(() => {});
+    }
     // 0.8.0-rc.14: also clear ✍ reactions on every follow-up
     // message that was autosteered into THIS turn — they live in
     // separate handleMessage scopes whose reactors are already GC'd.
@@ -2394,6 +2439,7 @@ async function main() {
     db = dbClient.open(DB_PATH);
     console.log(`[db] opened ${DB_PATH}`);
     tg = createSender(db, console, config);
+    richMediaFileIdCache = createMediaFileIdCache();
     richEditMessageText = createRichEditor({
       tg,
       botName: BOT_NAME,

@@ -272,7 +272,7 @@ test('e2e: real claude — an out-of-roots image degrades to a placeholder while
     assert.ok(media[0].source.startsWith(cwdReal + path.sep), `the surviving photo is the in-root one: ${media[0].source}`);
 
     const json = JSON.stringify(r.blocks);
-    assert.ok(json.includes('foreign (image unavailable)'),
+    assert.ok(json.includes('foreign (media unavailable)'),
       `the rejected image degrades to its caption + unavailable marker. blocks=${json.slice(0, 500)}`);
     assert.ok(!json.includes(outsidePng) && !json.includes('foreign.png'),
       `the rejected path/basename never enters the rendered blocks. blocks=${json.slice(0, 500)}`);

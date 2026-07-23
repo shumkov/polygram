@@ -19,6 +19,7 @@ const assert = require('node:assert/strict');
 const {
   POLYGRAM_DISPLAY_HINT,
   TELEGRAM_TABLE_WIDTH_BUDGET,
+  buildPolygramDisplayHint,
   appendDisplayHint,
 } = require('../lib/telegram/display-hint');
 
@@ -91,6 +92,32 @@ describe('POLYGRAM_DISPLAY_HINT — content', () => {
     // mobile users see broken tables. Mid-range guards both ends.
     assert.ok(TELEGRAM_TABLE_WIDTH_BUDGET >= 24);
     assert.ok(TELEGRAM_TABLE_WIDTH_BUDGET <= 60);
+  });
+});
+
+describe('rich media display hint', () => {
+  test('rich mode teaches the unchanged syntax, typed extensions, wrappers, and text rule', () => {
+    const richHint = buildPolygramDisplayHint(true);
+    assert.match(richHint, /!\[caption\]\(\/abs\/path/i);
+    assert.match(richHint, /\.jpe?g/i);
+    assert.match(richHint, /\.png/i);
+    assert.match(richHint, /\.webp/i);
+    assert.match(richHint, /\.mp4/i);
+    assert.match(richHint, /\.gif/i);
+    assert.match(richHint, /photo/i);
+    assert.match(richHint, /video/i);
+    assert.match(richHint, /animation/i);
+    assert.match(richHint, /<tg-collage>/i);
+    assert.match(richHint, /<tg-slideshow>/i);
+    assert.match(richHint, /at least a sentence/i);
+  });
+
+  test('plain mode remains media-free and equals the legacy default export', () => {
+    const plainHint = buildPolygramDisplayHint(false);
+    assert.equal(plainHint, POLYGRAM_DISPLAY_HINT);
+    assert.doesNotMatch(plainHint, /!\[caption\]\(/i);
+    assert.doesNotMatch(plainHint, /\.mp4|\.gif/i);
+    assert.doesNotMatch(plainHint, /<tg-collage>|<tg-slideshow>/i);
   });
 });
 
