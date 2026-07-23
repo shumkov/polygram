@@ -504,3 +504,28 @@ describe('rich-edit media handling', () => {
     assert.equal(calls[0].text, 'see cap');
   });
 });
+
+// The G6 live spike against the VPS's Bot API 10.1 server surfaced an
+// unclassified error shape: a blocks-unaware server (blocks arrived in
+// 10.2) ignores the blocks field entirely and rejects with
+// "rich message must be non-empty". api.js refuses empty blocks before
+// any call, so this response to a non-empty payload can only mean the
+// server cannot see typed blocks — a capability condition that must
+// latch, not a transient to retry forever.
+describe('capability classification — blocks-unaware server (Bot API 10.1)', () => {
+  const { isRichCapabilityError, isRichContentError } = require('../lib/telegram/rich');
+
+  test('the real 10.1-server rejection latches as a capability error', () => {
+    const err = new Error("Call to 'sendRichMessage' failed! (400: Bad Request: rich message must be non-empty)");
+    err.error_code = 400;
+    assert.equal(isRichCapabilityError(err), true);
+    assert.equal(isRichContentError(err), false);
+  });
+
+  test('the real pre-10.1-server 404 latches as a capability error (shumorobot spike shape)', () => {
+    const err = new Error("Call to 'sendRichMessage' failed! (404: Not Found: method not found)");
+    err.error_code = 404;
+    assert.equal(isRichCapabilityError(err), true);
+    assert.equal(isRichContentError(err), false);
+  });
+});
