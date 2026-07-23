@@ -213,3 +213,22 @@ describe('Bug 2 — every streamed-reply success exit clears the reactor', () =>
     }
   });
 });
+
+describe('non-streamed completion drains media and bubble cleanup', () => {
+  const src = readHandleMessageSection();
+  const start = src.indexOf('// Not streamed (response too short');
+  const end = src.indexOf('  } catch (err) {', start);
+  const tail = src.slice(start, end);
+
+  test('a short final segment flushes failures recorded by intermediate seals', () => {
+    assert.match(tail, /await mediaContext\.flushPartialDeliveryWarning\(outMetaBase\)/,
+      'the common completion tail must surface seal failures even when the final bubble never streamed');
+    assert.match(tail, /if \(!mediaContext\.deliveryIncomplete\)\s*\{\s*reactor\.clear\(\)/,
+      'the common tail must preserve the error reaction after an incomplete seal delivery');
+  });
+
+  test('a short final segment still deletes terse-mode archived bubbles', () => {
+    assert.match(tail, /await cleanupArchivedBubbles\(\)/,
+      'late archived IDs are drained before finalize returns streamed:false and must be cleaned up');
+  });
+});

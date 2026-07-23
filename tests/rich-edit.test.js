@@ -193,6 +193,117 @@ describe('richEditMessageText — content error → plain fallback, NO latch', (
     assert.ok(m.events.find((e) => e.kind === 'rich-content-fallback'));
     assert.equal(m.events.some((e) => e.kind === 'rich-capability-latched'), false);
   });
+
+  test('terminal content fallback rescues accepted photos after the plain text edit', async () => {
+    const order = [];
+    const m = makeDeps({
+      tgError: new Error('RICH_MESSAGE_BLOCKS_TOO_MANY'),
+      isRichContentError: () => true,
+    });
+    const originalTg = m.deps.tg;
+    m.deps.tg = async (...args) => {
+      const result = await originalTg(...args);
+      order.push(args[1] === 'editMessageText' && args[2].rich_message ? 'rich' : 'plain');
+      return result;
+    };
+    const mediaContext = {
+      rescueBlocks: async () => { order.push('photo'); },
+    };
+    const editor = createRichEditor(m.deps);
+    await editor({
+      ...baseArgs,
+      phase: 'final',
+      mediaContext,
+      blocks: [
+        { type: 'paragraph', text: 'See the result.' },
+        {
+          type: 'photo',
+          photo: { type: 'photo', media: { source: '/validated/result.png', fingerprint: 'fp' } },
+          caption: { text: 'Result' },
+        },
+      ],
+      sourceText: 'See the result.\n\n![Result](/validated/result.png)',
+    });
+
+    assert.deepEqual(order, ['plain', 'photo'],
+      'the failed rich attempt is not recorded because it throws; plain text must land before rescue');
+  });
+
+  test('preview content fallback stays plain and does not start a rescue', async () => {
+    const m = makeDeps({
+      tgError: new Error('RICH_MESSAGE_BLOCKS_TOO_MANY'),
+      isRichContentError: () => true,
+    });
+    let rescues = 0;
+    const editor = createRichEditor(m.deps);
+    await editor({
+      ...baseArgs,
+      phase: 'preview',
+      mediaContext: { rescueBlocks: async () => { rescues += 1; } },
+    });
+
+    assert.equal(rescues, 0);
+    assert.equal(m.tgCalls.length, 2, 'preview uses only the existing rich-then-plain fallback');
+  });
+
+  test('media-only terminal fallback deletes the placeholder before anchored rescue', async () => {
+    const order = [];
+    const m = makeDeps({
+      tgError: new Error('RICH_MESSAGE_BLOCKS_TOO_MANY'),
+      isRichContentError: () => true,
+    });
+    m.deps.sanitizeFallbackText = () => '';
+    const mediaContext = {
+      deletePlaceholder: async (messageId) => {
+        order.push(`delete:${messageId}`);
+        return true;
+      },
+      rescueBlocks: async (_blocks, opts) => {
+        order.push(`photo:${opts.anchorFirst}`);
+      },
+    };
+    const editor = createRichEditor(m.deps);
+    const result = await editor({
+      ...baseArgs,
+      phase: 'final',
+      hadReplyAnchor: true,
+      mediaContext,
+    });
+
+    assert.deepEqual(order, ['delete:99', 'photo:true']);
+    assert.equal(m.tgCalls.length, 1, 'an empty fallback never attempts editMessageText');
+    assert.equal(result.bubbleRemoved, true);
+  });
+
+  test('a changed local file never reaches the rich API and terminally falls back before rescue', async () => {
+    const m = makeDeps();
+    let rescues = 0;
+    const editor = createRichEditor(m.deps);
+    const result = await editor({
+      ...baseArgs,
+      phase: 'final',
+      mediaContext: {
+        preflightMedia: () => ({ ok: false }),
+        rescueBlocks: async () => { rescues += 1; },
+      },
+      blocks: [{
+        type: 'photo',
+        photo: {
+          type: 'photo',
+          media: { source: '/validated/result.png', fingerprint: 'old-fingerprint' },
+        },
+        caption: { text: 'Result' },
+      }],
+      sourceText: 'See the result.\n\n![Result](/validated/result.png)',
+    });
+
+    assert.equal(result.wentRich, false);
+    assert.equal(m.tgCalls.length, 1, 'preflight rejection must skip the rich Telegram request');
+    assert.equal(m.tgCalls[0].params.rich_message, undefined);
+    assert.equal(m.tgCalls[0].params.text, 'See the result.\n\n![Result](/validated/result.png)');
+    assert.equal(rescues, 1, 'terminal recovery still owns the one best-effort rescue pass');
+    assert.ok(m.events.some((event) => event.kind === 'rich-content-fallback'));
+  });
 });
 
 describe('richEditMessageText — transient error → rethrows, no fallback, no latch', () => {

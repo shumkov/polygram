@@ -13,7 +13,16 @@ const assert = require('node:assert/strict');
 const { createStreamer } = require('../lib/telegram/streamer');
 const { toTelegramRichBlocks } = require('../lib/telegram/rich');
 
-function makeHarness({ toRichPayload, richMaxLen, maxLen = 4096, onRichUpgrade, editReturns } = {}) {
+function makeHarness({
+  toRichPayload,
+  richMaxLen,
+  maxLen = 4096,
+  onRichUpgrade,
+  editReturns,
+  sendReturns,
+  preserveIntermediateBubbles,
+  logger,
+} = {}) {
   const sent = [];
   const edits = []; // each entry: string OR { rich:true, blocks }
   let nextId = 1000;
@@ -23,7 +32,9 @@ function makeHarness({ toRichPayload, richMaxLen, maxLen = 4096, onRichUpgrade, 
   const send = async (text) => {
     const id = nextId++;
     sent.push({ id, text });
-    return { message_id: id };
+    return sendReturns
+      ? sendReturns(id, text, sent.length - 1)
+      : { message_id: id };
   };
   // editReturns: optional (msgId, payload) => value|undefined — lets a
   // test simulate lib/telegram/rich-edit.js's {result, wentRich} contract
@@ -48,10 +59,11 @@ function makeHarness({ toRichPayload, richMaxLen, maxLen = 4096, onRichUpgrade, 
       const i = timers.indexOf(t);
       if (i !== -1) timers.splice(i, 1);
     },
-    logger: { log: () => {}, error: () => {}, warn: () => {} },
+    logger: logger || { log: () => {}, error: () => {}, warn: () => {} },
     toRichPayload,
     ...(richMaxLen != null && { richMaxLen }),
     ...(onRichUpgrade && { onRichUpgrade }),
+    ...(preserveIntermediateBubbles != null && { preserveIntermediateBubbles }),
   });
 
   async function advance(ms) {
@@ -461,6 +473,35 @@ describe('streamer — rich finalization limits', () => {
     assert.equal(result.finalEditOk, false);
   });
 
+  test('rich overflow still resolves accepted photos for discard-redelivery rescue', async () => {
+    const rescueEntry = {
+      kind: 'photo',
+      media: { source: '/validated/overflow.png', fingerprint: 'fp' },
+      caption: 'Overflow result',
+    };
+    let finalResolutionCalls = 0;
+    const toRichPayload = (text, opts) => {
+      const payload = toTelegramRichBlocks(text, opts);
+      if (!opts.partial) {
+        finalResolutionCalls += 1;
+        payload.rescueEntries = [rescueEntry];
+      }
+      return payload;
+    };
+    const body = `# Report\n\n${'x'.repeat(5000)}\n\n![Overflow result](/validated/overflow.png)`;
+    const h = makeHarness({ toRichPayload, richMaxLen: 1000 });
+    await h.streamer.onChunk('# Report');
+    await h.advance(500);
+
+    const result = await h.streamer.finalize(body);
+
+    assert.equal(result.overflow, true);
+    assert.equal(finalResolutionCalls, 1, 'final overflow must run one partial:false resolution pass');
+    assert.deepEqual(result.rescueEntries, [rescueEntry]);
+    assert.equal(h.edits.some((call) => call.payload?.rich), false,
+      'overflow resolution collects accepted media but must not attempt a rich edit');
+  });
+
   test('plain content overflows against the plain 4096 cap', async () => {
     const longPlain = 'plain prose, no structure. '.repeat(200); // no rich trigger
     const h = makeHarness({ toRichPayload: toTelegramRichBlocks, maxLen: 4096 });
@@ -621,7 +662,7 @@ describe('streamer — media resolution across the streaming→finalize boundary
     assert.equal(typeof mid.payload, 'object');
     const midJson = JSON.stringify(mid.payload.blocks);
     assert.ok(!midJson.includes('"source"'), 'the resolver must not run during streaming (no envelope leak)');
-    assert.ok(midJson.includes('🖼'), 'the streamed tick shows a placeholder, not a photo');
+    assert.ok(midJson.includes('📎'), 'the streamed tick shows a media placeholder, not an upload');
 
     const result = await h.streamer.finalize(body);
     assert.equal(result.finalEditOk, true);
@@ -631,5 +672,246 @@ describe('streamer — media resolution across the streaming→finalize boundary
     assert.equal(photo.photo.media.source, fs.realpathSync(okPng));
     assert.notEqual(JSON.stringify(final.payload.blocks), midJson,
       'finalize dedup key must differ from the placeholder tick, or the edit is suppressed as a no-op');
+  });
+});
+
+describe('streamer — steered intermediate-bubble media seals', () => {
+  function deferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function sealPayload(text, { partial }) {
+    if (partial) {
+      return {
+        usedRich: true,
+        blocks: [{ type: 'paragraph', text: `🖼 ${text}` }],
+      };
+    }
+    const media = { source: `/validated/${text}.png`, fingerprint: `fp:${text}` };
+    return {
+      usedRich: true,
+      blocks: [{ type: 'photo', photo: { type: 'photo', media } }],
+      rescueEntries: [{ kind: 'photo', media, caption: text }],
+    };
+  }
+
+  test('force boundary seals the old media placeholder without mutating the new bubble', async () => {
+    const renderCalls = [];
+    const h = makeHarness({
+      toRichPayload: (text, opts) => {
+        renderCalls.push({ text, ...opts });
+        return sealPayload(text, opts);
+      },
+      sendReturns: (id, _text, index) => ({
+        message_id: id,
+        _hadReplyAnchor: index === 0,
+      }),
+    });
+
+    await h.streamer.onChunk('bubble-a');
+    await h.streamer.onChunk('bubble-a-media');
+    await h.advance(500);
+    const oldId = h.sent[0].id;
+    h.streamer.forceNewMessage();
+    await h.streamer.onChunk('bubble-b');
+
+    assert.equal(h.streamer.msgId, h.sent[1].id, 'the next bubble detaches synchronously');
+    await h.streamer.drainSeals();
+
+    const seal = h.edits.find((call) => call.payload?.phase === 'seal');
+    assert.ok(seal, 'the force boundary must produce one seal edit');
+    assert.equal(seal.msgId, oldId);
+    assert.equal(seal.payload.sourceText, 'bubble-a-media');
+    assert.equal(seal.payload.hadReplyAnchor, true);
+    assert.ok(seal.payload.blocks.some((block) => block.type === 'photo'));
+    assert.ok(renderCalls.some((call) => call.text === 'bubble-a-media' && call.partial === false));
+    assert.equal(h.streamer.msgId, h.sent[1].id);
+    assert.equal(h.streamer.currentText, 'bubble-b');
+  });
+
+  test('force boundary skips a final tree with no accepted media', async () => {
+    const h = makeHarness({
+      toRichPayload: (text, { partial }) => ({
+        usedRich: true,
+        blocks: [{ type: 'paragraph', text: partial ? `🖼 ${text}` : text }],
+        ...(!partial && { rescueEntries: [] }),
+      }),
+    });
+
+    await h.streamer.onChunk('bubble-a');
+    h.streamer.forceNewMessage();
+    await h.streamer.onChunk('bubble-b');
+    await h.streamer.drainSeals();
+
+    assert.equal(h.edits.some((call) => call.payload?.phase === 'seal'), false);
+    assert.equal(h.streamer.currentText, 'bubble-b');
+  });
+
+  test('seal waits for an old placeholder edit so it cannot overwrite materialized media', async () => {
+    const oldEdit = deferred();
+    let editCount = 0;
+    const h = makeHarness({
+      toRichPayload: sealPayload,
+      editReturns: (_msgId, payload) => {
+        editCount += 1;
+        if (editCount === 1) return oldEdit.promise;
+        return { result: { message_id: 1 }, wentRich: payload?.rich === true };
+      },
+    });
+
+    await h.streamer.onChunk('bubble-a');
+    await h.streamer.onChunk('bubble-a-media');
+    const oldFlush = h.advance(500);
+    await Promise.resolve();
+    h.streamer.forceNewMessage();
+    await h.streamer.onChunk('bubble-b');
+    await Promise.resolve();
+
+    assert.equal(h.edits.length, 1, 'seal must remain behind the in-flight placeholder edit');
+    oldEdit.resolve({ result: { message_id: 1 }, wentRich: true });
+    await oldFlush;
+    await h.streamer.drainSeals();
+
+    assert.equal(h.edits.length, 2);
+    assert.equal(h.edits[1].payload.phase, 'seal');
+    assert.equal(h.edits[1].msgId, h.sent[0].id);
+    assert.equal(h.streamer.msgId, h.sent[1].id);
+    assert.equal(h.streamer.currentText, 'bubble-b');
+  });
+
+  test('a pending initial send is sealed after its late message id arrives', async () => {
+    const firstSend = deferred();
+    const h = makeHarness({
+      toRichPayload: sealPayload,
+      sendReturns: (id, _text, index) => index === 0
+        ? firstSend.promise
+        : { message_id: id, _hadReplyAnchor: false },
+    });
+
+    const oldChunk = h.streamer.onChunk('bubble-a-media');
+    h.streamer.forceNewMessage();
+    await h.streamer.onChunk('bubble-b');
+    const activeId = h.streamer.msgId;
+
+    firstSend.resolve({ message_id: h.sent[0].id, _hadReplyAnchor: true });
+    await oldChunk;
+    await h.streamer.drainSeals();
+
+    const seal = h.edits.find((call) => call.payload?.phase === 'seal');
+    assert.equal(seal.msgId, h.sent[0].id);
+    assert.equal(seal.payload.hadReplyAnchor, true);
+    assert.equal(h.streamer.msgId, activeId, 'late old send completion must not replace the active id');
+    assert.equal(h.streamer.currentText, 'bubble-b');
+  });
+
+  test('seal jobs drain in force-boundary order when the first seal is slow', async () => {
+    const firstSeal = deferred();
+    const sealSources = [];
+    const h = makeHarness({
+      toRichPayload: sealPayload,
+      editReturns: (_msgId, payload) => {
+        if (payload?.phase !== 'seal') return undefined;
+        sealSources.push(payload.sourceText);
+        return payload.sourceText === 'bubble-a' ? firstSeal.promise : undefined;
+      },
+    });
+
+    await h.streamer.onChunk('bubble-a');
+    h.streamer.forceNewMessage();
+    await h.streamer.onChunk('bubble-b');
+    await Promise.resolve();
+    h.streamer.forceNewMessage();
+    await h.streamer.onChunk('bubble-c');
+    await Promise.resolve();
+
+    assert.deepEqual(sealSources, ['bubble-a'], 'seal B must wait behind slow seal A');
+    firstSeal.resolve({ result: { message_id: 1 }, wentRich: true });
+    await h.streamer.drainSeals();
+    assert.deepEqual(sealSources, ['bubble-a', 'bubble-b']);
+    assert.equal(h.streamer.currentText, 'bubble-c');
+  });
+
+  test('terse mode archives a late initial send and never seals it', async () => {
+    const firstSend = deferred();
+    const h = makeHarness({
+      preserveIntermediateBubbles: false,
+      toRichPayload: sealPayload,
+      sendReturns: (id, _text, index) => index === 0
+        ? firstSend.promise
+        : { message_id: id },
+    });
+
+    const oldChunk = h.streamer.onChunk('bubble-a-media');
+    h.streamer.forceNewMessage();
+    await h.streamer.onChunk('bubble-b');
+    firstSend.resolve({ message_id: h.sent[0].id, _hadReplyAnchor: true });
+    await oldChunk;
+    await h.streamer.drainSeals();
+
+    assert.deepEqual(h.streamer.getArchived(), [h.sent[0].id]);
+    assert.equal(h.edits.some((call) => call.payload?.phase === 'seal'), false);
+    assert.equal(h.streamer.msgId, h.sent[1].id);
+  });
+
+  test('seal failures are source-free, non-fatal, and drained by flushDraft', async () => {
+    const errors = [];
+    const h = makeHarness({
+      toRichPayload: sealPayload,
+      editReturns: (_msgId, payload) => {
+        if (payload?.phase === 'seal') {
+          throw new Error('failed for /validated/private-shot.png');
+        }
+        return undefined;
+      },
+      logger: {
+        log: () => {},
+        warn: () => {},
+        error: (message) => errors.push(message),
+      },
+    });
+
+    await h.streamer.onChunk('private-shot');
+    h.streamer.forceNewMessage();
+    await h.streamer.onChunk('bubble-b');
+    await h.streamer.flushDraft();
+
+    assert.equal(h.streamer.currentText, 'bubble-b');
+    assert.equal(h.streamer.msgId, h.sent[1].id);
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].includes('/validated/private-shot.png'), false);
+  });
+
+  test('finalize and discard wait for outstanding seals', async () => {
+    for (const terminal of ['finalize', 'discard']) {
+      const slowSeal = deferred();
+      let terminalSettled = false;
+      const h = makeHarness({
+        toRichPayload: sealPayload,
+        editReturns: (_msgId, payload) => payload?.phase === 'seal'
+          ? slowSeal.promise
+          : undefined,
+      });
+      await h.streamer.onChunk(`bubble-a-${terminal}`);
+      h.streamer.forceNewMessage();
+      await h.streamer.onChunk(`bubble-b-${terminal}`);
+      await Promise.resolve();
+
+      const terminalPromise = terminal === 'finalize'
+        ? h.streamer.finalize(`bubble-b-${terminal}`)
+        : h.streamer.discard();
+      terminalPromise.then(() => { terminalSettled = true; });
+      await Promise.resolve();
+      assert.equal(terminalSettled, false, `${terminal} must wait for the seal chain`);
+
+      slowSeal.resolve({ result: { message_id: 1 }, wentRich: true });
+      await terminalPromise;
+      assert.equal(terminalSettled, true);
+    }
   });
 });

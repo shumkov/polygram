@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * Rich Message MEDIA blocks against a real Telegram Bot API — the G6
- * live checks for photo/collage/slideshow blocks (docs/0.18.0-rich-
- * messages-plan.md §16.7):
+ * live checks for typed media blocks (docs/0.18.0-rich-messages-plan.md
+ * §§16.7 and 17.11):
  *
  *   (a) editMessageText{rich_message} on an existing PLAIN message with
  *       a photo block whose media is a grammy InputFile — verifies the
@@ -23,6 +23,11 @@
  *       (manually) to learn whether IT fetched the URL (SSRF surface →
  *       keep the cloud-only rule in rich-media.js) or Telegram's DCs
  *       did (rule can be lifted).
+ *   (g-h) standalone local video and animation blocks, including the
+ *       returned response shapes used for file_id learning.
+ *   (i) mixed photo/video/animation collage and slideshow blocks.
+ *   (j) second rich edits that reuse learned video/animation file_ids.
+ *   (k) direct sendPhoto/sendVideo/sendAnimation sidecars.
  *
  * SAFETY: this sends REAL messages using a REAL bot token to a REAL
  * Telegram chat. Dry-run by default — prints what it would do without
@@ -31,11 +36,12 @@
  * own bot) unless --chat explicitly overrides it.
  *
  * Usage:
- *   node scripts/spikes/rich-media-blocks.mjs [--config PATH] [--bot NAME] [--confirm] [--chat ID]
+ *   node scripts/spikes/rich-media-blocks.mjs [--config PATH] [--bot NAME] [--confirm] [--chat ID] \
+ *     [--video /absolute/fixture.mp4] [--animation /absolute/fixture.gif]
  *
  * Defaults: --config ~/.polygram/config.json, --bot <first bot in config>.
- * Test photos are generated locally (tiny PNGs) in a temp dir — nothing
- * from the operator's disk is uploaded.
+ * Test photos are generated locally. The video and animation gates
+ * require operator-selected absolute fixture paths.
  */
 
 import fs from 'node:fs';
@@ -46,14 +52,24 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { Bot, InputFile } = require('grammy');
 const { isRichContentError, isRichCapabilityError } = require('../../lib/telegram/rich.js');
+const { largestPhotoFileId } = require('../../lib/telegram/rich-media.js');
 
 function parseArgs(argv) {
-  const out = { config: path.join(os.homedir(), '.polygram', 'config.json'), bot: null, confirm: false, chat: null };
+  const out = {
+    config: path.join(os.homedir(), '.polygram', 'config.json'),
+    bot: null,
+    confirm: false,
+    chat: null,
+    video: null,
+    animation: null,
+  };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--config') out.config = argv[++i];
     else if (argv[i] === '--bot') out.bot = argv[++i];
     else if (argv[i] === '--confirm') out.confirm = true;
     else if (argv[i] === '--chat') out.chat = argv[++i];
+    else if (argv[i] === '--video') out.video = argv[++i];
+    else if (argv[i] === '--animation') out.animation = argv[++i];
   }
   return out;
 }
@@ -92,6 +108,15 @@ function makeTestPng(dir, name) {
 
 const REMOTE_PHOTO_URL = 'https://telegram.org/img/t_logo.png';
 
+function requireFixture(source, extension, label) {
+  if (!source || !path.isAbsolute(source) || path.extname(source).toLowerCase() !== extension) {
+    throw new Error(`--${label} must be an absolute ${extension} fixture path`);
+  }
+  const resolved = fs.realpathSync(source);
+  if (!fs.statSync(resolved).isFile()) throw new Error(`--${label} must point to a file`);
+  return resolved;
+}
+
 async function main() {
   const cfg = loadBotConfig();
   const chatId = args.chat || cfg.adminChatId;
@@ -99,24 +124,39 @@ async function main() {
 
   console.log(`bot=${cfg.botName} chat=${chatId} confirm=${args.confirm}`);
   if (!args.confirm) {
-    console.log('DRY RUN — would run checks (a) photo-via-edit, (b) collage/slideshow, (c) bad-media error shape, (d) >10-photo collage. Pass --confirm to send.');
+    console.log('DRY RUN — would run photo, standalone video/animation, mixed-wrapper, response-shape, learned-ID edit, and typed-sidecar checks. Pass --confirm with --video and --animation fixtures to send.');
     return;
   }
 
+  const videoFixture = requireFixture(args.video, '.mp4', 'video');
+  const animationFixture = requireFixture(args.animation, '.gif', 'animation');
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rich-media-spike-'));
   const bot = new Bot(cfg.token, cfg.apiRoot ? { client: { apiRoot: cfg.apiRoot } } : undefined);
 
-  const photoBlock = (media, captionText = null) => ({
-    type: 'photo',
-    photo: { type: 'photo', media },
+  const mediaBlock = (kind, media, captionText = null) => ({
+    type: kind,
+    [kind]: { type: kind, media },
     ...(captionText ? { caption: { text: captionText } } : {}),
   });
+  const photoBlock = (media, captionText = null) => mediaBlock('photo', media, captionText);
+  const returnedBlock = (result, kind) => (
+    result?.rich_message?.blocks?.find((block) => block?.type === kind) || null
+  );
+  const returnedFileId = (result, kind) => {
+    const block = returnedBlock(result, kind);
+    if (kind === 'photo') {
+      return largestPhotoFileId(block?.photo);
+    }
+    return block?.[kind]?.file_id || null;
+  };
+  let videoResult = null;
+  let animationResult = null;
 
   // (a) plain send → rich edit introducing a photo upload
   try {
     const sent = await bot.api.raw.sendMessage({ chat_id: chatId, text: `${prefix} (a) plain message, about to become rich with a photo` });
     const local = makeTestPng(tmp, 'edit-upload.png');
-    await bot.api.raw.editMessageText({
+    const edited = await bot.api.raw.editMessageText({
       chat_id: chatId,
       message_id: sent.message_id,
       rich_message: {
@@ -126,7 +166,11 @@ async function main() {
         ],
       },
     });
-    record('a-photo-via-edit', true, 'plain→rich edit with InputFile upload accepted');
+    const fileId = returnedFileId(edited, 'photo');
+    record('a-photo-via-edit', Boolean(fileId),
+      fileId
+        ? 'plain→rich edit accepted and returned PhotoSize[] with a reusable file_id'
+        : 'edit succeeded but the returned rich photo shape had no reusable file_id');
   } catch (err) {
     record('a-photo-via-edit', false, `${err.message} (capability=${isRichCapabilityError(err)}, content=${isRichContentError(err)})`);
   }
@@ -221,6 +265,138 @@ async function main() {
     }
   } else {
     console.log('[SKIP] f-url-via-local-api — no apiRoot configured');
+  }
+
+  // (g) standalone video upload and returned Video shape
+  try {
+    videoResult = await bot.api.raw.sendRichMessage({
+      chat_id: chatId,
+      rich_message: {
+        blocks: [
+          { type: 'paragraph', text: `${prefix} (g) standalone video` },
+          mediaBlock('video', new InputFile(videoFixture), 'video fixture'),
+        ],
+      },
+    });
+    const fileId = returnedFileId(videoResult, 'video');
+    record('g-standalone-video', Boolean(fileId),
+      fileId
+        ? 'video accepted and returned Video.file_id'
+        : 'video accepted but returned shape had no Video.file_id');
+  } catch (err) {
+    record('g-standalone-video', false, `${err.message}`);
+  }
+
+  // (h) standalone animation upload and returned Animation shape
+  try {
+    animationResult = await bot.api.raw.sendRichMessage({
+      chat_id: chatId,
+      rich_message: {
+        blocks: [
+          { type: 'paragraph', text: `${prefix} (h) standalone animation` },
+          mediaBlock('animation', new InputFile(animationFixture), 'animation fixture'),
+        ],
+      },
+    });
+    const fileId = returnedFileId(animationResult, 'animation');
+    record('h-standalone-animation', Boolean(fileId),
+      fileId
+        ? 'animation accepted and returned Animation.file_id'
+        : 'animation accepted but returned shape had no Animation.file_id');
+  } catch (err) {
+    record('h-standalone-animation', false, `${err.message}`);
+  }
+
+  // (i) mixed wrapper children preserve the request order
+  try {
+    const mixedPhoto = makeTestPng(tmp, 'mixed.png');
+    await bot.api.raw.sendRichMessage({
+      chat_id: chatId,
+      rich_message: {
+        blocks: [
+          { type: 'paragraph', text: `${prefix} (i) mixed wrappers` },
+          {
+            type: 'collage',
+            blocks: [
+              photoBlock(new InputFile(mixedPhoto), 'photo'),
+              mediaBlock('video', new InputFile(videoFixture), 'video'),
+              mediaBlock('animation', new InputFile(animationFixture), 'animation'),
+            ],
+          },
+          {
+            type: 'slideshow',
+            blocks: [
+              mediaBlock('animation', new InputFile(animationFixture), 'animation first'),
+              photoBlock(REMOTE_PHOTO_URL, 'photo second'),
+              mediaBlock('video', new InputFile(videoFixture), 'video third'),
+            ],
+          },
+        ],
+      },
+    });
+    record('i-mixed-wrappers', true, 'mixed collage and slideshow accepted in authored order');
+  } catch (err) {
+    record('i-mixed-wrappers', false, `${err.message}`);
+  }
+
+  // (j) edit twice using the reusable IDs learned from standalone results
+  try {
+    const videoId = returnedFileId(videoResult, 'video');
+    const animationId = returnedFileId(animationResult, 'animation');
+    if (!videoResult?.message_id || !animationResult?.message_id || !videoId || !animationId) {
+      throw new Error('standalone response did not provide message IDs and reusable media IDs');
+    }
+    for (const [kind, result, fileId] of [
+      ['video', videoResult, videoId],
+      ['animation', animationResult, animationId],
+    ]) {
+      await bot.api.raw.editMessageText({
+        chat_id: chatId,
+        message_id: result.message_id,
+        rich_message: {
+          blocks: [
+            { type: 'paragraph', text: `${prefix} (j) ${kind} learned-ID edit 1` },
+            mediaBlock(kind, fileId, `${kind} ID reuse`),
+          ],
+        },
+      });
+      await bot.api.raw.editMessageText({
+        chat_id: chatId,
+        message_id: result.message_id,
+        rich_message: {
+          blocks: [
+            { type: 'paragraph', text: `${prefix} (j) ${kind} learned-ID edit 2` },
+            mediaBlock(kind, fileId, `${kind} ID reused again`),
+          ],
+        },
+      });
+    }
+    record('j-learned-id-edits', true, 'second video and animation edits accepted reusable file_ids');
+  } catch (err) {
+    record('j-learned-id-edits', false, `${err.message}`);
+  }
+
+  // (k) the direct methods used by typed fallback rescue accept source uploads
+  try {
+    const sidecarPhoto = makeTestPng(tmp, 'sidecar.png');
+    await bot.api.raw.sendPhoto({
+      chat_id: chatId,
+      photo: new InputFile(sidecarPhoto),
+      caption: `${prefix} (k) photo sidecar`,
+    });
+    await bot.api.raw.sendVideo({
+      chat_id: chatId,
+      video: new InputFile(videoFixture),
+      caption: `${prefix} (k) video sidecar`,
+    });
+    await bot.api.raw.sendAnimation({
+      chat_id: chatId,
+      animation: new InputFile(animationFixture),
+      caption: `${prefix} (k) animation sidecar`,
+    });
+    record('k-typed-sidecars', true, 'sendPhoto/sendVideo/sendAnimation source uploads accepted');
+  } catch (err) {
+    record('k-typed-sidecars', false, `${err.message}`);
   }
 
   fs.rmSync(tmp, { recursive: true, force: true });
