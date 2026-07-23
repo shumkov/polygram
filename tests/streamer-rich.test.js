@@ -126,6 +126,31 @@ describe('streamer — progressive rich streaming (integration with real toTeleg
     assert.equal(finalList.items[0].has_checkbox, true);
   });
 
+  test('a blockquote mid-stream upgrades the live edit to rich blocks', async () => {
+    const h = makeHarness({ toRichPayload: toTelegramRichBlocks });
+    await h.streamer.onChunk('Heads up.');
+    await h.advance(500);
+    // Trailing paragraph keeps the blockquote out of the held-back tail.
+    await h.streamer.onChunk('Heads up.\n\n> this caveat matters\n\nMore prose after.');
+    await h.advance(500);
+    const last = h.edits[h.edits.length - 1];
+    assert.equal(typeof last.payload, 'object', 'blockquote content must trigger a rich edit');
+    assert.ok(last.payload.blocks.some((b) => b.type === 'blockquote'));
+    assert.ok(h.streamer.isRichMode);
+  });
+
+  test('a divider mid-stream upgrades the live edit to rich blocks', async () => {
+    const h = makeHarness({ toRichPayload: toTelegramRichBlocks });
+    await h.streamer.onChunk('Section one.');
+    await h.advance(500);
+    await h.streamer.onChunk('Section one.\n\n---\n\nSection two starts here.');
+    await h.advance(500);
+    const last = h.edits[h.edits.length - 1];
+    assert.equal(typeof last.payload, 'object', 'a divider must trigger a rich edit');
+    assert.ok(last.payload.blocks.some((b) => b.type === 'divider'));
+    assert.ok(h.streamer.isRichMode);
+  });
+
   test('onRichUpgrade fires exactly once on the plain→rich transition', async () => {
     let upgrades = 0;
     const h = makeHarness({ toRichPayload: toTelegramRichBlocks, onRichUpgrade: () => { upgrades++; } });
