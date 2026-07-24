@@ -1346,3 +1346,14 @@ describe('capability classification — blocks-unaware server (Bot API 10.1)', (
     assert.equal(isRichContentError(err), false);
   });
 });
+
+describe('content classification — invalid media (Bot API 10.2)', () => {
+  const { isRichCapabilityError, isRichContentError } = require('../lib/telegram/rich');
+
+  test("UMI production: wrong remote file identifier specified: can't unserialize it. Wrong last symbol", () => {
+    const err = new Error("Call to 'sendRichMessage' failed! (400: Bad Request: wrong remote file identifier specified: can't unserialize it. Wrong last symbol)");
+    err.error_code = 400;
+    assert.equal(isRichCapabilityError(err), false);
+    assert.equal(isRichContentError(err), true);
+  });
+});
