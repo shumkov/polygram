@@ -94,6 +94,10 @@ function fixture(overrides = {}) {
     chunkBudget: 4096,
     startupRetryDelayMs: overrides.startupRetryDelayMs,
     getIsShuttingDown: () => overrides.shuttingDown === true,
+    getOomObservation: overrides.getOomObservation
+      || (() => (overrides.oomDetected
+        ? { status: 'detected', detected: true, delta: 1n }
+        : { status: 'unchanged', detected: false, delta: 0n })),
     ...(overrides.authDisabledGate !== undefined ? { authDisabledGate: overrides.authDisabledGate } : {}),
     logger: { log: () => {}, error: (m) => calls.loggerErrors.push(m) },
   });
@@ -180,9 +184,13 @@ describe('createDispatcher — error → terminal status mapping', () => {
   });
 
   test('shutting down + new: status=replay-pending, no error reply', async () => {
-    const { calls } = await runAndFail(new Error('killed'), { shuttingDown: true });
+    const { calls } = await runAndFail(new Error('bridge disconnected'), {
+      shuttingDown: true,
+      isAutoResumable: true,
+    });
     assert.equal(calls.setInboundStatus[0]?.status, 'replay-pending');
     assert.equal(calls.tg.length, 0);
+    assert.equal(calls.autoResumeAttempts.length, 0);
   });
 
   test('shutting down + replay: status=replay-attempted', async () => {
@@ -193,6 +201,38 @@ describe('createDispatcher — error → terminal status mapping', () => {
     fx.getResolver().reject(new Error('killed'));
     await nextTick(); await nextTick();
     assert.equal(fx.calls.setInboundStatus[0]?.status, 'replay-attempted');
+  });
+
+  test('OOM visible before shutdown signal: status=replay-pending, no error reply or auto-resume', async () => {
+    const { calls } = await runAndFail(new Error('bridge disconnected'), {
+      oomDetected: true,
+      isAutoResumable: true,
+    });
+    assert.equal(calls.setInboundStatus[0]?.status, 'replay-pending');
+    assert.equal(calls.tg.length, 0);
+    assert.equal(calls.autoResumeAttempts.length, 0);
+    assert.ok(calls.events.some((event) => (
+      event.kind === 'handler-error' && event.detail.oom_shutdown === true
+    )));
+  });
+
+  test('OOM visible before shutdown signal preserves the replay one-shot guard', async () => {
+    const replayMsg = { ...baseMsg, _isReplay: true };
+    const fx = fixture({ oomDetected: true });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, replayMsg, {});
+    await nextTick();
+    fx.getResolver().reject(new Error('bridge disconnected'));
+    await nextTick(); await nextTick();
+    assert.equal(fx.calls.setInboundStatus[0]?.status, 'replay-attempted');
+    assert.equal(fx.calls.tg.length, 0);
+  });
+
+  test('OOM observer failure preserves ordinary error handling', async () => {
+    const { calls } = await runAndFail(new Error('boom'), {
+      getOomObservation: () => { throw new Error('observer failed'); },
+    });
+    assert.equal(calls.setInboundStatus[0]?.status, 'failed');
+    assert.equal(calls.tg.length, 1);
   });
 
   test('genuine error: status=failed + user error reply sent', async () => {

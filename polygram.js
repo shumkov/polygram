@@ -129,6 +129,8 @@ const { classify: classifyError, classifyTurnEndError, detectWedgedSessionError,
 const { createAutoResumeTracker, isAutoResumable } = require('./lib/db/auto-resume');
 const { createAuthDisabledGate } = require('./lib/ops/auth-disabled-gate');
 const { createHeartbeat } = require('./lib/ops/heartbeat');
+const { createCgroupOomObserver } = require('./lib/ops/cgroup-oom-observer');
+const { persistShutdownDisposition } = require('./lib/ops/shutdown-disposition');
 const { resolveReplayWindowMs } = require('./lib/db/replay-window');
 const { pruneEvents, resolveRetentionPolicy, validatePolicy } = require('./lib/db/events-retention');
 const { sweepSecrets, resolveSecretSweepConfig } = require('./lib/db/secret-sweep');
@@ -2372,6 +2374,7 @@ let startPollWatchdog = null;
 // ─── Main ───────────────────────────────────────────────────────────
 
 async function main() {
+  const cgroupOomObserver = createCgroupOomObserver();
   loadConfig();
 
   let dbOverride;
@@ -2468,6 +2471,10 @@ async function main() {
       db.logEvent('inbox-swept', { files: swept.swept, bytes: swept.bytes, retention_days: inboxRetentionMs / 86_400_000 });
     }
     db.logEvent('polygram-start', { migration: migration.reason, imported: migration.imported });
+    if (cgroupOomObserver.startup.status === 'unavailable') {
+      console.warn(`[oom-observer] unavailable (${cgroupOomObserver.startup.reason}); handled shutdown signals will retain clean-restart behavior`);
+      db.logEvent('oom-observer-unavailable', { reason: cgroupOomObserver.startup.reason });
+    }
   } catch (err) {
     console.error(`[db] FATAL: ${err.message}`);
     console.error('Bridge cannot run without a DB (Phase 2: DB is source of truth).');
@@ -2907,6 +2914,7 @@ async function main() {
     chunkMarkdownText, deliverReplies,
     chunkBudget: TG_CHUNK_BUDGET,
     getIsShuttingDown: () => isShuttingDown,
+    getOomObservation: () => cgroupOomObserver.sample(),
     authDisabledGate,
     logger: console,
   }));
@@ -2985,6 +2993,7 @@ async function main() {
   const SHUTDOWN_DRAIN_MS = 30_000;
   const shutdown = async () => {
     if (isShuttingDown) return;
+    const shutdownObservation = cgroupOomObserver.sample();
     isShuttingDown = true;
     console.log('\nShutting down...');
     // 1. Stop accepting new inbound first so nothing new queues behind the drain.
@@ -3071,28 +3080,30 @@ async function main() {
     let remaining = 0;
     for (const n of inFlightHandlers.values()) remaining += n;
 
-    // 3. This handler only runs on a DELIBERATE shutdown (SIGINT/SIGTERM/SIGHUP);
-    //    a crash (SIGKILL/OOM/panic) never reaches here. Record a clean-shutdown
-    //    marker AND mark any still-in-flight rows replay-pending, atomically, on
-    //    EVERY clean shutdown (not just when in-flight>0) — boot uses the marker
-    //    to SKIP re-answering stale messages on a deliberate restart while still
-    //    recovering everything on a crash (0.14, §H1). markReplayPending alone
-    //    (the old behavior) couldn't distinguish the two, so every deploy
-    //    re-answered. A stale replay-pending row from a prior life would also be
-    //    crash-recovered on a deliberate restart without the unconditional marker.
+    // 3. A handled signal is normally deliberate, but a Linux supervisor can
+    //    also stop the service after an OOM-killed child. Persist crash-like
+    //    state when the process cgroup recorded an OOM kill; otherwise retain
+    //    the clean-restart marker. Both paths mark in-flight work replayable in
+    //    the same transaction as the marker update.
     if (db) {
       try {
-        const res = db.recordCleanShutdown({ botName: BOT_NAME });
+        const res = persistShutdownDisposition({
+          db,
+          botName: BOT_NAME,
+          observation: shutdownObservation,
+        });
         logEvent('shutdown-drain', {
           bot: BOT_NAME,
           in_flight: remaining,
-          replay_marked: res?.replayMarked ?? 0,
+          replay_marked: res.replayMarked,
           elapsed_ms: drainElapsed,
-          clean: true,
+          clean: res.clean,
+          shutdown_reason: res.shutdownReason,
+          ...(res.oomKillDelta != null ? { oom_kill_delta: res.oomKillDelta } : {}),
         });
-        console.log(`[shutdown] clean shutdown recorded; drained ${drainElapsed}ms, ${remaining} in-flight, ${res?.replayMarked ?? 0} marked replay-pending`);
+        console.log(`[shutdown] ${res.clean ? 'clean' : 'crash-like'} shutdown recorded (${res.shutdownReason}); drained ${drainElapsed}ms, ${remaining} in-flight, ${res.replayMarked} marked replay-pending`);
       } catch (err) {
-        console.error(`[shutdown] recordCleanShutdown failed: ${err.message}`);
+        console.error(`[shutdown] persistence failed: ${err.message}`);
       }
     }
 

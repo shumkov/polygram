@@ -82,4 +82,60 @@ describe('clean-shutdown marker', () => {
     assert.equal(db.consumeCleanShutdownMarker({ botName: 'umi-assistant', now: NOW + 1, maxAgeMs: MAX_AGE }).clean, false);
     assert.equal(db.consumeCleanShutdownMarker({ botName: 'shumabit', now: NOW + 1, maxAgeMs: MAX_AGE }).clean, true);
   });
+
+  test('recordCrashShutdown marks in-flight rows, clears the marker, and preserves the polling offset', () => {
+    db.savePollingOffset('shumabit', 424242);
+    db.recordCleanShutdown({ botName: 'shumabit', now: NOW - 2_000 });
+    insertInbound({ msg: 1, status: 'processing', ts: NOW - 1_000 });
+
+    const result = db.recordCrashShutdown({ botName: 'shumabit', now: NOW });
+
+    assert.equal(result.replayMarked, 1);
+    assert.equal(db.raw.prepare("SELECT handler_status h FROM messages WHERE msg_id=1").get().h, 'replay-pending');
+    assert.equal(db.getPollingOffset('shumabit'), 424242);
+    assert.equal(
+      db.consumeCleanShutdownMarker({ botName: 'shumabit', now: NOW + 1, maxAgeMs: MAX_AGE }).clean,
+      false,
+    );
+  });
+
+  test('recordCrashShutdown is isolated to its bot', () => {
+    db.recordCleanShutdown({ botName: 'shumabit', now: NOW - 2_000 });
+    db.recordCleanShutdown({ botName: 'umi-assistant', now: NOW - 2_000 });
+    insertInbound({ bot: 'shumabit', msg: 1, status: 'dispatched', ts: NOW - 1_000 });
+    insertInbound({ bot: 'umi-assistant', msg: 2, status: 'dispatched', ts: NOW - 1_000 });
+
+    db.recordCrashShutdown({ botName: 'shumabit', now: NOW });
+
+    const rows = db.raw.prepare('SELECT msg_id, handler_status FROM messages ORDER BY msg_id').all();
+    assert.deepEqual(rows, [
+      { msg_id: 1, handler_status: 'replay-pending' },
+      { msg_id: 2, handler_status: 'dispatched' },
+    ]);
+    assert.equal(db.consumeCleanShutdownMarker({ botName: 'shumabit', now: NOW + 1, maxAgeMs: MAX_AGE }).clean, false);
+    assert.equal(db.consumeCleanShutdownMarker({ botName: 'umi-assistant', now: NOW + 1, maxAgeMs: MAX_AGE }).clean, true);
+  });
+
+  test('recordCrashShutdown rolls replay marking back if marker clearing fails', () => {
+    db.recordCleanShutdown({ botName: 'shumabit', now: NOW - 2_000 });
+    insertInbound({ msg: 1, status: 'dispatched', ts: NOW - 1_000 });
+    db.raw.exec(`
+      CREATE TRIGGER fail_crash_marker_clear
+      BEFORE UPDATE OF clean_shutdown_at ON polling_state
+      WHEN OLD.bot_name = 'shumabit' AND NEW.clean_shutdown_at IS NULL
+      BEGIN
+        SELECT RAISE(ABORT, 'forced marker failure');
+      END
+    `);
+
+    assert.throws(
+      () => db.recordCrashShutdown({ botName: 'shumabit', now: NOW }),
+      /forced marker failure/,
+    );
+    assert.equal(db.raw.prepare("SELECT handler_status h FROM messages WHERE msg_id=1").get().h, 'dispatched');
+    assert.equal(
+      db.raw.prepare("SELECT clean_shutdown_at c FROM polling_state WHERE bot_name='shumabit'").get().c,
+      NOW - 2_000,
+    );
+  });
 });
