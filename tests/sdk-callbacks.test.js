@@ -561,6 +561,39 @@ describe('onAutonomousAssistantMessage — bot-initiated wakeup', () => {
     assert.equal(h.tgCalls[0].params.text, 'sdk wakeup');
   });
 
+  test('isolated-topic autonomous output is sent to its originating thread', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onAutonomousAssistantMessage('-1003369922517:37', {
+      text: 'completed report',
+      sessionId: 'sess-topic',
+      backend: 'cli',
+      alreadyDelivered: false,
+    });
+    assert.equal(h.tgCalls.length, 1);
+    assert.deepEqual(h.tgCalls[0].params, {
+      chat_id: '-1003369922517',
+      text: 'completed report',
+      message_thread_id: 37,
+    });
+  });
+
+  test('isolated-topic autonomous output is suppressed after confirmed delivery', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onAutonomousAssistantMessage('-1003369922517:37', {
+      text: 'completed report',
+      sessionId: 'sess-topic',
+      backend: 'cli',
+      alreadyDelivered: true,
+    });
+    assert.equal(h.tgCalls.length, 0);
+    assert.equal(h.events.length, 1);
+    assert.equal(h.events[0].detail.chat_id, '-1003369922517');
+    assert.equal(h.events[0].detail.thread_id, '37');
+    assert.equal(h.events[0].detail.already_delivered, true);
+  });
+
   // ─── F#23 — autonomous wakeup respects parseResponse + sanitizer ──────
   //
   // F#22 closed the channels double-send. But the handler's `tg(sendMessage)`

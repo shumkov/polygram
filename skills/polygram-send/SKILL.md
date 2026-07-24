@@ -1,25 +1,44 @@
 ---
 name: polygram-send
-description: Send messages, photos, documents, or stickers from a script (or from agent Bash) into the same Telegram chat the bot is in. Use when an agent or cron job needs to post a file, photo, or out-of-band text to a polygram chat — typically Xero invoices (PDF/.docx), generated reports, screenshots, or status pings tied to long-running work. Do NOT use for normal turn replies (those go through the agent's text reply, polygram delivers automatically). Do NOT use Telegram MCP — polygram-send is the supported path.
+description: Choose the correct polygram delivery path for SDK turns, CLI/channels turns, and detached scripts. Use IPC for cron jobs, files, or genuinely out-of-turn sends; use the reply MCP for interactive CLI text; return inline text for interactive SDK replies.
 ---
 
 # polygram-send
 
 Polygram exposes a per-bot Unix socket at `/tmp/polygram-<bot>.sock`. Authorized callers (same UID, with the per-bot secret) can send Telegram API methods through it. Polygram routes them to the live bot connection, logs them in the `messages` table, and applies markdown / chunking / dedup.
 
-This is the **supported path** for any agent or script that needs to deliver a file or out-of-band message into a polygram-managed chat. Telegram MCP is **not** wired up; agents that try to call Telegram directly will hit auth or routing issues.
+This is the **supported IPC path** for a script that needs to deliver a file or out-of-band message into a polygram-managed chat. Interactive turns have backend-specific delivery paths described below. Generic Telegram MCP is not wired up; CLI/channels turns use polygram's own reply MCP instead.
 
-## When to use
+## Choose exactly one delivery lane
+
+### SDK interactive turn
+
+Return the user-visible reply as inline assistant text. Polygram delivers it through the streamed SDK reply path. Do not also call the reply MCP or IPC, because that duplicates the message.
+
+Conversation transcript text does not prove an earlier reply reached Telegram. Do not claim a report was "already sent" or "posted above" based only on transcript history. If delivery is uncertain, include the content in the current inline reply.
+
+### CLI/channels interactive turn
+
+Inline final text is not delivered to Telegram. Send every user-visible text reply through `mcp__polygram-bridge__reply` within the turn. Do not use IPC for the normal interactive reply.
+
+Only a successful reply-tool receipt proves delivery. Transcript text and an attempted call without a successful receipt do not. If delivery is uncertain, call the reply tool now instead of claiming the message was sent earlier.
+
+### Cron or detached script
+
+Use the `polygram-send` IPC client described below. This lane is for code running outside an interactive turn, including cron jobs, detached background scripts, generated files, and genuinely out-of-turn status updates. Check the IPC response and treat only a successful response as proof of delivery.
+
+## When to use IPC
 
 - Agent generated a file (PDF, .docx, image, etc.) and the user asked for it in chat
 - Cron job needs to post a status update to the relevant chat
 - Long-running work needs an out-of-turn nudge (e.g. "build finished, here's the artifact")
 
-## When NOT to use
+## When NOT to use IPC
 
-- Your normal text reply to the user — return text from the turn, polygram delivers it through the streamed reply path. Don't double-send.
+- A normal SDK text reply — return inline text.
+- A normal CLI/channels text reply — use `mcp__polygram-bridge__reply`.
 - Anything that needs the message attributed to "user" — IPC always sends as the bot.
-- The Telegram MCP — explicitly NOT supported. Polygram blocks outbound message routing through anything other than its own bridge.
+- Generic Telegram MCP — it is not a polygram delivery path.
 
 ## Allowed methods
 
@@ -139,8 +158,9 @@ The IPC socket validates a per-bot secret (`/tmp/polygram-<bot>.secret`, mode 06
 
 ## Don't
 
-- Don't call this for normal text replies. Just emit text from the turn — polygram delivers it.
-- Don't use Telegram MCP.
+- Don't use IPC for a normal interactive text reply; follow the SDK or CLI lane above.
+- Don't use generic Telegram MCP.
+- Don't infer successful delivery from transcript text.
 - Don't pass localhost URLs to `document`/`photo`.
 - Don't hardcode `message_thread_id` from previous sessions.
 - Don't omit `source` from agent-triggered sends.

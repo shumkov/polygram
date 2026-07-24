@@ -27,7 +27,7 @@ const dbClient = require('./lib/db');
 const {
   migrateJsonToDb, getClaudeSessionId, resolveSessionForSpawn,
 } = require('./lib/db/sessions');
-const { buildPrompt } = require('./lib/prompt');
+const { buildPrompt, resolvePromptBackend } = require('./lib/prompt');
 const { filterAttachments, resolveFileCaps, resolveMaxFileOverride, MAX_TOTAL_BYTES } = require('./lib/attachments');
 // 0.9.0: SDK ProcessManager is the only pm. CLI pm
 // (lib/process-manager.js) deleted in commit 6.
@@ -430,6 +430,7 @@ function formatPrompt(msg, sessionCtx, attachments = [], { sessionKey = null } =
     attachments,
     replyTo: resolveReplyTo(msg),
     polygramHistory,
+    backend: resolvePromptBackend({ config, chatId, threadId }),
     // Only advertise stickers this bot actually has — empty for a bot with no
     // sticker set, so its prompt never mentions stickers.
     stickerEmojis: Object.keys(emojiToSticker),

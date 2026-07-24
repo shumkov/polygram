@@ -19,6 +19,8 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 // Per-component numeric comparison — deliberately NOT a string/lexicographic
 // compare, which would incorrectly rank e.g. "0.10.0" below "0.4.0" (the
@@ -49,6 +51,35 @@ test('checkClaudeAuthHealth is exported by the installed @shumkov/orchestra', ()
     'installed @shumkov/orchestra is missing claudeBin.checkClaudeAuthHealth — '
       + 'bump the @shumkov/orchestra dependency to a release that exports it '
       + 'before deploying (polygram.js calls it unconditionally on every message)',
+  );
+});
+
+test('@shumkov/orchestra is exact and matches the lockfile and installed package', () => {
+  const root = path.join(__dirname, '..');
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
+  const installed = require('@shumkov/orchestra/package.json');
+  const spec = manifest.dependencies['@shumkov/orchestra'];
+
+  assert.match(
+    spec,
+    /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/,
+    'package.json must use a bare exact orchestra semver; ranges, tags, and protocols are unvalidated',
+  );
+  assert.equal(
+    lock.packages[''].dependencies['@shumkov/orchestra'],
+    spec,
+    'the lockfile root dependency must preserve the exact orchestra pin',
+  );
+  assert.equal(
+    lock.packages['node_modules/@shumkov/orchestra'].version,
+    spec,
+    'the lockfile package entry must match the exact orchestra pin',
+  );
+  assert.equal(
+    installed.version,
+    spec,
+    'the installed orchestra package must match the validated exact version',
   );
 });
 
