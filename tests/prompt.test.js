@@ -5,8 +5,11 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const {
+  resolvePromptBackend,
   xmlEscape,
   truncateReplyText,
   buildReplyToBlock,
@@ -363,6 +366,56 @@ describe('buildPrompt — full integration', () => {
     assert.ok(p.includes('<polygram-info>'));
     assert.ok(p.includes('hello'));
     assert.ok(p.endsWith('</channel>'));
+  });
+
+  test('SDK prompt keeps inline text as the delivery path', () => {
+    const p = buildPrompt({ msg: basicMsg, backend: 'sdk' });
+    assert.match(p, /Just reply with text — polygram delivers your response automatically/);
+    assert.match(p, /Do NOT use Telegram MCP tools/);
+    assert.doesNotMatch(p, /mcp__polygram-bridge__reply/);
+  });
+
+  test('CLI prompt requires a successful reply-tool receipt for visible delivery', () => {
+    const p = buildPrompt({ msg: basicMsg, backend: 'cli' });
+    assert.match(p, /Inline final text is invisible to the Telegram user/);
+    assert.match(p, /MUST call `mcp__polygram-bridge__reply`/);
+    assert.match(p, /Only a successful reply-tool receipt proves delivery/);
+    assert.match(p, /Do not claim .*already sent.*posted above.*based only on the transcript/i);
+    assert.match(p, /If delivery is uncertain, send it now/i);
+    assert.doesNotMatch(p, /Just reply with text/);
+    assert.doesNotMatch(p, /Do NOT use Telegram MCP tools/);
+  });
+
+  test('delivery skill keeps interactive CLI files on the reply MCP lane', () => {
+    const skill = fs.readFileSync(
+      path.join(__dirname, '../skills/polygram-send/SKILL.md'),
+      'utf8',
+    );
+    assert.match(skill, /CLI\/channels interactive turn[\s\S]*reply[\s\S]*files/i);
+    assert.match(skill, /Do not use IPC[^.]*interactive[^.]*file/i);
+    assert.doesNotMatch(
+      skill.match(/^description:.*$/m)?.[0] || '',
+      /Use IPC for cron jobs, files/i,
+    );
+  });
+
+  test('topic backend override selects the CLI delivery contract', () => {
+    const backend = resolvePromptBackend({
+      config: {
+        chats: {
+          '-100123': {
+            pm: 'sdk',
+            topics: { 37: { pm: 'cli' } },
+          },
+        },
+      },
+      chatId: '-100123',
+      threadId: 37,
+    });
+    assert.equal(backend, 'cli');
+    const p = buildPrompt({ msg: basicMsg, backend });
+    assert.match(p, /MUST call `mcp__polygram-bridge__reply`/);
+    assert.doesNotMatch(p, /Just reply with text/);
   });
 
   test('no sticker set → prompt never mentions stickers', () => {
