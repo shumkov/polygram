@@ -39,6 +39,7 @@ function fixture(overrides = {}) {
     clearSessionId: [],
     deliverReplies: [],
     loggerErrors: [],
+    sequence: [],
   };
 
   let handleResolver;
@@ -58,11 +59,15 @@ function fixture(overrides = {}) {
     },
     db: {
       setInboundHandlerStatus: (row) => calls.setInboundStatus.push(row),
-      clearSessionId: (sk) => calls.clearSessionId.push(sk),
+      clearSessionId: (sk) => {
+        calls.clearSessionId.push(sk);
+        calls.sequence.push('clearSessionId');
+      },
     },
     dbWrite: (fn) => { try { fn(); } catch {} },
     tg: async (bot, method, params, meta) => {
       calls.tg.push({ bot, method, params, meta });
+      calls.sequence.push(`tg:${meta?.source || 'unknown'}`);
       return { ok: true };
     },
     botName: 'testbot',
@@ -241,6 +246,28 @@ describe('createDispatcher — error → terminal status mapping', () => {
     assert.equal(calls.tg.length, 1);
     assert.equal(calls.tg[0].method, 'sendMessage');
     assert.match(calls.tg[0].params.text, /error: boom/);
+  });
+
+  test('SESSION_PROCESS_LOST clears the saved session before guidance and never auto-resumes', async () => {
+    const err = Object.assign(new Error('contained process tree exited'), {
+      code: 'SESSION_PROCESS_LOST',
+    });
+    const { calls } = await runAndFail(err, {
+      classifyError: realClassify,
+      isAutoResumable: true,
+    });
+
+    assert.deepEqual(calls.clearSessionId, ['sk']);
+    assert.equal(calls.autoResumeAttempts.length, 0);
+    assert.equal(calls.sendToProcess.length, 0);
+    assert.equal(calls.tg.length, 1);
+    assert.match(calls.tg[0].params.text, /resend/i);
+    assert.match(calls.tg[0].params.text, /fresh session/i);
+    assert.ok(
+      calls.sequence.indexOf('clearSessionId') < calls.sequence.indexOf('tg:error-reply'),
+      'the stale session id must be cleared before resend guidance is sent',
+    );
+    assert.ok(calls.events.some((event) => event.kind === 'session-reset-after-process-loss'));
   });
 });
 

@@ -2406,6 +2406,9 @@ async function main() {
   loadStickers();
   DB_PATH = dbOverride || path.join(DB_DIR, `${BOT_NAME}.db`);
   console.log(`[polygram] bot: ${BOT_NAME} (${Object.keys(config.chats).length} chats) db: ${DB_PATH}`);
+  const sessionLauncher = process.env.ORCHESTRA_SESSION_LAUNCHER;
+  const requireExistingServer = process.env.ORCHESTRA_TMUX_REQUIRE_SERVER === '1';
+  console.log(`[polygram] session containment configured: ${sessionLauncher ? 'yes' : 'no'}`);
 
   // rc.50: claim our PID file BEFORE binding the bot token. If a
   // prior daemon (orphan from a botched restart) is still running,
@@ -2429,7 +2432,11 @@ async function main() {
     // sessions (dead safety net + EEXIST on cli respawn of a leaked session).
     const sweep = await sweepTmuxOrphans({
       botName: BOT_NAME,
-      runner: createTmuxRunner({ logger: console, sessionPrefix: 'polygram' }),
+      runner: createTmuxRunner({
+        logger: console,
+        sessionPrefix: 'polygram',
+        requireExistingServer,
+      }),
       logger: console,
     });
     if (sweep.swept.length > 0) {
@@ -2739,7 +2746,11 @@ async function main() {
   // tmux backend runner — one per daemon, shared across all TmuxProcess
   // instances. Construction is cheap (no system call until first
   // spawn/send). Only used if any chat in config has pm:'tmux'.
-  const tmuxRunner = createTmuxRunner({ logger: console, sessionPrefix: 'polygram' });
+  const tmuxRunner = createTmuxRunner({
+    logger: console,
+    sessionPrefix: 'polygram',
+    requireExistingServer,
+  });
   // Verify the pinned claude CLI binary is present. The tmux
   // backend spawns this exact binary by absolute path (see
   // lib/claude-bin.js + TmuxProcess.start) — it never resolves
@@ -2801,6 +2812,7 @@ async function main() {
     db,
     logger: console,
     tmuxRunner,
+    sessionLauncher,
     botName: BOT_NAME,
     // channels backend
     toolDispatcher: channelsToolDispatcher,
