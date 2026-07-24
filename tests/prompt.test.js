@@ -5,6 +5,8 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const {
   resolvePromptBackend,
@@ -382,6 +384,19 @@ describe('buildPrompt — full integration', () => {
     assert.match(p, /If delivery is uncertain, send it now/i);
     assert.doesNotMatch(p, /Just reply with text/);
     assert.doesNotMatch(p, /Do NOT use Telegram MCP tools/);
+  });
+
+  test('delivery skill keeps interactive CLI files on the reply MCP lane', () => {
+    const skill = fs.readFileSync(
+      path.join(__dirname, '../skills/polygram-send/SKILL.md'),
+      'utf8',
+    );
+    assert.match(skill, /CLI\/channels interactive turn[\s\S]*reply[\s\S]*files/i);
+    assert.match(skill, /Do not use IPC[^.]*interactive[^.]*file/i);
+    assert.doesNotMatch(
+      skill.match(/^description:.*$/m)?.[0] || '',
+      /Use IPC for cron jobs, files/i,
+    );
   });
 
   test('topic backend override selects the CLI delivery contract', () => {

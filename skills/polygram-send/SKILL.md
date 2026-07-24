@@ -1,13 +1,13 @@
 ---
 name: polygram-send
-description: Choose the correct polygram delivery path for SDK turns, CLI/channels turns, and detached scripts. Use IPC for cron jobs, files, or genuinely out-of-turn sends; use the reply MCP for interactive CLI text; return inline text for interactive SDK replies.
+description: Choose the correct polygram delivery path for SDK turns, CLI/channels turns, and detached scripts. Use IPC for cron jobs or genuinely out-of-turn sends; use the reply MCP for interactive CLI text and files; return inline text for interactive SDK replies.
 ---
 
 # polygram-send
 
 Polygram exposes a per-bot Unix socket at `/tmp/polygram-<bot>.sock`. Authorized callers (same UID, with the per-bot secret) can send Telegram API methods through it. Polygram routes them to the live bot connection, logs them in the `messages` table, and applies markdown / chunking / dedup.
 
-This is the **supported IPC path** for a script that needs to deliver a file or out-of-band message into a polygram-managed chat. Interactive turns have backend-specific delivery paths described below. Generic Telegram MCP is not wired up; CLI/channels turns use polygram's own reply MCP instead.
+This is the **supported IPC path** for a detached script that needs to deliver a file or out-of-band message into a polygram-managed chat. Interactive turns have backend-specific delivery paths described below. Generic Telegram MCP is not wired up; CLI/channels turns use polygram's own reply MCP instead.
 
 ## Choose exactly one delivery lane
 
@@ -19,17 +19,17 @@ Conversation transcript text does not prove an earlier reply reached Telegram. D
 
 ### CLI/channels interactive turn
 
-Inline final text is not delivered to Telegram. Send every user-visible text reply through `mcp__polygram-bridge__reply` within the turn. Do not use IPC for the normal interactive reply.
+Inline final text is not delivered to Telegram. Send every user-visible text reply through `mcp__polygram-bridge__reply` within the turn. Attach generated files through that tool's `files` array. Do not use IPC for an interactive text or file reply.
 
 Only a successful reply-tool receipt proves delivery. Transcript text and an attempted call without a successful receipt do not. If delivery is uncertain, call the reply tool now instead of claiming the message was sent earlier.
 
 ### Cron or detached script
 
-Use the `polygram-send` IPC client described below. This lane is for code running outside an interactive turn, including cron jobs, detached background scripts, generated files, and genuinely out-of-turn status updates. Check the IPC response and treat only a successful response as proof of delivery.
+Use the `polygram-send` IPC client described below. This lane is for code running outside an interactive turn, including cron jobs, detached background scripts that generated files, and genuinely out-of-turn status updates. Check the IPC response and treat only a successful response as proof of delivery.
 
 ## When to use IPC
 
-- Agent generated a file (PDF, .docx, image, etc.) and the user asked for it in chat
+- A detached script generated a file (PDF, .docx, image, etc.) after the interactive turn ended
 - Cron job needs to post a status update to the relevant chat
 - Long-running work needs an out-of-turn nudge (e.g. "build finished, here's the artifact")
 
@@ -37,6 +37,7 @@ Use the `polygram-send` IPC client described below. This lane is for code runnin
 
 - A normal SDK text reply — return inline text.
 - A normal CLI/channels text reply — use `mcp__polygram-bridge__reply`.
+- A CLI/channels file reply during an interactive turn — pass absolute paths in the reply tool's `files` array.
 - Anything that needs the message attributed to "user" — IPC always sends as the bot.
 - Generic Telegram MCP — it is not a polygram delivery path.
 
