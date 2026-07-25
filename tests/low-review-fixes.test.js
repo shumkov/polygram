@@ -59,12 +59,12 @@ function addPending(proc, turnId, { replies = [] } = {}) {
 // removeAllListeners covers the kill() path, but the bridge-disconnect
 // drain and resetSession do NOT — those are the genuine leak paths.
 
-test('L5: bridge-disconnect drain removes the per-turn stop-hook listener', () => {
+test('L5: bridge-disconnect drain removes the per-turn stop-hook listener', async () => {
   const proc = makeProc();
   addPending(proc, 'A');
   proc._resolveTurn('A'); // registers onStop
   assert.equal(proc.listenerCount('stop-hook'), 1, 'precondition: one onStop registered');
-  proc._handleBridgeDisconnected();
+  await proc._handleBridgeDisconnected();
   assert.equal(proc.listenerCount('stop-hook'), 0, 'disconnect drain must remove the stop-hook listener');
 });
 
@@ -81,13 +81,13 @@ test('L5: resetSession removes the per-turn stop-hook listener', async () => {
 // The bridge-disconnect drain must clear _interruptGraceTimer, matching
 // _doKill (otherwise a stray timer survives on a dead instance).
 
-test('L6: bridge-disconnect drain clears _interruptGraceTimer', () => {
+test('L6: bridge-disconnect drain clears _interruptGraceTimer', async () => {
   const proc = makeProc();
   let fired = false;
   proc._interruptGraceTimer = setTimeout(() => { fired = true; }, 50_000);
   assert.ok(proc._interruptGraceTimer, 'precondition: interrupt grace timer armed');
   // Invoke the disconnect drain directly (extracted helper).
-  proc._handleBridgeDisconnected();
+  await proc._handleBridgeDisconnected();
   assert.equal(proc._interruptGraceTimer, null, 'disconnect drain must null the interrupt grace timer');
   assert.equal(fired, false);
 });
