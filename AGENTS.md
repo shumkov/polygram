@@ -3,21 +3,21 @@
 Project: polygram — Telegram daemon for Claude Code that preserves
 the OpenClaw per-chat session model. Targets two backends:
 
-- **SDK ProcessManager** (`lib/process/sdk-process.js`) — first-class
-  Anthropic SDK runtime. Stable contract.
-- **tmux backend** (`lib/process/tmux-process.js` + `lib/tmux/`) —
-  hosts the real `claude` CLI inside a tmux session and observes
-  behaviour via capture-pane + the per-session JSONL log. Brittle
-  by nature: depends on undocumented internals of the CLI's JSONL
-  format, queue mechanics, and TUI banner shape.
+- **SDK backend** — Orchestra's `SdkProcess`, configured through
+  `lib/sdk/build-options.js`, uses the Anthropic Agent SDK runtime.
+- **CLI backend** — Orchestra's `CliProcess` hosts the real `claude`
+  CLI in tmux and connects it to Telegram through the Channels MCP
+  bridge and hook NDJSON. It also observes the per-session JSONL log.
+  This remains brittle because those CLI surfaces are not public
+  compatibility contracts.
 
 ## Pinned claude CLI version
 
-> **The tmux backend is tightly coupled to ONE specific
+> **The CLI backend is tightly coupled to ONE specific
 > `claude` CLI version. Polygram's CI / spikes / production
 > hosts MUST run that exact version.**
 
-The tmux backend reads internal claude artefacts:
+The CLI backend reads internal claude artefacts:
 - Per-session JSONL events under `~/.claude/projects/<encoded-cwd>/`
 - Queue-operation enqueue / dequeue / remove events
 - `attachment.type='queued_command'` for fold detection
@@ -34,31 +34,27 @@ needed because the TUI's behaviour, not polygram's logic, drifted.
 
 ### Current pinned version
 
-The version polygram has been validated against is recorded in the
-TmuxProcess source — search for `CLAUDE_CLI_PINNED_VERSION` in
-`lib/process/tmux-process.js`.
+The version polygram has been validated against is owned by Orchestra.
+Search the exact installed dependency for
+`CLAUDE_CLI_PINNED_VERSION` in
+`node_modules/@shumkov/orchestra/lib/claude-bin.js`.
 
 ### How the pin is enforced (hard pin, since 0.10.0-rc.19)
 
-Polygram does **not** spawn the bare `claude` on `$PATH`. The claude
-CLI installs each version as a standalone binary at
-`~/.local/share/claude/versions/<version>` and points
-`~/.local/bin/claude` (a symlink) at the active one — the CLI's
-auto-updater re-points that symlink whenever a new version lands.
-A `$PATH` spawn therefore silently drifts (shumorobot 2026-05-16:
-the CLI auto-updated 2.1.142 → 2.1.143 between deploys).
+Polygram does **not** spawn the bare `claude` on `$PATH`. Orchestra's
+`ensureVendoredClaudeBin()` resolves the exact pin, copies it from
+`~/.local/share/claude/versions/<version>` into Polygram's
+`~/.local/share/polygram/claude-bin/<version>` vendor directory, and
+returns that absolute path to `CliProcess`. The separate vendor copy is
+required because Claude's updater both moves the active symlink and
+prunes older versioned binaries.
 
-`TmuxProcess.start()` resolves the **absolute versioned path** via
-`lib/claude-bin.js` (`resolvePinnedClaudeBin`) and spawns that. The
-versioned binary is immutable — the updater only adds new files, it
-never overwrites an existing one — so the pin holds across CLI
-auto-updates. If the pinned binary is missing, `start()` throws
-`CLAUDE_BIN_MISSING` with an actionable message (run
-`claude install <version>`); SDK-backed chats are unaffected.
-
-Override the resolved path with `POLYGRAM_CLAUDE_BIN` (non-standard
-installs, CI, tests). Daemon boot logs the absolute binary the tmux
-backend will use.
+Override CLI selection with `ORCHESTRA_CLAUDE_BIN`. Polygram also uses
+`POLYGRAM_CLAUDE_BIN` as the SDK query's
+`pathToClaudeCodeExecutable`. Compatibility gates set both selectors
+to the same attested path. Daemon boot logs the exact vendored binary
+used by CLI-backed chats; SDK-backed chats remain available if CLI
+preflight fails.
 
 ### Upgrade procedure (separate, deliberate process)
 
@@ -71,31 +67,29 @@ own change with its own validation gate:
    any change in: hooks, settings.json schema, JSONL event format,
    queue semantics, `--agent` flag behaviour, banner/READY strings,
    permission-mode UI, paste handling.
-3. **Update `CLAUDE_CLI_PINNED_VERSION`** in `lib/process/tmux-process.js`
-   to the new value (string compare).
-4. **Run the full real-claude spike suite** against the new CLI:
+3. **Preserve the current binary offline.** Copy the host-specific
+   current pin outside both Claude's versions tree and Polygram's
+   garbage-collected vendor tree; verify `--version` and SHA-256.
+4. **Run the checked old/new matrix on one gate commit before editing
+   the pin:**
    ```sh
-   node scripts/spikes/autosteer-tui-real.mjs        # autosteer / multi-msg
-   node scripts/spikes/post-tool-batch.mjs            # SDK PostToolBatch
-   node scripts/spikes/subagent-task.mjs              # subagent
-   node scripts/spikes/session-resume.mjs             # resume
-   node scripts/spikes/compact-boundary.mjs           # auto-compact
-   node scripts/spikes/tool-less-drain.mjs            # tool-only turns
+   node scripts/spikes/run-claude-gate-matrix.mjs \
+     --old-bin /absolute/path/to/old \
+     --candidate-bin /absolute/path/to/candidate \
+     --artifact-base /private/mode-0700/directory
    ```
-   ALL must PASS. Any new failure = a regression introduced by the
-   CLI version change. File it as a polygram bug to fix in the
-   bump PR.
-5. **Diff the JSONL format.** Run `subagent-task.mjs` and
-   `post-tool-batch.mjs`, capture the JSONL files for both old and
-   new CLI versions, diff. New event types, renamed fields, removed
-   fields = behaviour change that the parser
-   (`lib/tmux/session-log-parser.js`) may need to handle.
+   Every applicable cell must pass. Normalize and compare the captured
+   session, hook, queue, task-notification, Stop, reply, and worker
+   evidence. An unexplained lifecycle change blocks the bump.
+5. **Update `CLAUDE_CLI_PINNED_VERSION`** in Orchestra's
+   `lib/claude-bin.js`, then release and consume the new exact Orchestra
+   version through separately reviewable PRs.
 6. **Test in staging** for at least 24h on shumorobot before
    shumabit / umi-assistant. Watch the events DB for
    `autosteer-match-miss`, `autonomous-wakeup-message`, and
    `tool-only-completion` events — these are the leading
    indicators of TUI-format drift.
-7. **Document the bump** in the rc commit message. Include: old
+7. **Document the bump** in the release commit message. Include: old
    version → new version, summary of CLI release notes that
    could affect us, any code adjustments made.
 
@@ -124,12 +118,9 @@ Background + the options considered:
 
 - `npm test` — fast unit + integration tests, no CLI needed, no
   network. CI runs this.
-- `scripts/spikes/*.mjs` — real-claude / real-SDK gates. NOT in CI.
-  Run before tagging RCs and before bumping the CLI pin.
-  - `autosteer-tui-real.mjs` — 50 scenarios for the tmux backend's
-    autosteer + multi-msg + paste / queue / fold-vs-new-turn
-    behaviour. Authoritative. See
-    `docs/0.10.0-spike-leftovers.md` for the rc.15 baseline.
+- `scripts/spikes/*.mjs` — real-Claude / real-SDK gates. NOT in CI.
+  Run the version-controlled matrix before bumping the CLI pin; see
+  `scripts/spikes/README.md`.
 
 ## Deploy
 

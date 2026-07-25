@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 1,
+  "versions": {
+    "old": "2.1.173",
+    "candidate": "2.1.220"
+  },
+  "comparator": {
+    "model": "claude-sonnet-4-6",
+    "effort": "medium"
+  },
+  "scenarios": [
+    {
+      "id": "cli-contract",
+      "driver": "scripts/spikes/cli-contract-matrix.mjs",
+      "args": {
+        "old": [],
+        "candidate": []
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "readiness, reply, fold, multiline, interrupt, warm resume, and file reply pass with legacy process-tree evidence",
+        "candidate": "the same lifecycle passes and every observed candidate self-spawn has wrapper provenance"
+      },
+      "comparison": {
+        "lifecycle": "shape-equal",
+        "equalFields": ["resolvedModel", "fileObserved", "spawnCount"]
+      },
+      "cost": {
+        "usdEstimate": 0.08,
+        "destructive": false
+      },
+      "artifactCollector": "private session, hooks, process tree, wrapper records, and sanitized-result.json"
+    },
+    {
+      "id": "workflow-direct",
+      "driver": "scripts/spikes/workflow-autonomous-completion.mjs",
+      "args": {
+        "old": ["--delivery", "direct"],
+        "candidate": ["--delivery", "direct"]
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "one out-of-turn direct sentinel after launch-turn closure, no fallback, and no foreign route",
+        "candidate": "the same delivery result with native Workflow lifecycle and candidate wrapper provenance"
+      },
+      "comparison": {
+        "lifecycle": "shape-equal",
+        "equalFields": ["resolvedModel", "directCompletionCount", "fallbackCount", "deliveryPipeline", "deliverySentCount", "deliveryFailedCount"]
+      },
+      "cost": {
+        "usdEstimate": 0.12,
+        "destructive": false
+      },
+      "artifactCollector": "private session, hooks, Workflow metadata, wrapper records, and sanitized-result.json"
+    },
+    {
+      "id": "workflow-fallback",
+      "driver": "scripts/spikes/workflow-autonomous-completion.mjs",
+      "args": {
+        "old": ["--delivery", "fail"],
+        "candidate": ["--delivery", "fail"]
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "synthetic direct failure produces one transcript fallback and no foreign-route sentinel",
+        "candidate": "the same single fallback result with native Workflow lifecycle and candidate wrapper provenance"
+      },
+      "comparison": {
+        "lifecycle": "shape-equal",
+        "equalFields": ["resolvedModel", "directCompletionCount", "fallbackCount", "deliveryPipeline", "deliverySentCount", "deliveryFailedCount"]
+      },
+      "cost": {
+        "usdEstimate": 0.12,
+        "destructive": false
+      },
+      "artifactCollector": "private session, hooks, Workflow metadata, wrapper records, and sanitized-result.json"
+    },
+    {
+      "id": "delayed-mcp",
+      "driver": "scripts/spikes/delayed-mcp-background.mjs",
+      "args": {
+        "old": ["--expected-mode", "foreground"],
+        "candidate": ["--expected-mode", "background"]
+      },
+      "environment": {
+        "common": {
+          "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "1000"
+        }
+      },
+      "oracle": {
+        "old": "the handler crosses the threshold, remains foreground, and delivers one marker",
+        "candidate": "the handler crosses the same threshold, emits native background lifecycle, and delivers one marker"
+      },
+      "comparison": {
+        "lifecycle": "shape-equal",
+        "equalFields": ["resolvedModel", "markerCount", "resultSubtype"]
+      },
+      "cost": {
+        "usdEstimate": 0.02,
+        "destructive": false
+      },
+      "artifactCollector": "private SDK stream and sanitized-result.json"
+    },
+    {
+      "id": "sdk-post-tool-batch",
+      "driver": "scripts/spikes/post-tool-batch.mjs",
+      "args": {
+        "old": [],
+        "candidate": []
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "PostToolBatch injects the queued marker into the final reply",
+        "candidate": "the same marker is incorporated with the selected candidate executable"
+      },
+      "comparison": {
+        "lifecycle": "shape-equal",
+        "equalFields": ["resolvedModel", "hookFiredCount", "markerPresent", "resultSubtype"]
+      },
+      "cost": {
+        "usdEstimate": 0.01,
+        "destructive": false
+      },
+      "artifactCollector": "run metadata and sanitized-result.json"
+    },
+    {
+      "id": "sdk-subagent",
+      "driver": "scripts/spikes/subagent-task.mjs",
+      "args": {
+        "old": [],
+        "candidate": []
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "the turn succeeds with attributed subagent output",
+        "candidate": "the turn succeeds with current nested and forwarded attribution"
+      },
+      "comparison": {
+        "lifecycle": "shape-equal",
+        "equalFields": ["resolvedModel", "resultSubtype"]
+      },
+      "cost": {
+        "usdEstimate": 0.03,
+        "destructive": false
+      },
+      "artifactCollector": "run metadata and sanitized-result.json"
+    },
+    {
+      "id": "sdk-resume",
+      "driver": "scripts/spikes/session-resume.mjs",
+      "args": {
+        "old": [],
+        "candidate": []
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "a fresh query resumes the session and recalls the marker",
+        "candidate": "the same fresh-query resume succeeds"
+      },
+      "comparison": {
+        "lifecycle": "shape-equal",
+        "equalFields": ["resolvedModel", "firstResultSubtype", "secondResultSubtype", "markerRecalled"]
+      },
+      "cost": {
+        "usdEstimate": 0.01,
+        "destructive": false
+      },
+      "artifactCollector": "run metadata and sanitized-result.json"
+    },
+    {
+      "id": "sdk-compact",
+      "driver": "scripts/spikes/compact-boundary.mjs",
+      "args": {
+        "old": [],
+        "candidate": []
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "a compact boundary is observed before a successful result",
+        "candidate": "the same compact boundary and successful result are observed"
+      },
+      "comparison": {
+        "lifecycle": "shape-equal",
+        "equalFields": ["resolvedModel", "compactBoundarySeen", "resultSubtype"]
+      },
+      "cost": {
+        "usdEstimate": 3,
+        "destructive": false
+      },
+      "artifactCollector": "run metadata and sanitized-result.json"
+    },
+    {
+      "id": "sdk-tool-less-drain",
+      "driver": "scripts/spikes/tool-less-drain.mjs",
+      "args": {
+        "old": [],
+        "candidate": []
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "PostToolBatch remains absent and the tool-less turn completes successfully",
+        "candidate": "the same tool-less completion behavior is preserved"
+      },
+      "comparison": {
+        "lifecycle": "shape-equal",
+        "equalFields": ["resolvedModel", "hookFiredCount", "resultSubtypes", "bufferedMarkerCount"]
+      },
+      "cost": {
+        "usdEstimate": 0.01,
+        "destructive": false
+      },
+      "artifactCollector": "run metadata and sanitized-result.json"
+    },
+    {
+      "id": "candidate-opus-projection",
+      "candidateOnly": true,
+      "driver": "scripts/spikes/opus-default-projection.mjs",
+      "args": {
+        "candidate": []
+      },
+      "environment": {
+        "common": {},
+        "candidate": {
+          "CLAUDE_GATE_MODEL": "opus"
+        }
+      },
+      "expectedResolvedModel": "claude-opus-5",
+      "documentedWorkflowSizeGuideline": "medium",
+      "oracle": {
+        "candidate": "fresh Opus selection resolves to claude-opus-5; no Workflow policy override is present; bounded topology and complete report are recorded"
+      },
+      "cost": {
+        "usdEstimate": 0.3,
+        "destructive": false
+      },
+      "artifactCollector": "private session, hooks, Workflow metadata, wrapper records, and sanitized-result.json"
+    }
+  ]
+}
