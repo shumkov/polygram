@@ -17,13 +17,17 @@ import {
   copyPrivateGateArtifact,
   normalizeGateJsonl,
   readWrapperRecords,
+  resolveGateLifecycleModel,
   validateWrapperProvenance,
   writeSanitizedGateResult,
 } from './claude-gate-evidence.mjs';
 import {
+  WORKFLOW_GATE_SESSION_PREFIX,
+  evaluateWorkflowOutOfTurnTiming,
   makeTreePrivate,
   prepareWorkflowProject,
   evaluateWorkflowDeliveryEvidence,
+  readWorkflowTaskNotificationAt,
   summarizeWorkflowRecord,
 } from './workflow-fixture.mjs';
 import {
@@ -61,6 +65,10 @@ if (!['direct', 'fail'].includes(deliveryMode)) {
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const STOP_GRACE_MS = 2_000;
+const SCHEDULING_MARGIN_MS = 500;
+const COMPLETION_PROCESSING_MARGIN_MS = 100;
+const COMPLETION_PREFIX = 'WF-COMPLETE:';
 const noopStreamer = {
   onChunk: async () => {},
   forceNewMessage: () => {},
@@ -79,7 +87,12 @@ function projectDirFor(cwd) {
   return path.join(os.homedir(), '.claude', 'projects', encodeCwd(cwd));
 }
 
-function collectWorkflowMetadata(projectDir, sessionId, artifactDir) {
+function collectWorkflowMetadata(
+  projectDir,
+  sessionId,
+  artifactDir,
+  expectedResult,
+) {
   const workflowDir = path.join(projectDir, sessionId, 'workflows');
   if (!fs.existsSync(workflowDir)) return [];
   const privateDir = path.join(artifactDir, 'raw-private', 'workflows');
@@ -91,7 +104,7 @@ function collectWorkflowMetadata(projectDir, sessionId, artifactDir) {
     if (!/^wf_[A-Za-z0-9-]+\.json$/.test(name)) continue;
     try {
       const record = JSON.parse(fs.readFileSync(path.join(workflowDir, name), 'utf8'));
-      metadata.push(summarizeWorkflowRecord(record));
+      metadata.push(summarizeWorkflowRecord(record, { expectedResult }));
     } catch {}
   }
   return metadata;
@@ -116,7 +129,7 @@ registerGateSessionProject(selection, fixture.cwd);
 const suffix = crypto.randomBytes(4).toString('hex');
 const sentinel = `${selection.version.replace(/\./g, '-')}-${suffix}`;
 const launchMarker = `WF-LAUNCHED:${sentinel}`;
-const completionMarker = `WF-COMPLETE:${sentinel}`;
+const completionMarker = `${COMPLETION_PREFIX}${crypto.randomBytes(16).toString('hex')}`;
 const originChatId = '-999000220';
 const originThreadId = 220;
 const sessionKey = `${originChatId}:${originThreadId}`;
@@ -126,6 +139,7 @@ const directCalls = [];
 const fallbackCalls = [];
 const eventKinds = [];
 let launchTurnClosedAt = null;
+let launchStopHookAt = null;
 let completionAt = null;
 let completionResolve = null;
 let proc = null;
@@ -136,6 +150,15 @@ let workflowMetadata = [];
 let processTree = [];
 let resolvedModel = null;
 let deliveryEvaluation = { pass: false, reasons: ['delivery not evaluated'] };
+let timingEvaluation = {
+  pass: false,
+  reasons: ['out-of-turn timing not evaluated'],
+  requiredTaskNotificationDelayMs: STOP_GRACE_MS + SCHEDULING_MARGIN_MS,
+  requiredCompletionAfterNotificationMs: COMPLETION_PROCESSING_MARGIN_MS,
+  taskNotificationAfterStopMs: null,
+  completionAfterLaunchTurnMs: null,
+  completionAfterTaskNotificationMs: null,
+};
 let fallbackPipeline = null;
 let fallbackSentCount = 0;
 let fallbackFailedCount = 0;
@@ -190,7 +213,7 @@ const autonomousCallbacks = createSdkCallbacks({
   },
 });
 const runner = withClaudeGateTmuxEnv(createTmuxRunner({
-  sessionPrefix: 'polygram-workflow-gate',
+  sessionPrefix: WORKFLOW_GATE_SESSION_PREFIX,
   logger: console,
 }), selection);
 
@@ -238,12 +261,12 @@ try {
     },
     appDataDir: path.join(fixture.cwd, '.orchestra'),
     attachmentBase: path.join(fixture.cwd, '.attachments'),
-    sessionPrefix: 'polygram-workflow-gate',
+    sessionPrefix: WORKFLOW_GATE_SESSION_PREFIX,
     bridgeServerName: 'polygram-workflow-gate-bridge',
     productName: 'polygram-workflow-gate',
     surfaceName: 'synthetic channel',
     turnQuietMs: 1_500,
-    stopGraceMs: 2_000,
+    stopGraceMs: STOP_GRACE_MS,
   });
 
   for (const eventName of [
@@ -252,11 +275,16 @@ try {
     'thinking',
     'idle',
     'tool-use',
-    'stop-hook',
     'delivery-work-settled',
   ]) {
     proc.on(eventName, () => eventKinds.push(eventName));
   }
+  proc.on('stop-hook', () => {
+    eventKinds.push('stop-hook');
+    if (launchStopHookAt === null && launchTurnClosedAt === null) {
+      launchStopHookAt = Date.now();
+    }
+  });
   proc.on('autonomous-assistant-message', (message) => {
     autonomousCallbacks.onAutonomousAssistantMessage(
       sessionKey,
@@ -299,6 +327,11 @@ try {
     },
   );
   launchTurnClosedAt = Date.now();
+  fs.writeFileSync(
+    path.join(fixture.cwd, '.workflow-completion-marker'),
+    `${completionMarker}\n`,
+    { encoding: 'utf8', mode: 0o600 },
+  );
   assert.equal(launchResult.metrics?.resultSubtype, 'success');
   assert.equal(proc.pendingTurns.size, 0, 'launch turn must close before completion');
   assert.ok(
@@ -312,7 +345,7 @@ try {
   await sleep(4_000);
 
   const completionDirectCalls = directCalls.filter(
-    (call) => call.toolName === 'reply' && call.text.includes(completionMarker),
+    (call) => call.toolName === 'reply' && call.text.includes(COMPLETION_PREFIX),
   );
   if (deliveryMode === 'direct') {
     assert.equal(completion.kind, 'direct');
@@ -322,12 +355,12 @@ try {
     assert.equal(completion.kind, 'fallback');
     assert.ok(completionDirectCalls.length >= 1, 'forced failure must exercise direct reply');
     assert.equal(fallbackCalls.length, 1, 'failed direct delivery must emit one fallback');
-    assert.equal(fallbackCalls[0].text.trim(), completionMarker);
   }
 
   deliveryEvaluation = evaluateWorkflowDeliveryEvidence({
     deliveryMode,
     marker: completionMarker,
+    completionPrefix: COMPLETION_PREFIX,
     originRoute,
     foreignRoutes: [...foreignRoutes],
     directAttempts: completionDirectCalls,
@@ -349,19 +382,31 @@ try {
     selection.artifactDir,
     'session.jsonl',
   );
+  timingEvaluation = evaluateWorkflowOutOfTurnTiming({
+    launchStopHookAt,
+    launchTurnClosedAt,
+    taskNotificationAt: readWorkflowTaskNotificationAt(
+      privateSession,
+      completionMarker,
+    ),
+    completionAt,
+    stopGraceMs: STOP_GRACE_MS,
+    schedulingMarginMs: SCHEDULING_MARGIN_MS,
+    completionProcessingMarginMs: COMPLETION_PROCESSING_MARGIN_MS,
+  });
+  assert.equal(
+    timingEvaluation.pass,
+    true,
+    timingEvaluation.reasons.join('; '),
+  );
   lifecycle.session = normalizeGateJsonl(privateSession);
-  const initModels = lifecycle.session
-    .filter((event) => event.type === 'system' && event.subtype === 'init')
-    .map((event) => event.model)
-    .filter(Boolean);
   const expectedResolvedModel = process.env.CLAUDE_GATE_EXPECTED_RESOLVED_MODEL
     || selection.model;
-  assert.ok(initModels.length > 0, 'Workflow session must expose an init model');
-  assert.ok(
-    initModels.every((model) => model === expectedResolvedModel),
-    'Workflow init model must match the expected resolved model',
-  );
-  resolvedModel = initModels.at(-1);
+  resolvedModel = resolveGateLifecycleModel({
+    records: lifecycle.session,
+    expectedModel: expectedResolvedModel,
+    label: 'Workflow session',
+  });
   assert.ok(
     lifecycle.session.some((event) => (
       event.type === 'assistant' && event.toolNames.includes('Workflow')
@@ -402,6 +447,7 @@ try {
     claudeProjectDir,
     proc.claudeSessionId,
     selection.artifactDir,
+    completionMarker,
   );
   assert.ok(workflowMetadata.length >= 1, 'native Workflow metadata must be discoverable');
   assert.ok(
@@ -414,9 +460,11 @@ try {
   );
   assert.ok(
     workflowMetadata.every((record) => (
-      record.status === 'completed' && record.reportComplete
+      record.status === 'completed'
+      && record.reportComplete
+      && record.reportMatchesExpected
     )),
-    'bounded Workflow must complete with a terminal report',
+    'bounded Workflow must complete with the expected terminal report',
   );
 
   processTree = mergeProcessTrees(processTree, captureTmuxProcessTree({
@@ -453,8 +501,9 @@ try {
     launchTurnClosedBeforeCompletion: Boolean(
       launchTurnClosedAt && completionAt && completionAt > launchTurnClosedAt,
     ),
+    outOfTurnTiming: timingEvaluation,
     directCompletionCount: directCalls.filter(
-      (call) => call.toolName === 'reply' && call.text.includes(completionMarker),
+      (call) => call.toolName === 'reply' && call.text.includes(COMPLETION_PREFIX),
     ).length,
     fallbackCount: fallbackCalls.length,
     deliveryPipeline: fallbackPipeline,

@@ -16,6 +16,7 @@ import {
   copyPrivateGateArtifact,
   normalizeGateJsonl,
   readWrapperRecords,
+  resolveGateLifecycleModel,
   validateWrapperProvenance,
   writeSanitizedGateResult,
 } from './claude-gate-evidence.mjs';
@@ -297,19 +298,11 @@ try {
   lifecycle = copyAndNormalizeLifecycle(proc, cwd, selection);
   assert.ok(lifecycle.hooks?.some((event) => event.hookEventName === 'Stop'));
   assert.ok(lifecycle.session?.some((event) => event.type === 'assistant'));
-  const observedModels = lifecycle.session
-    .filter((event) => (
-      (event.type === 'system' && event.subtype === 'init')
-      || event.type === 'assistant'
-    ))
-    .map((event) => event.model)
-    .filter(Boolean);
-  assert.ok(observedModels.length > 0, 'session must contain an observed model');
-  assert.ok(
-    observedModels.every((model) => model === selection.model),
-    'observed model must match the configured comparator model',
-  );
-  resolvedModel = observedModels.at(-1);
+  resolvedModel = resolveGateLifecycleModel({
+    records: lifecycle.session,
+    expectedModel: selection.model,
+    label: 'CLI session',
+  });
 
   const wrapperRecords = readWrapperRecords(selection);
   validateWrapperProvenance(selection, wrapperRecords, {

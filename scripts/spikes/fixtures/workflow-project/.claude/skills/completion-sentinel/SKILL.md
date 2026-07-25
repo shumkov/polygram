@@ -11,22 +11,29 @@ The invocation argument is a short opaque sentinel available as `$ARGUMENTS`.
 
 Build and launch a background Workflow with at most three agents:
 
-1. One agent first runs `sleep 8`, then verifies that `2 + 2 = 4`.
+1. One agent waits for the marker file to appear by checking
+   `.workflow-completion-marker` once per second for at most two minutes. It
+   then runs `sleep 20`, reads the marker, and verifies that `2 + 2 = 4`. This
+   delay keeps completion beyond the launch turn's stop-grace window.
 2. One agent verifies that the sentinel was preserved byte-for-byte.
 3. An optional final agent checks both findings.
 
-The Workflow's terminal result must contain exactly:
-
-`WF-COMPLETE:$ARGUMENTS`
+The Workflow's terminal result must contain exactly the marker read from
+`.workflow-completion-marker`. Do not read that file in the launch turn; only a
+Workflow agent may read it after the delay.
 
 After the Workflow tool returns its background-launch receipt, immediately call
 the channel `reply` tool with exactly:
 
 `WF-LAUNCHED:$ARGUMENTS`
 
-Then end the launch turn. Do not poll, wait, or send another user message.
+Then end the launch turn. Never call any `WF-COMPLETE` text in the launch turn, even
+though the background-launch receipt contains a task identifier. Do not poll,
+wait, or send another user message.
 
-When the native task notification later arrives, call the channel `reply` tool
-once with exactly `WF-COMPLETE:$ARGUMENTS`. If that completion reply returns an
-error, do not retry it: leave exactly `WF-COMPLETE:$ARGUMENTS` as the terminal
-assistant text so polygram's released transcript fallback can rescue it.
+Only when the current user event contains `<task-notification>` may you call the
+channel `reply` tool once with exactly the Workflow's terminal result from that
+event. Send the raw marker without quotes, backticks, labels, or commentary. If
+that completion reply returns an error, do not retry it: leave exactly the raw
+marker as the terminal assistant text so polygram's released transcript fallback
+can rescue it.

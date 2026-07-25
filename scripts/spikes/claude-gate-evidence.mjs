@@ -107,6 +107,27 @@ export function normalizeGateJsonl(filePath) {
   return records;
 }
 
+export function resolveGateLifecycleModel({
+  records,
+  expectedModel,
+  label = 'session',
+}) {
+  const observedModels = (Array.isArray(records) ? records : [])
+    .filter((record) => (
+      (record.type === 'system' && record.subtype === 'init')
+      || record.type === 'assistant'
+    ))
+    .map((record) => record.model)
+    .filter(Boolean);
+  if (observedModels.length === 0) {
+    throw new Error(`${label} must contain an observed model`);
+  }
+  if (observedModels.some((model) => model !== expectedModel)) {
+    throw new Error(`${label} observed models must match the expected model`);
+  }
+  return observedModels.at(-1);
+}
+
 export function readWrapperRecords(selection) {
   const recordsPath = path.join(selection.artifactDir, 'process-wrapper.ndjson');
   if (!fs.existsSync(recordsPath)) return [];
@@ -208,6 +229,17 @@ export function createSdkGateObserver(
     },
     finish() {
       selection?.stopSdkProcessSampling?.();
+      let modelResolutionError = null;
+      try {
+        resolvedModel = resolveGateLifecycleModel({
+          records: lifecycle,
+          expectedModel: expectedResolvedModel,
+          label: 'SDK lifecycle',
+        });
+      } catch (error) {
+        resolvedModel = null;
+        modelResolutionError = error.message;
+      }
       const wrapperRecords = selection?.artifactDir
         ? readWrapperRecords(selection)
         : [];
@@ -222,6 +254,17 @@ export function createSdkGateObserver(
         observedClaudePids,
         unwrappedRootPids,
       });
+      if (!lifecycle.some((record) => (
+        record.type === 'system'
+        && record.subtype === 'init'
+        && typeof record.model === 'string'
+      ))) {
+        evaluation.reasons.push('SDK lifecycle must contain an observed init model');
+      }
+      if (modelResolutionError) {
+        evaluation.reasons.push(modelResolutionError);
+      }
+      evaluation.pass = evaluation.reasons.length === 0;
       return {
         ...evaluation,
         resolvedModel,

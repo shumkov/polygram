@@ -140,6 +140,31 @@ test('wrapper provenance validation is shared and fails closed', async () => {
   );
 });
 
+test('lifecycle model resolver accepts CLI assistant evidence and rejects conflicts', async () => {
+  const { resolveGateLifecycleModel } = await import(moduleUrl);
+  assert.equal(resolveGateLifecycleModel({
+    records: [
+      { type: 'assistant', model: 'claude-sonnet-4-6' },
+      { type: 'assistant' },
+    ],
+    expectedModel: 'claude-sonnet-4-6',
+    label: 'CLI',
+  }), 'claude-sonnet-4-6');
+  assert.throws(() => resolveGateLifecycleModel({
+    records: [
+      { type: 'system', subtype: 'init', model: 'claude-sonnet-4-6' },
+      { type: 'assistant', model: 'claude-opus-5' },
+    ],
+    expectedModel: 'claude-sonnet-4-6',
+    label: 'CLI',
+  }), /must match/);
+  assert.throws(() => resolveGateLifecycleModel({
+    records: [{ type: 'assistant' }],
+    expectedModel: 'claude-sonnet-4-6',
+    label: 'CLI',
+  }), /observed model/);
+});
+
 test('SDK evidence requires the observed init model and complete process provenance', async () => {
   const { evaluateSdkGateEvidence } = await import(moduleUrl);
   const selection = {
@@ -223,4 +248,21 @@ test('SDK observer records normalized lifecycle and fails a missing init model',
   assert.equal(evidence.resultSubtype, 'success');
   assert.doesNotMatch(JSON.stringify(evidence.lifecycle), /private body|private/);
   assert.equal(createSdkGateObserver(selection).finish().pass, false);
+
+  const mixedModelObserver = createSdkGateObserver(selection);
+  mixedModelObserver.observe({
+    type: 'system',
+    subtype: 'init',
+    model: 'claude-sonnet-4-6',
+  });
+  mixedModelObserver.observe({
+    type: 'assistant',
+    message: {
+      model: 'claude-opus-5',
+      content: [{ type: 'text', text: 'private body' }],
+    },
+  });
+  const mixedModelEvidence = mixedModelObserver.finish();
+  assert.equal(mixedModelEvidence.pass, false);
+  assert.match(mixedModelEvidence.reasons.join('\n'), /observed models must match/);
 });

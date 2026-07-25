@@ -15,6 +15,8 @@ const SKILL_RELATIVE_PATH = path.join(
   'SKILL.md',
 );
 
+export const WORKFLOW_GATE_SESSION_PREFIX = 'polygram-gate';
+
 export function makeTreePrivate(root) {
   const stat = fs.statSync(root);
   if (stat.isDirectory()) {
@@ -37,7 +39,7 @@ function hasWorkflowPolicyOverride(cwd) {
   return false;
 }
 
-export function summarizeWorkflowRecord(record) {
+export function summarizeWorkflowRecord(record, { expectedResult } = {}) {
   const progressTypes = {};
   for (const entry of Array.isArray(record?.workflowProgress)
     ? record.workflowProgress
@@ -68,6 +70,90 @@ export function summarizeWorkflowRecord(record) {
     ),
     reportComplete: typeof record?.result === 'string'
       && record.result.trim().length > 0,
+    ...(typeof expectedResult === 'string' && {
+      reportMatchesExpected: record?.result?.trim() === expectedResult,
+    }),
+  };
+}
+
+export function readWorkflowTaskNotificationAt(sessionPath, expectedMarker) {
+  if (typeof expectedMarker !== 'string' || expectedMarker.length === 0) {
+    throw new TypeError('expectedMarker must be a non-empty string');
+  }
+  const timestamps = [];
+  for (const line of fs.readFileSync(sessionPath, 'utf8').split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const record = JSON.parse(line);
+      if (
+        record?.type !== 'user'
+        || record.origin?.kind !== 'task-notification'
+        || record.promptSource !== 'system'
+        || typeof record.message?.content !== 'string'
+        || !record.message.content.includes('<task-notification>')
+        || record.message.content.split(expectedMarker).length - 1 !== 1
+      ) {
+        continue;
+      }
+      const timestamp = Date.parse(record.timestamp);
+      if (Number.isFinite(timestamp)) timestamps.push(timestamp);
+    } catch {}
+  }
+  if (timestamps.length !== 1) {
+    throw new Error('Workflow session must contain exactly one timed matching task notification');
+  }
+  return timestamps[0];
+}
+
+export function evaluateWorkflowOutOfTurnTiming({
+  launchStopHookAt,
+  launchTurnClosedAt,
+  taskNotificationAt,
+  completionAt,
+  stopGraceMs,
+  schedulingMarginMs,
+  completionProcessingMarginMs,
+}) {
+  const reasons = [];
+  const requiredTaskNotificationDelayMs = stopGraceMs + schedulingMarginMs;
+  const requiredCompletionAfterNotificationMs = completionProcessingMarginMs;
+  const taskNotificationAfterStopMs = (
+    Number.isFinite(taskNotificationAt) && Number.isFinite(launchStopHookAt)
+  ) ? taskNotificationAt - launchStopHookAt : null;
+  const completionAfterLaunchTurnMs = (
+    Number.isFinite(completionAt) && Number.isFinite(launchTurnClosedAt)
+  ) ? completionAt - launchTurnClosedAt : null;
+  const completionAfterTaskNotificationMs = (
+    Number.isFinite(completionAt) && Number.isFinite(taskNotificationAt)
+  ) ? completionAt - taskNotificationAt : null;
+
+  if (
+    !Number.isFinite(taskNotificationAfterStopMs)
+    || taskNotificationAfterStopMs < requiredTaskNotificationDelayMs
+  ) {
+    reasons.push('task notification did not cross the launch stop-grace boundary');
+  }
+  if (
+    !Number.isFinite(completionAfterLaunchTurnMs)
+    || completionAfterLaunchTurnMs <= 0
+  ) {
+    reasons.push('completion did not arrive after the launch turn closed');
+  }
+  if (
+    !Number.isFinite(completionAfterTaskNotificationMs)
+    || completionAfterTaskNotificationMs < requiredCompletionAfterNotificationMs
+  ) {
+    reasons.push('completion did not arrive after the task notification');
+  }
+
+  return {
+    pass: reasons.length === 0,
+    reasons,
+    requiredTaskNotificationDelayMs,
+    requiredCompletionAfterNotificationMs,
+    taskNotificationAfterStopMs,
+    completionAfterLaunchTurnMs,
+    completionAfterTaskNotificationMs,
   };
 }
 
@@ -175,6 +261,7 @@ function markerOccurrences(text, marker) {
 export function evaluateWorkflowDeliveryEvidence({
   deliveryMode,
   marker,
+  completionPrefix = marker,
   originRoute,
   foreignRoutes = [],
   directAttempts = [],
@@ -188,17 +275,28 @@ export function evaluateWorkflowDeliveryEvidence({
   const matchingAttempts = directAttempts.filter(
     (attempt) => markerOccurrences(attempt.text, marker) > 0,
   );
+  const unexpectedCompletionAttempts = directAttempts.filter((attempt) => (
+    typeof attempt.text === 'string'
+    && attempt.text.includes(completionPrefix)
+    && (
+      markerOccurrences(attempt.text, marker) !== 1
+      || markerOccurrences(attempt.text, completionPrefix) !== 1
+    )
+  ));
+  if (unexpectedCompletionAttempts.length > 0) {
+    reasons.push('unexpected completion-shaped direct attempt was observed');
+  }
   if (matchingAttempts.length !== 1) {
     reasons.push('completion must make exactly one direct attempt');
   }
   if (
     matchingAttempts.some((attempt) => (
       attempt.route !== originRoute
-      || attempt.text.trim() !== marker
       || markerOccurrences(attempt.text, marker) !== 1
+      || markerOccurrences(attempt.text, completionPrefix) !== 1
     ))
   ) {
-    reasons.push('direct attempt must use the exact completion text on the origin route');
+    reasons.push('direct attempt must contain one unambiguous completion on the origin route');
   }
   if (
     [...directAttempts, ...fallbackDeliveries].some((call) => (
@@ -222,11 +320,11 @@ export function evaluateWorkflowDeliveryEvidence({
     if (
       fallbackDeliveries.length !== 1
       || fallbackDeliveries[0]?.route !== originRoute
-      || fallbackDeliveries[0]?.text?.trim() !== marker
       || markerOccurrences(fallbackDeliveries[0]?.text, marker) !== 1
+      || markerOccurrences(fallbackDeliveries[0]?.text, completionPrefix) !== 1
       || fallbackDeliveries[0]?.delivered !== true
     ) {
-      reasons.push('fallback must deliver the exact completion text once on the origin route');
+      reasons.push('fallback must deliver one unambiguous completion on the origin route');
     }
     if (
       fallbackPipeline !== 'helper'

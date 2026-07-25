@@ -12,6 +12,36 @@ const moduleUrl = pathToFileURL(
   path.join(__dirname, '..', 'scripts', 'spikes', 'workflow-fixture.mjs'),
 ).href;
 
+test('Workflow gate socket prefix fits the reproduced macOS Unix-path limit', async () => {
+  const { WORKFLOW_GATE_SESSION_PREFIX } = await import(moduleUrl);
+  assert.equal(typeof WORKFLOW_GATE_SESSION_PREFIX, 'string');
+  const reproducedTmpDir = '/var/folders/1m/jkbsl8jn10d6pm5wqqt682ym0000gp/T';
+  const socketPath = path.join(
+    reproducedTmpDir,
+    `${WORKFLOW_GATE_SESSION_PREFIX}-${'f'.repeat(32)}.sock`,
+  );
+  assert.ok(Buffer.byteLength(socketPath) < 104);
+
+  const driver = fs.readFileSync(path.join(
+    __dirname,
+    '..',
+    'scripts',
+    'spikes',
+    'workflow-autonomous-completion.mjs',
+  ), 'utf8');
+  assert.equal(
+    driver.match(/sessionPrefix: WORKFLOW_GATE_SESSION_PREFIX/g)?.length,
+    2,
+    'the tmux runner and CliProcess must share the sweep prefix',
+  );
+  assert.doesNotMatch(driver, /sessionPrefix: 'polygram-workflow-gate'/);
+  assert.ok(
+    driver.indexOf("path.join(fixture.cwd, '.workflow-completion-marker')")
+      > driver.indexOf('launchTurnClosedAt = Date.now()'),
+    'the completion marker must not exist before the launch turn closes',
+  );
+});
+
 test('Workflow gate prepares a private project-local skill that mandates native bounded Workflow', async (t) => {
   const parentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-workflow-fixture-'));
   t.after(() => fs.rmSync(parentDir, { recursive: true, force: true }));
@@ -32,6 +62,13 @@ test('Workflow gate prepares a private project-local skill that mandates native 
   assert.match(content, /^---\nname: completion-sentinel\n/m);
   assert.match(content, /native `Workflow` tool exactly once/i);
   assert.match(content, /at most three agents/i);
+  assert.match(content, /sleep 20/);
+  assert.match(content, /\.workflow-completion-marker/);
+  assert.match(content, /wait.*marker file.*appear/i);
+  assert.doesNotMatch(content, /WF-COMPLETE:\$ARGUMENTS/);
+  assert.match(content, /never call.*WF-COMPLETE.*launch turn/i);
+  assert.match(content, /current user event.*<task-notification>/i);
+  assert.match(content, /without quotes, backticks, labels, or commentary/i);
   assert.match(content, /\$ARGUMENTS/);
   assert.match(prepared.fixtureHash, /^[a-f0-9]{64}$/);
   assert.equal(prepared.skillName, 'completion-sentinel');
@@ -163,10 +200,11 @@ test('Opus projection requires Opus 5 and a complete unoverridden Workflow', asy
   assert.match(invalid.reasons.join('\n'), /report/);
 });
 
-test('Workflow delivery oracle requires one exact visible completion on the origin route', async () => {
+test('Workflow delivery oracle requires one unambiguous visible completion on the origin route', async () => {
   const { evaluateWorkflowDeliveryEvidence } = await import(moduleUrl);
   const common = {
     marker: 'WF-COMPLETE:test',
+    completionPrefix: 'WF-COMPLETE:',
     originRoute: '-100:37',
     foreignRoutes: ['-100:root', '-100:38'],
   };
@@ -206,6 +244,125 @@ test('Workflow delivery oracle requires one exact visible completion on the orig
   });
   assert.equal(duplicate.pass, false);
   assert.match(duplicate.reasons.join('\n'), /exactly one direct attempt/);
-  assert.match(duplicate.reasons.join('\n'), /exact completion text/);
+  assert.match(duplicate.reasons.join('\n'), /unambiguous completion/);
   assert.match(duplicate.reasons.join('\n'), /production helper pipeline/);
+
+  const premature = evaluateWorkflowDeliveryEvidence({
+    ...common,
+    deliveryMode: 'direct',
+    directAttempts: [
+      {
+        route: '-100:37',
+        text: 'WF-COMPLETE:guessed',
+        delivered: true,
+      },
+      {
+        route: '-100:37',
+        text: 'WF-COMPLETE:test',
+        delivered: true,
+      },
+    ],
+  });
+  assert.equal(premature.pass, false);
+  assert.match(premature.reasons.join('\n'), /unexpected completion-shaped/);
+
+  assert.deepEqual(evaluateWorkflowDeliveryEvidence({
+    ...common,
+    deliveryMode: 'direct',
+    directAttempts: [{
+      route: '-100:37',
+      text: '"WF-COMPLETE:test"',
+      delivered: true,
+    }],
+  }), { pass: true, reasons: [] });
+});
+
+test('Workflow timing oracle rejects a task notification inside stop grace', async (t) => {
+  const {
+    evaluateWorkflowOutOfTurnTiming,
+    readWorkflowTaskNotificationAt,
+  } = await import(moduleUrl);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-workflow-timing-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const sessionPath = path.join(dir, 'session.jsonl');
+  fs.writeFileSync(sessionPath, [
+    JSON.stringify({
+      type: 'user',
+      timestamp: '2026-07-25T19:16:40.543Z',
+      origin: { kind: 'task-notification' },
+      promptSource: 'system',
+      message: {
+        content: '<task-notification>WF-COMPLETE:expected</task-notification>',
+      },
+    }),
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-07-25T19:16:43.473Z',
+      message: { content: [{ type: 'text', text: 'sensitive' }] },
+    }),
+    JSON.stringify({
+      type: 'user',
+      timestamp: '2026-07-25T19:17:00.000Z',
+      origin: { kind: 'task-notification' },
+      promptSource: 'system',
+      message: { content: 'not a task notification envelope' },
+    }),
+    JSON.stringify({
+      type: 'user',
+      timestamp: '2026-07-25T19:17:10.000Z',
+      origin: { kind: 'task-notification' },
+      promptSource: 'system',
+      message: {
+        content: '<task-notification>WF-COMPLETE:unrelated</task-notification>',
+      },
+    }),
+  ].join('\n'));
+  assert.equal(
+    readWorkflowTaskNotificationAt(sessionPath, 'WF-COMPLETE:expected'),
+    Date.parse('2026-07-25T19:16:40.543Z'),
+  );
+
+  const common = {
+    launchStopHookAt: 1_000,
+    launchTurnClosedAt: 3_100,
+    completionAt: 24_000,
+    stopGraceMs: 2_000,
+    schedulingMarginMs: 500,
+    completionProcessingMarginMs: 100,
+  };
+
+  const inGrace = evaluateWorkflowOutOfTurnTiming({
+    ...common,
+    taskNotificationAt: 1_269,
+  });
+  assert.equal(inGrace.pass, false);
+  assert.equal(inGrace.taskNotificationAfterStopMs, 269);
+  assert.match(inGrace.reasons.join('\n'), /stop-grace boundary/);
+
+  assert.equal(evaluateWorkflowOutOfTurnTiming({
+    ...common,
+    launchStopHookAt: null,
+    taskNotificationAt: 21_000,
+  }).pass, false);
+
+  const earlyCompletion = evaluateWorkflowOutOfTurnTiming({
+    ...common,
+    completionAt: 20_000,
+    taskNotificationAt: 21_000,
+  });
+  assert.equal(earlyCompletion.pass, false);
+  assert.match(earlyCompletion.reasons.join('\n'), /after the task notification/);
+
+  assert.deepEqual(evaluateWorkflowOutOfTurnTiming({
+    ...common,
+    taskNotificationAt: 21_000,
+  }), {
+    pass: true,
+    reasons: [],
+    requiredTaskNotificationDelayMs: 2_500,
+    requiredCompletionAfterNotificationMs: 100,
+    taskNotificationAfterStopMs: 20_000,
+    completionAfterLaunchTurnMs: 20_900,
+    completionAfterTaskNotificationMs: 3_000,
+  });
 });
