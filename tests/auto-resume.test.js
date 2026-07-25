@@ -174,6 +174,14 @@ describe('isAutoResumable — gate', () => {
     assert.equal(isAutoResumable({ error: err }), false);
   });
 
+  test('SESSION_PROCESS_LOST → never resumable, even when its message resembles an idle timeout', () => {
+    const err = Object.assign(
+      new Error('Timeout: 300s idle with no Claude activity'),
+      { code: 'SESSION_PROCESS_LOST' },
+    );
+    assert.equal(isAutoResumable({ error: err }), false);
+  });
+
   test('F#6: BRIDGE_DISCONNECTED + aborted=true blocks (user said stop)', () => {
     const err = Object.assign(new Error('bridge disconnected'), { code: 'BRIDGE_DISCONNECTED' });
     assert.equal(isAutoResumable({ error: err, aborted: true }), false);

@@ -112,6 +112,18 @@ describe('classify — typed-code short-circuit', () => {
     assert.ok(r.userMessage && r.userMessage.length > 0);
   });
 
+  test('SESSION_PROCESS_LOST calmly directs the user to resend into a fresh session', () => {
+    const err = Object.assign(new Error('contained process tree exited'), {
+      code: 'SESSION_PROCESS_LOST',
+    });
+    const r = classify(err);
+    assert.equal(r.kind, 'sessionProcessLost');
+    assert.match(r.userMessage, /resend/i);
+    assert.match(r.userMessage, /fresh session/i);
+    assert.equal(r.isTransient, false);
+    assert.equal(r.autoRecover, null);
+  });
+
   // 0.16 busy-aware ceiling: a turn that kept extending while working but hit
   // the hard wall-clock backstop gets a DISTINCT code + message from a
   // went-quiet TURN_TIMEOUT, so the user knows it ran long vs stalled.
