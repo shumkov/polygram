@@ -297,16 +297,19 @@ try {
   lifecycle = copyAndNormalizeLifecycle(proc, cwd, selection);
   assert.ok(lifecycle.hooks?.some((event) => event.hookEventName === 'Stop'));
   assert.ok(lifecycle.session?.some((event) => event.type === 'assistant'));
-  const initModels = lifecycle.session
-    .filter((event) => event.type === 'system' && event.subtype === 'init')
+  const observedModels = lifecycle.session
+    .filter((event) => (
+      (event.type === 'system' && event.subtype === 'init')
+      || event.type === 'assistant'
+    ))
     .map((event) => event.model)
     .filter(Boolean);
-  assert.ok(initModels.length > 0, 'session must contain an observed init model');
+  assert.ok(observedModels.length > 0, 'session must contain an observed model');
   assert.ok(
-    initModels.every((model) => model === selection.model),
-    'observed init model must match the configured comparator model',
+    observedModels.every((model) => model === selection.model),
+    'observed model must match the configured comparator model',
   );
-  resolvedModel = initModels.at(-1);
+  resolvedModel = observedModels.at(-1);
 
   const wrapperRecords = readWrapperRecords(selection);
   validateWrapperProvenance(selection, wrapperRecords, {

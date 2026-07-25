@@ -52,6 +52,7 @@ export function normalizeGateRecord(obj) {
     return {
       type: 'assistant',
       hasParent: Boolean(obj.parentUuid || obj.parent_uuid || obj.parent_tool_use_id),
+      ...(stringField(obj.message?.model) && { model: obj.message.model }),
       ...(stringField(obj.message?.stop_reason) && { stopReason: obj.message.stop_reason }),
       contentTypes: blocks.map((block) => block?.type).filter(Boolean),
       toolNames: blocks

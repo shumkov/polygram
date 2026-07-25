@@ -16,6 +16,12 @@ describe('encodeCwd', () => {
   test('absolute path leading dash matches claude convention', () => {
     assert.equal(encodeCwd('/A/B'), '-A-B');
   });
+  test('real gate path: dots become dashes in Claude project directories', () => {
+    assert.equal(
+      encodeCwd('/private/tmp/polygram-claude-220-gate.9oFBKr/cli-workspace'),
+      '-private-tmp-polygram-claude-220-gate-9oFBKr-cli-workspace',
+    );
+  });
 });
 
 describe('sessionLogPath', () => {

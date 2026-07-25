@@ -23,6 +23,7 @@ test('gate evidence normalizer keeps lifecycle shape without message or tool bod
       type: 'assistant',
       parentUuid: 'private-parent',
       message: {
+        model: 'claude-sonnet-4-6',
         stop_reason: 'end_turn',
         content: [
           { type: 'text', text: secret },
@@ -63,6 +64,7 @@ test('gate evidence normalizer keeps lifecycle shape without message or tool bod
   assert.deepEqual(normalized[2], {
     type: 'assistant',
     hasParent: true,
+    model: 'claude-sonnet-4-6',
     stopReason: 'end_turn',
     contentTypes: ['text', 'tool_use'],
     toolNames: ['Bash'],
