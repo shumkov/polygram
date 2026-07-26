@@ -288,6 +288,7 @@ test('SDK process evidence retains selected binary parent pids', async (t) => {
     artifactBaseDir: path.join(dir, 'artifacts'),
     runId: 'process-parent-run',
     processEnv: { PATH: process.env.PATH },
+    processPlatform: 'darwin',
     processSnapshotFn: () => childPid
       ? [{ pid: childPid, ppid: 4242, command: executablePath }]
       : [],

@@ -941,6 +941,7 @@ test('process tree capture binds pid, parent, and executable from one snapshot',
     selection: { artifactDir: dir },
     label: 'snapshot',
     spawn,
+    platform: 'darwin',
     realpath: (value) => value,
   });
 
