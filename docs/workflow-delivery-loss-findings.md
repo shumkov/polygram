@@ -1,6 +1,6 @@
 # Workflow completion delivery loss — production findings
 
-**Status:** root cause confirmed; no fix implemented
+**Status:** root cause confirmed; fixes implemented in open PRs, not merged or deployed
 
 **Investigated:** 2026-07-24
 
@@ -231,18 +231,18 @@ The root cause is a contract mismatch plus a missing deterministic fallback.
    Claude interprets its own transcript as proof that the user received the answer,
    masking the delivery gap with a confident false claim.
 
-## Why no code was shipped
+## Why the fix is cross-package
 
-A prompt-only change is small but not a reliable fix. It would remove one source of
+A prompt-only change is small but not a reliable fix. It removes one source of
 confusion, yet delivery would still depend on model compliance with a tool-call
-contract. The current production failures demonstrate that this cannot be the only
-guard.
+contract. The production failures demonstrate that this cannot be the only guard.
 
 The deterministic fix belongs in `@shumkov/orchestra`, which is a separate package
 and owns CLI cycle/Stop attribution. It must also solve duplicate suppression and
 interim-reply semantics. Polygram then needs a dependency bump and an integration
-test. This crosses the turn-lifecycle boundary and is not a safe few-line patch in
-this repository.
+test. This crosses the turn-lifecycle boundary and was therefore implemented and
+reviewed as a separate Orchestra change rather than a speculative patch in this
+repository.
 
 Claude Code 2.1.211 later added improved background-result reporting, specifically
 waiting for real completion instead of fabricating results. That may reduce the
@@ -321,9 +321,20 @@ cycle identity when a real user message arrives during an autonomous completion.
 
 ## Changes made
 
-No runtime code, dependency, configuration, production data, or service state was
-changed. The production DB and transcript queries were read-only. Temporary query
-scripts were removed from both the worktree and the VPS after use.
+The production DB and transcript queries were read-only. Temporary query scripts
+were removed from both the worktree and the VPS after use. No production data,
+configuration, package, or service state was changed.
 
-No test suite was run because no executable code changed, and no commit, push, or PR
-was created.
+The deterministic Workflow delivery contract is implemented in
+[Orchestra PR #7](https://github.com/shumkov/orchestra/pull/7). The Claude
+`2.1.220` readiness prerequisite and pin are split into
+[Orchestra PR #8](https://github.com/shumkov/orchestra/pull/8) and
+[Orchestra PR #9](https://github.com/shumkov/orchestra/pull/9).
+[Polygram PR #27](https://github.com/shumkov/polygram/pull/27) contains the
+fail-closed 21-cell compatibility, delivery, privacy, and acceptance gates.
+
+The authoritative old/candidate matrix passed 21/21, the focused gate suite passed
+146/146, the full Polygram suite passed with zero failures and 13 explicit skips,
+and the Polygram Linux CI job passed. The Orchestra delivery and readiness PRs also
+have green CI. All changes remain open for review: nothing has been merged,
+published, tagged, or deployed.
