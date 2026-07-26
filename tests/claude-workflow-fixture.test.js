@@ -65,6 +65,11 @@ test('Workflow gate prepares a private project-local skill that mandates native 
   assert.match(content, /sleep 20/);
   assert.match(content, /\.workflow-completion-marker/);
   assert.match(content, /wait.*marker file.*appear/i);
+  assert.match(content, /ordinary JavaScript/i);
+  assert.match(content, /\^WF-COMPLETE:\[a-f0-9\]\{32\}\$/);
+  assert.match(content, /require\s+exactly one match/i);
+  assert.match(content, /return that match directly/i);
+  assert.match(content, /do not ask.*agent.*restate/i);
   assert.doesNotMatch(content, /WF-COMPLETE:\$ARGUMENTS/);
   assert.match(content, /never call.*WF-COMPLETE.*launch turn/i);
   assert.match(content, /current user event.*<task-notification>/i);
@@ -109,6 +114,60 @@ test('Workflow evidence records topology and completeness without result bodies'
     reportComplete: true,
   });
   assert.doesNotMatch(JSON.stringify(summary), /sensitive/);
+});
+
+test('Workflow metadata evidence selects only the task-notification-linked run', async () => {
+  const { summarizeWorkflowRecordsForTask } = await import(moduleUrl);
+  const summaries = summarizeWorkflowRecordsForTask([
+    {
+      taskId: 'failed-preflight',
+      status: 'failed',
+      agentCount: 0,
+      result: null,
+    },
+    {
+      taskId: 'notified-task',
+      status: 'completed',
+      agentCount: 2,
+      result: 'WF-COMPLETE:expected',
+    },
+  ], {
+    taskId: 'notified-task',
+    expectedResult: 'WF-COMPLETE:expected',
+  });
+
+  assert.deepEqual(summaries, [{
+    status: 'completed',
+    agentCount: 2,
+    defaultModel: null,
+    durationMs: null,
+    totalTokens: null,
+    totalToolCalls: null,
+    phaseCount: null,
+    progressCount: null,
+    progressTypes: {},
+    reportComplete: true,
+    reportMatchesExpected: true,
+  }]);
+  assert.throws(
+    () => summarizeWorkflowRecordsForTask([
+      { taskId: 'unrelated', status: 'completed', result: 'WF-COMPLETE:expected' },
+    ], {
+      taskId: 'notified-task',
+      expectedResult: 'WF-COMPLETE:expected',
+    }),
+    /exactly one notification-linked run/,
+  );
+  assert.throws(
+    () => summarizeWorkflowRecordsForTask([
+      { taskId: 'notified-task', status: 'completed', result: 'WF-COMPLETE:expected' },
+      { taskId: 'notified-task', status: 'completed', result: 'WF-COMPLETE:expected' },
+    ], {
+      taskId: 'notified-task',
+      expectedResult: 'WF-COMPLETE:expected',
+    }),
+    /exactly one notification-linked run/,
+  );
 });
 
 test('Workflow default evidence is fingerprinted from the exact selected binary', async (t) => {
@@ -281,6 +340,7 @@ test('Workflow timing oracle rejects a task notification inside stop grace', asy
   const {
     evaluateWorkflowOutOfTurnTiming,
     readWorkflowTaskNotificationAt,
+    readWorkflowTaskNotificationEvidence,
   } = await import(moduleUrl);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-workflow-timing-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -292,7 +352,12 @@ test('Workflow timing oracle rejects a task notification inside stop grace', asy
       origin: { kind: 'task-notification' },
       promptSource: 'system',
       message: {
-        content: '<task-notification>WF-COMPLETE:expected</task-notification>',
+        content: [
+          '<task-notification>',
+          '<task-id>notified-task</task-id>',
+          '<result>WF-COMPLETE:expected</result>',
+          '</task-notification>',
+        ].join('\n'),
       },
     }),
     JSON.stringify({
@@ -320,6 +385,13 @@ test('Workflow timing oracle rejects a task notification inside stop grace', asy
   assert.equal(
     readWorkflowTaskNotificationAt(sessionPath, 'WF-COMPLETE:expected'),
     Date.parse('2026-07-25T19:16:40.543Z'),
+  );
+  assert.deepEqual(
+    readWorkflowTaskNotificationEvidence(sessionPath, 'WF-COMPLETE:expected'),
+    {
+      timestamp: Date.parse('2026-07-25T19:16:40.543Z'),
+      taskId: 'notified-task',
+    },
   );
 
   const common = {

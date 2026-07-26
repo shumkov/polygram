@@ -154,6 +154,81 @@ test('legacy selection does not claim unsupported self-spawn wrapper evidence', 
   assert.equal(selection.sdkOptions.env.CLAUDE_CODE_GATE_RUN_ID, undefined);
 });
 
+test('SDK process evidence records a process sampling failure after launch', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-gate-sampling-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const executablePath = makeFakeClaude(dir);
+  let snapshotCalls = 0;
+
+  const { createClaudeGateSelection } = await import(helperUrl);
+  const selection = await createClaudeGateSelection({
+    executablePath,
+    expectedVersion: '2.1.220',
+    artifactBaseDir: path.join(dir, 'artifacts'),
+    runId: 'sampling-failure-run',
+    processEnv: { PATH: process.env.PATH },
+    processSnapshotFn: () => {
+      snapshotCalls += 1;
+      if (snapshotCalls === 1) return [];
+      throw new Error('synthetic process snapshot failure');
+    },
+  });
+  const child = selection.sdkOptions.spawnClaudeCodeProcess({
+    command: executablePath,
+    args: [],
+    cwd: selection.sdkCwd,
+    env: selection.sdkOptions.env,
+  });
+  await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', resolve);
+  });
+  selection.stopSdkProcessSampling();
+
+  assert.equal(selection.sdkProcessEvidence.samplingFailed, true);
+  assert.equal(selection.sdkProcessEvidence.sampleCount, 1);
+  assert.ok(selection.sdkProcessEvidence.samplingFailureCount >= 1);
+  assert.match(selection.sdkProcessEvidence.samplingErrorHash, /^[a-f0-9]{64}$/);
+});
+
+test('SDK process evidence retains tracking after an initial sampling failure', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-gate-initial-sampling-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const executablePath = makeFakeClaude(dir);
+
+  const { createClaudeGateSelection } = await import(helperUrl);
+  const selection = await createClaudeGateSelection({
+    executablePath,
+    expectedVersion: '2.1.220',
+    artifactBaseDir: path.join(dir, 'artifacts'),
+    runId: 'initial-sampling-failure-run',
+    processEnv: { PATH: process.env.PATH },
+    processSnapshotFn: () => {
+      throw new Error('synthetic initial process snapshot failure');
+    },
+  });
+  let child;
+  assert.doesNotThrow(() => {
+    child = selection.sdkOptions.spawnClaudeCodeProcess({
+      command: executablePath,
+      args: [],
+      cwd: selection.sdkCwd,
+      env: selection.sdkOptions.env,
+    });
+  });
+  await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', resolve);
+  });
+
+  assert.equal(selection.sdkProcessEvidence.samplingFailed, true);
+  assert.ok(selection.sdkProcessEvidence.samplingFailureCount >= 1);
+  assert.match(selection.sdkProcessEvidence.samplingErrorHash, /^[a-f0-9]{64}$/);
+  const failureCountAfterExit = selection.sdkProcessEvidence.samplingFailureCount;
+  selection.stopSdkProcessSampling();
+  assert.equal(selection.sdkProcessEvidence.samplingFailureCount, failureCountAfterExit);
+});
+
 test('artifact base validation never chmods an existing broad directory', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-gate-base-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

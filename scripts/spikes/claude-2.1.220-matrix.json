@@ -190,15 +190,15 @@
         "common": {}
       },
       "oracle": {
-        "old": "a compact boundary is observed before a successful result",
-        "candidate": "the same compact boundary and successful result are observed"
+        "old": "manual PreCompact and compact boundary precede one same-session marker recall",
+        "candidate": "the same ordered manual boundary and same-session recall succeed"
       },
       "comparison": {
         "lifecycle": "shape-equal",
-        "equalFields": ["resolvedModel", "compactBoundarySeen", "resultSubtype"]
+        "equalFields": ["resolvedModel", "preCompactCount", "compactBoundaryCount", "resultCount", "sameSession", "ordered", "recallPromptMarkerFree", "markerRecallCount", "resultSubtype"]
       },
       "cost": {
-        "usdEstimate": 3,
+        "usdEstimate": 0.03,
         "destructive": false
       },
       "artifactCollector": "run metadata and sanitized-result.json"

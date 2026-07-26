@@ -164,12 +164,17 @@ function descendantPids(snapshot, rootPid) {
   return found;
 }
 
-function createSdkProcessEvidence(executablePath) {
+function createSdkProcessEvidence(
+  executablePath,
+  { processSnapshotFn = processSnapshot } = {},
+) {
   const realExecutable = fs.realpathSync(executablePath);
   const rootPids = new Set();
   const activeRoots = new Set();
   const selectedBinaryPids = new Set();
   let sampleCount = 0;
+  let samplingFailureCount = 0;
+  let samplingErrorHash = null;
   let timer = null;
 
   function isSelectedBinary(command) {
@@ -183,7 +188,7 @@ function createSdkProcessEvidence(executablePath) {
 
   function sample() {
     if (activeRoots.size === 0) return;
-    const snapshot = processSnapshot();
+    const snapshot = processSnapshotFn();
     sampleCount += 1;
     for (const rootPid of activeRoots) {
       const descendants = descendantPids(snapshot, rootPid);
@@ -200,12 +205,27 @@ function createSdkProcessEvidence(executablePath) {
     publicEvidence.selectedBinaryPids = [...selectedBinaryPids]
       .sort((left, right) => left - right);
     publicEvidence.sampleCount = sampleCount;
+    publicEvidence.samplingFailed = samplingFailureCount > 0;
+    publicEvidence.samplingFailureCount = samplingFailureCount;
+    publicEvidence.samplingErrorHash = samplingErrorHash;
+  }
+
+  function recordSamplingFailure(error) {
+    samplingFailureCount += 1;
+    if (!samplingErrorHash) {
+      samplingErrorHash = hashSensitiveString(
+        error?.stack || error?.message || String(error),
+      );
+    }
   }
 
   const publicEvidence = {
     rootPids: [],
     selectedBinaryPids: [],
     sampleCount: 0,
+    samplingFailed: false,
+    samplingFailureCount: 0,
+    samplingErrorHash: null,
   };
 
   function stopTimerIfIdle() {
@@ -231,21 +251,29 @@ function createSdkProcessEvidence(executablePath) {
       activeRoots.add(child.pid);
       selectedBinaryPids.add(child.pid);
       refreshPublicEvidence(publicEvidence);
-      sample();
+      try {
+        sample();
+      } catch (error) {
+        recordSamplingFailure(error);
+      }
       refreshPublicEvidence(publicEvidence);
       if (!timer) {
         timer = setInterval(() => {
           try {
             sample();
-            refreshPublicEvidence(publicEvidence);
-          } catch {}
+          } catch (error) {
+            recordSamplingFailure(error);
+          }
+          refreshPublicEvidence(publicEvidence);
         }, 250);
         timer.unref?.();
       }
       child.once('exit', () => {
         try {
           sample();
-        } catch {}
+        } catch (error) {
+          recordSamplingFailure(error);
+        }
         activeRoots.delete(child.pid);
         refreshPublicEvidence(publicEvidence);
         stopTimerIfIdle();
@@ -260,7 +288,9 @@ function createSdkProcessEvidence(executablePath) {
     stop() {
       try {
         sample();
-      } catch {}
+      } catch (error) {
+        recordSamplingFailure(error);
+      }
       activeRoots.clear();
       stopTimerIfIdle();
       refreshPublicEvidence(publicEvidence);
@@ -277,6 +307,7 @@ export async function createClaudeGateSelection({
   runId = process.env.CLAUDE_GATE_RUN_ID || crypto.randomUUID(),
   processEnv = process.env,
   processWrapperPath = DEFAULT_WRAPPER_PATH,
+  processSnapshotFn = processSnapshot,
   model = processEnv.CLAUDE_GATE_MODEL || 'claude-sonnet-4-6',
   effort = processEnv.CLAUDE_GATE_EFFORT || 'medium',
 } = {}) {
@@ -303,7 +334,9 @@ export async function createClaudeGateSelection({
     { artifactDir },
     sdkCwd,
   );
-  const sdkProcessTracker = createSdkProcessEvidence(executablePath);
+  const sdkProcessTracker = createSdkProcessEvidence(executablePath, {
+    processSnapshotFn,
+  });
   const executablePathHash = hashSensitiveString(fs.realpathSync(executablePath));
   const selectorEnv = {
     CLAUDE_GATE_BIN: executablePath,

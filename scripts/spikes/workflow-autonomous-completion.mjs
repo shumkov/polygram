@@ -27,8 +27,8 @@ import {
   makeTreePrivate,
   prepareWorkflowProject,
   evaluateWorkflowDeliveryEvidence,
-  readWorkflowTaskNotificationAt,
-  summarizeWorkflowRecord,
+  readWorkflowTaskNotificationEvidence,
+  summarizeWorkflowRecordsForTask,
 } from './workflow-fixture.mjs';
 import {
   captureTmuxProcessTree,
@@ -92,6 +92,7 @@ function collectWorkflowMetadata(
   sessionId,
   artifactDir,
   expectedResult,
+  expectedTaskId,
 ) {
   const workflowDir = path.join(projectDir, sessionId, 'workflows');
   if (!fs.existsSync(workflowDir)) return [];
@@ -99,15 +100,18 @@ function collectWorkflowMetadata(
   fs.cpSync(workflowDir, privateDir, { recursive: true });
   makeTreePrivate(privateDir);
 
-  const metadata = [];
+  const records = [];
   for (const name of fs.readdirSync(workflowDir)) {
     if (!/^wf_[A-Za-z0-9-]+\.json$/.test(name)) continue;
     try {
       const record = JSON.parse(fs.readFileSync(path.join(workflowDir, name), 'utf8'));
-      metadata.push(summarizeWorkflowRecord(record, { expectedResult }));
+      records.push(record);
     } catch {}
   }
-  return metadata;
+  return summarizeWorkflowRecordsForTask(records, {
+    taskId: expectedTaskId,
+    expectedResult,
+  });
 }
 
 function waitForCompletion(register, timeoutMs = 360_000) {
@@ -382,13 +386,14 @@ try {
     selection.artifactDir,
     'session.jsonl',
   );
+  const taskNotification = readWorkflowTaskNotificationEvidence(
+    privateSession,
+    completionMarker,
+  );
   timingEvaluation = evaluateWorkflowOutOfTurnTiming({
     launchStopHookAt,
     launchTurnClosedAt,
-    taskNotificationAt: readWorkflowTaskNotificationAt(
-      privateSession,
-      completionMarker,
-    ),
+    taskNotificationAt: taskNotification.timestamp,
     completionAt,
     stopGraceMs: STOP_GRACE_MS,
     schedulingMarginMs: SCHEDULING_MARGIN_MS,
@@ -448,6 +453,7 @@ try {
     proc.claudeSessionId,
     selection.artifactDir,
     completionMarker,
+    taskNotification.taskId,
   );
   assert.ok(workflowMetadata.length >= 1, 'native Workflow metadata must be discoverable');
   assert.ok(

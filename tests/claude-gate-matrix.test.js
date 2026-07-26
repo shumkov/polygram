@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
+const { encodeCwd } = require('../lib/util/claude-session-jsonl');
 
 const repoRoot = path.resolve(__dirname, '..');
 const manifestPath = path.join(
@@ -67,6 +68,24 @@ test('delayed MCP uses the same threshold and version-specific modes', () => {
   );
   assert.deepEqual(scenario.args.old, ['--expected-mode', 'foreground']);
   assert.deepEqual(scenario.args.candidate, ['--expected-mode', 'background']);
+});
+
+test('SDK compact gate uses one ordered manual same-session boundary', () => {
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const scenario = manifest.scenarios.find(({ id }) => id === 'sdk-compact');
+  const driver = fs.readFileSync(path.join(repoRoot, scenario.driver), 'utf8');
+
+  assert.deepEqual(scenario.environment.common, {});
+  assert.match(scenario.oracle.old, /manual PreCompact.*compact boundary.*recall/i);
+  assert.match(scenario.oracle.candidate, /same/i);
+  assert.doesNotMatch(driver, /async function\* makeInput/);
+  assert.doesNotMatch(driver, /prompt: makeInput\(\)/);
+  assert.match(driver, /async function runTurn/);
+  assert.match(driver, /resume: resumeId/);
+  assert.match(driver, /const COMPACT_MINIMUM_EXCHANGES = 5/);
+  assert.match(driver, /for \(const prompt of primingPrompts\)/);
+  assert.match(driver, /PreCompact/);
+  assert.match(driver, /evaluateManualCompactEvidence/);
 });
 
 test('candidate-only production projection proves the Opus 5 resolution', () => {
@@ -286,7 +305,7 @@ test('accepted matrix cleanup removes private evidence and preserves sanitized r
     '{"status":"PASS"}',
     { mode: 0o600 },
   );
-  const sdkCwd = path.join(runDir, 'sdk-workspace');
+  const sdkCwd = path.join(runDir, 'sdk.workspace');
   fs.mkdirSync(sdkCwd, { mode: 0o700 });
   fs.writeFileSync(
     path.join(runDir, 'session-projects.json'),
@@ -297,7 +316,7 @@ test('accepted matrix cleanup removes private evidence and preserves sanitized r
   fs.mkdirSync(claudeProjectsDir, { mode: 0o700 });
   const sourceProjectDir = path.join(
     claudeProjectsDir,
-    fs.realpathSync(sdkCwd).replace(/\//g, '-'),
+    encodeCwd(fs.realpathSync(sdkCwd)),
   );
   fs.mkdirSync(sourceProjectDir, { mode: 0o700 });
   fs.writeFileSync(path.join(sourceProjectDir, 'private.jsonl'), 'raw', {

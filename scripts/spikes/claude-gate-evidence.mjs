@@ -118,7 +118,7 @@ export function resolveGateLifecycleModel({
       || record.type === 'assistant'
     ))
     .map((record) => record.model)
-    .filter(Boolean);
+    .filter((model) => model && model !== '<synthetic>');
   if (observedModels.length === 0) {
     throw new Error(`${label} must contain an observed model`);
   }
@@ -182,10 +182,14 @@ export function evaluateSdkGateEvidence({
   wrapperRecords = [],
   observedClaudePids = [],
   unwrappedRootPids = [],
+  processSamplingFailed = false,
 }) {
   const reasons = [];
   if (typeof resolvedModel !== 'string' || resolvedModel !== expectedResolvedModel) {
     reasons.push('observed SDK init model does not match the expected model');
+  }
+  if (processSamplingFailed) {
+    reasons.push('SDK process sampling failed while the Claude root was active');
   }
   try {
     validateWrapperProvenance(selection, wrapperRecords, {
@@ -246,6 +250,9 @@ export function createSdkGateObserver(
       const observedClaudePids = selection?.sdkProcessEvidence
         ?.selectedBinaryPids || [];
       const unwrappedRootPids = selection?.sdkProcessEvidence?.rootPids || [];
+      const processSamplingFailed = (
+        selection?.sdkProcessEvidence?.samplingFailed === true
+      );
       const evaluation = evaluateSdkGateEvidence({
         selection,
         resolvedModel,
@@ -253,6 +260,7 @@ export function createSdkGateObserver(
         wrapperRecords,
         observedClaudePids,
         unwrappedRootPids,
+        processSamplingFailed,
       });
       if (!lifecycle.some((record) => (
         record.type === 'system'
@@ -274,6 +282,11 @@ export function createSdkGateObserver(
           rootPids: [...unwrappedRootPids],
           selectedBinaryPids: [...observedClaudePids],
           sampleCount: selection?.sdkProcessEvidence?.sampleCount || 0,
+          samplingFailed: processSamplingFailed,
+          samplingFailureCount:
+            selection?.sdkProcessEvidence?.samplingFailureCount || 0,
+          samplingErrorHash:
+            selection?.sdkProcessEvidence?.samplingErrorHash || null,
         },
         lifecycle,
       };

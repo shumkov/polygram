@@ -1,6 +1,10 @@
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+
+const require = createRequire(import.meta.url);
+const { encodeCwd } = require('../../lib/util/claude-session-jsonl');
 
 const RUN_PREFIX_RE = /^[A-Za-z0-9._-]{1,96}$/;
 
@@ -372,7 +376,7 @@ export function purgeAcceptedGateArtifacts({
       const gateCwd = assertContained(runDir, cwd);
       const projectDir = assertContained(
         realClaudeProjectsDir,
-        path.join(realClaudeProjectsDir, gateCwd.replace(/\//g, '-')),
+        path.join(realClaudeProjectsDir, encodeCwd(gateCwd)),
       );
       if (!fs.existsSync(projectDir)) continue;
       const projectStat = fs.lstatSync(projectDir);

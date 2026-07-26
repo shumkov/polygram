@@ -16,9 +16,12 @@ Build and launch a background Workflow with at most three agents:
    then runs `sleep 20`, reads the marker, and verifies that `2 + 2 = 4`. This
    delay keeps completion beyond the launch turn's stop-grace window.
 2. One agent verifies that the sentinel was preserved byte-for-byte.
-3. An optional final agent checks both findings.
+3. Do not ask another agent to restate or reformat the marker. After both agents
+   finish, use ordinary JavaScript in the Workflow script to extract every line
+   matching `^WF-COMPLETE:[a-f0-9]{32}$` with multiline matching from the first
+   agent's result. Require exactly one match and return that match directly.
 
-The Workflow's terminal result must contain exactly the marker read from
+The Workflow's terminal result must equal exactly the marker read from
 `.workflow-completion-marker`. Do not read that file in the launch turn; only a
 Workflow agent may read it after the delay.
 

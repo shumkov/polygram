@@ -76,11 +76,26 @@ export function summarizeWorkflowRecord(record, { expectedResult } = {}) {
   };
 }
 
-export function readWorkflowTaskNotificationAt(sessionPath, expectedMarker) {
+export function summarizeWorkflowRecordsForTask(
+  records,
+  { taskId, expectedResult } = {},
+) {
+  if (!Array.isArray(records)) throw new TypeError('records must be an array');
+  if (typeof taskId !== 'string' || taskId.length === 0) {
+    throw new TypeError('taskId must be a non-empty string');
+  }
+  const matching = records.filter((record) => record?.taskId === taskId);
+  if (matching.length !== 1) {
+    throw new Error('Workflow metadata must contain exactly one notification-linked run');
+  }
+  return matching.map((record) => summarizeWorkflowRecord(record, { expectedResult }));
+}
+
+export function readWorkflowTaskNotificationEvidence(sessionPath, expectedMarker) {
   if (typeof expectedMarker !== 'string' || expectedMarker.length === 0) {
     throw new TypeError('expectedMarker must be a non-empty string');
   }
-  const timestamps = [];
+  const evidence = [];
   for (const line of fs.readFileSync(sessionPath, 'utf8').split(/\r?\n/)) {
     if (!line.trim()) continue;
     try {
@@ -95,14 +110,30 @@ export function readWorkflowTaskNotificationAt(sessionPath, expectedMarker) {
       ) {
         continue;
       }
+      const taskIds = [...record.message.content.matchAll(
+        /<task-id>\s*([^<]+?)\s*<\/task-id>/g,
+      )].map((match) => match[1].trim());
+      if (taskIds.length !== 1 || !taskIds[0]) {
+        throw new Error('matching Workflow task notification must contain one task id');
+      }
       const timestamp = Date.parse(record.timestamp);
-      if (Number.isFinite(timestamp)) timestamps.push(timestamp);
-    } catch {}
+      if (!Number.isFinite(timestamp)) {
+        throw new Error('matching Workflow task notification must have a timestamp');
+      }
+      evidence.push({ timestamp, taskId: taskIds[0] });
+    } catch (error) {
+      if (error instanceof SyntaxError) continue;
+      throw error;
+    }
   }
-  if (timestamps.length !== 1) {
+  if (evidence.length !== 1) {
     throw new Error('Workflow session must contain exactly one timed matching task notification');
   }
-  return timestamps[0];
+  return evidence[0];
+}
+
+export function readWorkflowTaskNotificationAt(sessionPath, expectedMarker) {
+  return readWorkflowTaskNotificationEvidence(sessionPath, expectedMarker).timestamp;
 }
 
 export function evaluateWorkflowOutOfTurnTiming({

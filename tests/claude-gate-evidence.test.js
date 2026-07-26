@@ -150,6 +150,14 @@ test('lifecycle model resolver accepts CLI assistant evidence and rejects confli
     expectedModel: 'claude-sonnet-4-6',
     label: 'CLI',
   }), 'claude-sonnet-4-6');
+  assert.equal(resolveGateLifecycleModel({
+    records: [
+      { type: 'system', subtype: 'init', model: 'claude-sonnet-4-6' },
+      { type: 'assistant', model: '<synthetic>' },
+    ],
+    expectedModel: 'claude-sonnet-4-6',
+    label: 'SDK',
+  }), 'claude-sonnet-4-6');
   assert.throws(() => resolveGateLifecycleModel({
     records: [
       { type: 'system', subtype: 'init', model: 'claude-sonnet-4-6' },
@@ -210,6 +218,41 @@ test('SDK evidence requires the observed init model and complete process provena
     observedClaudePids: [2200, 2201],
     unwrappedRootPids: [2200],
   }).pass, false);
+});
+
+test('SDK observer fails closed when process sampling failed', async () => {
+  const { createSdkGateObserver } = await import(moduleUrl);
+  const selection = {
+    version: '2.1.173',
+    sha256: 'old-sha',
+    model: 'claude-sonnet-4-6',
+    sessionLauncher: null,
+    sanitizedAttestation: {
+      executablePathHash: 'old-path-hash',
+    },
+    sdkProcessEvidence: {
+      rootPids: [1730],
+      selectedBinaryPids: [1730],
+      sampleCount: 1,
+      samplingFailed: true,
+      samplingFailureCount: 1,
+      samplingErrorHash: 'a'.repeat(64),
+    },
+  };
+  const observer = createSdkGateObserver(selection);
+  observer.observe({
+    type: 'system',
+    subtype: 'init',
+    model: 'claude-sonnet-4-6',
+  });
+
+  const evidence = observer.finish();
+
+  assert.equal(evidence.pass, false);
+  assert.match(evidence.reasons.join('\n'), /process sampling failed/i);
+  assert.equal(evidence.processEvidence.samplingFailed, true);
+  assert.equal(evidence.processEvidence.samplingFailureCount, 1);
+  assert.equal(evidence.processEvidence.samplingErrorHash, 'a'.repeat(64));
 });
 
 test('SDK observer records normalized lifecycle and fails a missing init model', async () => {
