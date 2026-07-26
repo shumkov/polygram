@@ -36,6 +36,8 @@ gate-owned cwds are recorded privately and preflighted before deletion:
 
 ```sh
 node scripts/spikes/run-claude-gate-matrix.mjs \
+  --old-bin /absolute/path/to/claude-2.1.173 \
+  --candidate-bin /absolute/path/to/claude-2.1.220 \
   --artifact-base /absolute/private/artifact-directory \
   --accept-run <run-prefix>
 ```
@@ -47,7 +49,9 @@ The matrix covers:
 - native Workflow direct delivery and forced direct-failure fallback
   after launch-turn closure, with foreign-topic checks;
 - delayed MCP foreground behavior on `2.1.173` and native
-  auto-background completion on `2.1.220`;
+  auto-background completion on `2.1.220`; the runner clears any inherited
+  `CLAUDE_AUTO_BACKGROUND_TASKS` value, then opts in only the candidate cell and
+  correlates its task/tool-use lifecycle;
 - SDK PostToolBatch, subagent attribution, resume, compaction, and
   tool-less completion;
 - candidate worker-wrapper provenance and the separate Opus 5
@@ -56,9 +60,17 @@ The matrix covers:
   anchors in the exact SHA-attested candidate executable.
 
 For every old/new cell, the runner also compares privacy-safe normalized
-lifecycle shapes. Hook fields, queue operations, task-notification
-provenance, ancestry shapes, and pivotal event ordering must match; any
-unreviewed lifecycle difference fails the pair.
+lifecycle evidence. Cells use strict shape equality by default. The CLI
+contract runs twice per version and compares its same-version results before
+all four old/new pairings. Each run must first match the manifest's exact
+35-row session-pivotal and 21-row transport-hook baselines. Candidate runs may
+then remove one reviewed `task_reminder`; either version may also remove at most
+one interrupt-correlated `hook_cancelled`. One source-bound composite proof must
+show that every removed row's parser push is empty, every retained input line
+emits the same event batch, and final flush is unchanged. The runner
+independently checks the private transcript hash. Unknown or malformed
+normalized rows, missing/false/stale proof evidence, and any other projected
+difference fail the gate.
 
 Every run requires `CLAUDE_GATE_BIN` and
 `CLAUDE_GATE_EXPECTED_VERSION`; the matrix runner supplies those plus

@@ -14,26 +14,34 @@ import {
   withClaudeGateTmuxEnv,
 } from './claude-executable.mjs';
 import {
+  collectGateLifecycleEvidence,
+  collectGateSessionEvidence,
   copyPrivateGateArtifact,
-  normalizeGateJsonl,
   readWrapperRecords,
   resolveGateLifecycleModel,
   validateWrapperProvenance,
+  waitForGateSessionTerminal,
+  writePrivateGateFailure,
   writeSanitizedGateResult,
 } from './claude-gate-evidence.mjs';
 import {
+  WORKFLOW_GATE_ORIGIN_ROUTE,
   WORKFLOW_GATE_SESSION_PREFIX,
   evaluateWorkflowOutOfTurnTiming,
+  evaluateWorkflowLaunchDeliveryEvidence,
   makeTreePrivate,
   prepareWorkflowProject,
+  readWorkflowPreLaunchTerminalState,
   evaluateWorkflowDeliveryEvidence,
   readWorkflowTaskNotificationEvidence,
   summarizeWorkflowRecordsForTask,
+  waitForWorkflowCompletionTurnEvidence,
+  waitForWorkflowDeliveryWorkSettled,
 } from './workflow-fixture.mjs';
 import {
   captureTmuxProcessTree,
   mergeProcessTrees,
-  selectedBinaryPids,
+  selectedBinaryProcesses,
 } from './process-tree-evidence.mjs';
 
 const require = createRequire(import.meta.url);
@@ -69,6 +77,8 @@ const STOP_GRACE_MS = 2_000;
 const SCHEDULING_MARGIN_MS = 500;
 const COMPLETION_PROCESSING_MARGIN_MS = 100;
 const COMPLETION_PREFIX = 'WF-COMPLETE:';
+const BRIDGE_SERVER_NAME = 'polygram-workflow-gate-bridge';
+const REPLY_TOOL_NAME = `mcp__${BRIDGE_SERVER_NAME}__reply`;
 const noopStreamer = {
   onChunk: async () => {},
   forceNewMessage: () => {},
@@ -136,7 +146,7 @@ const launchMarker = `WF-LAUNCHED:${sentinel}`;
 const completionMarker = `${COMPLETION_PREFIX}${crypto.randomBytes(16).toString('hex')}`;
 const originChatId = '-999000220';
 const originThreadId = 220;
-const sessionKey = `${originChatId}:${originThreadId}`;
+const sessionKey = WORKFLOW_GATE_ORIGIN_ROUTE;
 const originRoute = sessionKey;
 const foreignRoutes = new Set(['-999000220:root', '-999000220:221']);
 const directCalls = [];
@@ -149,11 +159,29 @@ let completionResolve = null;
 let proc = null;
 let status = 'FAIL';
 let failureHash = null;
+let failureStage = 'initializing';
 let lifecycle = {};
+let lifecycleSources = {};
+let lifecycleProofs = [];
 let workflowMetadata = [];
 let processTree = [];
 let resolvedModel = null;
 let deliveryEvaluation = { pass: false, reasons: ['delivery not evaluated'] };
+let launchCalls = [];
+let launchDeliveryEvaluation = {
+  pass: false,
+  reasons: ['launch delivery not evaluated'],
+  proof: {
+    launchDeliveryCount: 0,
+    exactlyOneCall: false,
+    replyToolMatched: false,
+    originRouteMatched: false,
+    exactTextMatched: false,
+    deliverySucceeded: false,
+    nonInterim: false,
+    zeroFiles: false,
+  },
+};
 let timingEvaluation = {
   pass: false,
   reasons: ['out-of-turn timing not evaluated'],
@@ -163,6 +191,7 @@ let timingEvaluation = {
   completionAfterLaunchTurnMs: null,
   completionAfterTaskNotificationMs: null,
 };
+let completionTurnProof = null;
 let fallbackPipeline = null;
 let fallbackSentCount = 0;
 let fallbackFailedCount = 0;
@@ -231,16 +260,25 @@ try {
     botName: `wfgate${suffix}`,
     claudeBin: selection.executablePath,
     sessionLauncher: selection.sessionLauncher,
-    toolDispatcher: async ({ chatId, threadId, toolName, text }) => {
+    toolDispatcher: async ({
+      chatId,
+      threadId,
+      toolName,
+      text,
+      interim,
+      files,
+    }) => {
       const route = `${chatId}:${threadId ?? 'root'}`;
       const call = {
         route,
         toolName,
         text: typeof text === 'string' ? text : '',
+        interim: interim === true,
+        files: files === undefined ? [] : files,
         delivered: true,
       };
 
-      if (toolName === 'reply' && call.text.includes(completionMarker)) {
+      if (toolName === 'reply' && call.text === completionMarker) {
         if (deliveryMode === 'fail') {
           call.delivered = false;
           directCalls.push(call);
@@ -266,7 +304,7 @@ try {
     appDataDir: path.join(fixture.cwd, '.orchestra'),
     attachmentBase: path.join(fixture.cwd, '.attachments'),
     sessionPrefix: WORKFLOW_GATE_SESSION_PREFIX,
-    bridgeServerName: 'polygram-workflow-gate-bridge',
+    bridgeServerName: BRIDGE_SERVER_NAME,
     productName: 'polygram-workflow-gate',
     surfaceName: 'synthetic channel',
     turnQuietMs: 1_500,
@@ -304,18 +342,24 @@ try {
     permissionMode: 'bypassPermissions',
     isolateUserConfig: true,
   };
+  failureStage = 'starting-cli';
   await proc.start({
     cwd: fixture.cwd,
     chatConfig,
     threadId: 220,
     existingSessionId: null,
   });
+  registerGateSessionProject(selection, fixture.cwd, proc.claudeSessionId);
   processTree = captureTmuxProcessTree({
     tmuxSession: proc.tmuxSession,
     selection,
     label: 'startup',
   });
+  const sessionPath = sessionLogPath(fixture.cwd, proc.claudeSessionId);
+  const terminalBeforeLaunch = readWorkflowPreLaunchTerminalState(sessionPath);
 
+  failureStage = 'launching-workflow';
+  const launchCallStart = directCalls.length;
   const launchResult = await proc.send(
     `/completion-sentinel ${sentinel}`,
     {
@@ -331,6 +375,35 @@ try {
     },
   );
   launchTurnClosedAt = Date.now();
+  const launchTerminal = await waitForGateSessionTerminal({
+    filePath: sessionPath,
+    afterTurnDurationCount: terminalBeforeLaunch.turnDurationCount,
+    timeoutMs: 15_000,
+  });
+  launchCalls = directCalls.slice(launchCallStart).map((call) => ({
+    ...call,
+    files: Array.isArray(call.files) ? [...call.files] : call.files,
+  }));
+  launchDeliveryEvaluation = evaluateWorkflowLaunchDeliveryEvidence({
+    calls: launchCalls,
+    launchMarker,
+    originRoute,
+  });
+  assert.equal(
+    launchDeliveryEvaluation.pass,
+    true,
+    launchDeliveryEvaluation.reasons.join('; '),
+  );
+  const completionTurnEvidence = waitForWorkflowCompletionTurnEvidence({
+    emitter: proc,
+    sessionPath,
+    completionMarker,
+    replyToolName: REPLY_TOOL_NAME,
+    deliveryMode,
+    afterTurnDurationCount: launchTerminal.turnDurationCount,
+    eventTimeoutMs: 360_000,
+    durableTimeoutMs: 15_000,
+  });
   fs.writeFileSync(
     path.join(fixture.cwd, '.workflow-completion-marker'),
     `${completionMarker}\n`,
@@ -338,15 +411,13 @@ try {
   );
   assert.equal(launchResult.metrics?.resultSubtype, 'success');
   assert.equal(proc.pendingTurns.size, 0, 'launch turn must close before completion');
-  assert.ok(
-    directCalls.some((call) => call.route === originRoute && call.text.includes(launchMarker)),
-    'launch acknowledgement must reach the origin route',
-  );
 
+  failureStage = 'awaiting-completion';
   const completion = await completionPromise;
   if (deliveryMode === 'fail') await fallbackPipelineSettled;
   assert.ok(completionAt > launchTurnClosedAt, 'completion must arrive after launch turn closure');
-  await sleep(4_000);
+  completionTurnProof = await completionTurnEvidence;
+  await waitForWorkflowDeliveryWorkSettled(proc, { timeoutMs: 30_000 });
 
   const completionDirectCalls = directCalls.filter(
     (call) => call.toolName === 'reply' && call.text.includes(COMPLETION_PREFIX),
@@ -361,6 +432,7 @@ try {
     assert.equal(fallbackCalls.length, 1, 'failed direct delivery must emit one fallback');
   }
 
+  failureStage = 'evaluating-delivery';
   deliveryEvaluation = evaluateWorkflowDeliveryEvidence({
     deliveryMode,
     marker: completionMarker,
@@ -379,8 +451,6 @@ try {
     deliveryEvaluation.reasons.join('; '),
   );
 
-  const sessionPath = sessionLogPath(fixture.cwd, proc.claudeSessionId);
-  assert.ok(fs.existsSync(sessionPath), 'Workflow session JSONL must exist');
   const privateSession = copyPrivateGateArtifact(
     sessionPath,
     selection.artifactDir,
@@ -390,6 +460,7 @@ try {
     privateSession,
     completionMarker,
   );
+  failureStage = 'evaluating-timing';
   timingEvaluation = evaluateWorkflowOutOfTurnTiming({
     launchStopHookAt,
     launchTurnClosedAt,
@@ -404,7 +475,11 @@ try {
     true,
     timingEvaluation.reasons.join('; '),
   );
-  lifecycle.session = normalizeGateJsonl(privateSession);
+  failureStage = 'collecting-evidence';
+  const sessionEvidence = collectGateSessionEvidence(privateSession);
+  lifecycle.session = sessionEvidence.records;
+  lifecycleSources.session = sessionEvidence.source;
+  lifecycleProofs = sessionEvidence.proofs;
   const expectedResolvedModel = process.env.CLAUDE_GATE_EXPECTED_RESOLVED_MODEL
     || selection.model;
   resolvedModel = resolveGateLifecycleModel({
@@ -434,7 +509,11 @@ try {
       selection.artifactDir,
       'hooks.ndjson',
     );
-    lifecycle.hooks = normalizeGateJsonl(privateHooks);
+    const hookEvidence = collectGateLifecycleEvidence(privateHooks, {
+      stream: 'hooks',
+    });
+    lifecycle.hooks = hookEvidence.records;
+    lifecycleSources.hooks = hookEvidence.source;
     assert.ok(
       lifecycle.hooks.some((event) => (
         event.type === 'hook'
@@ -479,13 +558,23 @@ try {
     label: 'after-workflow',
   }));
   const wrapperRecords = readWrapperRecords(selection);
+  const observedClaudeProcesses = selectedBinaryProcesses(
+    selection,
+    processTree,
+  );
+  assert.ok(
+    observedClaudeProcesses.length > 0,
+    'process tree must contain the selected Claude executable',
+  );
   validateWrapperProvenance(selection, wrapperRecords, {
-    observedClaudePids: selectedBinaryPids(selection, processTree),
+    observedClaudeProcesses,
   });
 
+  failureStage = 'complete';
   status = 'PASS';
 } catch (error) {
   failureHash = hashSensitiveString(error?.stack || error?.message || String(error));
+  writePrivateGateFailure(selection.artifactDir, error);
   console.error(`FAIL (${failureHash.slice(0, 12)})`);
 } finally {
   if (proc) {
@@ -500,6 +589,7 @@ try {
     scenario: `workflow-autonomous-completion-${deliveryMode}`,
     status,
     failureHash,
+    failureStage: status === 'PASS' ? null : failureStage,
     attestation: selection.sanitizedAttestation,
     resolvedModel,
     fixtureHash: fixture.fixtureHash,
@@ -507,7 +597,20 @@ try {
     launchTurnClosedBeforeCompletion: Boolean(
       launchTurnClosedAt && completionAt && completionAt > launchTurnClosedAt,
     ),
-    outOfTurnTiming: timingEvaluation,
+    outOfTurnTiming: {
+      pass: timingEvaluation.pass,
+      reasonCount: timingEvaluation.reasons.length,
+      requiredTaskNotificationDelayMs:
+        timingEvaluation.requiredTaskNotificationDelayMs,
+      requiredCompletionAfterNotificationMs:
+        timingEvaluation.requiredCompletionAfterNotificationMs,
+      taskNotificationAfterStopMs:
+        timingEvaluation.taskNotificationAfterStopMs,
+      completionAfterLaunchTurnMs:
+        timingEvaluation.completionAfterLaunchTurnMs,
+      completionAfterTaskNotificationMs:
+        timingEvaluation.completionAfterTaskNotificationMs,
+    },
     directCompletionCount: directCalls.filter(
       (call) => call.toolName === 'reply' && call.text.includes(COMPLETION_PREFIX),
     ).length,
@@ -527,7 +630,11 @@ try {
         fallbackCalls.filter((call) => call.route === route).length,
       ]),
     ),
-    eventKinds,
+    eventKinds: eventKinds.map(hashSensitiveString),
+    launchDeliveryCount: launchDeliveryEvaluation.proof.launchDeliveryCount,
+    launchDeliveryReasonCount: launchDeliveryEvaluation.reasons.length,
+    launchDeliveryProof: launchDeliveryEvaluation.proof,
+    completionTurnProof,
     workflowMetadata,
     processTree: processTree.map((record) => ({
       pid: record.pid,
@@ -536,6 +643,8 @@ try {
     })),
     wrapperRecords: readWrapperRecords(selection),
     lifecycle,
+    lifecycleSources,
+    lifecycleProofs,
     deliveryReasonCount: deliveryEvaluation.reasons.length,
   });
 }

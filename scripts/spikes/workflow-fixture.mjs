@@ -4,6 +4,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { sha256File } from './claude-executable.mjs';
+import {
+  readGateSessionTerminalState,
+  waitForGateEventSequence,
+} from './claude-gate-evidence.mjs';
 
 const SOURCE_ROOT = fileURLToPath(
   new URL('./fixtures/workflow-project', import.meta.url),
@@ -16,6 +20,255 @@ const SKILL_RELATIVE_PATH = path.join(
 );
 
 export const WORKFLOW_GATE_SESSION_PREFIX = 'polygram-gate';
+export const WORKFLOW_GATE_ORIGIN_ROUTE = '-999000220:220';
+
+export function readWorkflowPreLaunchTerminalState(sessionPath) {
+  if (typeof sessionPath !== 'string' || sessionPath.length === 0) {
+    throw new TypeError('Workflow pre-launch session path is required');
+  }
+  if (!fs.existsSync(sessionPath)) {
+    return {
+      turnDurationCount: 0,
+      pivotalSuffix: [],
+    };
+  }
+  return readGateSessionTerminalState(sessionPath);
+}
+
+function readWorkflowReplyReceiptEvidence({
+  sessionPath,
+  completionMarker,
+  replyToolName,
+  toolUseId,
+  deliveryMode,
+}) {
+  const records = [];
+  for (const line of fs.readFileSync(sessionPath, 'utf8').split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      records.push(JSON.parse(line));
+    } catch {
+      throw new Error('Workflow session contains malformed receipt evidence');
+    }
+  }
+
+  const toolUses = [];
+  const toolResults = [];
+  records.forEach((record, recordIndex) => {
+    const blocks = Array.isArray(record?.message?.content)
+      ? record.message.content
+      : [];
+    for (const block of blocks) {
+      if (block?.type === 'tool_use' && block.id === toolUseId) {
+        toolUses.push({ block, recordIndex });
+      }
+      if (block?.type === 'tool_result' && block.tool_use_id === toolUseId) {
+        toolResults.push({ block, recordIndex });
+      }
+    }
+  });
+
+  if (toolUses.length === 0 || toolResults.length === 0) return null;
+  if (toolUses.length !== 1 || toolResults.length !== 1) {
+    throw new Error('Workflow completion receipt identity is ambiguous');
+  }
+
+  const [{ block: toolUse, recordIndex: toolUseIndex }] = toolUses;
+  const [{ block: toolResult, recordIndex: toolResultIndex }] = toolResults;
+  if (
+    toolUse.name !== replyToolName
+    || typeof toolUse.input?.text !== 'string'
+    || toolUse.input.text !== completionMarker
+    || toolResultIndex <= toolUseIndex
+  ) {
+    throw new Error('Workflow completion receipt does not match the captured reply');
+  }
+
+  const payloadTexts = typeof toolResult.content === 'string'
+    ? [toolResult.content]
+    : Array.isArray(toolResult.content)
+      ? toolResult.content
+        .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+        .map((block) => block.text)
+      : [];
+  const payloads = payloadTexts.flatMap((text) => {
+    try {
+      const payload = JSON.parse(text);
+      return payload && typeof payload === 'object' && !Array.isArray(payload)
+        ? [payload]
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  if (payloads.length !== 1) {
+    throw new Error('Workflow completion receipt payload is not unambiguous JSON');
+  }
+
+  const [payload] = payloads;
+  const receiptIsError = toolResult.is_error === true;
+  if (deliveryMode === 'direct') {
+    if (payload.ok !== true || receiptIsError) {
+      throw new Error('Workflow direct receipt does not prove successful delivery');
+    }
+  } else if (
+    payload.ok !== false
+    || typeof payload.error !== 'string'
+    || payload.error.length === 0
+    || !receiptIsError
+  ) {
+    throw new Error('Workflow fallback receipt does not prove failed direct delivery');
+  }
+
+  return {
+    transcriptToolUseCount: toolUses.length,
+    transcriptToolResultCount: toolResults.length,
+    receiptOk: payload.ok,
+    receiptIsError,
+  };
+}
+
+function waitForWorkflowDurableCompletionEvidence({
+  sessionPath,
+  completionMarker,
+  replyToolName,
+  toolUseId,
+  deliveryMode,
+  afterTurnDurationCount,
+  timeoutMs,
+  pollMs,
+}) {
+  const startedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    const poll = () => {
+      let terminal;
+      let receipt;
+      try {
+        terminal = readGateSessionTerminalState(sessionPath);
+        receipt = readWorkflowReplyReceiptEvidence({
+          sessionPath,
+          completionMarker,
+          replyToolName,
+          toolUseId,
+          deliveryMode,
+        });
+      } catch (error) {
+        reject(error);
+        return;
+      }
+
+      const terminalAdvanced = (
+        terminal.turnDurationCount > afterTurnDurationCount
+        && terminal.pivotalSuffix.length === 2
+        && terminal.pivotalSuffix[0]?.type === 'system'
+        && terminal.pivotalSuffix[0]?.subtype === 'stop_hook_summary'
+        && terminal.pivotalSuffix[1]?.type === 'system'
+        && terminal.pivotalSuffix[1]?.subtype === 'turn_duration'
+      );
+      if (terminalAdvanced && receipt) {
+        resolve({
+          ...receipt,
+          terminalAdvanced: true,
+          turnDurationCount: terminal.turnDurationCount,
+        });
+        return;
+      }
+      if (Date.now() - startedAt >= timeoutMs) {
+        reject(new Error(
+          `Workflow completion evidence timed out after ${timeoutMs}ms`,
+        ));
+        return;
+      }
+      setTimeout(poll, pollMs);
+    };
+    poll();
+  });
+}
+
+export function waitForWorkflowCompletionTurnEvidence({
+  emitter,
+  sessionPath,
+  completionMarker,
+  replyToolName,
+  deliveryMode,
+  afterTurnDurationCount,
+  eventTimeoutMs,
+  durableTimeoutMs,
+  pollMs = 25,
+}) {
+  if (
+    typeof sessionPath !== 'string'
+    || sessionPath.length === 0
+    || typeof completionMarker !== 'string'
+    || completionMarker.length === 0
+    || typeof replyToolName !== 'string'
+    || replyToolName.length === 0
+    || !['direct', 'fail'].includes(deliveryMode)
+    || !Number.isInteger(afterTurnDurationCount)
+    || afterTurnDurationCount < 0
+    || !Number.isFinite(durableTimeoutMs)
+    || durableTimeoutMs <= 0
+    || !Number.isFinite(pollMs)
+    || pollMs <= 0
+  ) {
+    throw new TypeError('Workflow completion evidence requires bounded correlation inputs');
+  }
+
+  const state = {};
+  const steps = [
+    {
+      eventName: 'tool-use-detail',
+      matches: (event) => (
+        event?.name === replyToolName
+        && typeof event?.toolUseId === 'string'
+        && event.toolUseId.length > 0
+        && typeof event?.input?.text === 'string'
+        && event.input.text === completionMarker
+      ),
+      capture: (event, sequenceState) => {
+        sequenceState.toolUseId = event.toolUseId;
+      },
+    },
+    ...(deliveryMode === 'direct' ? [{
+      eventName: 'tool-result',
+      matches: (event, sequenceState) => (
+        event?.name === replyToolName
+        && event?.toolUseId === sequenceState.toolUseId
+        && event?.isError === false
+      ),
+    }] : []),
+    {
+      eventName: 'stop-hook',
+      matches: () => true,
+    },
+  ];
+  const eventSequence = waitForGateEventSequence({
+    emitter,
+    steps,
+    timeoutMs: eventTimeoutMs,
+    label: `Workflow ${deliveryMode} completion lifecycle`,
+    state,
+  });
+
+  return eventSequence.then(async () => {
+    const durable = await waitForWorkflowDurableCompletionEvidence({
+      sessionPath,
+      completionMarker,
+      replyToolName,
+      toolUseId: state.toolUseId,
+      deliveryMode,
+      afterTurnDurationCount,
+      timeoutMs: durableTimeoutMs,
+      pollMs,
+    });
+    return {
+      toolUseMatched: true,
+      toolResultEventMatched: deliveryMode === 'direct',
+      stopAfterToolUse: true,
+      ...durable,
+    };
+  });
+}
 
 export function makeTreePrivate(root) {
   const stat = fs.statSync(root);
@@ -69,9 +322,9 @@ export function summarizeWorkflowRecord(record, { expectedResult } = {}) {
       )),
     ),
     reportComplete: typeof record?.result === 'string'
-      && record.result.trim().length > 0,
+      && record.result.length > 0,
     ...(typeof expectedResult === 'string' && {
-      reportMatchesExpected: record?.result?.trim() === expectedResult,
+      reportMatchesExpected: record?.result === expectedResult,
     }),
   };
 }
@@ -95,6 +348,7 @@ export function readWorkflowTaskNotificationEvidence(sessionPath, expectedMarker
   if (typeof expectedMarker !== 'string' || expectedMarker.length === 0) {
     throw new TypeError('expectedMarker must be a non-empty string');
   }
+  const serializedExpectedResult = JSON.stringify(expectedMarker);
   const evidence = [];
   for (const line of fs.readFileSync(sessionPath, 'utf8').split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -106,7 +360,16 @@ export function readWorkflowTaskNotificationEvidence(sessionPath, expectedMarker
         || record.promptSource !== 'system'
         || typeof record.message?.content !== 'string'
         || !record.message.content.includes('<task-notification>')
-        || record.message.content.split(expectedMarker).length - 1 !== 1
+      ) {
+        continue;
+      }
+      const results = [...record.message.content.matchAll(
+        /<result>([\s\S]*?)<\/result>/g,
+      )].map((match) => match[1]);
+      if (
+        results.length !== 1
+        || results[0] !== serializedExpectedResult
+        || JSON.parse(results[0]) !== expectedMarker
       ) {
         continue;
       }
@@ -186,6 +449,49 @@ export function evaluateWorkflowOutOfTurnTiming({
     completionAfterLaunchTurnMs,
     completionAfterTaskNotificationMs,
   };
+}
+
+export function waitForWorkflowDeliveryWorkSettled(
+  process,
+  { timeoutMs = 30_000 } = {},
+) {
+  if (
+    typeof process?.hasPendingDeliveryWork !== 'function'
+    || typeof process?.on !== 'function'
+    || typeof process?.off !== 'function'
+  ) {
+    throw new TypeError('Workflow delivery settlement requires a process emitter');
+  }
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError('Workflow delivery settlement timeout must be positive');
+  }
+  if (!process.hasPendingDeliveryWork()) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      process.off('delivery-work-settled', onSettled);
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const onSettled = () => {
+      if (!process.hasPendingDeliveryWork()) finish(resolve);
+    };
+    timer = setTimeout(() => {
+      finish(
+        reject,
+        new Error('Workflow delivery work did not settle before timeout'),
+      );
+    }, timeoutMs);
+    process.on('delivery-work-settled', onSettled);
+    onSettled();
+  });
 }
 
 export async function inspectWorkflowSizeGuidelineDefault({
@@ -289,6 +595,51 @@ function markerOccurrences(text, marker) {
   return typeof text === 'string' ? text.split(marker).length - 1 : 0;
 }
 
+export function evaluateWorkflowLaunchDeliveryEvidence({
+  calls,
+  launchMarker,
+  originRoute,
+}) {
+  if (
+    !Array.isArray(calls)
+    || typeof launchMarker !== 'string'
+    || launchMarker.length === 0
+    || typeof originRoute !== 'string'
+    || originRoute.length === 0
+  ) {
+    throw new TypeError('Workflow launch evidence requires calls, marker, and route');
+  }
+
+  const exactlyOneCall = calls.length === 1;
+  const call = exactlyOneCall ? calls[0] : null;
+  const proof = {
+    launchDeliveryCount: calls.length,
+    exactlyOneCall,
+    replyToolMatched: call?.toolName === 'reply',
+    originRouteMatched: call?.route === originRoute,
+    exactTextMatched: call?.text === launchMarker,
+    deliverySucceeded: call?.delivered === true,
+    nonInterim: call?.interim !== true,
+    zeroFiles: Array.isArray(call?.files) && call.files.length === 0,
+  };
+  const reasons = [];
+  if (!proof.exactlyOneCall) {
+    reasons.push('launch turn must make exactly one channel call');
+  } else {
+    if (!proof.replyToolMatched) reasons.push('launch call must use the reply tool');
+    if (!proof.originRouteMatched) reasons.push('launch reply must use the origin route');
+    if (!proof.exactTextMatched) reasons.push('launch reply must contain exact text');
+    if (!proof.deliverySucceeded) reasons.push('launch reply must prove successful delivery');
+    if (!proof.nonInterim) reasons.push('launch reply must be non-interim');
+    if (!proof.zeroFiles) reasons.push('launch reply must be sent without files');
+  }
+  return {
+    pass: reasons.length === 0,
+    reasons,
+    proof,
+  };
+}
+
 export function evaluateWorkflowDeliveryEvidence({
   deliveryMode,
   marker,
@@ -304,15 +655,12 @@ export function evaluateWorkflowDeliveryEvidence({
   const reasons = [];
   const foreign = new Set(foreignRoutes);
   const matchingAttempts = directAttempts.filter(
-    (attempt) => markerOccurrences(attempt.text, marker) > 0,
+    (attempt) => attempt.text === marker,
   );
   const unexpectedCompletionAttempts = directAttempts.filter((attempt) => (
     typeof attempt.text === 'string'
     && attempt.text.includes(completionPrefix)
-    && (
-      markerOccurrences(attempt.text, marker) !== 1
-      || markerOccurrences(attempt.text, completionPrefix) !== 1
-    )
+    && attempt.text !== marker
   ));
   if (unexpectedCompletionAttempts.length > 0) {
     reasons.push('unexpected completion-shaped direct attempt was observed');
@@ -323,8 +671,7 @@ export function evaluateWorkflowDeliveryEvidence({
   if (
     matchingAttempts.some((attempt) => (
       attempt.route !== originRoute
-      || markerOccurrences(attempt.text, marker) !== 1
-      || markerOccurrences(attempt.text, completionPrefix) !== 1
+      || attempt.text !== marker
     ))
   ) {
     reasons.push('direct attempt must contain one unambiguous completion on the origin route');
@@ -351,8 +698,7 @@ export function evaluateWorkflowDeliveryEvidence({
     if (
       fallbackDeliveries.length !== 1
       || fallbackDeliveries[0]?.route !== originRoute
-      || markerOccurrences(fallbackDeliveries[0]?.text, marker) !== 1
-      || markerOccurrences(fallbackDeliveries[0]?.text, completionPrefix) !== 1
+      || fallbackDeliveries[0]?.text !== marker
       || fallbackDeliveries[0]?.delivered !== true
     ) {
       reasons.push('fallback must deliver one unambiguous completion on the origin route');

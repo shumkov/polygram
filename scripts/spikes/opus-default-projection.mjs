@@ -14,6 +14,7 @@ import {
   hashSensitiveString,
 } from './claude-executable.mjs';
 import {
+  collectGateLifecycleEvidence,
   createSdkGateObserver,
   writeSanitizedGateResult,
 } from './claude-gate-evidence.mjs';
@@ -84,6 +85,9 @@ for await (const message of q) {
   if (message.type === 'result') resultSubtype = message.subtype;
 }
 fs.closeSync(streamFd);
+const streamEvidence = collectGateLifecycleEvidence(streamPath, {
+  stream: 'sdk',
+});
 
 const childArtifactBase = path.join(selection.artifactDir, 'nested-runs');
 fs.mkdirSync(childArtifactBase, { mode: 0o700 });
@@ -101,6 +105,7 @@ const workflowRun = spawnSync(
       CLAUDE_GATE_EXPECTED_VERSION: selection.version,
       CLAUDE_GATE_RUN_ID: childRunId,
       CLAUDE_GATE_ARTIFACT_BASE: childArtifactBase,
+      CLAUDE_GATE_SCENARIO_ID: 'workflow-direct',
       CLAUDE_GATE_MODEL: 'opus',
       CLAUDE_GATE_EFFORT: selection.effort,
       CLAUDE_GATE_EXPECTED_RESOLVED_MODEL: expectedResolvedModel,
@@ -151,6 +156,10 @@ const resultPath = writeSanitizedGateResult(selection.artifactDir, {
   documentedWorkflowSizeGuideline,
   workflowSizeGuidelineEvidence,
   lifecycle: sdkEvidence.lifecycle,
+  lifecycleSources: {
+    sdk: streamEvidence.source,
+  },
+  lifecycleProofs: [],
   wrapperRecords: sdkEvidence.wrapperRecords,
   processEvidence: sdkEvidence.processEvidence,
   workflowPolicyOverridePresent: workflowResult?.workflowPolicyOverridePresent ?? null,

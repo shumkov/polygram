@@ -28,7 +28,9 @@ const gate = await createClaudeGateSelection();
 const observer = createSdkGateObserver(gate);
 
 const q = query({
-  prompt: 'List files in /tmp with `ls /tmp | head -3`, then run `pwd`. After both tools, summarize what you saw briefly.',
+  prompt: 'List files in /tmp with `ls /tmp | head -3`, then run `pwd`. '
+    + 'After both tools, inspect any `<channel source="user-followup">` context, '
+    + 'include any requested verification value verbatim, then summarize briefly.',
   options: buildClaudeGateSdkOptions(gate, {
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,

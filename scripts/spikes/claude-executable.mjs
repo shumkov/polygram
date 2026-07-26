@@ -10,8 +10,24 @@ import {
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
+import { resolveProcessExecutable } from './process-executable-evidence.mjs';
+
 const execFileAsync = promisify(execFile);
 const RUN_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const PROTECTED_GATE_ENV_KEYS = new Set([
+  'CLAUDE_CODE_GATE_ARTIFACT_DIR',
+  'CLAUDE_CODE_GATE_RUN_ID',
+  'CLAUDE_CODE_PROCESS_WRAPPER',
+  'CLAUDE_GATE_ARTIFACT_DIR',
+  'CLAUDE_GATE_BIN',
+  'CLAUDE_GATE_EFFORT',
+  'CLAUDE_GATE_EXPECTED_VERSION',
+  'CLAUDE_GATE_MODEL',
+  'CLAUDE_GATE_RUN_ID',
+  'ORCHESTRA_CLAUDE_BIN',
+  'POLYGRAM_CLAUDE_BIN',
+]);
 const WRAPPER_MIN_VERSION = [2, 1, 208];
 const DEFAULT_WRAPPER_PATH = fileURLToPath(
   new URL('./claude-process-wrapper.mjs', import.meta.url),
@@ -93,7 +109,7 @@ function createPrivateArtifactDir(artifactBaseDir, runId) {
   return fs.realpathSync(artifactDir);
 }
 
-export function registerGateSessionProject(selection, cwd) {
+export function registerGateSessionProject(selection, cwd, sessionId = null) {
   if (!selection?.artifactDir || !path.isAbsolute(selection.artifactDir)) {
     throw new TypeError('selection must contain an absolute artifactDir');
   }
@@ -109,16 +125,36 @@ export function registerGateSessionProject(selection, cwd) {
   const manifestPath = path.join(realArtifactDir, 'session-projects.json');
   const manifest = fs.existsSync(manifestPath)
     ? JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
-    : { schemaVersion: 1, cwds: [] };
+    : { schemaVersion: 2, projects: [] };
   if (
-    manifest.schemaVersion !== 1
-    || !Array.isArray(manifest.cwds)
-    || manifest.cwds.some((entry) => typeof entry !== 'string')
+    manifest.schemaVersion !== 2
+    || !Array.isArray(manifest.projects)
+    || manifest.projects.some((project) => (
+      !project
+      || typeof project !== 'object'
+      || Array.isArray(project)
+      || JSON.stringify(Object.keys(project).sort())
+        !== JSON.stringify(['cwd', 'sessionIds'])
+      || typeof project.cwd !== 'string'
+      || !Array.isArray(project.sessionIds)
+      || project.sessionIds.some((id) => !SESSION_ID_RE.test(id))
+    ))
   ) {
     throw new Error('session project manifest is malformed');
   }
-  if (!manifest.cwds.includes(realCwd)) manifest.cwds.push(realCwd);
-  manifest.cwds.sort();
+  if (sessionId !== null && !SESSION_ID_RE.test(sessionId || '')) {
+    throw new TypeError('session id must be a safe non-empty identifier');
+  }
+  let project = manifest.projects.find((entry) => entry.cwd === realCwd);
+  if (!project) {
+    project = { cwd: realCwd, sessionIds: [] };
+    manifest.projects.push(project);
+  }
+  if (sessionId && !project.sessionIds.includes(sessionId)) {
+    project.sessionIds.push(sessionId);
+    project.sessionIds.sort();
+  }
+  manifest.projects.sort((left, right) => left.cwd.localeCompare(right.cwd));
 
   const temporaryPath = `${manifestPath}.${process.pid}.tmp`;
   fs.writeFileSync(temporaryPath, `${JSON.stringify(manifest, null, 2)}\n`, {
@@ -132,16 +168,17 @@ export function registerGateSessionProject(selection, cwd) {
 }
 
 function processSnapshot() {
-  const output = execFileSync('ps', ['-axo', 'pid=,ppid=,comm='], {
+  const output = execFileSync('ps', ['-axo', 'pid=,ppid=,state=,comm='], {
     encoding: 'utf8',
     maxBuffer: 4 * 1024 * 1024,
   });
   return output.split(/\r?\n/).flatMap((line) => {
-    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
     return match ? [{
       pid: Number(match[1]),
       ppid: Number(match[2]),
-      command: match[3],
+      state: match[3],
+      command: match[4],
     }] : [];
   });
 }
@@ -166,44 +203,124 @@ function descendantPids(snapshot, rootPid) {
 
 function createSdkProcessEvidence(
   executablePath,
-  { processSnapshotFn = processSnapshot } = {},
+  {
+    artifactDir,
+    processSnapshotFn = processSnapshot,
+    processExecutableResolver = resolveProcessExecutable,
+    processPlatform = process.platform,
+  } = {},
 ) {
   const realExecutable = fs.realpathSync(executablePath);
   const rootPids = new Set();
   const activeRoots = new Set();
-  const selectedBinaryPids = new Set();
+  const selectedBinaryProcesses = new Map();
   let sampleCount = 0;
   let samplingFailureCount = 0;
   let samplingErrorHash = null;
   let timer = null;
 
-  function isSelectedBinary(command) {
-    if (!path.isAbsolute(command)) return false;
-    try {
-      return fs.realpathSync(command) === realExecutable;
-    } catch {
-      return false;
-    }
+  function writeProcessSnapshot(activeRootPids, processes) {
+    if (!artifactDir) return;
+    const privateDir = path.join(artifactDir, 'raw-private');
+    fs.mkdirSync(privateDir, { recursive: true, mode: 0o700 });
+    const snapshotPath = path.join(
+      privateDir,
+      'sdk-process-snapshots.ndjson',
+    );
+    fs.appendFileSync(
+      snapshotPath,
+      `${JSON.stringify({
+        sampleIndex: sampleCount,
+        activeRootPids,
+        processes,
+      })}\n`,
+      { encoding: 'utf8', mode: 0o600 },
+    );
+    fs.chmodSync(snapshotPath, 0o600);
   }
 
   function sample() {
     if (activeRoots.size === 0) return;
     const snapshot = processSnapshotFn();
-    sampleCount += 1;
-    for (const rootPid of activeRoots) {
+    const activeRootPids = [...activeRoots]
+      .sort((left, right) => left - right);
+    const stagedProcesses = new Map();
+    const stagedSelected = new Map();
+    for (const rootPid of activeRootPids) {
       const descendants = descendantPids(snapshot, rootPid);
       for (const processInfo of snapshot) {
-        if (descendants.has(processInfo.pid) && isSelectedBinary(processInfo.command)) {
-          selectedBinaryPids.add(processInfo.pid);
+        if (!descendants.has(processInfo.pid)) continue;
+        if (!stagedProcesses.has(processInfo.pid)) {
+          stagedProcesses.set(processInfo.pid, {
+            pid: processInfo.pid,
+            ppid: processInfo.ppid,
+            executable: null,
+          });
+        }
+        const mustResolve = (
+          processInfo.pid === rootPid
+          || processPlatform === 'linux'
+          || path.isAbsolute(processInfo.command)
+          || processInfo.command === path.basename(realExecutable)
+        );
+        if (!mustResolve) continue;
+        let observedExecutable;
+        try {
+          observedExecutable = processExecutableResolver({
+            pid: processInfo.pid,
+            command: processInfo.command,
+            platform: processPlatform,
+          });
+        } catch (error) {
+          if (
+            processInfo.pid === rootPid
+            || processInfo.command === realExecutable
+            || processInfo.command === path.basename(realExecutable)
+          ) {
+            if (
+              selectedBinaryProcesses.has(processInfo.pid)
+              && (() => {
+                const current = processSnapshotFn().find(
+                  (candidate) => candidate.pid === processInfo.pid,
+                );
+                return current === undefined
+                  || /^[ZX]/.test(current.state || '');
+              })()
+            ) {
+              continue;
+            }
+            throw error;
+          }
+          continue;
+        }
+        stagedProcesses.get(processInfo.pid).executable = observedExecutable;
+        if (observedExecutable === realExecutable) {
+          stagedSelected.set(processInfo.pid, {
+            pid: processInfo.pid,
+            ppid: processInfo.ppid,
+          });
         }
       }
     }
+    for (const [pid, processInfo] of stagedSelected) {
+      selectedBinaryProcesses.set(pid, processInfo);
+    }
+    sampleCount += 1;
+    writeProcessSnapshot(
+      activeRootPids,
+      [...stagedProcesses.values()]
+        .sort((left, right) => left.pid - right.pid),
+    );
   }
 
   function refreshPublicEvidence(publicEvidence) {
+    const processes = [...selectedBinaryProcesses.values()]
+      .sort((left, right) => left.pid - right.pid);
     publicEvidence.rootPids = [...rootPids].sort((left, right) => left - right);
-    publicEvidence.selectedBinaryPids = [...selectedBinaryPids]
-      .sort((left, right) => left - right);
+    publicEvidence.selectedBinaryPids = processes.map((processInfo) => processInfo.pid);
+    publicEvidence.selectedBinaryProcesses = processes.map((processInfo) => ({
+      ...processInfo,
+    }));
     publicEvidence.sampleCount = sampleCount;
     publicEvidence.samplingFailed = samplingFailureCount > 0;
     publicEvidence.samplingFailureCount = samplingFailureCount;
@@ -212,6 +329,23 @@ function createSdkProcessEvidence(
 
   function recordSamplingFailure(error) {
     samplingFailureCount += 1;
+    if (artifactDir) {
+      const privateDir = path.join(artifactDir, 'raw-private');
+      fs.mkdirSync(privateDir, { recursive: true, mode: 0o700 });
+      const failurePath = path.join(
+        privateDir,
+        'sdk-process-sampling-errors.ndjson',
+      );
+      fs.appendFileSync(
+        failurePath,
+        `${JSON.stringify({
+          recordedAt: new Date().toISOString(),
+          detail: error?.stack || error?.message || String(error),
+        })}\n`,
+        { encoding: 'utf8', mode: 0o600 },
+      );
+      fs.chmodSync(failurePath, 0o600);
+    }
     if (!samplingErrorHash) {
       samplingErrorHash = hashSensitiveString(
         error?.stack || error?.message || String(error),
@@ -222,6 +356,7 @@ function createSdkProcessEvidence(
   const publicEvidence = {
     rootPids: [],
     selectedBinaryPids: [],
+    selectedBinaryProcesses: [],
     sampleCount: 0,
     samplingFailed: false,
     samplingFailureCount: 0,
@@ -249,7 +384,6 @@ function createSdkProcessEvidence(
     if (Number.isInteger(child.pid)) {
       rootPids.add(child.pid);
       activeRoots.add(child.pid);
-      selectedBinaryPids.add(child.pid);
       refreshPublicEvidence(publicEvidence);
       try {
         sample();
@@ -308,6 +442,8 @@ export async function createClaudeGateSelection({
   processEnv = process.env,
   processWrapperPath = DEFAULT_WRAPPER_PATH,
   processSnapshotFn = processSnapshot,
+  processExecutableResolver = resolveProcessExecutable,
+  processPlatform = process.platform,
   model = processEnv.CLAUDE_GATE_MODEL || 'claude-sonnet-4-6',
   effort = processEnv.CLAUDE_GATE_EFFORT || 'medium',
 } = {}) {
@@ -335,7 +471,10 @@ export async function createClaudeGateSelection({
     sdkCwd,
   );
   const sdkProcessTracker = createSdkProcessEvidence(executablePath, {
+    artifactDir,
     processSnapshotFn,
+    processExecutableResolver,
+    processPlatform,
   });
   const executablePathHash = hashSensitiveString(fs.realpathSync(executablePath));
   const selectorEnv = {
@@ -406,11 +545,24 @@ export function buildClaudeGateSdkOptions(selection, overrides = {}) {
     throw new TypeError('selection must come from createClaudeGateSelection');
   }
   const { env: overrideEnv = {}, ...rest } = overrides;
+  const protectedOptions = new Set([
+    'cwd',
+    'effort',
+    'model',
+    'pathToClaudeCodeExecutable',
+    'spawnClaudeCodeProcess',
+  ]);
+  if (
+    Object.keys(rest).some((key) => protectedOptions.has(key))
+    || Object.keys(overrideEnv).some((key) => PROTECTED_GATE_ENV_KEYS.has(key))
+  ) {
+    throw new TypeError('protected SDK gate option cannot be overridden');
+  }
   return {
+    ...rest,
     ...selection.sdkOptions,
     model: selection.model,
     effort: selection.effort,
-    ...rest,
     env: {
       ...selection.sdkOptions.env,
       ...overrideEnv,
@@ -428,6 +580,13 @@ export function withClaudeGateTmuxEnv(tmuxRunner, selection) {
   return {
     ...tmuxRunner,
     spawn(options = {}) {
+      if (
+        Object.keys(options.envExtras || {}).some(
+          (key) => PROTECTED_GATE_ENV_KEYS.has(key),
+        )
+      ) {
+        throw new TypeError('protected CLI gate environment cannot be overridden');
+      }
       return tmuxRunner.spawn({
         ...options,
         envExtras: {

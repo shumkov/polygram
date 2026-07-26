@@ -13,17 +13,25 @@ import {
   withClaudeGateTmuxEnv,
 } from './claude-executable.mjs';
 import {
+  collectGateLifecycleEvidence,
+  collectGateSessionEvidence,
   copyPrivateGateArtifact,
-  normalizeGateJsonl,
+  readGateSessionTerminalState,
   readWrapperRecords,
   resolveGateLifecycleModel,
   validateWrapperProvenance,
+  waitForGateEventSequence,
+  waitForGateSessionTerminal,
+  writePrivateGateFailure,
   writeSanitizedGateResult,
 } from './claude-gate-evidence.mjs';
 import {
+  makeTreePrivate,
+} from './workflow-fixture.mjs';
+import {
   captureTmuxProcessTree,
   mergeProcessTrees,
-  selectedBinaryPids,
+  selectedBinaryProcesses,
 } from './process-tree-evidence.mjs';
 
 const require = createRequire(import.meta.url);
@@ -31,6 +39,8 @@ const { CliProcess, createTmuxRunner } = require('@shumkov/orchestra');
 const { sessionLogPath } = require('../../lib/util/claude-session-jsonl');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const BRIDGE_SERVER_NAME = 'polygram-gate-bridge';
+const INTERRUPT_SOURCE_MSG_ID = 5;
 const noopStreamer = {
   onChunk: async () => {},
   forceNewMessage: () => {},
@@ -56,7 +66,9 @@ function turnContext(sourceMsgId) {
 }
 
 function copyAndNormalizeLifecycle(proc, cwd, selection) {
-  const output = {};
+  const lifecycle = {};
+  const lifecycleSources = {};
+  let lifecycleProofs = [];
   const sessionPath = sessionLogPath(cwd, proc.claudeSessionId);
   if (fs.existsSync(sessionPath)) {
     const privateSession = copyPrivateGateArtifact(
@@ -64,7 +76,13 @@ function copyAndNormalizeLifecycle(proc, cwd, selection) {
       selection.artifactDir,
       'session.jsonl',
     );
-    output.session = normalizeGateJsonl(privateSession);
+    const sessionEvidence = collectGateSessionEvidence(privateSession, {
+      interruptSourceMsgId: INTERRUPT_SOURCE_MSG_ID,
+      channelServerName: BRIDGE_SERVER_NAME,
+    });
+    lifecycle.session = sessionEvidence.records;
+    lifecycleSources.session = sessionEvidence.source;
+    lifecycleProofs = sessionEvidence.proofs;
   }
   if (proc._hookNdjsonPath && fs.existsSync(proc._hookNdjsonPath)) {
     const privateHooks = copyPrivateGateArtifact(
@@ -72,9 +90,13 @@ function copyAndNormalizeLifecycle(proc, cwd, selection) {
       selection.artifactDir,
       'hooks.ndjson',
     );
-    output.hooks = normalizeGateJsonl(privateHooks);
+    const hookEvidence = collectGateLifecycleEvidence(privateHooks, {
+      stream: 'hooks',
+    });
+    lifecycle.hooks = hookEvidence.records;
+    lifecycleSources.hooks = hookEvidence.source;
   }
-  return output;
+  return { lifecycle, lifecycleSources, lifecycleProofs };
 }
 
 const selection = await createClaudeGateSelection();
@@ -88,10 +110,15 @@ let fileObserved = false;
 let spawnCount = 0;
 let proc = null;
 let lifecycle = {};
+let lifecycleSources = {};
+let lifecycleProofs = [];
 let processTree = [];
 let resolvedModel = null;
+let startupHandshake = null;
 let status = 'FAIL';
 let failureHash = null;
+let failureStage = 'initializing';
+const startupStartedAt = Date.now();
 
 const baseRunner = createTmuxRunner({
   sessionPrefix: 'polygram-gate',
@@ -149,7 +176,7 @@ try {
     appDataDir: path.join(cwd, '.orchestra'),
     attachmentBase: path.join(cwd, '.attachments'),
     sessionPrefix: 'polygram-gate',
-    bridgeServerName: 'polygram-gate-bridge',
+    bridgeServerName: BRIDGE_SERVER_NAME,
     productName: 'polygram-gate',
     surfaceName: 'synthetic channel',
     turnQuietMs: 1_500,
@@ -169,6 +196,14 @@ try {
   ]) {
     proc.on(eventName, () => eventKinds.push(eventName));
   }
+  let bridgeReadyMs = null;
+  let mcpReadyMs = null;
+  proc.once('bridge-ready', () => {
+    bridgeReadyMs = Date.now() - startupStartedAt;
+  });
+  proc.once('mcp-ready', () => {
+    mcpReadyMs = Date.now() - startupStartedAt;
+  });
 
   const chatConfig = {
     cwd,
@@ -177,6 +212,7 @@ try {
     permissionMode: 'bypassPermissions',
     isolateUserConfig: true,
   };
+  failureStage = 'starting-cli';
   await proc.start({
     cwd,
     chatConfig,
@@ -186,7 +222,16 @@ try {
   assert.equal(proc.model, selection.model);
   assert.equal(proc.effort, selection.effort);
   assert.equal(spawnCount, 1);
+  assert.ok(Number.isInteger(bridgeReadyMs));
+  assert.ok(Number.isInteger(mcpReadyMs));
+  assert.ok(mcpReadyMs >= bridgeReadyMs);
+  startupHandshake = {
+    bridgeReadyMs,
+    mcpReadyMs,
+    bridgeReadyToMcpReadyMs: mcpReadyMs - bridgeReadyMs,
+  };
   const sessionAtStart = proc.claudeSessionId;
+  registerGateSessionProject(selection, cwd, sessionAtStart);
   processTree = captureTmuxProcessTree({
     tmuxSession: proc.tmuxSession,
     selection,
@@ -195,6 +240,7 @@ try {
 
   let replyStart = replies.length;
   const readyMarker = `CLI-READY-${suffix}`;
+  failureStage = 'readiness-reply';
   await proc.send(
     `Reply through the channel reply tool with exactly ${readyMarker}.`,
     { timeoutMs: 120_000, maxTurnMs: 150_000, context: turnContext(1) },
@@ -206,6 +252,7 @@ try {
 
   replyStart = replies.length;
   const multilineMarker = `MULTILINE-${suffix}`;
+  failureStage = 'multiline-reply';
   await proc.send(
     `Read both lines of this message and reply exactly ${multilineMarker}.\n`
       + 'The second line is required evidence that multiline input arrived.',
@@ -218,12 +265,29 @@ try {
 
   replyStart = replies.length;
   const followupMarker = `FOLLOWUP-${suffix}`;
+  failureStage = 'follow-up-fold';
+  const foldStarted = waitForGateEventSequence({
+    emitter: proc,
+    timeoutMs: 60_000,
+    label: 'fold turn pickup',
+    steps: [
+      {
+        eventName: 'turn-start',
+        matches: (event) => String(event?.anchorMsgId) === '3',
+      },
+      {
+        eventName: 'tool-use',
+        matches: (toolName) => toolName === 'Bash',
+      },
+    ],
+  });
   const foldTurn = proc.send(
     'Run `sleep 6` with Bash, then answer this message and every follow-up '
       + 'channel message received during the sleep in one final reply.',
     { timeoutMs: 150_000, maxTurnMs: 180_000, context: turnContext(3) },
   );
-  await sleep(3_000);
+  await foldStarted;
+  await sleep(1_000);
   const injected = proc.injectUserMessage({
     content: `Include exactly ${followupMarker} in the combined reply.`,
     priority: 'next',
@@ -249,9 +313,14 @@ try {
     'folded follow-up must be acknowledged instead of dropped',
   );
 
+  failureStage = 'interrupt';
   const cancelTurn = proc.send(
     'Run `sleep 30` with Bash. Do not reply until the command finishes.',
-    { timeoutMs: 120_000, maxTurnMs: 150_000, context: turnContext(5) },
+    {
+      timeoutMs: 120_000,
+      maxTurnMs: 150_000,
+      context: turnContext(INTERRUPT_SOURCE_MSG_ID),
+    },
   );
   cancelTurn.catch(() => {});
   await sleep(4_000);
@@ -268,6 +337,7 @@ try {
 
   replyStart = replies.length;
   const warmMarker = `CLI-WARM-${suffix}`;
+  failureStage = 'warm-reply';
   await proc.send(
     `Reply through the channel reply tool with exactly ${warmMarker}.`,
     { timeoutMs: 120_000, maxTurnMs: 150_000, context: turnContext(6) },
@@ -279,13 +349,59 @@ try {
   assert.equal(spawnCount, 1, 'interruption must not respawn the CLI process');
 
   replyStart = replies.length;
-  await proc.send(
+  failureStage = 'file-reply';
+  const fileMarker = `FILE-OK-${suffix}`;
+  const fileSessionPath = sessionLogPath(cwd, proc.claudeSessionId);
+  const terminalBeforeFile = readGateSessionTerminalState(fileSessionPath);
+  const fileSequenceState = {};
+  const fileLifecycle = waitForGateEventSequence({
+    emitter: proc,
+    timeoutMs: 120_000,
+    label: 'file reply lifecycle',
+    state: fileSequenceState,
+    steps: [
+      {
+        eventName: 'turn-start',
+        matches: (event) => String(event?.anchorMsgId) === '7',
+      },
+      {
+        eventName: 'tool-use-detail',
+        matches: (event) => (
+          event?.name === 'mcp__polygram-gate-bridge__reply'
+          && event?.input?.text === fileMarker
+        ),
+        capture: (event, sequenceState) => {
+          sequenceState.toolUseId = event.toolUseId;
+        },
+      },
+      {
+        eventName: 'tool-result',
+        matches: (event, sequenceState) => (
+          event?.name === 'mcp__polygram-gate-bridge__reply'
+          && event?.toolUseId === sequenceState.toolUseId
+          && event?.isError === false
+        ),
+      },
+      {
+        eventName: 'stop-hook',
+        matches: () => true,
+      },
+    ],
+  });
+  const fileTurn = proc.send(
     'Create a UTF-8 text file containing exactly FILE-CONTENT-OK in the allowed '
-      + 'attachment staging directory, then call reply with text FILE-OK and attach that file.',
+      + `attachment staging directory, then call reply with text exactly ${fileMarker} `
+      + 'and attach that file.',
     { timeoutMs: 120_000, maxTurnMs: 150_000, context: turnContext(7) },
   );
+  await Promise.all([fileTurn, fileLifecycle]);
+  await waitForGateSessionTerminal({
+    filePath: fileSessionPath,
+    afterTurnDurationCount: terminalBeforeFile.turnDurationCount,
+    timeoutMs: 15_000,
+  });
   assert.ok(
-    replies.slice(replyStart).some((call) => call.text.includes('FILE-OK')),
+    replies.slice(replyStart).some((call) => call.text.includes(fileMarker)),
     'file reply marker must be delivered',
   );
   assert.equal(fileObserved, true, 'reply tool must receive the staged file');
@@ -295,7 +411,12 @@ try {
     label: 'after-file-reply',
   }));
 
-  lifecycle = copyAndNormalizeLifecycle(proc, cwd, selection);
+  failureStage = 'collecting-evidence';
+  ({
+    lifecycle,
+    lifecycleSources,
+    lifecycleProofs,
+  } = copyAndNormalizeLifecycle(proc, cwd, selection));
   assert.ok(lifecycle.hooks?.some((event) => event.hookEventName === 'Stop'));
   assert.ok(lifecycle.session?.some((event) => event.type === 'assistant'));
   resolvedModel = resolveGateLifecycleModel({
@@ -305,25 +426,40 @@ try {
   });
 
   const wrapperRecords = readWrapperRecords(selection);
+  const observedClaudeProcesses = selectedBinaryProcesses(
+    selection,
+    processTree,
+  );
+  assert.ok(
+    observedClaudeProcesses.length > 0,
+    'process tree must contain the selected Claude executable',
+  );
   validateWrapperProvenance(selection, wrapperRecords, {
-    observedClaudePids: selectedBinaryPids(selection, processTree),
+    observedClaudeProcesses,
   });
 
+  failureStage = 'complete';
   status = 'PASS';
 } catch (error) {
   failureHash = hashSensitiveString(error?.stack || error?.message || String(error));
+  writePrivateGateFailure(selection.artifactDir, error);
   console.error(`FAIL (${failureHash.slice(0, 12)})`);
 } finally {
   if (proc) {
     try {
       if (Object.keys(lifecycle).length === 0) {
-        lifecycle = copyAndNormalizeLifecycle(proc, cwd, selection);
+        ({
+          lifecycle,
+          lifecycleSources,
+          lifecycleProofs,
+        } = copyAndNormalizeLifecycle(proc, cwd, selection));
       }
     } catch {}
     try {
       await proc.kill('gate-complete');
     } catch {}
   }
+  makeTreePrivate(cwd);
 
   const wrapperRecords = readWrapperRecords(selection);
   writeSanitizedGateResult(selection.artifactDir, {
@@ -332,12 +468,14 @@ try {
     scenario: 'cli-contract-matrix',
     status,
     failureHash,
+    failureStage: status === 'PASS' ? null : failureStage,
     attestation: selection.sanitizedAttestation,
     resolvedModel,
     spawnCount,
     replyCount: replies.filter((call) => call.toolName === 'reply').length,
     fileObserved,
-    eventKinds,
+    startupHandshake,
+    eventKinds: eventKinds.map(hashSensitiveString),
     processTree: processTree.map((record) => ({
       pid: record.pid,
       ppid: record.ppid,
@@ -345,6 +483,8 @@ try {
     })),
     wrapperRecords,
     lifecycle,
+    lifecycleSources,
+    lifecycleProofs,
   });
 }
 

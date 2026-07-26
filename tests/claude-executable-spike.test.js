@@ -19,7 +19,25 @@ const wrapperPath = path.join(
   'claude-process-wrapper.mjs',
 );
 
-function makeFakeClaude(dir, version = '2.1.220') {
+test('real-Claude gate failures retain a content-free phase label', () => {
+  for (const driverName of [
+    'cli-contract-matrix.mjs',
+    'workflow-autonomous-completion.mjs',
+  ]) {
+    const driver = fs.readFileSync(path.join(
+      __dirname,
+      '..',
+      'scripts',
+      'spikes',
+      driverName,
+    ), 'utf8');
+    assert.match(driver, /let failureStage = 'initializing';/);
+    assert.match(driver, /failureStage: status === 'PASS' \? null : failureStage,/);
+    assert.match(driver, /failureStage = 'complete';/);
+  }
+});
+
+function makeFakeClaude(dir, version = '2.1.220', runtimeMs = 0) {
   const script = path.join(dir, `claude-${version}.mjs`);
   fs.writeFileSync(script, [
     '#!/usr/bin/env node',
@@ -28,6 +46,7 @@ function makeFakeClaude(dir, version = '2.1.220') {
     '  process.exit(0);',
     '}',
     "console.log(JSON.stringify({ wrapper: process.env.CLAUDE_CODE_PROCESS_WRAPPER || null, runId: process.env.CLAUDE_CODE_GATE_RUN_ID || null }));",
+    ...(runtimeMs > 0 ? [`setTimeout(() => {}, ${runtimeMs});`] : []),
   ].join('\n'), { mode: 0o700 });
   return script;
 }
@@ -102,6 +121,20 @@ test('candidate selection attests the executable and propagates selectors to CLI
   assert.equal(sdkOptions.env.KEEP_ME, 'yes');
   assert.equal(sdkOptions.env.SCENARIO_MARKER, 'kept');
   assert.equal(sdkOptions.env.CLAUDE_CODE_PROCESS_WRAPPER, wrapperPath);
+  for (const protectedOverrides of [
+    { pathToClaudeCodeExecutable: '/private/other-claude' },
+    { cwd: '/private/other-cwd' },
+    { spawnClaudeCodeProcess: () => {} },
+    { model: 'claude-opus-5' },
+    { effort: 'high' },
+    { env: { CLAUDE_GATE_BIN: '/private/other-claude' } },
+    { env: { CLAUDE_CODE_GATE_RUN_ID: 'other-run' } },
+  ]) {
+    assert.throws(
+      () => buildClaudeGateSdkOptions(selection, protectedOverrides),
+      /protected SDK gate option/i,
+    );
+  }
 
   assert.equal(fs.statSync(selection.artifactDir).mode & 0o777, 0o700);
   assert.equal(fs.statSync(selection.privateMetadataPath).mode & 0o777, 0o600);
@@ -113,8 +146,11 @@ test('candidate selection attests the executable and propagates selectors to CLI
   assert.deepEqual(
     JSON.parse(fs.readFileSync(sessionProjectsPath, 'utf8')),
     {
-      schemaVersion: 1,
-      cwds: [selection.sdkCwd],
+      schemaVersion: 2,
+      projects: [{
+        cwd: selection.sdkCwd,
+        sessionIds: [],
+      }],
     },
   );
   const privateMetadata = JSON.parse(fs.readFileSync(selection.privateMetadataPath, 'utf8'));
@@ -132,6 +168,16 @@ test('candidate selection attests the executable and propagates selectors to CLI
   assert.equal(spawnCalls[0].envExtras.KEEP_EXTRA, 'yes');
   assert.equal(spawnCalls[0].envExtras.CLAUDE_CODE_GATE_RUN_ID, 'candidate-test-run');
   assert.equal(spawnCalls[0].envExtras.CLAUDE_CODE_PROCESS_WRAPPER, wrapperPath);
+  for (const envExtras of [
+    { CLAUDE_GATE_BIN: '/private/other-claude' },
+    { ORCHESTRA_CLAUDE_BIN: '/private/other-claude' },
+    { CLAUDE_CODE_GATE_RUN_ID: 'other-run' },
+  ]) {
+    assert.throws(
+      () => runner.spawn({ name: 'gate', envExtras }),
+      /protected CLI gate environment/i,
+    );
+  }
   assert.equal(await runner.capture(), 'unchanged');
 });
 
@@ -229,6 +275,227 @@ test('SDK process evidence retains tracking after an initial sampling failure', 
   assert.equal(selection.sdkProcessEvidence.samplingFailureCount, failureCountAfterExit);
 });
 
+test('SDK process evidence retains selected binary parent pids', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-gate-process-parent-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const executablePath = makeFakeClaude(dir);
+  let childPid;
+
+  const { createClaudeGateSelection } = await import(helperUrl);
+  const selection = await createClaudeGateSelection({
+    executablePath,
+    expectedVersion: '2.1.220',
+    artifactBaseDir: path.join(dir, 'artifacts'),
+    runId: 'process-parent-run',
+    processEnv: { PATH: process.env.PATH },
+    processSnapshotFn: () => childPid
+      ? [{ pid: childPid, ppid: 4242, command: executablePath }]
+      : [],
+  });
+  const child = selection.sdkOptions.spawnClaudeCodeProcess({
+    command: executablePath,
+    args: [],
+    cwd: selection.sdkCwd,
+    env: selection.sdkOptions.env,
+  });
+  childPid = child.pid;
+  selection.stopSdkProcessSampling();
+
+  assert.deepEqual(selection.sdkProcessEvidence.selectedBinaryProcesses, [{
+    pid: childPid,
+    ppid: 4242,
+  }]);
+  assert.deepEqual(selection.sdkProcessEvidence.selectedBinaryPids, [childPid]);
+  await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', resolve);
+  });
+});
+
+test('SDK sampling ignores a clearly unrelated macOS basename descendant', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-gate-process-node-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const executablePath = makeFakeClaude(dir);
+  let childPid;
+
+  const { createClaudeGateSelection } = await import(helperUrl);
+  const selection = await createClaudeGateSelection({
+    executablePath,
+    expectedVersion: '2.1.220',
+    artifactBaseDir: path.join(dir, 'artifacts'),
+    runId: 'process-node-run',
+    processEnv: { PATH: process.env.PATH },
+    processSnapshotFn: () => childPid
+      ? [
+          { pid: childPid, ppid: 4242, command: executablePath },
+          { pid: childPid + 1, ppid: childPid, command: 'node' },
+        ]
+      : [],
+    processPlatform: 'darwin',
+  });
+  const child = selection.sdkOptions.spawnClaudeCodeProcess({
+    command: executablePath,
+    args: [],
+    cwd: selection.sdkCwd,
+    env: selection.sdkOptions.env,
+  });
+  childPid = child.pid;
+  selection.stopSdkProcessSampling();
+
+  assert.equal(selection.sdkProcessEvidence.samplingFailed, false);
+  assert.deepEqual(selection.sdkProcessEvidence.selectedBinaryProcesses, [{
+    pid: childPid,
+    ppid: 4242,
+  }]);
+  await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', resolve);
+  });
+});
+
+test('SDK sampling fails when a target-basename descendant cannot be resolved', async (t) => {
+  for (const processPlatform of ['darwin', 'linux']) {
+    const dir = fs.mkdtempSync(path.join(
+      os.tmpdir(),
+      `polygram-gate-process-target-${processPlatform}-`,
+    ));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const executablePath = makeFakeClaude(dir);
+    let childPid;
+
+    const { createClaudeGateSelection } = await import(helperUrl);
+    const selection = await createClaudeGateSelection({
+      executablePath,
+      expectedVersion: '2.1.220',
+      artifactBaseDir: path.join(dir, 'artifacts'),
+      runId: `process-target-${processPlatform}`,
+      processEnv: { PATH: process.env.PATH },
+      processPlatform,
+      processSnapshotFn: () => childPid
+        ? [
+            { pid: childPid, ppid: 4242, command: executablePath },
+            {
+              pid: childPid + 1,
+              ppid: childPid,
+              command: path.basename(executablePath),
+            },
+          ]
+        : [],
+      processExecutableResolver: ({ pid }) => {
+        if (pid === childPid) return fs.realpathSync(executablePath);
+        throw new Error('target vanished');
+      },
+    });
+    const child = selection.sdkOptions.spawnClaudeCodeProcess({
+      command: executablePath,
+      args: [],
+      cwd: selection.sdkCwd,
+      env: selection.sdkOptions.env,
+    });
+    childPid = child.pid;
+    selection.stopSdkProcessSampling();
+
+    assert.equal(
+      selection.sdkProcessEvidence.samplingFailed,
+      true,
+      processPlatform,
+    );
+    await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', resolve);
+    });
+  }
+});
+
+test('SDK sampling ignores a verified selected process that exits during resolution', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-gate-process-exit-race-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const executablePath = makeFakeClaude(dir, '2.1.220', 1_000);
+  let childPid;
+  let disappearing = false;
+  let returnedRacySnapshot = false;
+
+  const { createClaudeGateSelection } = await import(helperUrl);
+  const selection = await createClaudeGateSelection({
+    executablePath,
+    expectedVersion: '2.1.220',
+    artifactBaseDir: path.join(dir, 'artifacts'),
+    runId: 'process-exit-race',
+    processEnv: { PATH: process.env.PATH },
+    processPlatform: 'darwin',
+    processSnapshotFn: () => {
+      if (!childPid) return [];
+      if (disappearing && returnedRacySnapshot) {
+        return [{
+          pid: childPid,
+          ppid: 4242,
+          state: 'Z',
+          command: path.basename(executablePath),
+        }];
+      }
+      if (disappearing) returnedRacySnapshot = true;
+      return [{
+        pid: childPid,
+        ppid: 4242,
+        command: path.basename(executablePath),
+      }];
+    },
+    processExecutableResolver: () => {
+      if (disappearing) throw new Error('selected process exited');
+      return fs.realpathSync(executablePath);
+    },
+  });
+  const child = selection.sdkOptions.spawnClaudeCodeProcess({
+    command: executablePath,
+    args: [],
+    cwd: selection.sdkCwd,
+    env: selection.sdkOptions.env,
+  });
+  childPid = child.pid;
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.deepEqual(selection.sdkProcessEvidence.selectedBinaryPids, [childPid]);
+
+  disappearing = true;
+  selection.stopSdkProcessSampling();
+
+  assert.equal(selection.sdkProcessEvidence.samplingFailed, false);
+  await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', resolve);
+  });
+});
+
+test('a synthetically recorded SDK root is not selected-process evidence', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-gate-process-empty-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const executablePath = makeFakeClaude(dir);
+
+  const { createClaudeGateSelection } = await import(helperUrl);
+  const selection = await createClaudeGateSelection({
+    executablePath,
+    expectedVersion: '2.1.220',
+    artifactBaseDir: path.join(dir, 'artifacts'),
+    runId: 'process-empty-run',
+    processEnv: { PATH: process.env.PATH },
+    processSnapshotFn: () => [],
+  });
+  const child = selection.sdkOptions.spawnClaudeCodeProcess({
+    command: executablePath,
+    args: [],
+    cwd: selection.sdkCwd,
+    env: selection.sdkOptions.env,
+  });
+  selection.stopSdkProcessSampling();
+
+  assert.deepEqual(selection.sdkProcessEvidence.rootPids, [child.pid]);
+  assert.ok(selection.sdkProcessEvidence.sampleCount > 0);
+  assert.deepEqual(selection.sdkProcessEvidence.selectedBinaryProcesses, []);
+  await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', resolve);
+  });
+});
+
 test('artifact base validation never chmods an existing broad directory', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-gate-base-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -268,7 +535,11 @@ test('process wrapper records privacy-safe provenance and preserves wrapper env 
   const recordText = fs.readFileSync(recordsPath, 'utf8');
   const record = JSON.parse(recordText.trim());
   assert.equal(record.runId, 'wrapper-test-run');
+  assert.ok(Number.isInteger(record.pid) && record.pid > 0);
+  assert.ok(Number.isInteger(record.ppid) && record.ppid > 0);
   assert.equal(record.version, '2.1.220');
+  assert.ok(Number.isInteger(record.versionProbePid) && record.versionProbePid > 0);
+  assert.notEqual(record.versionProbePid, record.pid);
   assert.match(record.executablePathHash, /^[a-f0-9]{64}$/);
   assert.match(record.executableSha256, /^[a-f0-9]{64}$/);
   assert.match(record.argvHash, /^[a-f0-9]{64}$/);

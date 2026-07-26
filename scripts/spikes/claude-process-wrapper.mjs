@@ -2,7 +2,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -41,16 +41,20 @@ try {
 
 const versionProbeEnv = { ...process.env };
 delete versionProbeEnv.CLAUDE_CODE_PROCESS_WRAPPER;
-const versionResult = spawnSync(executablePath, ['--version'], {
-  env: versionProbeEnv,
-  encoding: 'utf8',
-  timeout: 15_000,
-  maxBuffer: 1024 * 1024,
+let versionProbePid;
+const versionResult = await new Promise((resolve) => {
+  const child = execFile(executablePath, ['--version'], {
+    env: versionProbeEnv,
+    encoding: 'utf8',
+    timeout: 15_000,
+    maxBuffer: 1024 * 1024,
+  }, (error, stdout) => resolve({ error, stdout }));
+  versionProbePid = child.pid;
 });
 const versionMatch = String(versionResult.stdout || '').trim().match(
   /^(\d+\.\d+\.\d+)\s+\(Claude Code\)$/,
 );
-if (versionResult.status !== 0 || !versionMatch) {
+if (versionResult.error || !Number.isInteger(versionProbePid) || !versionMatch) {
   fail('selected executable did not return a valid Claude Code version');
 }
 
@@ -65,6 +69,7 @@ const record = {
   runId,
   pid: process.pid,
   ppid: process.ppid,
+  versionProbePid,
   version: versionMatch[1],
   executablePathHash: hashSensitiveString(fs.realpathSync(executablePath)),
   executableSha256,

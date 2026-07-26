@@ -80,6 +80,7 @@ if (!first.sessionId) {
     firstResultSubtype: first.resultSubtype,
     secondResultSubtype: null,
     markerRecalled: false,
+    reasonCount: sdkEvidence.reasons.length + 1,
   });
   console.log('FAIL — first turn did not return a session_id');
   process.exit(1);
