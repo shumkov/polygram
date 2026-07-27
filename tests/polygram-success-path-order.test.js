@@ -114,22 +114,21 @@ describe('polygram.js success-path ordering (rc.10)', () => {
       `clearAutosteeredReactions block (line ${caveatLine}) must come AFTER the last deliverReplies (line ${lastDeliverLine})`);
   });
 
-  test('the success-path markReplied() comes AFTER the deferred reactor.clear()', () => {
+  test('the success-path delivery finalizer comes AFTER the deferred reactor.clear()', () => {
     const src = readHandleMessageSection();
     const rc10MarkerLine = findLineOf(src, 'rc.10: clear progress reactions AFTER');
-    // The markReplied() call that ends the success path is the one
-    // that follows the rc.10 deferred clears. Find any markReplied
-    // call AFTER the rc.10 marker.
-    let endOfSuccessMarkRepliedLine = -1;
+    // The delivery finalizer durably settles Codex delivery and then marks
+    // the inbound terminal. It must remain after the visual cleanup.
+    let finalizerLine = -1;
     const lines = src.split('\n');
     for (let i = rc10MarkerLine; i < lines.length; i++) {
-      if (lines[i].includes('markReplied();')) {
-        endOfSuccessMarkRepliedLine = i + 1;
+      if (lines[i].includes('await finalizeResultDelivery(')) {
+        finalizerLine = i + 1;
         break;
       }
     }
-    assert.ok(endOfSuccessMarkRepliedLine > rc10MarkerLine,
-      'success-path markReplied() must come AFTER the rc.10 deferred clears, finalising the inbound row\'s status as the very last side-effect');
+    assert.ok(finalizerLine > rc10MarkerLine,
+      'success-path delivery finalization must come AFTER the rc.10 deferred clears');
   });
 });
 
@@ -163,18 +162,22 @@ describe('Bug 2 — every streamed-reply success exit clears the reactor', () =>
   const lines = src.split('\n');
 
   // The streamed-reply success branches each end with this trailing
-  // pair. Find every `markReplied();` immediately followed by
-  // `return;` that is inside the streamed block (after a
-  // `streamer.finalize` / `streamer.discard` site).
+  // pair. Find each return whose nearby tail contains the delivery
+  // finalizer and a streamed branch log.
   function streamedSuccessReturns() {
     const out = [];
     for (let i = 0; i < lines.length; i += 1) {
-      if (!/^\s*markReplied\(\);\s*$/.test(lines[i])) continue;
-      if (!/^\s*return;\s*$/.test(lines[i + 1] || '')) continue;
+      if (!/^\s*return;\s*$/.test(lines[i])) continue;
       // Is this a STREAMED-branch return? The streamed branches log a
-      // "| streamed" / "streamed-redeliver" console line just above.
-      const ctx = lines.slice(Math.max(0, i - 6), i).join('\n');
-      if (/streamed/.test(ctx)) out.push(i + 1); // 1-indexed
+      // "| streamed" / "streamed-redeliver" console line and finalize
+      // durable delivery just above.
+      const ctx = lines.slice(Math.max(0, i - 12), i).join('\n');
+      if (
+        /streamed/.test(ctx)
+        && /await finalizeResultDelivery\(/.test(ctx)
+      ) {
+        out.push(i + 1); // 1-indexed
+      }
     }
     return out;
   }
@@ -189,12 +192,12 @@ describe('Bug 2 — every streamed-reply success exit clears the reactor', () =>
   test('each streamed-success early return is preceded by reactor.clear()', () => {
     const returns = streamedSuccessReturns();
     for (const lineNo of returns) {
-      // Walk back from the `markReplied();` line to the branch's
+      // Walk back from the return to the branch's
       // `sendInlineReactions()` call (the common tail of every
       // streamed-success branch) and require a `reactor.clear()`
       // somewhere between them.
       let start = -1;
-      for (let i = lineNo - 1; i >= 0 && i > lineNo - 30; i -= 1) {
+      for (let i = lineNo - 1; i >= 0 && i > lineNo - 40; i -= 1) {
         if (/sendInlineReactions\(\)/.test(lines[i])) { start = i; break; }
       }
       assert.ok(start >= 0,
@@ -210,6 +213,9 @@ describe('Bug 2 — every streamed-reply success exit clears the reactor', () =>
         `Bug 2: the streamed-success branch ending at line ${lineNo} `
         + `must also clear autosteered ✍ reactions before returning, `
         + `mirroring the rc.10 deferred-clear block.`);
+      assert.match(block, /await finalizeResultDelivery\(/,
+        `the streamed-success branch ending at line ${lineNo} must `
+        + `durably finalize delivery before returning`);
     }
   });
 });

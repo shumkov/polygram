@@ -386,6 +386,21 @@ describe('buildPrompt — full integration', () => {
     assert.doesNotMatch(p, /Do NOT use Telegram MCP tools/);
   });
 
+  test('Codex prompt uses inline app-server delivery without Claude Channels claims', () => {
+    const p = buildPrompt({ msg: basicMsg, backend: 'codex' });
+    assert.match(p, /Codex app-server runtime/);
+    assert.match(p, /Reply with inline text/);
+    assert.match(p, /streams and delivers your final response automatically/);
+    assert.match(p, /Do NOT use Telegram MCP tools/);
+    assert.match(p, /native macOS beta/);
+    assert.match(p, /command network and model-native web search are disabled/);
+    assert.match(p, /product MCP tools and interactive approvals are unavailable/);
+    assert.match(p, /Keep long-running commands in the foreground/);
+    assert.match(p, /Do not start detached or background servers/);
+    assert.doesNotMatch(p, /mcp__polygram-bridge__reply/);
+    assert.doesNotMatch(p, /channels mode/);
+  });
+
   test('delivery skill keeps interactive CLI files on the reply MCP lane', () => {
     const skill = fs.readFileSync(
       path.join(__dirname, '../skills/polygram-send/SKILL.md'),
@@ -416,6 +431,49 @@ describe('buildPrompt — full integration', () => {
     const p = buildPrompt({ msg: basicMsg, backend });
     assert.match(p, /MUST call `mcp__polygram-bridge__reply`/);
     assert.doesNotMatch(p, /Just reply with text/);
+  });
+
+  test('resolver selects Codex with existing truthy precedence and Claude aliases intact', () => {
+    assert.equal(resolvePromptBackend({
+      config: {
+        bot: { pm: 'sdk' },
+        chats: {
+          '42': {
+            pm: 'cli',
+            topics: { 7: { pm: 'codex' } },
+          },
+        },
+      },
+      chatId: 42,
+      threadId: 7,
+    }), 'codex');
+
+    assert.equal(resolvePromptBackend({
+      config: {
+        bot: { pm: 'codex' },
+        chats: {
+          '42': {
+            pm: 'tmux',
+            topics: { 7: { pm: '' } },
+          },
+        },
+      },
+      chatId: 42,
+      threadId: 7,
+    }), 'cli');
+
+    assert.equal(resolvePromptBackend({
+      config: {
+        chats: {
+          '42': {
+            pm: 'codex',
+            topics: { 7: { pm: 'unknown-backend' } },
+          },
+        },
+      },
+      chatId: 42,
+      threadId: 7,
+    }), 'sdk');
   });
 
   test('no sticker set → prompt never mentions stickers', () => {

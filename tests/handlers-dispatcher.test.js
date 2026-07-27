@@ -38,6 +38,8 @@ function fixture(overrides = {}) {
     autoResumeClears: [],
     clearSessionId: [],
     deliverReplies: [],
+    recoverCodex: [],
+    autoResumeChecks: [],
     loggerErrors: [],
     sequence: [],
   };
@@ -59,6 +61,7 @@ function fixture(overrides = {}) {
     },
     db: {
       setInboundHandlerStatus: (row) => calls.setInboundStatus.push(row),
+      getReplayProviderRecovery: overrides.getReplayProviderRecovery,
       clearSessionId: overrides.clearSessionId || ((sk) => {
         calls.clearSessionId.push(sk);
         calls.sequence.push('clearSessionId');
@@ -83,7 +86,14 @@ function fixture(overrides = {}) {
       isTransient: false,
       autoRecover: false,
     })),
-    isAutoResumable: () => overrides.isAutoResumable === true,
+    isAutoResumable: (input) => {
+      calls.autoResumeChecks.push(input);
+      return overrides.isAutoResumable === true;
+    },
+    recoverCodex: overrides.recoverCodex || (async (input) => {
+      calls.recoverCodex.push(input);
+      return { ok: true };
+    }),
     abortGrace: {
       isRecent: (sk) => overrides.abortRecent === true,
     },
@@ -365,6 +375,94 @@ describe('createDispatcher — auto-resume gating', () => {
     await nextTick(); await nextTick(); await nextTick(); await nextTick();
     assert.equal(fx.calls.deliverReplies.length, 1,
       'no reply-tool delivery → auto-resume still delivers the answer (unchanged behavior)');
+  });
+
+  test('Codex auto-resume delivers the authoritative inline final text once', async () => {
+    const fx = fixture({
+      isAutoResumable: true,
+      sendToProcessResult: {
+        text: 'authoritative Codex final',
+        sessionId: 'thread-a',
+        providerSessionId: 'thread-a',
+        providerTurnId: 'turn-a',
+        generationId: 'generation-a',
+      },
+    });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(new Error('300s no activity'));
+    await nextTick(); await nextTick(); await nextTick(); await nextTick();
+    assert.equal(fx.calls.deliverReplies.length, 1);
+    assert.deepEqual(
+      fx.calls.deliverReplies[0].chunks,
+      ['authoritative Codex final'],
+    );
+  });
+
+  test('Codex definitely-not-sent recovery re-dispatches the original input through the exact Codex path', async () => {
+    const providerRecovery = {
+      provider: 'codex',
+      deliveryState: 'prepared',
+      recoveryState: 'prepared',
+    };
+    const fx = fixture({
+      isAutoResumable: true,
+      getReplayProviderRecovery: () => providerRecovery,
+    });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    const error = Object.assign(new Error('request was not written'), {
+      code: 'CODEX_RPC_NOT_SENT',
+    });
+    fx.getResolver().reject(error);
+    await nextTick(); await nextTick(); await nextTick(); await nextTick();
+
+    assert.equal(fx.calls.sendToProcess.length, 0,
+      'Codex recovery must not inject Claude-style continuation text');
+    assert.equal(fx.calls.recoverCodex.length, 1);
+    assert.equal(fx.calls.recoverCodex[0].sessionKey, 'sk');
+    assert.equal(fx.calls.recoverCodex[0].msg, baseMsg);
+    assert.equal(fx.calls.recoverCodex[0].providerRecovery, providerRecovery);
+    assert.equal(fx.calls.autoResumeChecks[0].provider, 'codex');
+    assert.equal(fx.calls.autoResumeChecks[0].providerRecovery, providerRecovery);
+    assert.match(
+      fx.calls.tg.find((call) => call.meta?.source === 'auto-resume-indicator')
+        ?.params?.text || '',
+      /proven not sent/i,
+    );
+  });
+
+  test('unknown provider evidence cannot enter either provider auto-resume path', async () => {
+    const fx = fixture({
+      isAutoResumable: false,
+      getReplayProviderRecovery: () => ({
+        provider: 'unknown',
+        reason: 'conflicting-provider-evidence',
+      }),
+    });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(new Error('idle with no Claude activity'));
+    await nextTick(); await nextTick(); await nextTick();
+
+    assert.equal(fx.calls.autoResumeChecks[0].provider, 'unknown');
+    assert.equal(fx.calls.recoverCodex.length, 0);
+    assert.equal(fx.calls.sendToProcess.length, 0);
+  });
+
+  test('malformed Codex final text fails the resume instead of reaching Telegram', async () => {
+    const fx = fixture({
+      sendToProcessResult: {
+        text: { unexpected: 'object' },
+        providerTurnId: 'turn-a',
+        generationId: 'generation-a',
+      },
+    });
+    await assert.rejects(
+      fx.dispatcher.attemptAutoResume('sk', 100, baseMsg, {}),
+      (error) => error.code === 'CODEX_TEXT_EVENT_INVALID',
+    );
+    assert.equal(fx.calls.deliverReplies.length, 0);
   });
 
   test('resumable + IN cooldown → no resume attempt, fall through to error reply', async () => {

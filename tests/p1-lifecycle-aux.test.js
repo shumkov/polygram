@@ -141,7 +141,7 @@ describe('P1-C: open-question sessions are pinned from LRU eviction (S9)', () =>
     return p;
   }
 
-  test('_evictLRU skips the oldest session when it has an open question', () => {
+  test('_evictLRU skips the oldest session when it has an open question', async () => {
     const pm = new ProcessManager({ processFactory: () => ({}), logger: { warn: () => {}, error: () => {} } });
     const withQuestion = fakeProc({ key: 'asking', lastUsedTs: 1000, openQuestions: true });
     const idle = fakeProc({ key: 'idle', lastUsedTs: 2000 });
@@ -149,6 +149,7 @@ describe('P1-C: open-question sessions are pinned from LRU eviction (S9)', () =>
     pm.procs.set('idle', idle);
 
     const evicted = pm._evictLRU();
+    await new Promise((resolve) => setImmediate(resolve));
 
     assert.equal(evicted, true);
     assert.equal(withQuestion.killed.length, 0,

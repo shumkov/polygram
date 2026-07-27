@@ -19,7 +19,16 @@ const assert = require('node:assert/strict');
 const { makeFakePm } = require('./_helpers/fake-pm');
 
 describe('Pm interface — required methods on every fake', () => {
-  const REQUIRED_METHODS = ['has', 'get', 'getOrSpawn', 'send', 'kill', 'killChat', 'shutdown'];
+  const REQUIRED_METHODS = [
+    'has',
+    'get',
+    'getOrSpawn',
+    'replaceRuntime',
+    'send',
+    'kill',
+    'killChat',
+    'shutdown',
+  ];
 
   for (const m of REQUIRED_METHODS) {
     test(`fake exposes ${m}() by default`, () => {
@@ -31,7 +40,9 @@ describe('Pm interface — required methods on every fake', () => {
 
 describe('Pm interface — optional methods are off by default', () => {
   const OPTIONAL_METHODS = [
-    'steer', 'injectUserMessage', 'setModel', 'applyFlagSettings',
+    'steer', 'injectUserMessage', 'setModel', 'selectModelSettings',
+    'getModelSettingsStatus',
+    'applyFlagSettings',
     'setPermissionMode', 'drainQueue', 'interrupt', 'resetSession',
   ];
 
@@ -72,6 +83,38 @@ describe('Pm interface — call recording', () => {
     await assert.doesNotReject(pm.killChat(123));
     await assert.doesNotReject(pm.shutdown());
   });
+
+  test('runtime replacement returns the exact provider-labelled entry', async () => {
+    const pm = makeFakePm('runtime');
+    const entry = await pm.replaceRuntime('chat:7', {
+      chatId: 'chat',
+      threadId: '7',
+      label: 'Polygram topic',
+      runtime: 'codex',
+      backend: 'codex',
+      spawnProfileId: 'profile-a',
+      runtimeConfigIdentity: 'polygram-owned-identity',
+    });
+
+    assert.equal(entry.sessionKey, 'chat:7');
+    assert.equal(entry.label, 'Polygram topic');
+    assert.equal(entry.runtime, 'codex');
+    assert.equal(entry.backend, 'codex');
+    assert.equal(entry.spawnProfileId, 'profile-a');
+    assert.deepEqual(pm.calls[0], [
+      'replaceRuntime',
+      'chat:7',
+      {
+        chatId: 'chat',
+        threadId: '7',
+        label: 'Polygram topic',
+        runtime: 'codex',
+        backend: 'codex',
+        spawnProfileId: 'profile-a',
+        runtimeConfigIdentity: 'polygram-owned-identity',
+      },
+    ]);
+  });
 });
 
 describe('Pm interface — opted-in optional methods record', () => {
@@ -90,6 +133,30 @@ describe('Pm interface — opted-in optional methods record', () => {
     assert.equal(await pm.setModel('a', 'sonnet'), true);
     assert.equal(await pm.applyFlagSettings('a', { effortLevel: 'high' }), true);
     assert.equal(await pm.setPermissionMode('a', 'default'), true);
+  });
+
+  test('selectModelSettings records one complete pair and returns a discriminated outcome', async () => {
+    const nextTurn = { model: 'gpt-5.6-sol', effort: 'xhigh' };
+    const pm = makeFakePm('codex-settings', {
+      selectModelSettings: true,
+      selectModelSettingsResult: {
+        outcome: 'updated-live',
+        threadId: 'thread-1',
+        generationId: 'generation-1',
+        currentTurn: null,
+        nextTurn,
+      },
+    });
+
+    const result = await pm.selectModelSettings('chat:7', nextTurn);
+
+    assert.deepEqual(pm.calls, [[
+      'selectModelSettings',
+      'chat:7',
+      nextTurn,
+    ]]);
+    assert.equal(result.outcome, 'updated-live');
+    assert.deepEqual(result.nextTurn, nextTurn);
   });
 
   test('resetSession returns Promise of {closed, drainedPendings}', async () => {

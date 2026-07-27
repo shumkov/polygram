@@ -11,7 +11,11 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { classifyReplay, executeReplayPlan } = require('../lib/handlers/replay-disposition');
+const {
+  classifyReplay,
+  executeReplayPlan,
+  classifyCodexRecoveryEvidence,
+} = require('../lib/handlers/replay-disposition');
 
 const C = (chat_id, msg_id, thread_id = null) => ({ chat_id, msg_id, thread_id });
 
@@ -32,6 +36,134 @@ describe('classifyReplay — crash branch (recover all)', () => {
       hasCompletedTurn: (c) => answered.has(`${c.chat_id}/${c.msg_id}`),
     });
     assert.deepEqual(r.recover.map((c) => c.msg_id), [1]);
+  });
+});
+
+describe('classifyReplay — provider-aware Codex recovery fence', () => {
+  const codex = (delivery_state, recovery_state, extra = {}) => ({
+    provider: 'codex',
+    delivery_state,
+    recovery_state,
+    ...extra,
+  });
+
+  test('crash routes a prepared-only Codex request to the dedicated Codex recoverer', () => {
+    const candidate = C('-100', 1, '37');
+    const r = classifyReplay({
+      candidates: [candidate],
+      cleanShutdown: false,
+      getProviderRecovery: () => codex('prepared', 'prepared'),
+    });
+    assert.deepEqual(r.recover, [], 'must not enter the legacy/Claude recover path');
+    assert.deepEqual(r.recoverCodex, [candidate]);
+    assert.deepEqual(r.skip, []);
+    assert.deepEqual(r.notices, []);
+  });
+
+  test('clean restart preserves restart intent for prepared-only Codex work', () => {
+    const candidate = C('-100', 1, '37');
+    const r = classifyReplay({
+      candidates: [candidate],
+      cleanShutdown: true,
+      getProviderRecovery: () => codex('prepared', 'prepared'),
+    });
+    assert.deepEqual(r.recover, []);
+    assert.equal(r.recoverCodex, undefined);
+    assert.deepEqual(r.skip, [candidate]);
+    assert.equal(r.notices.length, 1);
+    assert.deepEqual(r.notices[0].items, [candidate]);
+  });
+
+  test('prepared then explicitly cancelled work is skipped silently on crash or clean restart', () => {
+    for (const cleanShutdown of [false, true]) {
+      const candidate = C('-100', cleanShutdown ? 2 : 1, '37');
+      const r = classifyReplay({
+        candidates: [candidate],
+        cleanShutdown,
+        getProviderRecovery: () => codex('prepared', 'cancelled'),
+      });
+      assert.deepEqual(r.recover, []);
+      assert.equal(r.recoverCodex, undefined);
+      assert.deepEqual(r.skip, [candidate]);
+      assert.deepEqual(r.notices, []);
+    }
+  });
+
+  test('write-attempted, response-observed, active, terminal, and ambiguous work is deferred', () => {
+    const cases = [
+      codex('write-attempted', 'ambiguous'),
+      codex('response-observed', 'active'),
+      codex('response-observed', 'terminal-pending'),
+      codex('response-observed', 'clean-pending'),
+      codex('response-observed', 'empty-registry-pending'),
+      codex('response-observed', 'ambiguous'),
+    ];
+    for (const [index, evidence] of cases.entries()) {
+      const candidate = C('-100', index + 1, '37');
+      const r = classifyReplay({
+        candidates: [candidate],
+        cleanShutdown: false,
+        getProviderRecovery: () => evidence,
+      });
+      assert.deepEqual(r.recover, [], JSON.stringify(evidence));
+      assert.equal(r.recoverCodex, undefined, JSON.stringify(evidence));
+      assert.deepEqual(r.skip, [], JSON.stringify(evidence));
+      assert.deepEqual(r.defer, [candidate], JSON.stringify(evidence));
+    }
+  });
+
+  test('linked steering input inherits its target and is never replayed independently', () => {
+    const candidate = C('-100', 1, '37');
+    const evidence = codex('prepared', 'prepared', {
+      linked_input_state: 'linked',
+      target_delivery_state: 'prepared',
+      target_recovery_state: 'prepared',
+    });
+    const disposition = classifyCodexRecoveryEvidence(evidence);
+    assert.deepEqual(disposition, {
+      action: 'defer',
+      reason: 'linked-input',
+      target: {
+        action: 'recover',
+        reason: 'request-proven-not-accepted',
+      },
+    });
+
+    const r = classifyReplay({
+      candidates: [candidate],
+      cleanShutdown: false,
+      getProviderRecovery: () => evidence,
+    });
+    assert.deepEqual(r.recover, []);
+    assert.equal(r.recoverCodex, undefined);
+    assert.deepEqual(r.skip, []);
+    assert.deepEqual(r.defer, [candidate]);
+  });
+
+  test('an authoritative resolver error or unknown provider fails closed', () => {
+    const candidates = [C('-100', 1), C('-100', 2)];
+    const threw = classifyReplay({
+      candidates: [candidates[0]],
+      getProviderRecovery: () => { throw new Error('ledger unavailable'); },
+    });
+    const unknown = classifyReplay({
+      candidates: [candidates[1]],
+      getProviderRecovery: () => null,
+    });
+    assert.deepEqual(threw.defer, [candidates[0]]);
+    assert.deepEqual(unknown.defer, [candidates[1]]);
+    assert.deepEqual(threw.recover, []);
+    assert.deepEqual(unknown.recover, []);
+  });
+
+  test('explicit Claude evidence retains the exact legacy crash policy', () => {
+    const candidate = C('-100', 1);
+    const r = classifyReplay({
+      candidates: [candidate],
+      cleanShutdown: false,
+      getProviderRecovery: () => ({ provider: 'claude' }),
+    });
+    assert.deepEqual(r, { recover: [candidate], skip: [], notices: [] });
   });
 });
 
@@ -129,6 +261,61 @@ describe('executeReplayPlan — crash branch', () => {
     assert.equal(res.recovered, 1);
     assert.equal(res.skipped, 1);
     assert.equal(res.noticed, 0);
+  });
+
+  test('Codex recovery never falls through to the legacy/Claude recoverer', async () => {
+    const candidate = C('-100', 1);
+    const plan = classifyReplay({
+      candidates: [candidate],
+      cleanShutdown: false,
+      getProviderRecovery: () => ({
+        provider: 'codex',
+        delivery_state: 'prepared',
+        recovery_state: 'prepared',
+      }),
+    });
+    let legacyCalls = 0;
+    const events = [];
+    const res = await executeReplayPlan({
+      plan,
+      deps: {
+        recover: async () => { legacyCalls += 1; return { ok: true }; },
+        sendNotice: async () => ({ ok: true }),
+        markSkipped: () => {},
+        logEvent: (kind, detail) => events.push({ kind, detail }),
+      },
+    });
+    assert.equal(legacyCalls, 0);
+    assert.equal(res.recovered, 0);
+    assert.equal(res.deferred, 1);
+    assert.equal(events[0].kind, 'codex-replay-deferred');
+    assert.equal(events[0].detail.reason, 'codex-recoverer-unavailable');
+  });
+
+  test('prepared-only Codex work uses the dedicated recoverer', async () => {
+    const candidate = C('-100', 1);
+    const plan = classifyReplay({
+      candidates: [candidate],
+      cleanShutdown: false,
+      getProviderRecovery: () => ({
+        provider: 'codex',
+        delivery_state: 'prepared',
+        recovery_state: 'prepared',
+      }),
+    });
+    const calls = [];
+    const res = await executeReplayPlan({
+      plan,
+      deps: {
+        recover: async () => { throw new Error('must not fail over to Claude'); },
+        recoverCodex: async (c) => { calls.push(c); return { ok: true }; },
+        sendNotice: async () => ({ ok: true }),
+        markSkipped: () => {},
+      },
+    });
+    assert.deepEqual(calls, [candidate]);
+    assert.equal(res.recovered, 1);
+    assert.equal(res.deferred, undefined);
   });
 });
 

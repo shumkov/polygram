@@ -15,6 +15,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { createSdkCallbacks } = require('../lib/sdk/callbacks');
+const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 
 const silentLogger = { log: () => {}, error: () => {} };
 
@@ -32,6 +33,7 @@ function baseDeps(overrides = {}) {
     deps: {
       db: {
         upsertSession(args) { upsertCalls.push(args); },
+        upsertProviderSession(args) { upsertCalls.push(args); },
       },
       dbWrite: (fn /* , label */) => fn(),
       config: {
@@ -168,6 +170,95 @@ describe('onInit — upserts session row with TOPIC-RESOLVED spawn identity', ()
       "pm_backend must be passed explicitly so DB layer never defaults "
         + "(pm:'tmux' aliases to 'cli' — factory.js Phase 4)");
   });
+
+  test('Codex persists its thread namespace without overwriting the dormant Claude session', () => {
+    const { db, dbPath } = freshDb('sdk-callbacks-codex-init');
+    try {
+      db.upsertSession({
+        session_key: '12345:24',
+        chat_id: '12345',
+        thread_id: '24',
+        claude_session_id: 'claude-session-a',
+        agent: 'finance',
+        cwd: '/claude/workspace',
+        model: 'sonnet',
+        effort: 'high',
+        pm_backend: 'sdk',
+        ts: 100,
+      });
+      const h = baseDeps({ db });
+      createSdkCallbacks(h.deps).onInit('12345:24', {
+        session_id: 'thread-codex-a',
+        providerSessionId: 'thread-codex-a',
+        generationId: 'generation-a',
+        backend: 'codex',
+      }, {
+        runtime: 'codex',
+        backend: 'codex',
+        chatId: '12345',
+        threadId: '24',
+        label: 'Codex',
+        cwd: '/codex/workspace',
+        model: 'gpt-5.6-sol',
+        effort: 'xhigh',
+      });
+
+      const codex = db.getProviderSession('12345:24', 'codex:app-server');
+      assert.equal(codex.provider, 'codex');
+      assert.equal(codex.provider_session_id, 'thread-codex-a');
+      assert.equal(codex.app_server_session_id, null);
+      assert.equal(codex.agent, null);
+      assert.equal(codex.cwd, '/codex/workspace');
+      assert.equal(codex.model, 'gpt-5.6-sol');
+      assert.equal(codex.effort, 'xhigh');
+      assert.equal(codex.pm_backend, 'codex');
+
+      const claude = db.getSession('12345:24');
+      assert.equal(claude.claude_session_id, 'claude-session-a');
+      assert.equal(claude.cwd, '/claude/workspace');
+      assert.equal(claude.model, 'sonnet');
+      assert.equal(
+        db.getProviderSession('12345:24', 'claude:inline').provider_session_id,
+        'claude-session-a',
+      );
+    } finally {
+      cleanupDb(dbPath, db);
+    }
+  });
+
+  test('Claude initialization retains the legacy and namespaced dual-write', () => {
+    const { db, dbPath } = freshDb('sdk-callbacks-claude-init');
+    try {
+      const h = baseDeps({ db });
+      createSdkCallbacks(h.deps).onInit('12345:24', {
+        session_id: 'claude-session-a',
+      }, {
+        runtime: 'claude',
+        backend: 'sdk',
+        chatId: '12345',
+        threadId: '24',
+        label: 'Claude',
+      });
+
+      const legacy = db.getSession('12345:24');
+      assert.equal(legacy.claude_session_id, 'claude-session-a');
+      assert.equal(legacy.agent, 'finance');
+      assert.equal(legacy.cwd, '/u');
+      assert.equal(legacy.model, 'sonnet');
+      assert.equal(legacy.effort, 'high');
+      assert.equal(legacy.pm_backend, 'sdk');
+      assert.equal(
+        db.getProviderSession('12345:24', 'claude:inline').provider_session_id,
+        'claude-session-a',
+      );
+      assert.equal(
+        db.getProviderSession('12345:24', 'codex:app-server'),
+        undefined,
+      );
+    } finally {
+      cleanupDb(dbPath, db);
+    }
+  });
 });
 
 describe('onClose — logs process-close event', () => {
@@ -178,6 +269,24 @@ describe('onClose — logs process-close event', () => {
     assert.equal(h.events.length, 1);
     assert.equal(h.events[0].kind, 'process-close');
     assert.equal(h.events[0].detail.code, 137);
+  });
+
+  test('Codex close detail does not replace the appended process entry', () => {
+    const h = baseDeps();
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onClose(
+      '12345',
+      0,
+      { backend: 'codex', generationId: 'generation-a', reason: 'stop' },
+      {
+        runtime: 'codex',
+        backend: 'codex',
+        chatId: '12345',
+        label: 'Codex chat',
+      },
+    );
+    assert.equal(h.events[0].detail.chat_id, '12345');
+    assert.equal(h.events[0].detail.session_key, '12345');
   });
 });
 
@@ -290,6 +399,85 @@ describe('onStreamChunk — routes to head pending streamer + heartbeats reactor
     const h = baseDeps();
     const cbs = createSdkCallbacks(h.deps);
     assert.doesNotThrow(() => cbs.onStreamChunk('k', 'x', { pendingQueue: [] }));
+  });
+
+  test('Codex cumulative snapshots replace rather than append in callback glue', () => {
+    const h = baseDeps();
+    const onChunkCalls = [];
+    const entry = {
+      runtime: 'codex',
+      generationId: 'generation-a',
+      pendingQueue: [{
+        context: {
+          streamer: {
+            onChunk: (text) => {
+              onChunkCalls.push(text);
+              return Promise.resolve();
+            },
+          },
+          reactor: { heartbeat: () => {} },
+        },
+      }],
+    };
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onStreamChunk('k', 'Hel', entry);
+    cbs.onStreamChunk('k', 'Hello', entry);
+    cbs.onStreamChunk('k', 'Hello world', entry);
+    assert.deepEqual(onChunkCalls, ['Hel', 'Hello', 'Hello world']);
+  });
+
+  test('malformed Codex stream values are ignored with content-free telemetry', () => {
+    const h = baseDeps();
+    const onChunkCalls = [];
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onStreamChunk('12345', { text: 'unexpected envelope' }, {
+      runtime: 'codex',
+      generationId: 'generation-a',
+      chatId: '12345',
+      pendingQueue: [{
+        context: {
+          streamer: {
+            onChunk: (text) => {
+              onChunkCalls.push(text);
+              return Promise.resolve();
+            },
+          },
+        },
+      }],
+    });
+    assert.deepEqual(onChunkCalls, []);
+    assert.deepEqual(h.events, [{
+      kind: 'codex-stream-event-invalid',
+      detail: {
+        chat_id: '12345',
+        session_key: '12345',
+        generation_id: 'generation-a',
+        value_type: 'object',
+      },
+    }]);
+    assert.equal(JSON.stringify(h.events).includes('unexpected envelope'), false);
+  });
+
+  test('Claude stream callback retains its prior opaque pass-through', () => {
+    const h = baseDeps();
+    const value = { legacy: 'opaque callback value' };
+    let observed;
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onStreamChunk('k', value, {
+      runtime: 'claude',
+      backend: 'sdk',
+      pendingQueue: [{
+        context: {
+          streamer: {
+            onChunk: (text) => {
+              observed = text;
+              return Promise.resolve();
+            },
+          },
+        },
+      }],
+    });
+    assert.equal(observed, value);
   });
 });
 

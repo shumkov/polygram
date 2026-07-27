@@ -110,6 +110,26 @@ describe('createRewindHandler.tryConsume', () => {
     assert.equal(execCalls.length, 0);
   });
 
+  test('Codex reports rewind as unsupported without executing or changing its thread', async () => {
+    const { h, execCalls, lastSend } = harness();
+    const r = await h.tryConsume({
+      sessionKey: 's',
+      chatId: '1',
+      msg: { from: { id: 7 } },
+      cleanText: '/rewind',
+      runtime: 'codex',
+      rewindSafe: true,
+      isOperatorIdentity: true,
+      paired: false,
+      accessMode: 'operator',
+      botUsername: 'b',
+    });
+    assert.equal(r.consumed, true);
+    assert.match(lastSend(), /Codex/i);
+    assert.match(lastSend(), /not supported/i);
+    assert.equal(execCalls.length, 0);
+  });
+
   test('/rewind from a non-operator: consumed + rejected, NOT executed', async () => {
     const { h, execCalls, lastSend } = harness();
     await h.tryConsume({ sessionKey: 's', chatId: '1', msg: opMsg({ from: { id: 7 } }), cleanText: '/rewind', rewindSafe: true, isOperatorIdentity: false, paired: false, accessMode: 'operator', botUsername: 'b' });

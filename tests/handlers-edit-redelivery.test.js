@@ -2,16 +2,33 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const { createEditRedelivery } = require('../lib/handlers/edit-redelivery');
 
-function harness({ inFlight = false, gate = true, optOut = false, chat = true } = {}) {
+function harness({
+  inFlight = false,
+  gate = true,
+  optOut = false,
+  chat = true,
+  backend = 'claude',
+  generationId = 'generation-a',
+} = {}) {
   const dispatched = [];
   const injected = [];
   const reactions = [];
   const events = [];
-  const proc = inFlight ? { inFlight: true } : null;
+  let proc = inFlight || backend === 'codex'
+    ? Object.assign(new EventEmitter(), {
+      backend,
+      runtime: backend,
+      generationId: backend === 'codex' ? generationId : undefined,
+      inFlight,
+      closed: false,
+    })
+    : null;
   const pm = {
     get: () => proc,
+    getBackend: () => proc?.backend ?? backend,
     injectUserMessage: (sk, opts) => { injected.push({ sk, opts }); return true; },
   };
   const config = {
@@ -32,7 +49,15 @@ function harness({ inFlight = false, gate = true, optOut = false, chat = true } 
   // out of the factory's main() scope — rc.34 boot crash). The harness threads fixed
   // values so the existing call sites stay m(msg, oldText).
   const m = (editedMsg, oldText) => realM(editedMsg, oldText, 'bot', null);
-  return { m, dispatched, injected, reactions, events };
+  return {
+    m,
+    dispatched,
+    injected,
+    reactions,
+    events,
+    get proc() { return proc; },
+    replaceProc(next) { proc = next; },
+  };
 }
 
 const editedMsg = (over = {}) => ({
@@ -134,6 +159,125 @@ describe('post-turn edit re-delivery', () => {
       dispatchHandleMessage: () => {}, bot: {}, logger: { error: () => {} },
     });
     assert.equal(m(editedMsg({ text: 'new' }), 'old', 'bot', null), false);
+  });
+});
+
+describe('post-turn edit re-delivery — Codex generation-fenced deferral', () => {
+  test('live Codex turn defers until idle without using the synchronous injector', () => {
+    const H = harness({ backend: 'codex', inFlight: true });
+
+    assert.equal(H.m(editedMsg({ text: 'corrected' }), 'original'), false);
+    assert.equal(H.dispatched.length, 0);
+    assert.equal(H.injected.length, 0);
+    assert.deepEqual(H.reactions, [{ cid: '100', mid: 500 }]);
+    assert.ok(H.events.some((event) => event.k === 'edit-redelivery-deferred'));
+
+    H.proc.inFlight = false;
+    H.proc.emit('idle');
+
+    assert.equal(H.dispatched.length, 1);
+    assert.equal(H.dispatched[0].msg.text, 'corrected');
+    assert.equal(H.dispatched[0].msg.reply_to_message.text, 'original');
+    assert.equal(H.dispatched[0].msg._requiredProvider, 'codex');
+    assert.ok(H.events.some((event) => event.k === 'edit-redelivered'));
+  });
+
+  test('re-edits coalesce to latest per message while different messages keep registration order', () => {
+    const H = harness({ backend: 'codex', inFlight: true });
+
+    H.m(editedMsg({ message_id: 500, text: 'first-500' }), 'original-500');
+    H.m(editedMsg({ message_id: 501, text: 'only-501' }), 'original-501');
+    H.m(editedMsg({ message_id: 500, text: 'latest-500' }), 'first-500');
+    assert.equal(H.dispatched.length, 0);
+    assert.equal(H.injected.length, 0);
+
+    H.proc.inFlight = false;
+    H.proc.emit('idle');
+
+    assert.deepEqual(
+      H.dispatched.map(({ msg }) => [msg.message_id, msg.text, msg.reply_to_message.text]),
+      [
+        [500, 'latest-500', 'first-500'],
+        [501, 'only-501', 'original-501'],
+      ],
+    );
+  });
+
+  test('close cancels deferred edits and cancellation telemetry contains no edited content', () => {
+    const H = harness({ backend: 'codex', inFlight: true });
+    H.m(editedMsg({ text: 'private corrected content' }), 'private original content');
+
+    H.proc.closed = true;
+    H.proc.emit('close');
+    H.proc.inFlight = false;
+    H.proc.emit('idle');
+
+    assert.equal(H.dispatched.length, 0);
+    const cancelled = H.events.find((event) => event.k === 'edit-redelivery-deferred-cancelled');
+    assert.ok(cancelled);
+    assert.equal(cancelled.d.reason, 'close');
+    assert.equal(JSON.stringify(cancelled.d).includes('private'), false);
+  });
+
+  test('generation replacement cannot release old deferred edits into the replacement', () => {
+    const H = harness({ backend: 'codex', inFlight: true, generationId: 'generation-old' });
+    const oldProc = H.proc;
+    H.m(editedMsg({ text: 'for old generation' }), 'original');
+
+    H.replaceProc(Object.assign(new EventEmitter(), {
+      backend: 'codex',
+      runtime: 'codex',
+      generationId: 'generation-new',
+      inFlight: false,
+      closed: false,
+    }));
+    oldProc.inFlight = false;
+    oldProc.emit('idle');
+
+    assert.equal(H.dispatched.length, 0);
+    const cancelled = H.events.find((event) => event.k === 'edit-redelivery-deferred-cancelled');
+    assert.ok(cancelled);
+    assert.equal(cancelled.d.reason, 'generation-replaced');
+  });
+
+  test('session reset cancels rather than resurrecting deferred edits', () => {
+    const H = harness({ backend: 'codex', inFlight: true });
+    H.m(editedMsg({ text: 'corrected' }), 'original');
+
+    H.proc.emit('session-reset', { reason: 'model-change' });
+    H.proc.inFlight = false;
+    H.proc.emit('idle');
+
+    assert.equal(H.dispatched.length, 0);
+    assert.equal(
+      H.events.find((event) => event.k === 'edit-redelivery-deferred-cancelled')?.d.reason,
+      'session-reset',
+    );
+  });
+
+  test('successful native stop cancels deferred edits even if the process remains open', () => {
+    const H = harness({ backend: 'codex', inFlight: true });
+    H.m(editedMsg({ text: 'corrected' }), 'original');
+
+    H.proc.inFlight = false;
+    H.proc.emit('codex-settled', {
+      kind: 'stopped',
+      generationId: 'generation-a',
+    });
+    H.proc.emit('idle');
+
+    assert.equal(H.dispatched.length, 0);
+    assert.equal(
+      H.events.find((event) => event.k === 'edit-redelivery-deferred-cancelled')?.d.reason,
+      'stop',
+    );
+  });
+
+  test('idle Codex edit keeps the ordinary immediate post-turn redelivery path', () => {
+    const H = harness({ backend: 'codex', inFlight: false });
+    assert.equal(H.m(editedMsg({ text: 'new' }), 'old'), true);
+    assert.equal(H.dispatched.length, 1);
+    assert.equal(H.injected.length, 0);
   });
 });
 

@@ -32,7 +32,7 @@ describe('polygram.js boot smoke', () => {
 
     const missing = [];
     for (const name of assigned) {
-      const declRe = new RegExp(`^(let|const|var)\\s+${name}\\b`, 'm');
+      const declRe = new RegExp(`^\\s*(let|const|var)\\s+${name}\\b`, 'm');
       if (!declRe.test(src)) missing.push(name);
     }
     assert.deepEqual(missing, [],

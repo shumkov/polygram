@@ -29,8 +29,8 @@ describe('secret sweep', () => {
   beforeEach(() => { ({ db, dbPath } = freshDb('secret-sweep')); nextId = 1; });
   afterEach(() => cleanupDb(dbPath, db));
 
-  test('migration 014: schema v14, table + column present', () => {
-    assert.equal(db.raw.pragma('user_version', { simple: true }), 14);
+  test('migration 014 artifacts remain present in later schemas', () => {
+    assert.ok(db.raw.pragma('user_version', { simple: true }) >= 14);
     assert.ok(db.raw.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='secret_redactions'").get());
     assert.ok(db.raw.prepare('PRAGMA table_info(messages)').all().some((c) => c.name === 'secret_scanned_at'));
   });

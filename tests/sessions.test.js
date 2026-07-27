@@ -11,7 +11,15 @@ const os = require('os');
 
 const { open } = require('../lib/db');
 const {
-  migrateJsonToDb, getClaudeSessionId, resolveSessionForSpawn,
+  migrateJsonToDb,
+  getClaudeSessionId,
+  resolveSessionForSpawn,
+  resolveProviderSessionForSpawn,
+  sessionNamespaceFor,
+  CLAUDE_INLINE_NAMESPACE,
+  CLAUDE_CHANNELS_NAMESPACE,
+  CODEX_APP_SERVER_NAMESPACE,
+  CODEX_SPAWN_IDENTITY_FIELDS,
 } = require('../lib/db/sessions');
 
 let db;
@@ -209,6 +217,191 @@ describe('getClaudeSessionId', () => {
   test('returns claude_session_id when present', () => {
     db.upsertSession({ session_key: '123', chat_id: '123', claude_session_id: 'abc' });
     assert.equal(getClaudeSessionId(db, '123'), 'abc');
+  });
+});
+
+describe('provider session namespaces', () => {
+  beforeEach(() => freshEnv());
+  afterEach(() => cleanup());
+
+  test('inline, Channels, and Codex resolve to distinct compatibility namespaces', () => {
+    assert.equal(
+      sessionNamespaceFor({ runtime: 'claude', backend: 'sdk' }),
+      CLAUDE_INLINE_NAMESPACE,
+    );
+    assert.equal(
+      sessionNamespaceFor({ runtime: 'claude', backend: 'tmux' }),
+      CLAUDE_INLINE_NAMESPACE,
+    );
+    assert.equal(
+      sessionNamespaceFor({ runtime: 'claude', backend: 'cli' }),
+      CLAUDE_CHANNELS_NAMESPACE,
+    );
+    assert.equal(
+      sessionNamespaceFor({ runtime: 'claude', backend: 'channels' }),
+      CLAUDE_CHANNELS_NAMESPACE,
+    );
+    assert.equal(
+      sessionNamespaceFor({ runtime: 'codex', backend: 'codex' }),
+      CODEX_APP_SERVER_NAMESPACE,
+    );
+  });
+
+  test('Claude → Codex → Claude preserves dormant rows without cross-resume', () => {
+    db.upsertSession({
+      session_key: 'chat:3',
+      chat_id: 'chat',
+      thread_id: '3',
+      claude_session_id: 'claude-session',
+      agent: 'shumabit',
+      cwd: '/workspace',
+      pm_backend: 'sdk',
+      ts: 1000,
+    });
+    db.upsertProviderSession({
+      session_key: 'chat:3',
+      namespace: CODEX_APP_SERVER_NAMESPACE,
+      provider: 'codex',
+      provider_session_id: 'codex-thread',
+      app_server_session_id: 'diagnostic-session',
+      agent: 'shumabit',
+      cwd: '/workspace',
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      pm_backend: 'codex',
+      ts: 2000,
+    });
+
+    const codex = resolveProviderSessionForSpawn(db, 'chat:3', {
+      runtime: 'codex',
+      backend: 'codex',
+      agent: 'shumabit',
+      cwd: '/workspace',
+    });
+    assert.equal(codex.existingSessionId, 'codex-thread');
+    assert.equal(codex.appServerSessionId, 'diagnostic-session');
+
+    const claude = resolveProviderSessionForSpawn(db, 'chat:3', {
+      runtime: 'claude',
+      backend: 'tmux',
+      agent: 'shumabit',
+      cwd: '/workspace',
+    });
+    assert.equal(claude.existingSessionId, 'claude-session');
+    assert.equal(claude.appServerSessionId, null);
+    assert.equal(getClaudeSessionId(db, 'chat:3'), 'claude-session');
+    assert.equal(
+      db.getProviderSession('chat:3', CODEX_APP_SERVER_NAMESPACE)
+        .provider_session_id,
+      'codex-thread',
+    );
+  });
+
+  test('provider reset clears only the selected namespace', () => {
+    db.upsertSession({
+      session_key: 'chat',
+      chat_id: 'chat',
+      claude_session_id: 'claude-session',
+      pm_backend: 'sdk',
+    });
+    db.upsertProviderSession({
+      session_key: 'chat',
+      namespace: CODEX_APP_SERVER_NAMESPACE,
+      provider: 'codex',
+      provider_session_id: 'codex-thread',
+      pm_backend: 'codex',
+    });
+
+    db.clearProviderSession('chat', CODEX_APP_SERVER_NAMESPACE);
+
+    assert.equal(
+      db.getProviderSession('chat', CODEX_APP_SERVER_NAMESPACE),
+      undefined,
+    );
+    assert.equal(getClaudeSessionId(db, 'chat'), 'claude-session');
+    assert.equal(
+      db.getProviderSession('chat', CLAUDE_INLINE_NAMESPACE)
+        .provider_session_id,
+      'claude-session',
+    );
+  });
+
+  test('Codex thread ID is the resume key and app-server session ID is diagnostic only', () => {
+    db.upsertProviderSession({
+      session_key: 'chat',
+      namespace: CODEX_APP_SERVER_NAMESPACE,
+      provider: 'codex',
+      provider_session_id: 'thread-resume-key',
+      app_server_session_id: 'diagnostic-only',
+      pm_backend: 'codex',
+    });
+    const resolved = resolveProviderSessionForSpawn(db, 'chat', {
+      runtime: 'codex',
+      backend: 'codex',
+    });
+    assert.equal(resolved.existingSessionId, 'thread-resume-key');
+    assert.notEqual(resolved.existingSessionId, resolved.appServerSessionId);
+  });
+
+  test('Codex spawn identity is exactly cwd', () => {
+    assert.deepEqual(CODEX_SPAWN_IDENTITY_FIELDS, ['cwd']);
+  });
+
+  test('Codex model and effort changes preserve the provider thread', () => {
+    db.upsertProviderSession({
+      session_key: 'chat',
+      namespace: CODEX_APP_SERVER_NAMESPACE,
+      provider: 'codex',
+      provider_session_id: 'old-thread',
+      cwd: '/workspace',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+      pm_backend: 'codex',
+    });
+
+    const resolved = resolveProviderSessionForSpawn(db, 'chat', {
+      runtime: 'codex',
+      backend: 'codex',
+      cwd: '/workspace',
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+    });
+
+    assert.equal(resolved.existingSessionId, 'old-thread');
+    assert.equal(resolved.drift, null);
+    assert.equal(
+      db.getProviderSession('chat', CODEX_APP_SERVER_NAMESPACE)
+        .provider_session_id,
+      'old-thread',
+    );
+  });
+
+  test('Codex cwd change still clears the provider thread', () => {
+    db.upsertProviderSession({
+      session_key: 'chat',
+      namespace: CODEX_APP_SERVER_NAMESPACE,
+      provider: 'codex',
+      provider_session_id: 'old-thread',
+      cwd: '/workspace-a',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+      pm_backend: 'codex',
+    });
+
+    const resolved = resolveProviderSessionForSpawn(db, 'chat', {
+      runtime: 'codex',
+      backend: 'codex',
+      cwd: '/workspace-b',
+      model: 'gpt-5.5',
+      effort: 'xhigh',
+    });
+
+    assert.equal(resolved.existingSessionId, null);
+    assert.deepEqual(resolved.drift.fields, ['cwd']);
+    assert.equal(
+      db.getProviderSession('chat', CODEX_APP_SERVER_NAMESPACE),
+      undefined,
+    );
   });
 });
 

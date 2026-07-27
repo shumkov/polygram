@@ -187,3 +187,76 @@ describe('isAutoResumable — gate', () => {
     assert.equal(isAutoResumable({ error: err, aborted: true }), false);
   });
 });
+
+describe('isAutoResumable — Codex durable acceptance fence', () => {
+  const notSent = Object.assign(new Error('request was not sent'), {
+    code: 'CODEX_RPC_NOT_SENT',
+  });
+
+  test('prepared-only Codex request may use a Codex-specific safe recovery path', () => {
+    assert.equal(isAutoResumable({
+      provider: 'codex',
+      providerRecovery: {
+        delivery_state: 'prepared',
+        recovery_state: 'prepared',
+      },
+      error: notSent,
+    }), true);
+  });
+
+  test('Codex never falls back to Claude timeout matching without durable evidence', () => {
+    assert.equal(isAutoResumable({
+      provider: 'codex',
+      error: new Error('Timeout: 300s idle with no Claude activity'),
+    }), false);
+  });
+
+  test('write-attempted, accepted, terminal, ambiguous, and cancelled Codex work cannot auto-resume', () => {
+    const cases = [
+      { delivery_state: 'write-attempted', recovery_state: 'ambiguous' },
+      { delivery_state: 'response-observed', recovery_state: 'active' },
+      { delivery_state: 'response-observed', recovery_state: 'terminal-pending' },
+      { delivery_state: 'response-observed', recovery_state: 'ambiguous' },
+      { delivery_state: 'prepared', recovery_state: 'cancelled' },
+    ];
+    for (const providerRecovery of cases) {
+      assert.equal(isAutoResumable({
+        provider: 'codex',
+        providerRecovery,
+        error: notSent,
+      }), false, JSON.stringify(providerRecovery));
+    }
+  });
+
+  test('linked steer input never auto-resumes independently even when its target was not sent', () => {
+    assert.equal(isAutoResumable({
+      provider: 'codex',
+      providerRecovery: {
+        delivery_state: 'prepared',
+        recovery_state: 'prepared',
+        linked_input_state: 'linked',
+        target_delivery_state: 'prepared',
+        target_recovery_state: 'prepared',
+      },
+      error: notSent,
+    }), false);
+  });
+
+  test('prepared evidence alone cannot make an unrelated Codex error resumable', () => {
+    assert.equal(isAutoResumable({
+      provider: 'codex',
+      providerRecovery: {
+        delivery_state: 'prepared',
+        recovery_state: 'prepared',
+      },
+      error: new Error('auth expired'),
+    }), false);
+  });
+
+  test('explicit Claude provider preserves the legacy code-based behavior', () => {
+    const err = Object.assign(new Error('bridge disconnected'), {
+      code: 'BRIDGE_DISCONNECTED',
+    });
+    assert.equal(isAutoResumable({ provider: 'claude', error: err }), true);
+  });
+});

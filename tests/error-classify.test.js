@@ -137,6 +137,76 @@ describe('classify — typed-code short-circuit', () => {
   });
 });
 
+describe('classify — Codex typed errors stay provider-specific and retry-safe', () => {
+  const cases = [
+    ['CODEX_AUTH_UNAVAILABLE', 'codexAuthUnavailable'],
+    ['CODEX_MODEL_UNAVAILABLE', 'codexModelUnavailable'],
+    ['CODEX_RATE_LIMITED', 'codexRateLimited'],
+    ['CODEX_PROTOCOL_ERROR', 'codexProtocol'],
+    ['CODEX_RPC_TIMEOUT', 'codexTimeout'],
+    ['CODEX_SINK_ABORTED', 'codexCancelled'],
+    ['CODEX_DURABILITY_FAILED', 'codexDurability'],
+    ['CODEX_PROCESS_EXITED', 'codexChildExit'],
+  ];
+
+  for (const [code, kind] of cases) {
+    test(`${code} maps to ${kind} without Claude or tmux guidance`, () => {
+      const classified = classify(Object.assign(
+        new Error('Claude tmux 429 rate limit text must not override the code'),
+        { code },
+      ));
+      assert.equal(classified.kind, kind);
+      assert.doesNotMatch(classified.userMessage || '', /Claude|tmux/i);
+      assert.equal(classified.isTransient, false);
+      assert.equal(classified.autoRecover, null);
+    });
+  }
+
+  test('a Codex RPC 429 uses the Codex-owned retry classification', () => {
+    const classified = classify(Object.assign(
+      new Error('app-server turn/start failed'),
+      { code: 'CODEX_RPC_ERROR', rpcCode: 429 },
+    ));
+    assert.equal(classified.kind, 'codexRateLimited');
+    assert.match(classified.userMessage, /Codex/i);
+    assert.equal(
+      classified.isTransient,
+      false,
+      'Codex owns any provider retry; Polygram must not retry the prompt',
+    );
+  });
+
+  test('CODEX_RPC_NOT_SENT says the request is safe to resend without auto-retrying', () => {
+    const classified = classify({ code: 'CODEX_RPC_NOT_SENT' });
+    assert.equal(classified.kind, 'codexNotSent');
+    assert.match(classified.userMessage, /did not receive|safe to try again/i);
+    assert.equal(classified.isTransient, false);
+    assert.equal(classified.autoRecover, null);
+  });
+
+  test('ambiguous Codex delivery suppresses unsafe resend advice', () => {
+    const classified = classify({ code: 'CODEX_RPC_OUTCOME_UNKNOWN' });
+    assert.equal(classified.kind, 'codexDurability');
+    assert.doesNotMatch(
+      classified.userMessage,
+      /please resend|safe to try again|resend (?:now|in a moment)/i,
+    );
+    assert.match(classified.userMessage, /do not resend|don't resend/i);
+  });
+
+  test('an unrecognized Codex code never falls through to legacy provider heuristics', () => {
+    const classified = classify(Object.assign(
+      new Error('Claude tmux auth failed with 429 capacity'),
+      { code: 'CODEX_FUTURE_PROVIDER_FAILURE' },
+    ));
+    assert.equal(classified.kind, 'codexProviderError');
+    assert.match(classified.userMessage, /Codex/i);
+    assert.doesNotMatch(classified.userMessage, /Claude|tmux/i);
+    assert.equal(classified.isTransient, false);
+    assert.equal(classified.autoRecover, null);
+  });
+});
+
 describe('classifyTurnEndError — streamer suffix + reactor state for turn-end errors', () => {
   const { classifyTurnEndError } = require('../lib/error/classify');
   test('TURN_TIMEOUT (went quiet) → stream-interrupted suffix + TIMEOUT reactor', () => {
@@ -147,6 +217,20 @@ describe('classifyTurnEndError — streamer suffix + reactor state for turn-end 
   test('TURN_MAX_EXCEEDED (hit hard cap) → TIMEOUT reactor (not generic ERROR)', () => {
     const r = classifyTurnEndError(Object.assign(new Error('hard max'), { code: 'TURN_MAX_EXCEEDED' }));
     assert.equal(r.reactorState, 'TIMEOUT');
+  });
+  test('Codex timeout codes → TIMEOUT reactor without message heuristics', () => {
+    for (const code of [
+      'CODEX_RPC_TIMEOUT',
+      'CODEX_TURN_START_TIMEOUT',
+      'CODEX_TURN_TIMEOUT',
+      'CODEX_INTERRUPT_TIMEOUT',
+    ]) {
+      const r = classifyTurnEndError(Object.assign(
+        new Error('provider detail withheld'),
+        { code },
+      ));
+      assert.equal(r.reactorState, 'TIMEOUT', code);
+    }
   });
   test('an unrelated error → generic ERROR reactor', () => {
     const r = classifyTurnEndError(new Error('something else blew up'));

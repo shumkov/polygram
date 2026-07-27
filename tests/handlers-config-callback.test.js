@@ -7,6 +7,7 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
+const { createAsyncLock } = require('@shumkov/orchestra');
 
 const {
   createHandleConfigCallback,
@@ -15,6 +16,26 @@ const {
 } = require('../lib/handlers/config-callback');
 
 const silentLogger = { log: () => {}, error: () => {} };
+const CODEX_VIEW = Object.freeze({
+  runtime: 'codex',
+  model: 'gpt-5.6-sol',
+  effort: 'high',
+  models: [
+    {
+      model: 'gpt-5.6-sol',
+      displayName: 'GPT-5.6 SOL',
+      defaultReasoningEffort: 'high',
+      supportedReasoningEfforts: ['high', 'xhigh'],
+    },
+    {
+      model: 'gpt-5.5',
+      displayName: 'GPT-5.5',
+      defaultReasoningEffort: 'high',
+      supportedReasoningEfforts: ['medium', 'high'],
+    },
+  ],
+  efforts: ['medium', 'high', 'xhigh'],
+});
 
 function makeCtx({ data, chatId = '12345', existingRows = 1 }) {
   const acks = [];
@@ -47,6 +68,10 @@ function makeDeps(overrides = {}) {
       },
       db: {
         logConfigChange: (args) => dbCalls.push(['logConfigChange', args]),
+        logConfigChanges: (rows) => {
+          if (overrides.auditError) throw overrides.auditError;
+          dbCalls.push(...rows.map((row) => ['logConfigChange', row]));
+        },
       },
       dbWrite: (fn) => fn(),
       pm: {
@@ -58,7 +83,21 @@ function makeDeps(overrides = {}) {
           pmCalls.push(['setModel', key, model]);
           return true;
         },
+        selectModelSettings: async (key, settings) => {
+          pmCalls.push(['selectModelSettings', key, settings]);
+          if (typeof overrides.selectModelSettings === 'function') {
+            return overrides.selectModelSettings(key, settings);
+          }
+          if (overrides.selectModelSettingsError) {
+            throw overrides.selectModelSettingsError;
+          }
+          return overrides.selectModelSettingsResult ?? {
+            outcome: 'not-loaded',
+            nextTurn: settings,
+          };
+        },
       },
+      intentLock: overrides.intentLock || createAsyncLock(),
       getSessionKey: (chatId) => String(chatId),
       formatConfigInfoText: (cfg, show) => `Model: ${cfg.model}, Effort: ${cfg.effort} (${show})`,
       buildConfigKeyboard: () => ({ inline_keyboard: [] }),
@@ -191,6 +230,341 @@ describe('handleConfigCallback — happy path', () => {
     await fn(ctx);
     assert.equal(ctx._edits.length, 1);
     assert.match(ctx._edits[0].text, /Model: sonnet, Effort: max/);
+  });
+});
+
+describe('handleConfigCallback — Codex model and effort', () => {
+  function codexDeps(overrides = {}) {
+    const seen = [];
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '12345': {
+            model: 'sonnet',
+            effort: 'max',
+            codexModel: 'gpt-5.6-sol',
+            codexEffort: 'high',
+          },
+        },
+      },
+      resolveRuntimeView: async (context) => {
+        seen.push(context);
+        return CODEX_VIEW;
+      },
+      ...overrides,
+    });
+    m.runtimeCalls = seen;
+    return m;
+  }
+
+  test('catalog model writes codexModel only and applies one complete Codex pair', async () => {
+    const views = [];
+    const m = codexDeps({
+      formatConfigInfoText: (...args) => {
+        views.push(['info', args[2], args[5]]);
+        return `Codex model: ${args[0].codexModel}`;
+      },
+      buildConfigKeyboard: (...args) => {
+        views.push(['keyboard', args[4]]);
+        return { inline_keyboard: [] };
+      },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:model:gpt-5.5' });
+    await fn(ctx);
+
+    const chat = m.deps.config.chats['12345'];
+    assert.equal(chat.codexModel, 'gpt-5.5');
+    assert.equal(chat.codexEffort, 'high');
+    assert.equal(chat.model, 'sonnet');
+    assert.deepEqual(m.pmCalls, [[
+      'selectModelSettings',
+      '12345',
+      { model: 'gpt-5.5', effort: 'high' },
+    ]]);
+    assert.deepEqual(m.runtimeCalls, [{
+      sessionKey: '12345',
+      chatId: '12345',
+      threadId: null,
+    }]);
+    assert.equal(m.dbCalls[0][1].field, 'model');
+    assert.equal(m.dbCalls[0][1].old_value, 'gpt-5.6-sol');
+    assert.equal(m.dbCalls.length, 1);
+    assert.match(ctx._acks[0].text, /next session/i);
+    assert.equal(views[0][0], 'info');
+    assert.equal(views[0][1], '12345');
+    assert.deepEqual(views[0][2].desiredSettings, {
+      model: 'gpt-5.5',
+      effort: 'high',
+    });
+    assert.equal(views[0][2].processStatus, 'not-loaded');
+    assert.equal(views[1][0], 'keyboard');
+    assert.equal(views[1][1], views[0][2]);
+  });
+
+  test('model switch atomically resets an unsupported effort to the target catalog default', async () => {
+    const saved = [];
+    const rendered = [];
+    const m = codexDeps({
+      saveConfig: () => saved.push(true),
+      formatConfigInfoText: (chat) => {
+        rendered.push({
+          model: chat.codexModel,
+          effort: chat.codexEffort,
+        });
+        return 'updated Codex config';
+      },
+    });
+    m.deps.config.chats['12345'].codexEffort = 'xhigh';
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:model:gpt-5.5' });
+    await fn(ctx);
+
+    const chat = m.deps.config.chats['12345'];
+    assert.deepEqual({
+      model: chat.codexModel,
+      effort: chat.codexEffort,
+    }, {
+      model: 'gpt-5.5',
+      effort: 'high',
+    });
+    assert.equal(saved.length, 1);
+    assert.deepEqual(
+      m.dbCalls.map((call) => ({
+        field: call[1].field,
+        old: call[1].old_value,
+        value: call[1].new_value,
+      })),
+      [
+        { field: 'model', old: 'gpt-5.6-sol', value: 'gpt-5.5' },
+        { field: 'effort', old: 'xhigh', value: 'high' },
+      ],
+    );
+    assert.deepEqual(rendered, [{
+      model: 'gpt-5.5',
+      effort: 'high',
+    }]);
+    assert.deepEqual(m.pmCalls, [[
+      'selectModelSettings',
+      '12345',
+      { model: 'gpt-5.5', effort: 'high' },
+    ]]);
+    assert.match(ctx._acks[0].text, /effort → high/);
+    assert.match(ctx._acks[0].text, /next session/i);
+  });
+
+  test('effort must be authenticated and supported by the selected Codex model', async () => {
+    const m = codexDeps();
+    const fn = createHandleConfigCallback(m.deps);
+
+    const invalid = makeCtx({ data: 'cfg:effort:medium' });
+    await fn(invalid);
+    assert.match(invalid._acks[0].text, /Invalid effort/);
+    assert.equal(m.dbCalls.length, 0);
+
+    const valid = makeCtx({ data: 'cfg:effort:xhigh' });
+    await fn(valid);
+    const chat = m.deps.config.chats['12345'];
+    assert.equal(chat.codexEffort, 'xhigh');
+    assert.equal(chat.effort, 'max');
+    assert.deepEqual(m.pmCalls.at(-1), [
+      'selectModelSettings',
+      '12345',
+      { model: 'gpt-5.6-sol', effort: 'xhigh' },
+    ]);
+    assert.match(valid._acks[0].text, /next session/i);
+  });
+
+  test('Claude aliases absent from the authenticated Codex catalog are rejected', async () => {
+    const m = codexDeps();
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:model:opus' });
+    await fn(ctx);
+    assert.match(ctx._acks[0].text, /Invalid model/);
+    assert.equal(m.dbCalls.length, 0);
+    assert.equal(m.pmCalls.length, 0);
+    assert.equal(
+      m.deps.config.chats['12345'].codexModel,
+      'gpt-5.6-sol',
+    );
+  });
+
+  test('an explicit Claude runtime view retains legacy fields and live apply', async () => {
+    const m = makeDeps({
+      resolveRuntimeView: async () => ({ runtime: 'claude' }),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    await fn(makeCtx({ data: 'cfg:model:opus' }));
+    const chat = m.deps.config.chats['12345'];
+    assert.equal(chat.model, 'opus');
+    assert.equal(chat.codexModel, undefined);
+    assert.equal(
+      m.pmCalls.some((call) => call[0] === 'setModel' && call[2] === 'opus'),
+      true,
+    );
+  });
+
+  test('runtime-view failure rejects a model write before config, DB, or process mutation', async () => {
+    const m = makeDeps({
+      resolveRuntimeView: async () => {
+        throw new Error('preflight unavailable');
+      },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:model:opus' });
+    await fn(ctx);
+    assert.equal(m.deps.config.chats['12345'].model, 'sonnet');
+    assert.equal(m.dbCalls.length, 0);
+    assert.equal(m.pmCalls.length, 0);
+    assert.equal(ctx._acks[0].show_alert, true);
+  });
+
+  test('save failure restores exact Codex properties and skips audit/process update', async () => {
+    const m = codexDeps({
+      saveConfig: () => {
+        throw new Error('read only filesystem');
+      },
+    });
+    const chat = m.deps.config.chats['12345'];
+    chat.codexEffort = 'xhigh';
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:model:gpt-5.5' });
+
+    await fn(ctx);
+
+    assert.deepEqual({
+      model: chat.codexModel,
+      effort: chat.codexEffort,
+    }, {
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+    });
+    assert.equal(m.dbCalls.length, 0);
+    assert.equal(m.pmCalls.length, 0);
+    assert.equal(ctx._edits.length, 0);
+    assert.match(ctx._acks[0].text, /couldn't save/i);
+    assert.equal(ctx._acks[0].show_alert, true);
+  });
+
+  test('atomic audit failure restores the persisted Codex pair and skips live selection', async () => {
+    let saves = 0;
+    const m = codexDeps({
+      auditError: new Error('second audit row rejected'),
+      saveConfig: () => { saves += 1; },
+    });
+    const chat = m.deps.config.chats['12345'];
+    chat.codexEffort = 'xhigh';
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:model:gpt-5.5' });
+
+    await fn(ctx);
+
+    assert.equal(saves, 2);
+    assert.deepEqual({
+      model: chat.codexModel,
+      effort: chat.codexEffort,
+    }, {
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+    });
+    assert.equal(m.dbCalls.length, 0);
+    assert.equal(m.pmCalls.length, 0);
+    assert.equal(ctx._edits.length, 0);
+    assert.match(ctx._acks[0].text, /couldn't audit.*nothing changed/i);
+    assert.equal(ctx._acks[0].show_alert, true);
+  });
+
+  test('audit plus rollback-save failure alerts on persisted config uncertainty', async () => {
+    let saves = 0;
+    const m = codexDeps({
+      auditError: new Error('audit unavailable'),
+      saveConfig: () => {
+        saves += 1;
+        if (saves === 2) throw new Error('rollback save failed');
+      },
+    });
+    m.deps.config.chats['12345'].codexEffort = 'xhigh';
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:model:gpt-5.5' });
+
+    await fn(ctx);
+
+    assert.equal(saves, 2);
+    assert.equal(m.pmCalls.length, 0);
+    assert.equal(ctx._edits.length, 0);
+    assert.match(
+      ctx._acks[0].text,
+      /persisted config needs attention/i,
+    );
+    assert.equal(ctx._acks[0].show_alert, true);
+  });
+
+  test('active Codex update reports current unchanged and next selected pair', async () => {
+    const m = codexDeps({
+      selectModelSettingsResult: {
+        outcome: 'updated-live',
+        threadId: 'thread-1',
+        generationId: 'generation-1',
+        currentTurn: { model: 'gpt-5.6-sol', effort: 'high' },
+        nextTurn: { model: 'gpt-5.5', effort: 'high' },
+      },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:model:gpt-5.5' });
+
+    await fn(ctx);
+
+    assert.match(ctx._acks[0].text, /current turn gpt-5\.6-sol\/high unchanged/i);
+    assert.match(ctx._acks[0].text, /next turn gpt-5\.5\/high/i);
+  });
+
+  test('unexpected PM failure reports durable selection with unknown live status', async () => {
+    const m = codexDeps({
+      selectModelSettingsError: new Error('unexpected PM failure'),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:effort:xhigh' });
+
+    await fn(ctx);
+
+    assert.equal(m.deps.config.chats['12345'].codexEffort, 'xhigh');
+    assert.equal(m.dbCalls.length, 1);
+    assert.match(ctx._acks[0].text, /durabl.*live status is unknown/i);
+  });
+
+  test('releases the session intent lock before card rendering and Telegram calls', async () => {
+    let held = false;
+    let rendered = false;
+    const m = codexDeps({
+      intentLock: {
+        async acquire(key) {
+          assert.equal(key, '12345');
+          held = true;
+          return () => { held = false; };
+        },
+      },
+      selectModelSettings: async () => {
+        assert.equal(held, true);
+        return {
+          outcome: 'not-loaded',
+          nextTurn: { model: 'gpt-5.5', effort: 'high' },
+        };
+      },
+      formatConfigInfoText: () => {
+        assert.equal(held, false);
+        rendered = true;
+        return 'updated';
+      },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+
+    await fn(makeCtx({ data: 'cfg:model:gpt-5.5' }));
+    assert.equal(rendered, true);
+    assert.equal(
+      m.pmCalls.some((call) => call[0] === 'selectModelSettings'),
+      true,
+    );
   });
 });
 
