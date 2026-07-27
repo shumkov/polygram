@@ -2,7 +2,7 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { createFormatConfigInfoText } = require('../lib/handlers/config-ui');
+const { createFormatConfigInfoText, MODEL_VERSIONS_DESC } = require('../lib/handlers/config-ui');
 
 function fmt({ procModel, procEffort, alive = true } = {}) {
   const proc = { model: procModel, effort: procEffort, closed: false };
@@ -20,14 +20,14 @@ describe('config card — running vs configured model/effort (cli reload-pending
   test('matched model → plain "Model: opus (ver)", no running line', () => {
     const f = fmt({ procModel: 'opus' });
     const body = f({ model: 'opus', effort: 'high' }, 'all', 'sk');
-    assert.match(body, /Model: opus \(claude-opus-4-8\)/);
+    assert.match(body, new RegExp(`Model: opus \\(${MODEL_VERSIONS_DESC.opus}\\)`));
     assert.doesNotMatch(body, /running/);
   });
 
   test('no live proc (cold) → plain configured model, no running line', () => {
     const f = fmt({ procModel: 'sonnet', alive: false });
     const body = f({ model: 'opus', effort: 'high' }, 'all', 'sk');
-    assert.match(body, /Model: opus \(claude-opus-4-8\)/);
+    assert.match(body, new RegExp(`Model: opus \\(${MODEL_VERSIONS_DESC.opus}\\)`));
     assert.doesNotMatch(body, /running/);
   });
 

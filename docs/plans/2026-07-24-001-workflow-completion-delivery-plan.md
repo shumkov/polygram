@@ -10,6 +10,14 @@ execution: code
 
 # Reliable Autonomous Workflow Completion Delivery - Plan
 
+> **Execution note (2026-07-25):** The delivery and prompt work in U1–U5 shipped
+> as Orchestra `0.4.3` and polygram `0.20.2`/`0.20.3`, and the out-of-turn
+> delivery path was revalidated in production from an isolated Telegram topic.
+> Do not execute this document's U6–U8 proposal for Claude Code `2.1.218`.
+> Polygram `0.21.0` and Orchestra `0.5.0` changed the release baseline, and the
+> user selected `2.1.220` instead. The replacement upgrade contract is
+> [`2026-07-25-001-claude-code-2.1.220-upgrade-plan.md`](./2026-07-25-001-claude-code-2.1.220-upgrade-plan.md).
+
 ## Goal Capsule
 
 Deliver a completed background Workflow result to its originating Telegram chat
