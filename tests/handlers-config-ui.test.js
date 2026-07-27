@@ -194,6 +194,17 @@ describe('MODEL_VERSIONS_DESC', () => {
       assert.match(v, /^claude-/);
     }
   });
+
+  // The card tells the user which concrete model an alias runs. That answer
+  // comes from the pinned claude CLI, not from us — the pinned 2.1.220
+  // resolves `--model opus` to claude-opus-5 (2.1.173 resolved it to
+  // claude-opus-4-8). A generic /^claude-/ assertion lets the mapping rot
+  // silently through a CLI bump and the card then names a model the session
+  // isn't running, which is the confusion the running-vs-configured line
+  // elsewhere in this card exists to prevent.
+  test('opus names the model the pinned CLI actually resolves it to', () => {
+    assert.equal(MODEL_VERSIONS_DESC.opus, 'claude-opus-5');
+  });
 });
 
 describe('config card — per-topic override resolution (Music topic /model bug, 2026-06-03)', () => {
