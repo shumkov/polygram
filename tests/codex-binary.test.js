@@ -20,7 +20,6 @@ const {
   CODEX_CLI_PINNED_VERSION,
   CodexBinaryError,
   createPinnedCodexBinaryResolver,
-  resolvePinnedCodexBinary,
 } = require('../lib/codex/binary');
 
 function sha256(contents) {
@@ -41,6 +40,7 @@ function resolverFor(contents, version = 'codex-cli 9.9.9', overrides = {}) {
   return createPinnedCodexBinaryResolver({
     cliVersion: version,
     binarySha256: sha256(contents),
+    platform: 'darwin',
     ...overrides,
   });
 }
@@ -86,8 +86,13 @@ describe('pinned Codex binary resolution', () => {
   });
 
   test('rejects missing configuration and a missing configured file actionably', async () => {
+    const resolve = createPinnedCodexBinaryResolver({
+      cliVersion: CODEX_CLI_PINNED_VERSION,
+      binarySha256: CODEX_BINARY_SHA256,
+      platform: 'darwin',
+    });
     await assert.rejects(
-      resolvePinnedCodexBinary({ env: {} }),
+      resolve({ env: {} }),
       (error) => (
         error instanceof CodexBinaryError
         && error.code === 'CODEX_BINARY_NOT_CONFIGURED'
@@ -96,7 +101,7 @@ describe('pinned Codex binary resolution', () => {
     );
 
     await assert.rejects(
-      resolvePinnedCodexBinary({
+      resolve({
         binaryPath: '/definitely/missing/polygram/codex-0.145.0',
       }),
       (error) => (
