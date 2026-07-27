@@ -4,7 +4,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const EventEmitter = require('events');
 const {
-  encodeCwd, sessionLogPath, parseLine, pipeToParser,
+  encodeCwd, sessionLogPath, parseLine, SessionEventAggregator, pipeToParser,
 } = require('../lib/util/claude-session-jsonl');
 
 // ─── path helpers ────────────────────────────────────────────────────
@@ -15,6 +15,12 @@ describe('encodeCwd', () => {
   });
   test('absolute path leading dash matches claude convention', () => {
     assert.equal(encodeCwd('/A/B'), '-A-B');
+  });
+  test('real gate path: dots become dashes in Claude project directories', () => {
+    assert.equal(
+      encodeCwd('/private/tmp/polygram-claude-220-gate.9oFBKr/cli-workspace'),
+      '-private-tmp-polygram-claude-220-gate-9oFBKr-cli-workspace',
+    );
   });
 });
 
@@ -363,6 +369,85 @@ describe('parseLine — attachment.queued_command (autosteer fold signal)', () =
       attachment: { type: 'queued_command' },
     });
     assert.deepEqual(parseLine(line), []);
+  });
+});
+
+describe('SessionEventAggregator — Claude 2.1.220 task reminder', () => {
+  function aggregate(includeTaskReminder) {
+    const aggregator = new SessionEventAggregator();
+    const lines = [
+      {
+        type: 'assistant',
+        sessionId: 'session-220',
+        message: {
+          id: 'assistant-reply',
+          content: [{
+            type: 'tool_use',
+            id: 'reply-call',
+            name: 'mcp__polygram-gate-bridge__reply',
+            input: {},
+          }],
+          stop_reason: 'tool_use',
+        },
+      },
+      {
+        type: 'user',
+        message: {
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'reply-call',
+            content: 'sent',
+          }],
+        },
+      },
+      ...(includeTaskReminder ? [{
+        type: 'attachment',
+        attachment: { type: 'task_reminder' },
+      }] : []),
+      {
+        type: 'assistant',
+        sessionId: 'session-220',
+        message: {
+          id: 'assistant-final',
+          content: [{ type: 'text', text: 'Delivered.' }],
+          stop_reason: 'end_turn',
+        },
+      },
+    ];
+    return [
+      ...lines.flatMap((line) => aggregator.push(JSON.stringify(line))),
+      ...aggregator.flush(),
+    ];
+  }
+
+  test('captured tool-result/reminder/end-turn placement emits no extra event', () => {
+    const withoutReminder = aggregate(false);
+    const withReminder = aggregate(true);
+
+    assert.deepEqual(withReminder, withoutReminder);
+    assert.equal(
+      withReminder.filter(({ type }) => type === 'result').length,
+      2,
+    );
+    assert.equal(
+      withReminder.filter(({ type }) => type === 'user-message').length,
+      0,
+    );
+    assert.equal(
+      withReminder.filter(({ type }) => type === 'queue-folded').length,
+      0,
+    );
+  });
+
+  test('queued_command remains the positive queue-folded control', () => {
+    const aggregator = new SessionEventAggregator();
+    assert.deepEqual(aggregator.push(JSON.stringify({
+      type: 'attachment',
+      attachment: {
+        type: 'queued_command',
+        prompt: 'fold this',
+      },
+    })), [{ type: 'queue-folded', prompt: 'fold this' }]);
   });
 });
 

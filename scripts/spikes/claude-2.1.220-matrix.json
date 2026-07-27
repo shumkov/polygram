@@ -1,0 +1,540 @@
+{
+  "schemaVersion": 1,
+  "versions": {
+    "old": "2.1.173",
+    "candidate": "2.1.220"
+  },
+  "comparator": {
+    "model": "claude-sonnet-4-6",
+    "effort": "medium"
+  },
+  "scenarios": [
+    {
+      "id": "cli-contract",
+      "evidenceSources": {
+        "session": "session.jsonl",
+        "hooks": "hooks.ndjson"
+      },
+      "driver": "scripts/spikes/cli-contract-matrix.mjs",
+      "args": {
+        "old": [],
+        "candidate": []
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "readiness, reply, fold, multiline, interrupt, warm resume, and file reply pass with legacy process-tree evidence",
+        "candidate": "the same lifecycle passes and every observed candidate self-spawn has wrapper provenance"
+      },
+      "comparison": {
+        "runsPerVersion": 2,
+        "sameVersion": "required",
+        "crossVersion": "all-pairs",
+        "lifecycle": {
+          "mode": "projected-compatible",
+          "streams": {
+            "session": {
+              "projection": "session-pivotal-v1"
+            },
+            "hooks": {
+              "projection": "matching-records",
+              "selectors": [
+                {
+                  "hookEventName": "UserPromptSubmit"
+                },
+                {
+                  "hookEventName": "Stop"
+                },
+                {
+                  "hookEventName": "PreToolUse",
+                  "toolName": "mcp__polygram-gate-bridge__reply"
+                },
+                {
+                  "hookEventName": "PostToolUse",
+                  "toolName": "mcp__polygram-gate-bridge__reply"
+                }
+              ]
+            }
+          },
+          "projectedBaseline": {
+            "session": [
+              { "type": "queue-operation", "operation": "enqueue" },
+              { "type": "queue-operation", "operation": "dequeue" },
+              { "type": "user", "hasParent": false, "contentKind": "string", "contentTypes": [], "originKind": "channel", "promptSource": "system" },
+              { "type": "attachment", "attachmentType": "deferred_tools_delta" },
+              { "type": "attachment", "attachmentType": "agent_listing_delta" },
+              { "type": "attachment", "attachmentType": "mcp_instructions_delta" },
+              { "type": "attachment", "attachmentType": "skill_listing" },
+              { "type": "system", "subtype": "stop_hook_summary" },
+              { "type": "system", "subtype": "turn_duration" },
+              { "type": "queue-operation", "operation": "enqueue" },
+              { "type": "queue-operation", "operation": "dequeue" },
+              { "type": "user", "hasParent": true, "contentKind": "string", "contentTypes": [], "originKind": "channel", "promptSource": "system" },
+              { "type": "system", "subtype": "stop_hook_summary" },
+              { "type": "system", "subtype": "turn_duration" },
+              { "type": "queue-operation", "operation": "enqueue" },
+              { "type": "queue-operation", "operation": "dequeue" },
+              { "type": "user", "hasParent": true, "contentKind": "string", "contentTypes": [], "originKind": "channel", "promptSource": "system" },
+              { "type": "queue-operation", "operation": "enqueue" },
+              { "type": "queue-operation", "operation": "remove" },
+              { "type": "attachment", "attachmentType": "queued_command" },
+              { "type": "system", "subtype": "stop_hook_summary" },
+              { "type": "system", "subtype": "turn_duration" },
+              { "type": "queue-operation", "operation": "enqueue" },
+              { "type": "queue-operation", "operation": "dequeue" },
+              { "type": "user", "hasParent": true, "contentKind": "string", "contentTypes": [], "originKind": "channel", "promptSource": "system" },
+              { "type": "queue-operation", "operation": "enqueue" },
+              { "type": "queue-operation", "operation": "dequeue" },
+              { "type": "user", "hasParent": true, "contentKind": "string", "contentTypes": [], "originKind": "channel", "promptSource": "system" },
+              { "type": "system", "subtype": "stop_hook_summary" },
+              { "type": "system", "subtype": "turn_duration" },
+              { "type": "queue-operation", "operation": "enqueue" },
+              { "type": "queue-operation", "operation": "dequeue" },
+              { "type": "user", "hasParent": true, "contentKind": "string", "contentTypes": [], "originKind": "channel", "promptSource": "system" },
+              { "type": "system", "subtype": "stop_hook_summary" },
+              { "type": "system", "subtype": "turn_duration" }
+            ],
+            "hooks": [
+              { "type": "hook", "hookEventName": "UserPromptSubmit" },
+              { "type": "hook", "hookEventName": "PreToolUse", "toolName": "mcp__polygram-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "PostToolUse", "toolName": "mcp__polygram-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "Stop" },
+              { "type": "hook", "hookEventName": "UserPromptSubmit" },
+              { "type": "hook", "hookEventName": "PreToolUse", "toolName": "mcp__polygram-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "PostToolUse", "toolName": "mcp__polygram-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "Stop" },
+              { "type": "hook", "hookEventName": "UserPromptSubmit" },
+              { "type": "hook", "hookEventName": "PreToolUse", "toolName": "mcp__polygram-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "PostToolUse", "toolName": "mcp__polygram-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "Stop" },
+              { "type": "hook", "hookEventName": "UserPromptSubmit" },
+              { "type": "hook", "hookEventName": "UserPromptSubmit" },
+              { "type": "hook", "hookEventName": "PreToolUse", "toolName": "mcp__polygram-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "PostToolUse", "toolName": "mcp__polygram-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "Stop" },
+              { "type": "hook", "hookEventName": "UserPromptSubmit" },
+              { "type": "hook", "hookEventName": "PreToolUse", "toolName": "mcp__polygram-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "PostToolUse", "toolName": "mcp__polygram-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "Stop" }
+            ]
+          },
+          "candidateOnlyInsertions": [
+            {
+              "stream": "session",
+              "record": {
+                "type": "attachment",
+                "attachmentType": "task_reminder"
+              },
+              "count": 1,
+              "proof": {
+                "type": "session-event-aggregator-removal",
+                "eligibility": "task-reminder-v1"
+              }
+            }
+          ],
+          "optionalInsertions": [
+            {
+              "stream": "session",
+              "record": {
+                "type": "attachment",
+                "attachmentType": "hook_cancelled"
+              },
+              "maxCount": 1,
+              "proof": {
+                "type": "session-event-aggregator-removal",
+                "eligibility": "interrupt-user-prompt-submit-v1"
+              }
+            }
+          ]
+        },
+        "equalFields": ["resolvedModel", "fileObserved", "spawnCount"]
+      },
+      "acceptance": {
+        "maxBridgeReadyToMcpReadyMs": 20000
+      },
+      "cost": {
+        "usdEstimate": 0.08,
+        "destructive": false
+      },
+      "artifactCollector": "private session, hooks, process tree, wrapper records, and sanitized-result.json"
+    },
+    {
+      "id": "workflow-direct",
+      "evidenceSources": {
+        "session": "session.jsonl",
+        "hooks": "hooks.ndjson"
+      },
+      "driver": "scripts/spikes/workflow-autonomous-completion.mjs",
+      "args": {
+        "old": ["--delivery", "direct"],
+        "candidate": ["--delivery", "direct"]
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "one out-of-turn direct sentinel after launch-turn closure, no fallback, and no foreign route",
+        "candidate": "the same delivery result with native Workflow lifecycle and candidate wrapper provenance"
+      },
+      "comparison": {
+        "lifecycle": {
+          "mode": "projected-compatible",
+          "streams": {
+            "session": {
+              "projection": "session-pivotal-v1"
+            },
+            "hooks": {
+              "projection": "matching-records",
+              "selectors": [
+                {
+                  "hookEventName": "UserPromptSubmit"
+                },
+                {
+                  "hookEventName": "Stop"
+                },
+                {
+                  "hookEventName": "PreToolUse",
+                  "toolName": "Workflow"
+                },
+                {
+                  "hookEventName": "PostToolUse",
+                  "toolName": "Workflow"
+                },
+                {
+                  "hookEventName": "PreToolUse",
+                  "toolName": "mcp__polygram-workflow-gate-bridge__reply"
+                },
+                {
+                  "hookEventName": "PostToolUse",
+                  "toolName": "mcp__polygram-workflow-gate-bridge__reply"
+                }
+              ]
+            }
+          },
+          "projectedBaseline": {
+            "session": [
+              { "type": "queue-operation", "operation": "enqueue" },
+              { "type": "queue-operation", "operation": "dequeue" },
+              { "type": "user", "hasParent": false, "contentKind": "string", "contentTypes": [], "originKind": "channel", "promptSource": "system" },
+              { "type": "attachment", "attachmentType": "deferred_tools_delta" },
+              { "type": "attachment", "attachmentType": "agent_listing_delta" },
+              { "type": "attachment", "attachmentType": "mcp_instructions_delta" },
+              { "type": "attachment", "attachmentType": "skill_listing" },
+              { "type": "attachment", "attachmentType": "command_permissions" },
+              { "type": "system", "subtype": "stop_hook_summary" },
+              { "type": "system", "subtype": "turn_duration" },
+              { "type": "queue-operation", "operation": "enqueue" },
+              { "type": "queue-operation", "operation": "dequeue" },
+              { "type": "user", "hasParent": true, "contentKind": "string", "contentTypes": [], "originKind": "task-notification", "promptSource": "system", "hasTaskNotification": true },
+              { "type": "system", "subtype": "stop_hook_summary" },
+              { "type": "system", "subtype": "turn_duration" }
+            ],
+            "hooks": [
+              { "type": "hook", "hookEventName": "UserPromptSubmit" },
+              { "type": "hook", "hookEventName": "PreToolUse", "toolName": "Workflow" },
+              { "type": "hook", "hookEventName": "PostToolUse", "toolName": "Workflow" },
+              { "type": "hook", "hookEventName": "PreToolUse", "toolName": "mcp__polygram-workflow-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "PostToolUse", "toolName": "mcp__polygram-workflow-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "Stop" },
+              { "type": "hook", "hookEventName": "UserPromptSubmit" },
+              { "type": "hook", "hookEventName": "PreToolUse", "toolName": "mcp__polygram-workflow-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "PostToolUse", "toolName": "mcp__polygram-workflow-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "Stop" }
+            ]
+          },
+          "candidateOnlyInsertions": [],
+          "optionalInsertions": []
+        },
+        "equalFields": ["resolvedModel", "directCompletionCount", "fallbackCount", "deliveryPipeline", "deliverySentCount", "deliveryFailedCount"]
+      },
+      "cost": {
+        "usdEstimate": 0.12,
+        "destructive": false
+      },
+      "artifactCollector": "private session, hooks, Workflow metadata, wrapper records, and sanitized-result.json"
+    },
+    {
+      "id": "workflow-fallback",
+      "evidenceSources": {
+        "session": "session.jsonl",
+        "hooks": "hooks.ndjson"
+      },
+      "driver": "scripts/spikes/workflow-autonomous-completion.mjs",
+      "args": {
+        "old": ["--delivery", "fail"],
+        "candidate": ["--delivery", "fail"]
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "synthetic direct failure produces one transcript fallback and no foreign-route sentinel",
+        "candidate": "the same single fallback result with native Workflow lifecycle and candidate wrapper provenance"
+      },
+      "comparison": {
+        "lifecycle": {
+          "mode": "projected-compatible",
+          "streams": {
+            "session": {
+              "projection": "session-pivotal-v1"
+            },
+            "hooks": {
+              "projection": "matching-records",
+              "selectors": [
+                {
+                  "hookEventName": "UserPromptSubmit"
+                },
+                {
+                  "hookEventName": "Stop"
+                },
+                {
+                  "hookEventName": "PreToolUse",
+                  "toolName": "Workflow"
+                },
+                {
+                  "hookEventName": "PostToolUse",
+                  "toolName": "Workflow"
+                },
+                {
+                  "hookEventName": "PreToolUse",
+                  "toolName": "mcp__polygram-workflow-gate-bridge__reply"
+                },
+                {
+                  "hookEventName": "PostToolUse",
+                  "toolName": "mcp__polygram-workflow-gate-bridge__reply"
+                }
+              ]
+            }
+          },
+          "projectedBaseline": {
+            "session": [
+              { "type": "queue-operation", "operation": "enqueue" },
+              { "type": "queue-operation", "operation": "dequeue" },
+              { "type": "user", "hasParent": false, "contentKind": "string", "contentTypes": [], "originKind": "channel", "promptSource": "system" },
+              { "type": "attachment", "attachmentType": "deferred_tools_delta" },
+              { "type": "attachment", "attachmentType": "agent_listing_delta" },
+              { "type": "attachment", "attachmentType": "mcp_instructions_delta" },
+              { "type": "attachment", "attachmentType": "skill_listing" },
+              { "type": "attachment", "attachmentType": "command_permissions" },
+              { "type": "system", "subtype": "stop_hook_summary" },
+              { "type": "system", "subtype": "turn_duration" },
+              { "type": "queue-operation", "operation": "enqueue" },
+              { "type": "queue-operation", "operation": "dequeue" },
+              { "type": "user", "hasParent": true, "contentKind": "string", "contentTypes": [], "originKind": "task-notification", "promptSource": "system", "hasTaskNotification": true },
+              { "type": "system", "subtype": "stop_hook_summary" },
+              { "type": "system", "subtype": "turn_duration" }
+            ],
+            "hooks": [
+              { "type": "hook", "hookEventName": "UserPromptSubmit" },
+              { "type": "hook", "hookEventName": "PreToolUse", "toolName": "Workflow" },
+              { "type": "hook", "hookEventName": "PostToolUse", "toolName": "Workflow" },
+              { "type": "hook", "hookEventName": "PreToolUse", "toolName": "mcp__polygram-workflow-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "PostToolUse", "toolName": "mcp__polygram-workflow-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "Stop" },
+              { "type": "hook", "hookEventName": "UserPromptSubmit" },
+              { "type": "hook", "hookEventName": "PreToolUse", "toolName": "mcp__polygram-workflow-gate-bridge__reply" },
+              { "type": "hook", "hookEventName": "Stop" }
+            ]
+          },
+          "candidateOnlyInsertions": [],
+          "optionalInsertions": []
+        },
+        "equalFields": ["resolvedModel", "directCompletionCount", "fallbackCount", "deliveryPipeline", "deliverySentCount", "deliveryFailedCount"]
+      },
+      "cost": {
+        "usdEstimate": 0.12,
+        "destructive": false
+      },
+      "artifactCollector": "private session, hooks, Workflow metadata, wrapper records, and sanitized-result.json"
+    },
+    {
+      "id": "delayed-mcp",
+      "evidenceSources": {
+        "sdk": "sdk-stream.ndjson"
+      },
+      "driver": "scripts/spikes/delayed-mcp-background.mjs",
+      "args": {
+        "old": ["--expected-mode", "foreground"],
+        "candidate": ["--expected-mode", "background"]
+      },
+      "environment": {
+        "common": {
+          "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "1000"
+        },
+        "candidate": {
+          "CLAUDE_AUTO_BACKGROUND_TASKS": "1"
+        }
+      },
+      "oracle": {
+        "old": "the handler crosses the threshold, remains foreground, and delivers one marker",
+        "candidate": "the handler crosses the same threshold, emits native background lifecycle, and delivers one marker"
+      },
+      "comparison": {
+        "lifecycle": {
+          "mode": "version-specific-oracle",
+          "oracle": "delayed-mcp-v1"
+        },
+        "equalFields": ["resolvedModel", "markerCount", "resultSubtype"]
+      },
+      "cost": {
+        "usdEstimate": 0.02,
+        "destructive": false
+      },
+      "artifactCollector": "private SDK stream, SDK process snapshots/evidence, wrapper records, run metadata, and sanitized-result.json"
+    },
+    {
+      "id": "sdk-post-tool-batch",
+      "driver": "scripts/spikes/post-tool-batch.mjs",
+      "args": {
+        "old": [],
+        "candidate": []
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "PostToolBatch injects the queued marker into the final reply",
+        "candidate": "the same marker is incorporated with the selected candidate executable"
+      },
+      "comparison": {
+        "lifecycle": "sdk-semantic-shape-v1",
+        "equalFields": ["resolvedModel", "hookFiredCount", "markerPresent", "resultSubtype"]
+      },
+      "cost": {
+        "usdEstimate": 0.01,
+        "destructive": false
+      },
+      "artifactCollector": "private SDK process snapshots/evidence, wrapper records, run metadata, and sanitized-result.json"
+    },
+    {
+      "id": "sdk-subagent",
+      "evidenceSources": {
+        "sdk": "sdk-stream.ndjson"
+      },
+      "driver": "scripts/spikes/subagent-task.mjs",
+      "args": {
+        "old": [],
+        "candidate": []
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "the turn succeeds with attributed subagent output",
+        "candidate": "the turn succeeds with current parent-attributed child-task lifecycle"
+      },
+      "comparison": {
+        "lifecycle": {
+          "mode": "version-specific-oracle",
+          "oracle": "sdk-subagent-v1"
+        },
+        "equalFields": ["resolvedModel", "resultSubtype"]
+      },
+      "cost": {
+        "usdEstimate": 0.03,
+        "destructive": false
+      },
+      "artifactCollector": "private SDK stream, SDK process snapshots/evidence, wrapper records, run metadata, and sanitized-result.json"
+    },
+    {
+      "id": "sdk-resume",
+      "driver": "scripts/spikes/session-resume.mjs",
+      "args": {
+        "old": [],
+        "candidate": []
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "a fresh query resumes the session and recalls the marker",
+        "candidate": "the same fresh-query resume succeeds"
+      },
+      "comparison": {
+        "lifecycle": "sdk-semantic-shape-v1",
+        "equalFields": ["resolvedModel", "firstResultSubtype", "secondResultSubtype", "markerRecalled"]
+      },
+      "cost": {
+        "usdEstimate": 0.01,
+        "destructive": false
+      },
+      "artifactCollector": "private SDK process snapshots/evidence, wrapper records, run metadata, and sanitized-result.json"
+    },
+    {
+      "id": "sdk-compact",
+      "driver": "scripts/spikes/compact-boundary.mjs",
+      "args": {
+        "old": [],
+        "candidate": []
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "manual PreCompact and compact boundary precede one same-session marker recall",
+        "candidate": "the same ordered manual boundary and same-session recall succeed"
+      },
+      "comparison": {
+        "lifecycle": "sdk-semantic-shape-v1",
+        "equalFields": ["resolvedModel", "preCompactCount", "compactBoundaryCount", "resultCount", "sameSession", "ordered", "recallPromptMarkerFree", "markerRecallCount", "resultSubtype"]
+      },
+      "cost": {
+        "usdEstimate": 0.03,
+        "destructive": false
+      },
+      "artifactCollector": "private SDK process snapshots/evidence, wrapper records, run metadata, and sanitized-result.json"
+    },
+    {
+      "id": "sdk-tool-less-drain",
+      "driver": "scripts/spikes/tool-less-drain.mjs",
+      "args": {
+        "old": [],
+        "candidate": []
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "old": "PostToolBatch remains absent and the tool-less turn completes successfully",
+        "candidate": "the same tool-less completion behavior is preserved"
+      },
+      "comparison": {
+        "lifecycle": "sdk-semantic-shape-v1",
+        "equalFields": ["resolvedModel", "hookFiredCount", "resultSubtypes", "bufferedMarkerCount"]
+      },
+      "cost": {
+        "usdEstimate": 0.01,
+        "destructive": false
+      },
+      "artifactCollector": "private SDK process snapshots/evidence, wrapper records, run metadata, and sanitized-result.json"
+    },
+    {
+      "id": "candidate-opus-projection",
+      "candidateOnly": true,
+      "evidenceSources": {
+        "sdk": "sdk-stream.ndjson"
+      },
+      "driver": "scripts/spikes/opus-default-projection.mjs",
+      "args": {
+        "candidate": []
+      },
+      "environment": {
+        "common": {},
+        "candidate": {
+          "CLAUDE_GATE_MODEL": "opus"
+        }
+      },
+      "expectedResolvedModel": "claude-opus-5",
+      "documentedWorkflowSizeGuideline": "medium",
+      "oracle": {
+        "candidate": "fresh Opus selection resolves to claude-opus-5; no Workflow policy override is present; bounded topology and complete report are recorded"
+      },
+      "cost": {
+        "usdEstimate": 0.3,
+        "destructive": false
+      },
+      "artifactCollector": "private SDK stream plus nested Workflow session, hooks, metadata, SDK/CLI process snapshots and evidence, wrapper records, run metadata, and sanitized-result.json"
+    }
+  ]
+}
