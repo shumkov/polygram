@@ -28,7 +28,7 @@ function sha256(contents) {
 }
 
 function fixture(t, { version = 'codex-cli 9.9.9' } = {}) {
-  const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'polygram-codex-bin-')));
+  const root = realpathSync(mkdtempSync(path.join(os.homedir(), '.polygram-codex-bin-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const binary = path.join(root, 'codex-9.9.9');
   const contents = `#!/bin/sh\nprintf '%s\\n' '${version}'\n`;

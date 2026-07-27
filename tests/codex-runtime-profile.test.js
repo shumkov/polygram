@@ -50,7 +50,7 @@ function digest(value) {
 }
 
 function fixture(t) {
-  const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'polygram-profile-')));
+  const root = realpathSync(mkdtempSync(path.join(os.homedir(), '.polygram-profile-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const workspace = path.join(root, 'workspace');
   const daemonSecretRoot = path.join(root, 'daemon-secrets');

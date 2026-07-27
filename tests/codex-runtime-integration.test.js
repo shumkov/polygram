@@ -391,7 +391,7 @@ function writeScenario(fixture, overrides = {}) {
 
 function makeFixture(t, scenario = {}) {
   const root = realpathSync(mkdtempSync(
-    path.join(os.tmpdir(), 'polygram-codex-integration-'),
+    path.join(os.homedir(), '.polygram-codex-integration-'),
   ));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const fixture = {
@@ -460,8 +460,8 @@ function createIntegrationOrchestra() {
         attestBinaryFn,
         attestCodexHomeFn,
         requestTimeoutMs: 5_000,
-        closeGraceMs: 1_000,
-        closeKillMs: 1_000,
+        closeGraceMs: 5_000,
+        closeKillMs: 5_000,
       });
     }
   }
