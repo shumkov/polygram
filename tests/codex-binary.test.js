@@ -130,6 +130,7 @@ describe('pinned Codex binary resolution', () => {
       createPinnedCodexBinaryResolver({
         cliVersion: first.version,
         binarySha256: '0'.repeat(64),
+        platform: 'darwin',
       })({ binaryPath: first.binary }),
       { code: 'CODEX_BINARY_MISMATCH' },
     );
