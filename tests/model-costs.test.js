@@ -55,6 +55,22 @@ describe('computeCostUsd', () => {
     assert.equal(cost, MODEL_COSTS.default.input);
   });
 
+  test('opus 5 turn: priced at its own rates, not the sonnet default', () => {
+    const usage = {
+      inputTokens: 1_000_000,
+      outputTokens: 1_000_000,
+      cacheReadTokens: 1_000_000,
+      cacheCreationTokens: 1_000_000,
+    };
+    const cost = computeCostUsd(usage, 'claude-opus-5');
+    // Opus 5: input=$5/M, output=$25/M, cacheRead=$0.50/M, cacheCreation=$6.25/M
+    const expected = 5 + 25 + 0.50 + 6.25;
+    assert.ok(Math.abs(cost - expected) < 1e-6, `expected ${expected}, got ${cost}`);
+    // A missing table entry silently bills opus 5 at sonnet rates — the whole
+    // reason the entry exists, so pin that it is NOT the default.
+    assert.notEqual(cost, computeCostUsd(usage, 'claude-unknown-future-9'));
+  });
+
   test('opus is the most expensive', () => {
     const usage = { inputTokens: 1_000_000, outputTokens: 1_000_000, cacheReadTokens: 0, cacheCreationTokens: 0 };
     const opus = computeCostUsd(usage, 'claude-opus-4-7');
