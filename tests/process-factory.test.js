@@ -93,4 +93,19 @@ describe('polygram production factory wiring', () => {
       'polygram must inject a per-chat display-hint resolver (orchestra defaults to empty); '
       + 'a static hint here silently drops richText for every pm:"cli" chat regardless of config');
   });
+  test('Codex factory wiring uses only the runtime controller receipt boundary', () => {
+    for (const field of [
+      'codexClientFactory: codexRuntimeController?.clientFactory',
+      'codexCheckpointSink: codexRuntimeController?.checkpointSink',
+      'codexExpectedStaticProfile: codexRuntimeController?.resolveReceipt',
+      'codexHostIdentity: codexManagerOptions.codexHostIdentity',
+      'codexBootSessionIdentity: codexManagerOptions.codexBootSessionIdentity',
+    ]) {
+      assert.ok(src.includes(field), field);
+    }
+    assert.match(
+      src,
+      /if \(proc\?\.runtime === 'codex'\) codexRuntimeController\.registerProcess\(proc\)/,
+    );
+  });
 });

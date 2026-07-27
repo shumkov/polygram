@@ -21,7 +21,10 @@ const path = require('node:path');
 // post-wiring marker without a ReferenceError. A fake token makes getMe 401
 // AFTER the wiring — irrelevant to what we assert.
 test('polygram.js boots through handler wiring without a ReferenceError', { timeout: 25000 }, async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-boot-'));
+  // The production IPC boundary deliberately rejects temporary roots.
+  // Use a short owner-only directory under the test user's home so this
+  // smoke test exercises the same secure runtime-directory path.
+  const dir = fs.mkdtempSync(path.join(os.homedir(), '.polygram-boot-'));
   fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({
     bots: { testbot: { token: '123:FAKE', pm: 'sdk' } },
     chats: { 1001: { name: 'Test', bot: 'testbot', model: 'sonnet', effort: 'medium', agent: 'default', cwd: '/tmp' } },
@@ -30,7 +33,11 @@ test('polygram.js boots through handler wiring without a ReferenceError', { time
 
   const proc = spawn(process.execPath, [path.join(__dirname, '..', 'polygram.js'), '--bot', 'testbot'], {
     cwd: dir,                                           // DATA_DIR = process.cwd()
-    env: { ...process.env, POLYGRAM_CLAUDE_BIN: '/usr/bin/echo' },
+    env: {
+      ...process.env,
+      POLYGRAM_CLAUDE_BIN: '/usr/bin/echo',
+      POLYGRAM_IPC_DIR: path.join(dir, '.ipc'),
+    },
   });
   let out = '';
   proc.stdout.on('data', (d) => { out += d; });

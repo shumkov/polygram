@@ -102,9 +102,66 @@ await tell('admin-bot', 'sendMessage', {
 }, { source: 'cron:billing-sync' });
 ```
 
+The daemon stores sockets and secrets in `<data-dir>/.ipc`, an
+owner-only `0700` directory. External callers must either run with the same
+working directory as the daemon or set `POLYGRAM_IPC_DIR` to that exact
+canonical absolute directory. Temporary paths and unsafe aliases are rejected;
+there is no `/tmp` fallback. If the data-directory path is too long for a
+portable Unix socket, set `POLYGRAM_IPC_DIR` to a shorter owner-only path.
+
 Allowed methods: `sendMessage`, `sendPhoto`, `sendDocument`, `sendSticker`,
 `sendChatAction`, `editMessageText`, `setMessageReaction`. Other methods
 are rejected server-side.
 
 If the target bot is down, `tell()` throws. Intentional — cron failures
 should surface, not silently log to a DB the bot isn't watching.
+
+## Native Codex beta diagnostics
+
+Codex is an opt-in native beta. Before selecting `pm: "codex"`, configure:
+
+- `codex.binary` as the canonical immutable executable for the pinned version;
+- `codex.home` as a dedicated, persistent, non-temporary `CODEX_HOME` with
+  mode `0700`;
+- owner-only `config.toml` and `auth.json` files with mode `0600`; and
+- the owned `polygram-session` profile with approval policy `never`, command
+  network disabled, and model web search disabled.
+
+List every other daemon credential or control tree in
+`codex.daemonSecretRoots`, including the interactive `~/.codex` tree when it
+exists; the dedicated deployment home is separate and must not be reused.
+
+Run the existing doctor against the intended config and database:
+
+```bash
+node scripts/doctor.js --bot my-bot --config /path/to/config.json --db /path/to/my-bot.db
+```
+
+The Codex checks are local and content-free. They verify the binary pin,
+dedicated home, installed protocol schema, owned profile, protected IPC runtime
+directory, stable host and kernel boot-session identity, and the daemon-wide
+lease. They do not print
+paths, credential contents, raw host/boot identities, generation IDs, prompts,
+command output, or raw failure text. They do not start app-server or perform
+authenticated model discovery. `codex-model-catalog` therefore remains a
+warning until the normal pinned startup preflight proves the selected profile,
+model, and effort are available.
+
+Lease results have daemon scope:
+
+- `clear` means this daemon has no live or quarantined native Codex owner.
+- `active` means one chat owns the daemon-wide Codex generation; a second
+  Codex chat must be rejected without spawning or changing its session.
+- `quarantined` is a hard failure. Do not delete the database, force-release
+  the lease, reset the chat, switch runtimes to evade it, or retry ambiguous
+  input automatically. Input reconciliation does not release containment.
+  The same validated host must reboot before native Codex can be released.
+
+This lease does not fence Claude, another Polygram daemon, or an
+uninstrumented host process.
+
+Detached and background development servers are unsupported in the native
+macOS beta. Healthy stop proves the exact Codex turn settled, tracked-terminal
+cleanup was accepted, and a fresh registry page was empty; it does not prove
+arbitrary descendants died. After transport or app-server hard loss, such a
+process may survive until the required host reboot.

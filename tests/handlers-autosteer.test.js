@@ -38,6 +38,66 @@ function makeDeps(overrides = {}) {
   };
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function codexError(code, message = code) {
+  return Object.assign(new Error(message), { code });
+}
+
+function makeCodexDeps(overrides = {}) {
+  const events = [];
+  const refs = [];
+  const steerCalls = [];
+  let entry = {
+    backend: 'codex',
+    runtime: 'codex',
+    generationId: 'generation-a',
+    inFlight: true,
+    closed: false,
+    state: 'Active',
+    activeTurnId: 'turn-a',
+  };
+  const pm = {
+    has: () => entry != null,
+    get: () => entry,
+    getBackend: () => entry?.backend ?? null,
+    async steerTurn(sessionKey, prompt, opts) {
+      steerCalls.push({ sessionKey, prompt, opts });
+      return {
+        outcome: 'accepted',
+        generationId: 'generation-a',
+        turnId: 'turn-a',
+        attemptId: 'steer-attempt-a',
+        targetAttemptId: 'turn-attempt-a',
+      };
+    },
+  };
+  Object.assign(pm, overrides.pm);
+  return {
+    events,
+    refs,
+    steerCalls,
+    get entry() { return entry; },
+    setEntry(next) { entry = next; },
+    deps: {
+      config: { bot: {} },
+      pm,
+      autosteeredRefs: { add: (key, ref) => refs.push({ key, ref }) },
+      logEvent: (kind, detail) => events.push({ kind, detail }),
+      ...overrides,
+      pm,
+    },
+  };
+}
+
 describe('isAutosteerEnabledFor — opt-out logic', () => {
   test('default: enabled when no opt-out set', () => {
     assert.equal(isAutosteerEnabledFor({}, { bot: {} }), true);
@@ -81,6 +141,7 @@ describe('createAutosteerHandlers — factory contract', () => {
     const h = createAutosteerHandlers(m.deps);
     assert.equal(typeof h.willAutosteer, 'function');
     assert.equal(typeof h.tryAutosteer, 'function');
+    assert.equal(typeof h.tryCodexAutosteer, 'function');
   });
 });
 
@@ -185,5 +246,402 @@ describe('tryAutosteer — full dispatch', () => {
     assert.equal(r.priority, 'later');
     const inject = m.pmCalls.find((c) => c[0] === 'injectUserMessage');
     assert.equal(inject[2].priority, 'later');
+  });
+});
+
+describe('tryCodexAutosteer — accepted steering', () => {
+  test('does not report or record acceptance before the RPC resolves', async () => {
+    const rpc = deferred();
+    const m = makeCodexDeps({
+      pm: {
+        steerTurn(sessionKey, prompt, opts) {
+          m.steerCalls.push({ sessionKey, prompt, opts });
+          return rpc.promise;
+        },
+      },
+    });
+    const h = createAutosteerHandlers(m.deps);
+    let settled = false;
+    const pending = h.tryCodexAutosteer({
+      sessionKey: 'k',
+      chatConfig: {},
+      chatId: '12345',
+      msg: { message_id: 555 },
+      prompt: 'follow-up',
+    }).then((result) => {
+      settled = true;
+      return result;
+    });
+
+    await Promise.resolve();
+    assert.equal(settled, false);
+    assert.equal(m.refs.length, 0);
+    assert.equal(m.events.length, 0);
+
+    rpc.resolve({
+      outcome: 'accepted',
+      generationId: 'generation-a',
+      turnId: 'turn-a',
+      attemptId: 'steer-attempt-a',
+      targetAttemptId: 'turn-attempt-a',
+    });
+    const result = await pending;
+
+    assert.deepEqual(result, {
+      autosteered: true,
+      outcome: 'accepted',
+      priority: 'next',
+      generationId: 'generation-a',
+      turnId: 'turn-a',
+      attemptId: 'steer-attempt-a',
+      targetAttemptId: 'turn-attempt-a',
+    });
+    assert.deepEqual(m.steerCalls, [{
+      sessionKey: 'k',
+      prompt: 'follow-up',
+      opts: { context: { sourceMsgId: 555 } },
+    }]);
+    assert.deepEqual(m.refs, [{
+      key: 'k',
+      ref: { chatId: '12345', msgId: 555 },
+    }]);
+    assert.equal(m.events[0].kind, 'autosteer');
+    assert.equal(m.events[0].detail.backend, 'codex');
+    assert.equal(m.events[0].detail.generation_id, 'generation-a');
+    assert.equal(m.events[0].detail.turn_id, 'turn-a');
+    assert.equal(m.events[0].detail.attempt_id, 'steer-attempt-a');
+    assert.equal(m.events[0].detail.target_attempt_id, 'turn-attempt-a');
+  });
+
+  test('an accepted result without a durable steer attempt ID is ambiguous', async () => {
+    const m = makeCodexDeps({
+      pm: {
+        async steerTurn() {
+          return {
+            outcome: 'accepted',
+            generationId: 'generation-a',
+            turnId: 'turn-a',
+          };
+        },
+      },
+    });
+    const h = createAutosteerHandlers(m.deps);
+
+    const result = await h.tryCodexAutosteer({
+      sessionKey: 'k',
+      chatConfig: {},
+      chatId: '1',
+      msg: { message_id: 1 },
+      prompt: 'follow-up',
+    });
+
+    assert.deepEqual(result, {
+      autosteered: false,
+      outcome: 'ambiguous',
+      queueOnce: false,
+      priority: 'next',
+      reason: 'accepted-without-durable-identifiers',
+      generationId: 'generation-a',
+      turnId: 'turn-a',
+      attemptId: null,
+      targetAttemptId: null,
+    });
+    assert.equal(m.refs.length, 0);
+    assert.equal(m.events.length, 0);
+  });
+
+  test('an accepted result with a mismatched generation is ambiguous', async () => {
+    const m = makeCodexDeps({
+      pm: {
+        async steerTurn() {
+          return {
+            outcome: 'accepted',
+            generationId: 'generation-b',
+            turnId: 'turn-a',
+            attemptId: 'steer-attempt-a',
+            targetAttemptId: 'turn-attempt-a',
+          };
+        },
+      },
+    });
+    const h = createAutosteerHandlers(m.deps);
+
+    const result = await h.tryCodexAutosteer({
+      sessionKey: 'k',
+      chatConfig: {},
+      chatId: '1',
+      msg: { message_id: 1 },
+      prompt: 'follow-up',
+    });
+
+    assert.equal(result.outcome, 'ambiguous');
+    assert.equal(result.queueOnce, false);
+    assert.equal(result.generationId, 'generation-a');
+    assert.equal(result.observedGenerationId, 'generation-b');
+    assert.equal(m.refs.length, 0);
+  });
+});
+
+describe('tryCodexAutosteer — fallback classification', () => {
+  test('definite no-active-turn rejection is queueable exactly once by the caller', async () => {
+    const m = makeCodexDeps({
+      pm: {
+        async steerTurn() {
+          return { outcome: 'queueable-not-active', turnId: 'turn-a' };
+        },
+      },
+    });
+    const h = createAutosteerHandlers(m.deps);
+    const result = await h.tryCodexAutosteer({
+      sessionKey: 'k',
+      chatConfig: {},
+      chatId: '1',
+      msg: { message_id: 1 },
+      prompt: 'follow-up',
+    });
+
+    assert.deepEqual(result, {
+      autosteered: false,
+      outcome: 'queue-once',
+      queueOnce: true,
+      priority: 'next',
+      reason: 'not-active',
+      generationId: 'generation-a',
+      turnId: 'turn-a',
+    });
+    assert.equal(m.refs.length, 0);
+  });
+
+  test('safe not-sent failure on the same live generation is queueable once', async () => {
+    const m = makeCodexDeps({
+      pm: {
+        async steerTurn() {
+          throw codexError('CODEX_RPC_NOT_SENT');
+        },
+      },
+    });
+    const h = createAutosteerHandlers(m.deps);
+    const result = await h.tryCodexAutosteer({
+      sessionKey: 'k',
+      chatConfig: {},
+      chatId: '1',
+      msg: { message_id: 1 },
+      prompt: 'follow-up',
+    });
+
+    assert.equal(result.outcome, 'queue-once');
+    assert.equal(result.queueOnce, true);
+    assert.equal(result.reason, 'rpc-not-sent');
+  });
+
+  test('not-sent failure after the generation starts quiescing is not queueable', async () => {
+    const m = makeCodexDeps({
+      pm: {
+        async steerTurn() {
+          m.entry.state = 'Quiescing';
+          throw codexError('CODEX_RPC_NOT_SENT');
+        },
+      },
+    });
+    const h = createAutosteerHandlers(m.deps);
+    const result = await h.tryCodexAutosteer({
+      sessionKey: 'k',
+      chatConfig: {},
+      chatId: '1',
+      msg: { message_id: 1 },
+      prompt: 'follow-up',
+    });
+
+    assert.equal(result.outcome, 'unavailable');
+    assert.equal(result.queueOnce, false);
+    assert.equal(result.reason, 'quiescing');
+  });
+
+  test('transport-unknown failure is ambiguous and never autoqueued', async () => {
+    const m = makeCodexDeps({
+      pm: {
+        async steerTurn() {
+          throw codexError('CODEX_RPC_OUTCOME_UNKNOWN');
+        },
+      },
+    });
+    const h = createAutosteerHandlers(m.deps);
+    const result = await h.tryCodexAutosteer({
+      sessionKey: 'k',
+      chatConfig: {},
+      chatId: '1',
+      msg: { message_id: 1 },
+      prompt: 'follow-up',
+    });
+
+    assert.deepEqual(result, {
+      autosteered: false,
+      outcome: 'ambiguous',
+      queueOnce: false,
+      priority: 'next',
+      reason: 'rpc-outcome-unknown',
+      generationId: 'generation-a',
+      errorCode: 'CODEX_RPC_OUTCOME_UNKNOWN',
+    });
+    assert.equal(m.refs.length, 0);
+  });
+
+  test('quiescing or explicitly unavailable work is never autoqueued', async () => {
+    const m = makeCodexDeps({
+      pm: {
+        async steerTurn() {
+          m.entry.state = 'Quiescing';
+          return { outcome: 'unavailable', reason: 'quiescing' };
+        },
+      },
+    });
+    const h = createAutosteerHandlers(m.deps);
+    const result = await h.tryCodexAutosteer({
+      sessionKey: 'k',
+      chatConfig: {},
+      chatId: '1',
+      msg: { message_id: 1 },
+      prompt: 'follow-up',
+    });
+
+    assert.deepEqual(result, {
+      autosteered: false,
+      outcome: 'unavailable',
+      queueOnce: false,
+      priority: 'next',
+      reason: 'quiescing',
+      generationId: 'generation-a',
+    });
+    assert.equal(m.refs.length, 0);
+  });
+
+  test('queue mode bypasses turn/steer and requests one ordinary queued send', async () => {
+    const m = makeCodexDeps();
+    const h = createAutosteerHandlers(m.deps);
+    const result = await h.tryCodexAutosteer({
+      sessionKey: 'k',
+      chatConfig: { autosteerMode: 'queue' },
+      chatId: '1',
+      msg: { message_id: 1 },
+      prompt: 'follow-up',
+    });
+
+    assert.deepEqual(result, {
+      autosteered: false,
+      outcome: 'queue-once',
+      queueOnce: true,
+      priority: 'later',
+      reason: 'queue-mode',
+      generationId: 'generation-a',
+      turnId: 'turn-a',
+    });
+    assert.equal(m.steerCalls.length, 0);
+  });
+});
+
+describe('tryCodexAutosteer — ordering and generation fences', () => {
+  test('two steers retain caller serialization and accepted identifier order', async () => {
+    const firstRpc = deferred();
+    const secondRpc = deferred();
+    const m = makeCodexDeps({
+      pm: {
+        steerTurn(sessionKey, prompt) {
+          m.steerCalls.push({ sessionKey, prompt });
+          return prompt === 'first' ? firstRpc.promise : secondRpc.promise;
+        },
+      },
+    });
+    const h = createAutosteerHandlers(m.deps);
+    const invoke = (messageId, prompt) => h.tryCodexAutosteer({
+      sessionKey: 'k',
+      chatConfig: {},
+      chatId: '1',
+      msg: { message_id: messageId },
+      prompt,
+    });
+    let intentTail = Promise.resolve();
+    const underIntentLock = (operation) => {
+      const pending = intentTail.then(operation, operation);
+      intentTail = pending.catch(() => {});
+      return pending;
+    };
+
+    const firstPending = underIntentLock(() => invoke(1, 'first'));
+    const secondPending = underIntentLock(() => invoke(2, 'second'));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepEqual(m.steerCalls.map((call) => call.prompt), ['first']);
+
+    firstRpc.resolve({
+      outcome: 'accepted',
+      generationId: 'generation-a',
+      turnId: 'turn-a',
+      attemptId: 'steer-attempt-a',
+      targetAttemptId: 'turn-attempt-a',
+    });
+    const first = await firstPending;
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepEqual(m.steerCalls.map((call) => call.prompt), ['first', 'second']);
+
+    secondRpc.resolve({
+      outcome: 'accepted',
+      generationId: 'generation-a',
+      turnId: 'turn-a',
+      attemptId: 'steer-attempt-b',
+      targetAttemptId: 'turn-attempt-a',
+    });
+    const second = await secondPending;
+
+    assert.deepEqual(
+      [first.attemptId, second.attemptId],
+      ['steer-attempt-a', 'steer-attempt-b'],
+    );
+    assert.deepEqual(m.refs.map((entry) => entry.ref.msgId), [1, 2]);
+  });
+
+  test('an acceptance from a replaced generation is ambiguous and never recorded', async () => {
+    const rpc = deferred();
+    const m = makeCodexDeps({
+      pm: {
+        steerTurn() {
+          return rpc.promise;
+        },
+      },
+    });
+    const h = createAutosteerHandlers(m.deps);
+    const pending = h.tryCodexAutosteer({
+      sessionKey: 'k',
+      chatConfig: {},
+      chatId: '1',
+      msg: { message_id: 1 },
+      prompt: 'follow-up',
+    });
+    m.setEntry({
+      ...m.entry,
+      generationId: 'generation-b',
+      activeTurnId: 'turn-b',
+    });
+    rpc.resolve({
+      outcome: 'accepted',
+      generationId: 'generation-a',
+      turnId: 'turn-a',
+      attemptId: 'steer-attempt-a',
+      targetAttemptId: 'turn-attempt-a',
+    });
+
+    const result = await pending;
+
+    assert.deepEqual(result, {
+      autosteered: false,
+      outcome: 'ambiguous',
+      queueOnce: false,
+      priority: 'next',
+      reason: 'generation-changed',
+      generationId: 'generation-a',
+      observedGenerationId: 'generation-b',
+    });
+    assert.equal(m.refs.length, 0);
+    assert.equal(m.events.length, 0);
   });
 });

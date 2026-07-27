@@ -19,6 +19,11 @@ function build({ backend = null, inFlight = false, botPm = null, applied = false
     config: { bot: { allowConfigCommands: true, pm: botPm } },
     db: { logConfigChange: () => {} },
     dbWrite: (fn) => { try { fn(); } catch { /* ignore */ } },
+    intentLock: {
+      async acquire() {
+        return () => {};
+      },
+    },
     pm,
     pairings: {},
     modelVersionsDesc: { opus: 'claude-opus-4-8', sonnet: 'claude-sonnet-4-6' },

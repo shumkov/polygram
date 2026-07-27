@@ -248,26 +248,36 @@ describe('buildSdkOptions — resume', () => {
 });
 
 describe('buildSdkOptions — IPC secret gate', () => {
-  test('exposeIpcSecretToChildren=false (default) → no POLYGRAM_IPC_SECRET in childEnv', () => {
+  test('exposeIpcSecretToChildren=false (default) → no IPC credentials in childEnv', () => {
     const fn = createBuildSdkOptions(baseDeps({
-      processEnv: { PATH: '/bin', POLYGRAM_IPC_SECRET: 'abc123' },
+      processEnv: {
+        PATH: '/bin',
+        POLYGRAM_IPC_SECRET: 'abc123',
+        POLYGRAM_IPC_DIR: '/private/polygram-ipc',
+      },
     }));
     const out = fn('chat-1', baseCtx());
     assert.equal(out.env.POLYGRAM_IPC_SECRET, undefined,
       'IPC secret must be opt-in to avoid prompt-injection-amplification');
+    assert.equal(out.env.POLYGRAM_IPC_DIR, undefined);
   });
 
-  test('exposeIpcSecretToChildren=true → POLYGRAM_IPC_SECRET propagated', () => {
+  test('exposeIpcSecretToChildren=true → matching secret and runtime directory propagated', () => {
     const fn = createBuildSdkOptions(baseDeps({
       config: {
         defaults: { model: 'sonnet', effort: 'high' },
         bot: { exposeIpcSecretToChildren: true },
         chats: {},
       },
-      processEnv: { PATH: '/bin', POLYGRAM_IPC_SECRET: 'abc123' },
+      processEnv: {
+        PATH: '/bin',
+        POLYGRAM_IPC_SECRET: 'abc123',
+        POLYGRAM_IPC_DIR: '/private/polygram-ipc',
+      },
     }));
     const out = fn('chat-1', baseCtx());
     assert.equal(out.env.POLYGRAM_IPC_SECRET, 'abc123');
+    assert.equal(out.env.POLYGRAM_IPC_DIR, '/private/polygram-ipc');
   });
 });
 

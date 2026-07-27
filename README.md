@@ -45,8 +45,9 @@ ergonomics while running on top of `claude` CLI.
 - **Write-before-send atomicity.** Outbound messages hit the DB as
   `pending` before the Telegram call, flip to `sent` or `failed` after.
   Boot sweep resolves stale `pending` rows from the last crash.
-- **Unix-socket IPC per bot.** Cron jobs and Claude Code approval hooks
-  talk to the bot process over `/tmp/polygram-<bot>.sock`. The bot
+- **Unix-socket IPC per bot.** Cron jobs and external scripts talk to the
+  bot process over `<data-dir>/.ipc/polygram-<bot>.sock` inside an
+  owner-only runtime directory. The bot
   is the only writer to its own DB.
 - **Inline-keyboard approvals.** Destructive tool calls gate on operator
   click via Claude Code's `PreToolUse` hook; 5-minute auto-deny.
@@ -139,9 +140,10 @@ polygram --bot partner-bot        # another bot, another process
 - `config.json` → `$PWD/config.json` (override with `--config` or `POLYGRAM_CONFIG`)
 - `<bot>.db` → `$PWD/<bot>.db` (override with `--db` or `POLYGRAM_DB`)
 - `inbox/` → `$PWD/inbox/` (override with `POLYGRAM_INBOX`)
+- `.ipc/` → `$PWD/.ipc/` (override with canonical absolute `POLYGRAM_IPC_DIR`)
 
 Migrations are bundled in the package and apply automatically. The daemon
-opens a Unix socket at `/tmp/polygram-<bot>.sock`.
+opens a Unix socket at `$PWD/.ipc/polygram-<bot>.sock`.
 
 For production, LaunchAgent plists are in `ops/`. See `ops/README.md`.
 

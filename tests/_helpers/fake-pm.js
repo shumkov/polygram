@@ -36,6 +36,10 @@
  * @param {boolean} [opts.steer]
  * @param {boolean} [opts.injectUserMessage]
  * @param {boolean} [opts.setModel]
+ * @param {boolean} [opts.selectModelSettings]
+ * @param {object} [opts.selectModelSettingsResult]
+ * @param {boolean} [opts.getModelSettingsStatus]
+ * @param {object} [opts.getModelSettingsStatusResult]
  * @param {boolean} [opts.applyFlagSettings]
  * @param {boolean} [opts.setPermissionMode]
  * @param {boolean} [opts.drainQueue]
@@ -46,13 +50,34 @@
  */
 function makeFakePm(name = 'fake', opts = {}) {
   const calls = [];
+  const entry = (key, ctx = {}) => ({
+    name,
+    key,
+    sessionKey: key,
+    chatId: ctx.chatId ?? null,
+    threadId: ctx.threadId ?? null,
+    label: ctx.label ?? name,
+    runtime: ctx.runtime ?? 'claude',
+    backend: ctx.backend ?? 'sdk',
+    spawnProfileId: ctx.spawnProfileId ?? null,
+    closed: false,
+    inFlight: false,
+    pendingQueue: [],
+  });
   /** @type {Pm & { name: string, calls: Array<Array<any>> }} */
   const pm = {
     name,
     calls,
     has(key) { calls.push(['has', key]); return true; },
-    get(key) { calls.push(['get', key]); return { name, key }; },
-    getOrSpawn(key, ctx) { calls.push(['getOrSpawn', key, ctx]); return { name, key }; },
+    get(key) { calls.push(['get', key]); return entry(key); },
+    getOrSpawn(key, ctx) {
+      calls.push(['getOrSpawn', key, ctx]);
+      return Promise.resolve(entry(key, ctx));
+    },
+    replaceRuntime(key, ctx) {
+      calls.push(['replaceRuntime', key, ctx]);
+      return Promise.resolve(entry(key, ctx));
+    },
     send(key, prompt, sendOpts) {
       calls.push(['send', key, prompt, sendOpts]);
       return Promise.resolve({ text: name, sessionId: 'fake-sess', cost: 0, duration: 0, error: null, metrics: {} });
@@ -73,6 +98,21 @@ function makeFakePm(name = 'fake', opts = {}) {
   }
   if (opts.setModel) {
     pm.setModel = async (key, m) => { calls.push(['setModel', key, m]); return true; };
+  }
+  if (opts.selectModelSettings) {
+    pm.selectModelSettings = async (key, settings) => {
+      calls.push(['selectModelSettings', key, settings]);
+      return opts.selectModelSettingsResult ?? {
+        outcome: 'not-loaded',
+        nextTurn: settings,
+      };
+    };
+  }
+  if (opts.getModelSettingsStatus) {
+    pm.getModelSettingsStatus = async (key) => {
+      calls.push(['getModelSettingsStatus', key]);
+      return opts.getModelSettingsStatusResult ?? { outcome: 'not-loaded' };
+    };
   }
   if (opts.applyFlagSettings) {
     pm.applyFlagSettings = async (key, s) => { calls.push(['applyFlagSettings', key, s]); return true; };

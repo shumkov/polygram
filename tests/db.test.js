@@ -5,6 +5,10 @@
 
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const Database = require('better-sqlite3');
 
 const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 const { open } = require('../lib/db'); // a couple of tests open a 2nd connection to the same file
@@ -18,7 +22,7 @@ describe('schema + migrations', () => {
 
   test('user_version is at current schema after migration', () => {
     const v = db.raw.pragma('user_version', { simple: true });
-    assert.ok(v >= 2, `expected user_version >= 2, got ${v}`);
+    assert.equal(v, 17);
   });
 
   test('WAL mode is enabled', () => {
@@ -27,8 +31,151 @@ describe('schema + migrations', () => {
 
   test('all tables exist', () => {
     const tables = db.raw.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name);
-    for (const t of ['sessions', 'messages', 'chat_migrations', 'config_changes', 'events', 'messages_fts']) {
+    for (const t of [
+      'sessions',
+      'agent_runtime_sessions',
+      'codex_runtime_identity',
+      'codex_reboot_releases',
+      'codex_generations',
+      'codex_daemon_lease',
+      'codex_turn_attempts',
+      'codex_attempt_checkpoints',
+      'inbound_runtime_selections',
+      'codex_linked_inputs',
+      'codex_dispatch_reservations',
+      'codex_item_effects',
+      'codex_attempt_reconciliations',
+      'codex_retry_reservations',
+      'messages',
+      'chat_migrations',
+      'config_changes',
+      'events',
+      'messages_fts',
+    ]) {
       assert.ok(tables.includes(t), `missing table: ${t}`);
+    }
+  });
+
+  test('Codex linked-input retention lookups are indexed in both directions', () => {
+    const indexes = db.raw.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'index'",
+    ).all().map((row) => row.name);
+    assert.ok(indexes.includes('idx_codex_linked_inputs_attempt'));
+    assert.ok(indexes.includes('idx_codex_linked_inputs_target'));
+  });
+
+  test('production-shaped Claude row remains exact across v14 migration and legacy rollback writes', () => {
+    const fixturePath = path.join(
+      os.tmpdir(),
+      `polygram-u5-migration-${process.pid}-${Date.now()}.db`,
+    );
+    let raw = new Database(fixturePath);
+    try {
+      const migrationDir = path.join(__dirname, '..', 'migrations');
+      for (const file of fs.readdirSync(migrationDir).sort()) {
+        const version = Number.parseInt(file.slice(0, 3), 10);
+        if (!Number.isSafeInteger(version) || version > 14) continue;
+        raw.exec(fs.readFileSync(path.join(migrationDir, file), 'utf8'));
+        raw.pragma(`user_version = ${version}`);
+      }
+      raw.prepare(`
+        INSERT INTO sessions (
+          session_key, chat_id, thread_id, claude_session_id, agent, cwd,
+          model, effort, created_ts, last_active_ts, pm_backend
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        '-1003807211164:3',
+        '-1003807211164',
+        '3',
+        'ec13e620-4975-4bff-a5d3-451f9d2dd390',
+        'music-curation:music-curator',
+        '/Users/ivanshumkov/Music/rekordbox',
+        'sonnet',
+        'high',
+        1_700_000_000_000,
+        1_700_000_000_123,
+        'tmux',
+      );
+      const before = raw.prepare('SELECT * FROM sessions').get();
+      raw.close();
+
+      const upgraded = open(fixturePath);
+      const after = upgraded.raw.prepare('SELECT * FROM sessions').get();
+      assert.deepEqual(after, before);
+      assert.deepEqual(
+        upgraded.getProviderSession('-1003807211164:3', 'claude:inline'),
+        {
+          session_key: '-1003807211164:3',
+          namespace: 'claude:inline',
+          provider: 'claude',
+          provider_session_id: 'ec13e620-4975-4bff-a5d3-451f9d2dd390',
+          app_server_session_id: null,
+          agent: 'music-curation:music-curator',
+          cwd: '/Users/ivanshumkov/Music/rekordbox',
+          model: 'sonnet',
+          effort: 'high',
+          pm_backend: 'tmux',
+          created_ts: 1_700_000_000_000,
+          last_active_ts: 1_700_000_000_123,
+        },
+      );
+      upgraded.upsertProviderSession({
+        session_key: '-1003807211164:3',
+        namespace: 'codex:app-server',
+        provider: 'codex',
+        provider_session_id: 'dormant-codex-thread',
+        app_server_session_id: 'diagnostic-session',
+        pm_backend: 'codex',
+        ts: 1_700_000_000_200,
+      });
+      upgraded.raw.close();
+
+      // Shape used by an old binary: it knows only the legacy sessions table.
+      raw = new Database(fixturePath);
+      raw.prepare(`
+        UPDATE sessions
+           SET claude_session_id = ?, last_active_ts = ?
+         WHERE session_key = ?
+      `).run(
+        'rollback-compatible-session',
+        1_700_000_000_456,
+        '-1003807211164:3',
+      );
+      assert.equal(
+        raw.prepare('SELECT claude_session_id FROM sessions').get().claude_session_id,
+        'rollback-compatible-session',
+      );
+      raw.close();
+
+      const returned = open(fixturePath);
+      assert.equal(
+        returned.getProviderSession(
+          '-1003807211164:3',
+          'claude:inline',
+        ).provider_session_id,
+        'rollback-compatible-session',
+      );
+      assert.equal(
+        returned.getProviderSession(
+          '-1003807211164:3',
+          'claude:inline',
+        ).last_active_ts,
+        1_700_000_000_456,
+      );
+      assert.equal(
+        returned.getProviderSession(
+          '-1003807211164:3',
+          'codex:app-server',
+        ).provider_session_id,
+        'dormant-codex-thread',
+      );
+      returned.raw.close();
+      raw = null;
+    } finally {
+      try { raw.close(); } catch {}
+      for (const suffix of ['', '-wal', '-shm']) {
+        try { fs.unlinkSync(fixturePath + suffix); } catch {}
+      }
     }
   });
 
@@ -254,6 +401,1380 @@ describe('sessions', () => {
   test('clearSessionId on missing key is a no-op', () => {
     assert.doesNotThrow(() => db.clearSessionId('nope'));
   });
+
+  test('Claude writes are dual-written into the compatibility namespace', () => {
+    db.upsertSession({
+      session_key: 'inline',
+      chat_id: 'inline',
+      claude_session_id: 'claude-inline',
+      pm_backend: 'sdk',
+      ts: 1000,
+    });
+    db.upsertSession({
+      session_key: 'channels',
+      chat_id: 'channels',
+      claude_session_id: 'claude-channels',
+      pm_backend: 'cli',
+      ts: 2000,
+    });
+
+    assert.equal(
+      db.getProviderSession('inline', 'claude:inline').provider_session_id,
+      'claude-inline',
+    );
+    assert.equal(
+      db.getProviderSession('channels', 'claude:channels').provider_session_id,
+      'claude-channels',
+    );
+    assert.equal(db.getProviderSession('inline', 'claude:channels'), undefined);
+    assert.equal(db.getProviderSession('channels', 'claude:inline'), undefined);
+  });
+
+  test('equal legacy and namespace timestamps prefer a different legacy session ID', () => {
+    db.upsertSession({
+      session_key: 'rollback-tie',
+      chat_id: 'rollback-tie',
+      claude_session_id: 'before-rollback',
+      pm_backend: 'sdk',
+      ts: 1000,
+    });
+    db.raw.prepare(`
+      UPDATE sessions
+         SET claude_session_id = ?
+       WHERE session_key = ?
+    `).run('written-by-old-binary', 'rollback-tie');
+
+    assert.equal(
+      db.getProviderSession(
+        'rollback-tie',
+        'claude:inline',
+      ).provider_session_id,
+      'written-by-old-binary',
+    );
+  });
+});
+
+describe('Codex synchronous durability ledger', () => {
+  beforeEach(() => { ({ db, dbPath } = freshDb('polygram-codex-ledger')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  const identity = {
+    stable_host_id: 'host-a',
+    boot_session_id: 'boot-a',
+  };
+
+  function generation(overrides = {}) {
+    return {
+      generation_id: 'generation-a',
+      session_key: 'chat:topic',
+      thread_id: 'thread-a',
+      app_server_session_id: 'app-server-diagnostic-a',
+      ...identity,
+      ts: 1000,
+      ...overrides,
+    };
+  }
+
+  function acquire(generationId = 'generation-a', ts = 1050) {
+    return db.acquireCodexLease({
+      generation_id: generationId,
+      ...identity,
+      ts,
+    });
+  }
+
+  function seedStoppedTurn(terminalStatus = 'interrupted') {
+    const base = {
+      generationId: 'generation-a',
+      threadId: 'thread-a',
+      ...identity,
+    };
+    for (const checkpoint of [
+      {
+        kind: 'request-prepared',
+        attemptId: 'attempt-a',
+        method: 'turn/start',
+        ts: 1100,
+      },
+      {
+        kind: 'request-write-attempted',
+        attemptId: 'attempt-a',
+        method: 'turn/start',
+        requestId: 'start-request',
+        ts: 1110,
+      },
+      {
+        kind: 'request-response-observed',
+        attemptId: 'attempt-a',
+        method: 'turn/start',
+        requestId: 'start-request',
+        outcome: 'result',
+        ts: 1120,
+      },
+      {
+        kind: 'turn-accepted',
+        attemptId: 'attempt-a',
+        turnId: 'turn-a',
+        ts: 1130,
+      },
+      {
+        kind: 'turn-terminal',
+        attemptId: 'attempt-a',
+        turnId: 'turn-a',
+        terminalStatus,
+        ts: 1140,
+      },
+      {
+        kind: 'stop-terminal-reconciled',
+        turnId: 'turn-a',
+        ts: 1150,
+      },
+      {
+        kind: 'stop-empty-registry-observed',
+        turnId: 'turn-a',
+        ts: 1160,
+      },
+    ]) {
+      db.recordCodexCheckpoint({ ...base, ...checkpoint });
+    }
+  }
+
+  test('stopped generation disposal and lease retirement commit together', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    seedStoppedTurn();
+
+    assert.deepEqual(db.settleCodexStoppedGeneration({
+      generation_id: 'generation-a',
+      ...identity,
+      ts: 1200,
+    }), {
+      changes: 1,
+      disposition: 'stop-cancelled',
+      attemptId: 'attempt-a',
+      retired: true,
+    });
+    assert.equal(db.getCodexAttempt('attempt-a').recovery_state, 'cancelled');
+    assert.equal(
+      db.raw.prepare(`
+        SELECT state FROM codex_generations WHERE generation_id = 'generation-a'
+      `).get().state,
+      'retired',
+    );
+    assert.equal(db.getCodexLease().status, 'clear');
+  });
+
+  test('stopped generation disposal rolls back when lease retirement fails', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    seedStoppedTurn();
+    db.raw.exec(`
+      CREATE TRIGGER reject_codex_lease_release
+      BEFORE UPDATE OF status ON codex_daemon_lease
+      WHEN NEW.status = 'clear'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected lease release failure');
+      END
+    `);
+
+    assert.throws(
+      () => db.settleCodexStoppedGeneration({
+        generation_id: 'generation-a',
+        ...identity,
+        ts: 1200,
+      }),
+      /injected lease release failure/,
+    );
+    assert.equal(
+      db.getCodexAttempt('attempt-a').recovery_state,
+      'clean-pending',
+    );
+    assert.equal(
+      db.raw.prepare(`
+        SELECT state FROM codex_generations WHERE generation_id = 'generation-a'
+      `).get().state,
+      'active',
+    );
+    assert.equal(db.getCodexLease().status, 'active');
+  });
+
+  test('final stopped delivery rolls back when atomic lease retirement fails', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    seedStoppedTurn('completed');
+    const base = {
+      generationId: 'generation-a',
+      threadId: 'thread-a',
+      ...identity,
+    };
+    db.raw.exec(`
+      CREATE TRIGGER reject_final_delivery_lease_release
+      BEFORE UPDATE OF status ON codex_daemon_lease
+      WHEN NEW.status = 'clear'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected final delivery retirement failure');
+      END
+    `);
+
+    assert.throws(
+      () => db.recordCodexDeliveryCheckpoint({
+        checkpoint: {
+          ...base,
+          kind: 'telegram-delivery-settled',
+          attemptId: 'attempt-a',
+          turnId: 'turn-a',
+          ts: 1200,
+        },
+        retireGeneration: true,
+      }),
+      /injected final delivery retirement failure/,
+    );
+    assert.equal(
+      db.getCodexAttempt('attempt-a').recovery_state,
+      'clean-pending',
+    );
+    assert.equal(
+      db.raw.prepare(`
+        SELECT state FROM codex_generations WHERE generation_id = 'generation-a'
+      `).get().state,
+      'active',
+    );
+    assert.equal(db.getCodexLease().status, 'active');
+    assert.equal(
+      db.raw.prepare(`
+        SELECT COUNT(*) AS count
+          FROM codex_attempt_checkpoints
+         WHERE attempt_id = 'attempt-a'
+           AND kind = 'telegram-delivery-settled'
+      `).get().count,
+      0,
+    );
+  });
+
+  test('unverified stopped delivery settles consumers but keeps the lease', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    seedStoppedTurn('completed');
+
+    const result = db.recordCodexDeliveryCheckpoint({
+      checkpoint: {
+        generationId: 'generation-a',
+        threadId: 'thread-a',
+        ...identity,
+        kind: 'telegram-delivery-settled',
+        attemptId: 'attempt-a',
+        turnId: 'turn-a',
+        ts: 1200,
+      },
+      retireGeneration: false,
+    });
+    assert.equal(result.retired, false);
+    assert.equal(db.getCodexAttempt('attempt-a').recovery_state, 'settled');
+    assert.equal(
+      db.raw.prepare(`
+        SELECT state FROM codex_generations WHERE generation_id = 'generation-a'
+      `).get().state,
+      'healthy-stopped',
+    );
+    assert.equal(db.getCodexLease().status, 'active');
+  });
+
+  test('prepared-only is replayable while write-attempted reconstructs quarantine', () => {
+    db.createCodexGeneration(generation());
+    const preparedResult = db.recordCodexCheckpoint({
+      kind: 'request-prepared',
+      generationId: 'generation-a',
+      attemptId: 'attempt-a',
+      method: 'turn/start',
+      threadId: 'thread-a',
+      source: 'telegram-message-a',
+      clientUserMessageId: 'client-message-a',
+      ...identity,
+      ts: 1100,
+    });
+    assert.equal(preparedResult instanceof Promise, false);
+
+    assert.deepEqual(
+      db.reconstructCodexRecovery({ ...identity, now: 1200 }),
+      {
+        status: 'clear',
+        reason: null,
+        containmentReleased: false,
+        replayableAttemptIds: ['attempt-a'],
+        unresolvedAttemptIds: [],
+      },
+    );
+
+    acquire();
+    db.recordCodexCheckpoint({
+      kind: 'request-write-attempted',
+      generationId: 'generation-a',
+      attemptId: 'attempt-a',
+      method: 'turn/start',
+      requestId: '1',
+      threadId: 'thread-a',
+      ...identity,
+      ts: 1300,
+    });
+
+    const restored = db.reconstructCodexRecovery({ ...identity, now: 1400 });
+    assert.equal(restored.status, 'quarantined');
+    assert.equal(restored.reason, 'persisted-active-generation');
+    assert.deepEqual(restored.unresolvedAttemptIds, ['attempt-a']);
+    assert.deepEqual(restored.replayableAttemptIds, []);
+  });
+
+  test('checkpoint transitions are ordered, content-free, and transactional', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    db.recordCodexCheckpoint({
+      kind: 'request-prepared',
+      generationId: 'generation-a',
+      attemptId: 'attempt-a',
+      method: 'turn/start',
+      threadId: 'thread-a',
+      ...identity,
+      ts: 1100,
+    });
+
+    assert.throws(
+      () => db.recordCodexCheckpoint({
+        kind: 'request-response-observed',
+        generationId: 'generation-a',
+        attemptId: 'attempt-a',
+        method: 'turn/start',
+        requestId: '1',
+        outcome: 'result',
+        threadId: 'thread-a',
+        ...identity,
+        ts: 1200,
+      }),
+      (error) => error.code === 'CODEX_CHECKPOINT_SEQUENCE_INVALID',
+    );
+    assert.equal(db.getCodexAttempt('attempt-a').delivery_state, 'prepared');
+    assert.equal(db.listCodexAttemptCheckpoints('attempt-a').length, 1);
+
+    db.recordCodexCheckpoint({
+      kind: 'request-write-attempted',
+      generationId: 'generation-a',
+      attemptId: 'attempt-a',
+      method: 'turn/start',
+      requestId: '1',
+      threadId: 'thread-a',
+      prompt: 'must never be persisted',
+      ...identity,
+      ts: 1300,
+    });
+    db.recordCodexCheckpoint({
+      kind: 'request-response-observed',
+      generationId: 'generation-a',
+      attemptId: 'attempt-a',
+      method: 'turn/start',
+      requestId: '1',
+      outcome: 'result',
+      threadId: 'thread-a',
+      ...identity,
+      ts: 1400,
+    });
+
+    const rows = db.listCodexAttemptCheckpoints('attempt-a');
+    assert.deepEqual(rows.map((row) => row.kind), [
+      'request-prepared',
+      'request-write-attempted',
+      'request-response-observed',
+    ]);
+    assert.equal(JSON.stringify(rows).includes('must never be persisted'), false);
+    assert.equal(db.getCodexAttempt('attempt-a').delivery_state, 'response-observed');
+  });
+
+  test('persists the exact Orchestra thread-status callback without payload content', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+
+    db.recordCodexCheckpoint({
+      kind: 'thread-status-changed',
+      generationId: 'generation-a',
+      threadId: 'thread-a',
+      turnId: null,
+      source: null,
+      clientUserMessageId: null,
+      hostIdentity: 'host-a',
+      bootSessionIdentity: 'boot-a',
+      statusType: 'active',
+    });
+
+    const row = db.raw.prepare(`
+      SELECT kind, thread_id, detail_json
+        FROM codex_attempt_checkpoints
+       WHERE generation_id = ?
+    `).get('generation-a');
+    assert.deepEqual(row, {
+      kind: 'thread-status-changed',
+      thread_id: 'thread-a',
+      detail_json: JSON.stringify({ statusType: 'active' }),
+    });
+  });
+
+  test('settles linked steering only when the target turn delivery settles', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    const base = {
+      generationId: 'generation-a',
+      threadId: 'thread-a',
+      ...identity,
+    };
+    for (const checkpoint of [
+      {
+        kind: 'request-prepared',
+        attemptId: 'turn-attempt',
+        method: 'turn/start',
+        ts: 1100,
+      },
+      {
+        kind: 'request-write-attempted',
+        attemptId: 'turn-attempt',
+        requestId: 'request-turn',
+        ts: 1200,
+      },
+      {
+        kind: 'request-response-observed',
+        attemptId: 'turn-attempt',
+        requestId: 'request-turn',
+        outcome: 'result',
+        ts: 1300,
+      },
+      {
+        kind: 'turn-accepted',
+        attemptId: 'turn-attempt',
+        turnId: 'turn-a',
+        ts: 1400,
+      },
+      {
+        kind: 'request-prepared',
+        attemptId: 'steer-attempt',
+        method: 'turn/steer',
+        turnId: 'turn-a',
+        ts: 1500,
+      },
+    ]) {
+      db.recordCodexCheckpoint({ ...base, ...checkpoint });
+    }
+    db.linkCodexSteeringInput({
+      linked_input_id: 'linked-a',
+      generation_id: 'generation-a',
+      attempt_id: 'steer-attempt',
+      target_attempt_id: 'turn-attempt',
+      telegram_chat_id: 'chat',
+      telegram_message_id: '2',
+      ts: 1600,
+    });
+    db.recordCodexCheckpoint({
+      ...base,
+      kind: 'turn-terminal',
+      attemptId: 'turn-attempt',
+      turnId: 'turn-a',
+      terminalStatus: 'completed',
+      ts: 1700,
+    });
+    for (const checkpoint of [
+      { kind: 'stop-terminal-reconciled', ts: 1710 },
+      { kind: 'stop-clean-accepted', ts: 1720 },
+      { kind: 'stop-empty-registry-observed', ts: 1730 },
+    ]) {
+      db.recordCodexCheckpoint({
+        ...base,
+        turnId: 'turn-a',
+        ...checkpoint,
+      });
+    }
+
+    assert.equal(
+      db.raw.prepare(`
+        SELECT state FROM codex_linked_inputs WHERE linked_input_id = ?
+      `).get('linked-a').state,
+      'linked',
+    );
+    assert.equal(
+      db.getCodexAttempt('turn-attempt').recovery_state,
+      'clean-pending',
+    );
+
+    db.recordCodexCheckpoint({
+      ...base,
+      kind: 'telegram-delivery-settled',
+      attemptId: 'turn-attempt',
+      turnId: 'turn-a',
+      ts: 1800,
+    });
+
+    assert.equal(db.getCodexAttempt('turn-attempt').recovery_state, 'settled');
+    assert.equal(db.getCodexAttempt('steer-attempt').recovery_state, 'settled');
+    assert.deepEqual(
+      db.raw.prepare(`
+        SELECT state, settled_ts
+          FROM codex_linked_inputs
+         WHERE linked_input_id = ?
+      `).get('linked-a'),
+      { state: 'settled', settled_ts: 1800 },
+    );
+  });
+
+  test('delivery and cleanup settle safely in either stop/background order', () => {
+    const seedLifecycle = ({
+      generationId,
+      threadId,
+      prefix,
+      startTs,
+    }) => {
+      const host = {
+        generationId,
+        threadId,
+        ...identity,
+      };
+      const record = (checkpoint) => db.recordCodexCheckpoint({
+        ...host,
+        ...checkpoint,
+      });
+      const startAttempt = `${prefix}-turn`;
+      const interruptAttempt = `${prefix}-interrupt`;
+      const cleanAttempt = `${prefix}-clean`;
+      for (const checkpoint of [
+        {
+          kind: 'request-prepared',
+          attemptId: startAttempt,
+          method: 'turn/start',
+          ts: startTs,
+        },
+        {
+          kind: 'request-write-attempted',
+          attemptId: startAttempt,
+          method: 'turn/start',
+          requestId: `${prefix}-start-request`,
+          ts: startTs + 10,
+        },
+        {
+          kind: 'request-response-observed',
+          attemptId: startAttempt,
+          method: 'turn/start',
+          requestId: `${prefix}-start-request`,
+          outcome: 'result',
+          ts: startTs + 20,
+        },
+        {
+          kind: 'turn-accepted',
+          attemptId: startAttempt,
+          turnId: `${prefix}-turn-id`,
+          ts: startTs + 30,
+        },
+        {
+          kind: 'turn-terminal',
+          attemptId: startAttempt,
+          turnId: `${prefix}-turn-id`,
+          terminalStatus: 'completed',
+          ts: startTs + 40,
+        },
+      ]) record(checkpoint);
+      for (const [attemptId, method, offset] of [
+        [interruptAttempt, 'turn/interrupt', 50],
+        [cleanAttempt, 'thread/backgroundTerminals/clean', 80],
+      ]) {
+        for (const checkpoint of [
+          {
+            kind: 'request-prepared',
+            attemptId,
+            method,
+            turnId: method === 'turn/interrupt' ? `${prefix}-turn-id` : null,
+            ts: startTs + offset,
+          },
+          {
+            kind: 'request-write-attempted',
+            attemptId,
+            method,
+            requestId: `${attemptId}-request`,
+            turnId: method === 'turn/interrupt' ? `${prefix}-turn-id` : null,
+            ts: startTs + offset + 10,
+          },
+          {
+            kind: 'request-response-observed',
+            attemptId,
+            method,
+            requestId: `${attemptId}-request`,
+            outcome: 'result',
+            turnId: method === 'turn/interrupt' ? `${prefix}-turn-id` : null,
+            ts: startTs + offset + 20,
+          },
+        ]) record(checkpoint);
+      }
+      return {
+        record,
+        startAttempt,
+        interruptAttempt,
+        cleanAttempt,
+        turnId: `${prefix}-turn-id`,
+      };
+    };
+
+    db.createCodexGeneration(generation());
+    acquire();
+    const stop = seedLifecycle({
+      generationId: 'generation-a',
+      threadId: 'thread-a',
+      prefix: 'stop',
+      startTs: 1100,
+    });
+    stop.record({
+      kind: 'telegram-delivery-settled',
+      attemptId: stop.startAttempt,
+      turnId: stop.turnId,
+      ts: 1300,
+    });
+    for (const checkpoint of [
+      { kind: 'stop-terminal-reconciled', turnId: stop.turnId, ts: 1310 },
+      { kind: 'stop-clean-accepted', ts: 1320 },
+      { kind: 'stop-empty-registry-observed', ts: 1330 },
+    ]) stop.record(checkpoint);
+    assert.deepEqual(
+      [stop.startAttempt, stop.interruptAttempt, stop.cleanAttempt]
+        .map((attemptId) => db.getCodexAttempt(attemptId).recovery_state),
+      ['settled', 'settled', 'settled'],
+    );
+    assert.equal(
+      db.raw.prepare(`
+        SELECT state FROM codex_generations WHERE generation_id = 'generation-a'
+      `).get().state,
+      'healthy-stopped',
+    );
+    db.markCodexGenerationRetired({
+      generation_id: 'generation-a',
+      ts: 1340,
+    });
+
+    db.createCodexGeneration(generation({
+      generation_id: 'generation-b',
+      session_key: 'chat:background',
+      thread_id: 'thread-b',
+      ts: 2000,
+    }));
+    acquire('generation-b', 2010);
+    const background = seedLifecycle({
+      generationId: 'generation-b',
+      threadId: 'thread-b',
+      prefix: 'background',
+      startTs: 2100,
+    });
+    for (const checkpoint of [
+      {
+        kind: 'background-terminal-reconciled',
+        turnId: background.turnId,
+        ts: 2300,
+      },
+      { kind: 'background-clean-accepted', ts: 2310 },
+      { kind: 'background-empty-registry-observed', ts: 2320 },
+    ]) background.record(checkpoint);
+    assert.equal(
+      db.getCodexAttempt(background.startAttempt).recovery_state,
+      'clean-pending',
+    );
+    background.record({
+      kind: 'telegram-delivery-settled',
+      attemptId: background.startAttempt,
+      turnId: background.turnId,
+      ts: 2330,
+    });
+    assert.deepEqual(
+      [
+        background.startAttempt,
+        background.interruptAttempt,
+        background.cleanAttempt,
+      ].map((attemptId) => db.getCodexAttempt(attemptId).recovery_state),
+      ['settled', 'settled', 'settled'],
+    );
+    assert.equal(
+      db.raw.prepare(`
+        SELECT state FROM codex_generations WHERE generation_id = 'generation-b'
+      `).get().state,
+      'active',
+    );
+  });
+
+  test('natural completion keeps the generation active for the next turn', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    const base = {
+      generationId: 'generation-a',
+      threadId: 'thread-a',
+      ...identity,
+    };
+    for (const checkpoint of [
+      {
+        kind: 'request-prepared',
+        attemptId: 'first-turn',
+        method: 'turn/start',
+        ts: 1100,
+      },
+      {
+        kind: 'request-write-attempted',
+        attemptId: 'first-turn',
+        method: 'turn/start',
+        requestId: 1,
+        ts: 1200,
+      },
+      {
+        kind: 'request-response-observed',
+        attemptId: 'first-turn',
+        method: 'turn/start',
+        requestId: 1,
+        outcome: 'result',
+        ts: 1300,
+      },
+      {
+        kind: 'turn-accepted',
+        attemptId: 'first-turn',
+        turnId: 'turn-1',
+        ts: 1400,
+      },
+      {
+        kind: 'turn-terminal',
+        attemptId: 'first-turn',
+        turnId: 'turn-1',
+        terminalStatus: 'completed',
+        ts: 1500,
+      },
+      {
+        kind: 'telegram-delivery-settled',
+        attemptId: 'first-turn',
+        turnId: 'turn-1',
+        ts: 1600,
+      },
+      {
+        kind: 'request-prepared',
+        attemptId: 'second-turn',
+        method: 'turn/start',
+        ts: 1700,
+      },
+      {
+        kind: 'request-write-attempted',
+        attemptId: 'second-turn',
+        method: 'turn/start',
+        requestId: 2,
+        ts: 1800,
+      },
+    ]) {
+      db.recordCodexCheckpoint({ ...base, ...checkpoint });
+    }
+    assert.equal(
+      db.raw.prepare(`
+        SELECT state FROM codex_generations WHERE generation_id = 'generation-a'
+      `).get().state,
+      'active',
+    );
+    assert.equal(
+      db.getCodexAttempt('second-turn').delivery_state,
+      'write-attempted',
+    );
+  });
+
+  test('only one Codex generation can own the daemon lease', () => {
+    db.createCodexGeneration(generation());
+    db.createCodexGeneration(generation({
+      generation_id: 'generation-b',
+      session_key: 'chat:other',
+      thread_id: 'thread-b',
+      ts: 1100,
+    }));
+    db.acquireCodexLease({
+      generation_id: 'generation-a',
+      ...identity,
+      ts: 1200,
+    });
+
+    assert.throws(
+      () => db.acquireCodexLease({
+        generation_id: 'generation-b',
+        ...identity,
+        ts: 1300,
+      }),
+      (error) => error.code === 'CODEX_DAEMON_GENERATION_BUSY',
+    );
+  });
+
+  test('checkpoint ownership, identifiers, predecessors, and duplicates are monotonic', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    const base = {
+      generationId: 'generation-a',
+      attemptId: 'attempt-a',
+      threadId: 'thread-a',
+      ...identity,
+    };
+    for (const checkpoint of [
+      { kind: 'request-prepared', method: 'turn/start', source: 'message-a', ts: 1100 },
+      { kind: 'request-write-attempted', method: 'turn/start', requestId: 'request-a', ts: 1200 },
+      {
+        kind: 'request-response-observed',
+        method: 'turn/start',
+        requestId: 'request-a',
+        outcome: 'result',
+        ts: 1300,
+      },
+      { kind: 'turn-accepted', turnId: 'turn-a', ts: 1400 },
+      {
+        kind: 'item-started',
+        turnId: 'turn-a',
+        itemId: 'item-a',
+        itemType: 'commandExecution',
+        ts: 1500,
+      },
+      {
+        kind: 'turn-terminal',
+        turnId: 'turn-a',
+        terminalStatus: 'completed',
+        ts: 1600,
+      },
+    ]) {
+      db.recordCodexCheckpoint({ ...base, ...checkpoint });
+    }
+
+    assert.equal(db.recordCodexCheckpoint({
+      ...base,
+      kind: 'item-started',
+      turnId: 'turn-a',
+      itemId: 'item-a',
+      itemType: 'commandExecution',
+      ts: 1700,
+    }).changes, 0);
+    assert.equal(db.recordCodexCheckpoint({
+      ...base,
+      kind: 'turn-terminal',
+      turnId: 'turn-a',
+      terminalStatus: 'completed',
+      ts: 1800,
+    }).changes, 0);
+    assert.throws(
+      () => db.recordCodexCheckpoint({
+        ...base,
+        kind: 'request-response-observed',
+        method: 'turn/start',
+        requestId: 'different-request',
+        outcome: 'result',
+        ts: 1900,
+      }),
+      (error) => error.code === 'CODEX_ATTEMPT_IDENTITY_MISMATCH',
+    );
+
+    db.recordCodexCheckpoint({
+      ...base,
+      kind: 'telegram-delivery-settled',
+      turnId: 'turn-a',
+      ts: 2000,
+    });
+    db.markCodexGenerationRetired({
+      generation_id: 'generation-a',
+      ts: 2100,
+    });
+    db.createCodexGeneration(generation({
+      generation_id: 'generation-b',
+      session_key: 'chat:other',
+      thread_id: 'thread-b',
+      ts: 2200,
+    }));
+    acquire('generation-b', 2300);
+
+    assert.throws(
+      () => db.recordCodexCheckpoint({
+        kind: 'thread-status-changed',
+        generationId: 'generation-a',
+        threadId: 'thread-a',
+        hostIdentity: 'host-a',
+        bootSessionIdentity: 'boot-a',
+        statusType: 'active',
+        ts: 2400,
+      }),
+      (error) => error.code === 'CODEX_CHECKPOINT_STALE_GENERATION',
+    );
+    assert.throws(
+      () => db.recordCodexItemEffect({
+        generation_id: 'generation-a',
+        attempt_id: 'attempt-a',
+        item_id: 'item-a',
+        item_type: 'commandExecution',
+        state: 'started',
+        ts: 2450,
+      }),
+      (error) => error.code === 'CODEX_CHECKPOINT_STALE_GENERATION',
+    );
+    assert.equal(
+      db.raw.prepare(`
+        SELECT state FROM codex_generations WHERE generation_id = ?
+      `).get('generation-a').state,
+      'retired',
+    );
+  });
+
+  test('numeric and string JSON-RPC request IDs remain durably distinct', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    for (const [attemptId, requestId] of [
+      ['numeric-attempt', 1],
+      ['string-attempt', '1'],
+    ]) {
+      db.recordCodexCheckpoint({
+        kind: 'request-prepared',
+        generationId: 'generation-a',
+        attemptId,
+        method: 'turn/start',
+        threadId: 'thread-a',
+        ...identity,
+        ts: 1100,
+      });
+      db.recordCodexCheckpoint({
+        kind: 'request-write-attempted',
+        generationId: 'generation-a',
+        attemptId,
+        method: 'turn/start',
+        requestId,
+        threadId: 'thread-a',
+        ...identity,
+        ts: 1200,
+      });
+    }
+
+    assert.deepEqual(
+      db.raw.prepare(`
+        SELECT attempt_id, request_id
+          FROM codex_turn_attempts
+         ORDER BY attempt_id
+      `).all(),
+      [
+        { attempt_id: 'numeric-attempt', request_id: 'number:1' },
+        { attempt_id: 'string-attempt', request_id: 'string:1' },
+      ],
+    );
+    assert.throws(
+      () => db.recordCodexCheckpoint({
+        kind: 'request-response-observed',
+        generationId: 'generation-a',
+        attemptId: 'numeric-attempt',
+        method: 'turn/start',
+        requestId: '1',
+        outcome: 'result',
+        threadId: 'thread-a',
+        ...identity,
+        ts: 1300,
+      }),
+      (error) => error.code === 'CODEX_ATTEMPT_IDENTITY_MISMATCH',
+    );
+  });
+
+  test('notification-first and response-first turn batches preserve transport ambiguity', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    const base = {
+      generationId: 'generation-a',
+      threadId: 'thread-a',
+      ...identity,
+    };
+    for (const checkpoint of [
+      {
+        kind: 'request-prepared',
+        attemptId: 'early-attempt',
+        method: 'turn/start',
+        ts: 1100,
+      },
+      {
+        kind: 'request-write-attempted',
+        attemptId: 'early-attempt',
+        method: 'turn/start',
+        requestId: 1,
+        ts: 1200,
+      },
+      {
+        kind: 'turn-started',
+        attemptId: 'early-attempt',
+        turnId: 'turn-early',
+        ts: 1300,
+      },
+      {
+        kind: 'item-started',
+        attemptId: 'early-attempt',
+        turnId: 'turn-early',
+        itemId: 'item-early',
+        itemType: 'commandExecution',
+        ts: 1400,
+      },
+      {
+        kind: 'item-delta-observed',
+        attemptId: 'early-attempt',
+        turnId: 'turn-early',
+        itemId: 'item-early',
+        deltaBytes: 12,
+        ts: 1500,
+      },
+      {
+        kind: 'item-completed',
+        attemptId: 'early-attempt',
+        turnId: 'turn-early',
+        itemId: 'item-early',
+        itemType: 'commandExecution',
+        ts: 1600,
+      },
+      {
+        kind: 'turn-terminal',
+        attemptId: 'early-attempt',
+        turnId: 'turn-early',
+        terminalStatus: 'completed',
+        ts: 1700,
+      },
+    ]) {
+      db.recordCodexCheckpoint({ ...base, ...checkpoint });
+    }
+    assert.deepEqual(
+      {
+        delivery_state: db.getCodexAttempt('early-attempt').delivery_state,
+        recovery_state: db.getCodexAttempt('early-attempt').recovery_state,
+        terminal_status: db.getCodexAttempt('early-attempt').terminal_status,
+      },
+      {
+        delivery_state: 'write-attempted',
+        recovery_state: 'ambiguous',
+        terminal_status: 'completed',
+      },
+    );
+    assert.throws(
+      () => db.recordCodexCheckpoint({
+        ...base,
+        kind: 'item-started',
+        attemptId: 'early-attempt',
+        turnId: 'turn-early',
+        itemId: 'late-item',
+        itemType: 'commandExecution',
+        ts: 1750,
+      }),
+      (error) => error.code === 'CODEX_CHECKPOINT_SEQUENCE_INVALID',
+    );
+    for (const checkpoint of [
+      {
+        kind: 'request-response-observed',
+        attemptId: 'early-attempt',
+        method: 'turn/start',
+        requestId: 1,
+        outcome: 'result',
+        ts: 1800,
+      },
+      {
+        kind: 'turn-accepted',
+        attemptId: 'early-attempt',
+        turnId: 'turn-early',
+        ts: 1900,
+      },
+    ]) {
+      db.recordCodexCheckpoint({ ...base, ...checkpoint });
+    }
+    assert.equal(
+      db.getCodexAttempt('early-attempt').recovery_state,
+      'terminal-pending',
+    );
+
+    for (const checkpoint of [
+      {
+        kind: 'request-prepared',
+        attemptId: 'response-first-attempt',
+        method: 'turn/start',
+        ts: 2000,
+      },
+      {
+        kind: 'request-write-attempted',
+        attemptId: 'response-first-attempt',
+        method: 'turn/start',
+        requestId: 2,
+        ts: 2100,
+      },
+      {
+        kind: 'request-response-observed',
+        attemptId: 'response-first-attempt',
+        method: 'turn/start',
+        requestId: 2,
+        outcome: 'result',
+        ts: 2200,
+      },
+      {
+        kind: 'turn-accepted',
+        attemptId: 'response-first-attempt',
+        turnId: 'turn-response-first',
+        ts: 2300,
+      },
+      {
+        kind: 'turn-started',
+        attemptId: 'response-first-attempt',
+        turnId: 'turn-response-first',
+        ts: 2400,
+      },
+      {
+        kind: 'turn-terminal',
+        attemptId: 'response-first-attempt',
+        turnId: 'turn-response-first',
+        terminalStatus: 'completed',
+        ts: 2500,
+      },
+    ]) {
+      db.recordCodexCheckpoint({ ...base, ...checkpoint });
+    }
+    assert.equal(
+      db.getCodexAttempt('response-first-attempt').recovery_state,
+      'terminal-pending',
+    );
+  });
+
+  test('containment makes every unsafe generation attempt reconcilable', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    const base = {
+      generationId: 'generation-a',
+      threadId: 'thread-a',
+      ...identity,
+    };
+    for (const checkpoint of [
+      {
+        kind: 'request-prepared',
+        attemptId: 'active-turn',
+        method: 'turn/start',
+        ts: 1100,
+      },
+      {
+        kind: 'request-write-attempted',
+        attemptId: 'active-turn',
+        method: 'turn/start',
+        requestId: 1,
+        ts: 1200,
+      },
+      {
+        kind: 'request-response-observed',
+        attemptId: 'active-turn',
+        method: 'turn/start',
+        requestId: 1,
+        outcome: 'result',
+        ts: 1300,
+      },
+      {
+        kind: 'turn-accepted',
+        attemptId: 'active-turn',
+        turnId: 'turn-a',
+        ts: 1400,
+      },
+      {
+        kind: 'request-prepared',
+        attemptId: 'cleanup-attempt',
+        method: 'thread/backgroundTerminals/clean',
+        ts: 1500,
+      },
+      {
+        kind: 'request-write-attempted',
+        attemptId: 'cleanup-attempt',
+        method: 'thread/backgroundTerminals/clean',
+        requestId: 2,
+        ts: 1600,
+      },
+      {
+        kind: 'request-response-observed',
+        attemptId: 'cleanup-attempt',
+        method: 'thread/backgroundTerminals/clean',
+        requestId: 2,
+        outcome: 'result',
+        ts: 1700,
+      },
+      {
+        kind: 'background-clean-accepted',
+        ts: 1800,
+      },
+      {
+        kind: 'request-prepared',
+        attemptId: 'safe-prepared',
+        method: 'turn/steer',
+        turnId: 'turn-a',
+        ts: 1900,
+      },
+      {
+        kind: 'containment-entered',
+        reason: 'notification-sink-failed',
+        ts: 2000,
+      },
+    ]) {
+      db.recordCodexCheckpoint({ ...base, ...checkpoint });
+    }
+
+    assert.deepEqual(
+      [
+        db.getCodexAttempt('active-turn').recovery_state,
+        db.getCodexAttempt('cleanup-attempt').recovery_state,
+        db.getCodexAttempt('safe-prepared').recovery_state,
+      ],
+      ['ambiguous', 'ambiguous', 'prepared'],
+    );
+    assert.equal(db.getCodexAttempt('active-turn').turn_id, 'turn-a');
+    assert.equal(db.getCodexAttempt('cleanup-attempt').request_id, 'number:2');
+    for (const attemptId of ['active-turn', 'cleanup-attempt']) {
+      assert.doesNotThrow(() => db.reconcileCodexAttempt({
+        attempt_id: attemptId,
+        disposition: 'dismissed',
+        actor: 'telegram:42',
+        reason: 'operator reviewed containment',
+        ts: 2100,
+      }));
+    }
+  });
+
+  test('linked steering and item effects persist identifiers but no raw payloads', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    for (const row of [
+      {
+        kind: 'request-prepared',
+        attemptId: 'turn-attempt',
+        method: 'turn/start',
+        ts: 1100,
+      },
+      {
+        kind: 'request-write-attempted',
+        attemptId: 'turn-attempt',
+        method: 'turn/start',
+        requestId: 1,
+        ts: 1120,
+      },
+      {
+        kind: 'request-response-observed',
+        attemptId: 'turn-attempt',
+        method: 'turn/start',
+        requestId: 1,
+        outcome: 'result',
+        ts: 1140,
+      },
+      {
+        kind: 'turn-accepted',
+        attemptId: 'turn-attempt',
+        turnId: 'turn-a',
+        ts: 1160,
+      },
+      {
+        kind: 'request-prepared',
+        attemptId: 'steer-attempt',
+        method: 'turn/steer',
+        turnId: 'turn-a',
+        source: 'message-2',
+        ts: 1200,
+      },
+    ]) {
+      db.recordCodexCheckpoint({
+        generationId: 'generation-a',
+        threadId: 'thread-a',
+        ...identity,
+        ...row,
+      });
+    }
+    db.linkCodexSteeringInput({
+      linked_input_id: 'linked-a',
+      generation_id: 'generation-a',
+      attempt_id: 'steer-attempt',
+      target_attempt_id: 'turn-attempt',
+      telegram_chat_id: 'chat',
+      telegram_message_id: '2',
+      ts: 1300,
+    });
+    assert.equal(db.linkCodexSteeringInput({
+      linked_input_id: 'linked-a',
+      generation_id: 'generation-a',
+      attempt_id: 'steer-attempt',
+      target_attempt_id: 'turn-attempt',
+      telegram_chat_id: 'chat',
+      telegram_message_id: '2',
+      ts: 1350,
+    }).changes, 0);
+    assert.throws(
+      () => db.linkCodexSteeringInput({
+        linked_input_id: 'linked-a',
+        generation_id: 'generation-a',
+        attempt_id: 'steer-attempt',
+        target_attempt_id: 'turn-attempt',
+        telegram_chat_id: 'chat',
+        telegram_message_id: 'different-message',
+        ts: 1360,
+      }),
+      (error) => error.code === 'CODEX_LINKED_INPUT_ID_REUSED',
+    );
+    assert.equal(db.recordCodexItemEffect({
+      generation_id: 'generation-a',
+      attempt_id: 'turn-attempt',
+      item_id: 'item-a',
+      item_type: 'commandExecution',
+      state: 'started',
+      ts: 1400,
+    }).changes, 1);
+    assert.equal(db.recordCodexItemEffect({
+      generation_id: 'generation-a',
+      attempt_id: 'turn-attempt',
+      item_id: 'item-a',
+      item_type: 'commandExecution',
+      state: 'completed',
+      ts: 1410,
+    }).changes, 1);
+    assert.equal(db.recordCodexItemEffect({
+      generation_id: 'generation-a',
+      attempt_id: 'turn-attempt',
+      item_id: 'item-a',
+      item_type: 'commandExecution',
+      state: 'completed',
+      ts: 1420,
+    }).changes, 0);
+    assert.throws(
+      () => db.recordCodexItemEffect({
+        generation_id: 'generation-a',
+        attempt_id: 'turn-attempt',
+        item_id: 'item-a',
+        item_type: 'commandExecution',
+        state: 'started',
+        ts: 1430,
+      }),
+      (error) => error.code === 'CODEX_EFFECT_STATE_CONFLICT',
+    );
+    assert.throws(
+      () => db.recordCodexItemEffect({
+        generation_id: 'generation-a',
+        attempt_id: 'turn-attempt',
+        item_id: 'item-a',
+        item_type: 'fileChange',
+        state: 'completed',
+        ts: 1440,
+      }),
+      (error) => error.code === 'CODEX_EFFECT_IDENTITY_MISMATCH',
+    );
+
+    assert.equal(
+      db.raw.prepare('SELECT target_attempt_id FROM codex_linked_inputs').get()
+        .target_attempt_id,
+      'turn-attempt',
+    );
+    assert.deepEqual(
+      db.raw.prepare(`
+        SELECT item_id, item_type, state
+          FROM codex_item_effects
+      `).get(),
+      {
+        item_id: 'item-a',
+        item_type: 'commandExecution',
+        state: 'completed',
+      },
+    );
+    assert.throws(
+      () => db.recordCodexItemEffect({
+        generation_id: 'generation-a',
+        attempt_id: 'turn-attempt',
+        item_id: 'item-b',
+        item_type: 'commandExecution',
+        state: 'started',
+        raw: { command: 'cat ~/.config/secrets' },
+      }),
+      (error) => error.code === 'CODEX_EFFECT_PAYLOAD_REJECTED',
+    );
+  });
 });
 
 describe('events + config_changes', () => {
@@ -288,10 +1809,53 @@ describe('events + config_changes', () => {
     assert.equal(row.user_id, 111111111);
   });
 
+  test('logConfigChanges rolls back the complete model and effort audit pair', () => {
+    assert.throws(
+      () => db.logConfigChanges([
+        {
+          chat_id: '1',
+          field: 'model',
+          old_value: 'gpt-a',
+          new_value: 'gpt-b',
+        },
+        {
+          chat_id: '1',
+          field: 'bogus',
+          old_value: 'high',
+          new_value: 'xhigh',
+        },
+      ]),
+    );
+    assert.equal(
+      db.raw.prepare('SELECT COUNT(*) AS count FROM config_changes').get().count,
+      0,
+    );
+  });
+
   test('config_changes CHECK rejects bad field', () => {
     assert.throws(
       () => db.logConfigChange({ chat_id: '1', field: 'bogus', new_value: 'x' }),
       /CHECK constraint/,
+    );
+  });
+
+  test('logConfigChange rejects malformed and cyclic values before SQLite binding', () => {
+    const cyclic = {};
+    cyclic.self = cyclic;
+    for (const newValue of [undefined, {}, cyclic, Symbol('bad'), Number.NaN]) {
+      assert.throws(
+        () => db.logConfigChange({
+          chat_id: '1',
+          field: 'runtime',
+          old_value: 'claude',
+          new_value: newValue,
+        }),
+        (error) => error.code === 'CONFIG_CHANGE_VALUE_INVALID',
+      );
+    }
+    assert.equal(
+      db.raw.prepare('SELECT COUNT(*) AS count FROM config_changes').get().count,
+      0,
     );
   });
 });

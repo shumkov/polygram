@@ -17,6 +17,7 @@ sessions.json.*
 /contrib/
 
 # Runtime
+.ipc/
 inbox/
 logs/
 node_modules/

@@ -25,7 +25,8 @@ const path = require('path');
 const processGuard = require('@shumkov/orchestra').processGuard;
 const dbClient = require('./lib/db');
 const {
-  migrateJsonToDb, getClaudeSessionId, resolveSessionForSpawn,
+  migrateJsonToDb, getClaudeSessionId, resolveProviderSessionForSpawn,
+  resolveSessionForSpawn,
 } = require('./lib/db/sessions');
 const { buildPrompt, resolvePromptBackend } = require('./lib/prompt');
 const { filterAttachments, resolveFileCaps, resolveMaxFileOverride, MAX_TOTAL_BYTES } = require('./lib/attachments');
@@ -57,6 +58,18 @@ const { sweepTmuxOrphans } = require('@shumkov/orchestra').orphanSweep;
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
 const { createBuildSdkOptions } = require('./lib/sdk/build-options');
 const { createSdkCallbacks } = require('./lib/sdk/callbacks');
+const {
+  createCodexRuntimeController,
+} = require('./lib/codex/runtime-controller');
+const {
+  buildCodexSpawnContext,
+} = require('./lib/codex/spawn-context');
+const {
+  scheduleCodexRetention,
+} = require('./lib/codex/retention-scheduler');
+const {
+  createTelegramDeliveryFinalizer,
+} = require('./lib/codex/delivery-finalizer');
 const { createQuestionStore } = require('./lib/questions/store');
 const { createQuestionHandlers } = require('./lib/handlers/questions');
 const { isRewindCommand, createRewindHandler } = require('./lib/rewind/rewind');
@@ -75,6 +88,10 @@ const { classifyReplay, executeReplayPlan } = require('./lib/handlers/replay-dis
 const { createDropRedeliverer } = require('./lib/handlers/drop-redeliver');
 const { createSessionFeedback } = require('./lib/feedback/session-feedback');
 const { createSlashCommands } = require('./lib/handlers/slash-commands');
+const {
+  buildCodexReconciliationView,
+  createHandleCodexReconciliationCallback,
+} = require('./lib/handlers/codex-reconciliation');
 const { createApprovals } = require('./lib/handlers/approvals');
 const { canonicalizeToolInput } = require('./lib/canonical-json');
 const {
@@ -480,12 +497,88 @@ async function clearAutosteeredReactions(sessionKey) {
 // once the runtime context (config, BOT_NAME, makeCanUseTool, logEvent)
 // is available.
 let buildSdkOptions = null;
+let codexRuntimeController = null;
 
-function buildSpawnContext(sessionKey) {
+async function resolveSessionRuntimeView({
+  sessionKey,
+  chatId,
+  threadId = null,
+} = {}) {
+  if (codexRuntimeController) {
+    const runtimeView = await codexRuntimeController.resolveRuntimeView({
+      sessionKey,
+      chatId,
+      threadId,
+    });
+    if (!isCodexRuntimeView(runtimeView)) return runtimeView;
+    if (typeof pm?.getModelSettingsStatus !== 'function') {
+      const error = new Error('Codex model-settings status is unavailable');
+      error.code = 'CODEX_RUNTIME_UNAVAILABLE';
+      throw error;
+    }
+    const settingsStatus = await pm.getModelSettingsStatus(sessionKey);
+    const processStatus = settingsStatus.outcome;
+    const unavailableReason = settingsStatus.reason ?? null;
+    const copySettings = (settings) => (
+      settings
+      && typeof settings.model === 'string'
+      && typeof settings.effort === 'string'
+        ? Object.freeze({
+          model: settings.model,
+          effort: settings.effort,
+        })
+        : null
+    );
+    return Object.freeze({
+      ...runtimeView,
+      desiredSettings: Object.freeze({
+        model: runtimeView.model,
+        effort: runtimeView.effort,
+      }),
+      nextTurnSettings: copySettings(settingsStatus.nextTurn),
+      observedThreadSettings: copySettings(settingsStatus.observedThread),
+      activeTurnSettings: copySettings(settingsStatus.currentTurn),
+      processStatus,
+      unavailableReason,
+    });
+  }
+  if (resolvePromptBackend({ config, chatId, threadId }) === 'codex') {
+    const error = new Error('Codex runtime controller is not initialized');
+    error.code = 'CODEX_RUNTIME_UNAVAILABLE';
+    throw error;
+  }
+  return Object.freeze({ runtime: 'claude' });
+}
+
+async function buildSpawnContext(sessionKey) {
   const chatId = getChatIdFromKey(sessionKey);
   const chatConfig = config.chats[chatId];
   if (!chatConfig) return null;
   const threadId = sessionKey.includes(':') ? sessionKey.split(':')[1] : null;
+  const promptBackend = resolvePromptBackend({
+    config,
+    chatId,
+    threadId: threadId || null,
+  });
+
+  if (promptBackend === 'codex') {
+    if (!codexRuntimeController) {
+      const error = new Error('Codex runtime controller is not initialized');
+      error.code = 'CODEX_RUNTIME_UNAVAILABLE';
+      throw error;
+    }
+    return buildCodexSpawnContext({
+      sessionKey,
+      chatId,
+      threadId: threadId || null,
+      chatConfig,
+      db,
+      pm,
+      runtimeController: codexRuntimeController,
+      getSessionLabel,
+      logEvent,
+    });
+  }
 
   // S2: a stored session is valid ONLY for the config it was spawned
   // under. agent / cwd are spawn-identity — baked into the process at
@@ -557,7 +650,7 @@ function buildSpawnContext(sessionKey) {
 }
 
 async function getOrSpawnForChat(sessionKey) {
-  const ctx = buildSpawnContext(sessionKey);
+  const ctx = await buildSpawnContext(sessionKey);
   if (!ctx) return null;
   return pm.getOrSpawn(sessionKey, ctx);
 }
@@ -573,6 +666,33 @@ async function sendToProcess(sessionKey, prompt, context = {}, { onDispatched } 
   // extending while provably working (cli backend). Per-chat → default →
   // 90 min. The checkpoint never extends a turn past this.
   const maxTurnHardMs = (chatConfig.maxTurnHard || config.defaults?.maxTurnHard || 5400) * 1000;
+
+  // CodexProcess owns a bounded cancellable queue. Commit the send into that
+  // queue immediately so /stop can reject it; the full-turn stdin lock below
+  // exists only to prevent Claude stream-json batching.
+  if (
+    entry.runtime === 'codex'
+    || entry.backend === 'codex'
+  ) {
+    if (
+      context.codexDispatchGenerationId
+      && entry.generationId !== context.codexDispatchGenerationId
+    ) {
+      const error = new Error(
+        'Codex queue authorization belongs to a replaced generation',
+      );
+      error.code = 'CODEX_DISPATCH_GENERATION_CHANGED';
+      throw error;
+    }
+    const turnP = pm.send(sessionKey, prompt, {
+      timeoutMs,
+      maxTurnMs,
+      maxTurnHardMs,
+      context,
+    });
+    if (typeof onDispatched === 'function') onDispatched();
+    return await turnP;
+  }
 
   // 0.12 Phase 2.1: HeartbeatReactor binding removed for CliProcess.
   // 0.11.0-channels needed a random-cycling working-pool reactor because
@@ -644,6 +764,7 @@ let attemptAutoResume = null;
 let errorReplyText = null;
 let queueWarnThreshold = null;
 let inFlightHandlers = null;
+let recoverCodexRequest = null;
 
 // AUTH_DISABLED (docs/AUTH_DISABLED_HANDLING_SPEC.md): dedupe/re-arm gate for
 // the operator notification (dispatcher.js) + Netdata-visibility heartbeat
@@ -725,12 +846,14 @@ const {
   MODEL_OPTIONS,
   EFFORT_OPTIONS,
   MODEL_VERSIONS_DESC,
+  isCodexRuntimeView,
 } = require('./lib/handlers/config-ui');
 let formatConfigInfoText = null;
 // CRITICAL: these placeholders MUST exist or 'use strict' boot fails
 // with ReferenceError. v4 review (commit 39) found 4 missing — restored.
 // Each handler is wired in main() once its deps exist.
 let handleConfigCallback = null;
+let handleCodexReconciliationCallback = null;
 let handleAbortIfRequested = null;
 let autosteer = null;
 let dispatchSlashCommand = null;
@@ -782,6 +905,23 @@ function parsePairCodeArgs(text) {
 async function handleMessage(sessionKey, chatId, msg, bot) {
   const chatConfig = config.chats[chatId];
   if (!chatConfig) return;
+  const selectedInboundProvider = resolvePromptBackend({
+    config,
+    chatId,
+    threadId: msg.message_thread_id?.toString() || null,
+  }) === 'codex'
+    ? 'codex'
+    : 'claude';
+  if (
+    msg._requiredProvider
+    && msg._requiredProvider !== selectedInboundProvider
+  ) {
+    const error = new Error(
+      `Recovery requires ${msg._requiredProvider}, but the session now selects ${selectedInboundProvider}`,
+    );
+    error.code = 'PROVIDER_RECOVERY_SELECTION_CHANGED';
+    throw error;
+  }
 
   // Mark the inbound row as 'dispatched' so the boot replay loop knows
   // this turn started. Cleared to 'replied' (or 'failed') when done.
@@ -792,6 +932,17 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     dbWrite(() => db.setInboundHandlerStatus({
       chat_id: chatId, msg_id: msg.message_id, status: 'dispatched',
     }), 'set handler_status=dispatched');
+    // This write is deliberately not best-effort: provider choice is the
+    // replay fence. A conflicting duplicate must stop before any provider
+    // process, reservation, or RPC observes the input.
+    db.recordInboundRuntimeSelection({
+      session_key: sessionKey,
+      bot_name: BOT_NAME,
+      telegram_chat_id: String(chatId),
+      telegram_message_id: String(msg.message_id),
+      provider: selectedInboundProvider,
+      ts: Date.now(),
+    });
   }
 
   const text = msg.text || msg.caption || '';
@@ -829,9 +980,15 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // command — which post-compaction lands in a stale-session state and
   // emits "🗜️ No active session — /compact only works once a turn has
   // started." Visible duplicate-reply UX bug.
-  const markReplied = () => dbWrite(() => db.setInboundHandlerStatus({
-    chat_id: chatId, msg_id: msg.message_id, status: 'replied',
-  }), 'set handler_status=replied');
+  const markHandlerStatus = (status) => dbWrite(
+    () => db.setInboundHandlerStatus({
+      chat_id: chatId,
+      msg_id: msg.message_id,
+      status,
+    }),
+    `set handler_status=${status}`,
+  );
+  const markReplied = () => markHandlerStatus('replied');
 
   // sendReply accepts (text, meta?) with optional extra Telegram params
   // pulled out via meta.params (kept separate so meta stays for DB tags).
@@ -856,9 +1013,47 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // (2026-06-03). getTopicConfig returns {} when there's no active topic.
     const _cardTopicCfg = getTopicConfig(chatConfig, threadIdStr || null);
     const effectiveRichText = resolveRichTextEnabled(config, chatId, threadIdStr || null);
-    const info = formatConfigInfoText(chatConfig, show, sessionKey, _cardTopicCfg, effectiveRichText);
-    const reply_markup = buildConfigKeyboard(chatConfig, show, _cardTopicCfg, effectiveRichText);
+    let runtimeView;
+    try {
+      runtimeView = await resolveSessionRuntimeView({
+        sessionKey,
+        chatId,
+        threadId: threadIdStr || null,
+      });
+    } catch (error) {
+      console.error(
+        `[${label}] config card runtime view failed: `
+          + `${error?.code || error?.name || 'unknown'}`,
+      );
+      await sendReply('Configuration is temporarily unavailable.');
+      return;
+    }
+    const info = await formatConfigInfoText(
+      chatConfig,
+      show,
+      sessionKey,
+      _cardTopicCfg,
+      effectiveRichText,
+      runtimeView,
+    );
+    const reply_markup = buildConfigKeyboard(
+      chatConfig,
+      show,
+      _cardTopicCfg,
+      effectiveRichText,
+      runtimeView,
+    );
     await sendReply(info, { params: { reply_markup } });
+    if (text === '/config' && isCodexRuntimeView(runtimeView)) {
+      for (const attempt of db.listUnresolvedCodexAttempts({
+        session_key: sessionKey,
+      })) {
+        const view = buildCodexReconciliationView(attempt);
+        await sendReply(view.text, {
+          params: { reply_markup: view.reply_markup },
+        });
+      }
+    }
     return;
   }
   // Slash command dispatch — extracted to lib/handlers/slash-commands.js.
@@ -883,22 +1078,24 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // read, and a token can expire between an original dispatch and its later
   // redelivery, so skipping it there would silently re-wedge exactly the
   // messages most likely to hit an expired-auth window (post-restart backlog).
-  let auth;
-  try {
-    auth = checkClaudeAuthHealth();
-  } catch (err) {
-    console.error(`[auth] health check failed: ${err.message}`);
-    auth = { state: 'unknown' };
-  }
-  if (auth.state === 'expired') {
-    const expIso = new Date(auth.refreshTokenExpiresAt).toISOString();
-    console.error(`[auth] Claude login EXPIRED (refresh token ${expIso}) — refusing turn for ${label}; re-login on the host.`);
-    logEvent('auth-expired', {
-      session_key: sessionKey, chat_id: chatId, source: 'dispatch-gate',
-      refresh_token_expires_at: auth.refreshTokenExpiresAt,
-    });
-    await sendReply('🔑 Claude login has expired and needs to be re-authenticated. Messages can\'t be processed until the login is refreshed on the host.');
-    return;
+  if (selectedInboundProvider === 'claude') {
+    let auth;
+    try {
+      auth = checkClaudeAuthHealth();
+    } catch (err) {
+      console.error(`[auth] health check failed: ${err.message}`);
+      auth = { state: 'unknown' };
+    }
+    if (auth.state === 'expired') {
+      const expIso = new Date(auth.refreshTokenExpiresAt).toISOString();
+      console.error(`[auth] Claude login EXPIRED (refresh token ${expIso}) — refusing turn for ${label}; re-login on the host.`);
+      logEvent('auth-expired', {
+        session_key: sessionKey, chat_id: chatId, source: 'dispatch-gate',
+        refresh_token_expires_at: auth.refreshTokenExpiresAt,
+      });
+      await sendReply('🔑 Claude login has expired and needs to be re-authenticated. Messages can\'t be processed until the login is refreshed on the host.');
+      return;
+    }
   }
 
   const t0 = Date.now();
@@ -1314,7 +1511,21 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // Skip the 🤔 → ✍ flash for messages that are about to be
   // autosteered. willAutosteer evaluates the same pre-condition
   // tryAutosteer would.
-  if (!voiceAck.ackEmitted && !autosteer.willAutosteer(sessionKey, chatConfig)) {
+  const feedbackEntry = pm.get(sessionKey);
+  const pendingCodexFollowup = Boolean(
+    feedbackEntry
+    && !feedbackEntry.closed
+    && feedbackEntry.inFlight
+    && (
+      feedbackEntry.runtime === 'codex'
+      || feedbackEntry.backend === 'codex'
+    ),
+  );
+  if (
+    !voiceAck.ackEmitted
+    && !pendingCodexFollowup
+    && !autosteer.willAutosteer(sessionKey, chatConfig)
+  ) {
     reactor.setState('THINKING');
   }
 
@@ -1347,9 +1558,182 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const releaseIntent = await intentLock.acquire(sessionKey);
   let steered = { autosteered: false };
   let sendPromise = null;
+  let codexDispatch = null;
+  let codexDispatchDecision = null;
   try {
-    steered = autosteer.tryAutosteer({ sessionKey, chatConfig, chatId, msg, prompt });
-    if (!steered.autosteered) {
+    const current = pm.get(sessionKey);
+    const liveCodexGeneration = Boolean(
+      current
+      && !current.closed
+      && current.inFlight
+      && typeof current.generationId === 'string'
+      && (
+        current.runtime === 'codex'
+        || current.backend === 'codex'
+      ),
+    );
+    if (liveCodexGeneration) {
+      if (!codexRuntimeController) {
+        codexDispatchDecision = 'unavailable';
+      } else {
+        try {
+          const dispatchClaim = codexRuntimeController.claimDispatchReservation({
+            sessionKey,
+            generationId: current.generationId,
+            botName: BOT_NAME,
+            telegramChatId: String(chatId),
+            telegramMessageId: String(msg.message_id),
+          });
+          codexDispatch = {
+            reservationId: dispatchClaim.reservationId,
+            generationId: dispatchClaim.generationId,
+            state: dispatchClaim.reservation?.state,
+          };
+          if (!dispatchClaim.claimed) {
+            codexDispatchDecision = 'duplicate';
+          } else {
+            steered = await autosteer.tryCodexAutosteer({
+              sessionKey,
+              chatConfig,
+              chatId,
+              msg,
+              prompt,
+            });
+            if (steered.outcome === 'accepted') {
+              try {
+                codexRuntimeController.finalizeAcceptedSteer({
+                  sessionKey,
+                  generationId: codexDispatch.generationId,
+                  reservationId: codexDispatch.reservationId,
+                  steerAttemptId: steered.attemptId,
+                  targetAttemptId: steered.targetAttemptId,
+                });
+                codexDispatchDecision = 'accepted';
+              } catch (error) {
+                try {
+                  codexRuntimeController.markDispatchDisposition({
+                    sessionKey,
+                    generationId: codexDispatch.generationId,
+                    reservationId: codexDispatch.reservationId,
+                    disposition: 'ambiguous',
+                  });
+                } catch {
+                  // The generation may have changed after app-server
+                  // acceptance. It is still unsafe to queue the input.
+                }
+                steered = { autosteered: false, outcome: 'ambiguous' };
+                codexDispatchDecision = 'ambiguous';
+                console.error(
+                  `[${label}] Codex steer linkage failed closed: `
+                    + `${error?.code || error?.name || 'unknown'}`,
+                );
+              }
+            } else if (steered.outcome === 'ambiguous') {
+              try {
+                codexRuntimeController.markDispatchDisposition({
+                  sessionKey,
+                  generationId: codexDispatch.generationId,
+                  reservationId: codexDispatch.reservationId,
+                  disposition: 'ambiguous',
+                });
+              } catch {
+                // Generation drift is itself ambiguous. Never queue.
+              }
+              codexDispatchDecision = 'ambiguous';
+            } else if (steered.outcome === 'unavailable') {
+              codexRuntimeController.markDispatchDisposition({
+                sessionKey,
+                generationId: codexDispatch.generationId,
+                reservationId: codexDispatch.reservationId,
+                disposition: 'cancelled',
+              });
+              codexDispatchDecision = 'unavailable';
+            } else {
+              // Queue mode, a definitely-not-sent steer, disabled
+              // autosteer, and a turn that became idle all converge on
+              // the ordinary CodexProcess queue.
+              const queueEntry = pm.get(sessionKey);
+              const sameQueueGeneration = (
+                queueEntry
+                && !queueEntry.closed
+                && queueEntry.generationId === codexDispatch.generationId
+              );
+              if (
+                sameQueueGeneration
+                && ['Active', 'Idle', 'StartingTurn']
+                  .includes(queueEntry.state)
+              ) {
+                codexRuntimeController.markDispatchDisposition({
+                  sessionKey,
+                  generationId: codexDispatch.generationId,
+                  reservationId: codexDispatch.reservationId,
+                  disposition: 'queue-authorized',
+                });
+                codexDispatchDecision = 'queue';
+              } else if (sameQueueGeneration) {
+                codexRuntimeController.markDispatchDisposition({
+                  sessionKey,
+                  generationId: codexDispatch.generationId,
+                  reservationId: codexDispatch.reservationId,
+                  disposition: 'cancelled',
+                });
+                codexDispatchDecision = 'unavailable';
+              } else {
+                try {
+                  codexRuntimeController.markDispatchDisposition({
+                    sessionKey,
+                    generationId: codexDispatch.generationId,
+                    reservationId: codexDispatch.reservationId,
+                    disposition: 'ambiguous',
+                  });
+                } catch {
+                  // The stale generation can no longer be mutated safely.
+                }
+                codexDispatchDecision = 'ambiguous';
+              }
+            }
+          }
+        } catch (error) {
+          if (codexDispatch) {
+            try {
+              codexRuntimeController.markDispatchDisposition({
+                sessionKey,
+                generationId: codexDispatch.generationId,
+                reservationId: codexDispatch.reservationId,
+                disposition: 'ambiguous',
+              });
+            } catch {
+              // Preserve the conservative classification even when the
+              // durable owner changed before the transition.
+            }
+            codexDispatchDecision = 'ambiguous';
+          } else {
+            codexDispatchDecision = 'unavailable';
+          }
+          console.error(
+            `[${label}] Codex dispatch reservation failed closed: `
+              + `${error?.code || error?.name || 'unknown'}`,
+          );
+        }
+      }
+    } else {
+      // Preserve Claude's synchronous injection path and timing.
+      steered = autosteer.tryAutosteer({
+        sessionKey,
+        chatConfig,
+        chatId,
+        msg,
+        prompt,
+      });
+    }
+    if (
+      !steered.autosteered
+      && !['duplicate', 'ambiguous', 'unavailable']
+        .includes(codexDispatchDecision)
+    ) {
+      if (codexDispatchDecision === 'queue') {
+        reactor.setState('THINKING');
+      }
       // Primary turn. Kick off the dispatch and hold the latch until
       // pm.send has made the process inFlight (onDispatched). The
       // turn RESULT is awaited only AFTER the latch is released — the
@@ -1363,6 +1747,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           // the question lifecycle (callbacks.js onQuestionAsked/-Resumed) can
           // pause it while the bot waits on the USER and resume on the answer.
           streamer, reactor, typing: stopTyping, sourceMsgId: msg.message_id,
+          codexDispatchReservationId: codexDispatch?.reservationId,
+          codexDispatchGenerationId: codexDispatch?.generationId,
           // 0.7.4 (item B): fire THINKING when Claude actually starts
           // emitting — not the moment we wrote stdin.
           onFirstStream: () => reactor.setState('THINKING'),
@@ -1374,6 +1760,46 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   } finally {
     releaseIntent();
   }
+  if (codexDispatchDecision === 'duplicate') {
+    stopTyping();
+    reactor.stop();
+    const terminalDuplicateStatus = (
+      codexDispatch?.state === 'settled'
+        ? 'replied'
+        : ['failed', 'interrupted', 'cancelled'].includes(codexDispatch?.state)
+          ? 'failed'
+          : codexDispatch?.state === 'ambiguous'
+            ? 'codex-ambiguous'
+            : null
+    );
+    if (terminalDuplicateStatus) {
+      dbWrite(() => db.setInboundHandlerStatus({
+        chat_id: chatId,
+        msg_id: msg.message_id,
+        status: terminalDuplicateStatus,
+      }), 'restore duplicate Codex handler status');
+    }
+    return;
+  }
+  if (['ambiguous', 'unavailable'].includes(codexDispatchDecision)) {
+    stopTyping();
+    await reactor.clear().catch(() => {});
+    reactor.stop();
+    const sendCodexDispatchNotice = (notice) => tg(bot, 'sendMessage', {
+      chat_id: chatId,
+      text: notice,
+      ...replyOpts(threadId),
+    }, {
+      source: 'codex-autosteer-notice',
+      botName: BOT_NAME,
+    });
+    await sendCodexDispatchNotice(
+      codexDispatchDecision === 'ambiguous'
+        ? 'This follow-up may have been incorporated. Please wait for the current turn to finish before retrying it.'
+        : 'I couldn’t add that follow-up while the current turn was stopping. Please send it again after the turn finishes.',
+    );
+    return;
+  }
   if (steered.autosteered) {
     stopTyping();
     // setState('AUTOSTEERED') is terminal — bypasses throttle,
@@ -1382,15 +1808,36 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // AUTOSTEERED is terminal; stop the reactor's STALL / TIMEOUT
     // timers so they don't pin the closure for up to 30s.
     reactor.stop();
-    markReplied();
     return;
   }
 
+  let deliveryFinalizer = null;
   try {
     const result = await sendPromise;
     // sendToProcess failures are captured (not thrown) so the latch
     // always releases; re-throw here into the existing handler.
     if (result && result.__sendError) throw result.__sendError;
+    let telegramDeliveryComplete = true;
+    deliveryFinalizer = createTelegramDeliveryFinalizer({
+      controller: codexRuntimeController,
+      sessionKey,
+      result,
+      queuedDispatch: (
+        codexDispatchDecision === 'queue'
+        && codexDispatch?.reservationId
+      )
+        ? {
+            reservationId: codexDispatch.reservationId,
+            botName: BOT_NAME,
+            telegramChatId: String(chatId),
+            telegramMessageId: String(msg.message_id),
+          }
+        : null,
+      markHandlerStatus,
+    });
+    const finalizeResultDelivery = (deliveryComplete = true) => (
+      deliveryFinalizer.finalize(deliveryComplete)
+    );
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
     // 0.7.6 (item F): persist per-turn telemetry. Stream-json result
@@ -1560,7 +2007,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // a placeholder so the user doesn't see silence with no reaction.
     // NO_REPLY is an explicit "stay silent" signal from the agent —
     // those still markReplied silently.
-    if (result.text === 'NO_REPLY') { markReplied(); return; }
+    if (result.text === 'NO_REPLY') {
+      await finalizeResultDelivery();
+      return;
+    }
     if (!result.text) {
       // 0.8.0-rc.7: tool-only completion is NOT an error. Under SDK
       // pm, a turn that ends after running tools (no closing text
@@ -1581,7 +2031,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           num_tool_uses: result.metrics?.numToolUses,
           num_assistant_messages: result.metrics?.numAssistantMessages,
         });
-        markReplied();
+        await finalizeResultDelivery();
         return;
       }
       // 0.7.1: if the fallback send itself fails, throw rather than
@@ -1615,7 +2065,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // does NOT remove the visible emoji. Without this clear, the
       // user sees 👀 next to their message indefinitely.
       await reactor.clear().catch(() => {});
-      markReplied();
+      await finalizeResultDelivery();
       return;
     }
 
@@ -1640,7 +2090,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       reactor.clear().catch(() => {});
       clearAutosteeredReactions(sessionKey).catch(() => {});
       console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | channels-delivered | ${chatConfig.model}/${chatConfig.effort}`);
-      markReplied();
+      await finalizeResultDelivery();
       return;
     }
 
@@ -1781,7 +2231,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           }
           clearAutosteeredReactions(sessionKey).catch(() => {});
           console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
-          markReplied();
+          await finalizeResultDelivery(
+            !mediaContext.deliveryIncomplete && telegramDeliveryComplete,
+          );
           return;
         }
         // Preview can't hold the final body (overflow OR last edit
@@ -1842,7 +2294,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         }
         clearAutosteeredReactions(sessionKey).catch(() => {});
         console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | streamed-redeliver(${reason}, ${chunks.length} chunks${r.failed.length ? `, ${r.failed.length} failed` : ''}) | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
-        markReplied();
+        await finalizeResultDelivery(
+          !mediaContext.deliveryIncomplete && telegramDeliveryComplete,
+        );
         return;
       }
       // Not streamed (response too short — never crossed minChars).
@@ -1855,6 +2309,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         message_id: msg.message_id,
         reaction: [{ type: 'emoji', emoji: parsed.reaction }],
       }, outMeta).catch((err) => {
+        telegramDeliveryComplete = false;
         console.error(`[${label}] setMessageReaction failed: ${err.message}`);
       });
     } else if (parsed.sticker) {
@@ -1863,6 +2318,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         sticker: parsed.sticker,
         ...(threadId && { message_thread_id: threadId }),
       }, { ...outMeta, stickerName: parsed.stickerLabel }).catch((err) => {
+        telegramDeliveryComplete = false;
         console.error(`[${label}] sendSticker failed: ${err.message}`);
       });
     } else if (parsed.text) {
@@ -1876,7 +2332,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         ? stripMediaMarkdown(parsed.text)
         : parsed.text;
       const chunks = chunkMarkdownText(shortText, TG_CHUNK_BUDGET);
-      await deliverReplies({
+      const deliveryResult = await deliverReplies({
         bot,
         send: (b, method, params, m) => tg(b, method, params, m),
         chatId,
@@ -1886,6 +2342,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         meta: outMeta,
         logger: { error: (m) => console.error(`[${label}] ${m}`) },
       });
+      mediaContext.recordTextFailures(deliveryResult.failed.length);
     }
 
     await mediaContext.flushPartialDeliveryWarning(outMetaBase);
@@ -1912,8 +2369,22 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // without breaking NEW-TURN.
     clearAutosteeredReactions(sessionKey).catch(() => {});
     console.log(`[${label}] ${elapsed}s | ${result.text.length} chars | ${chatConfig.model}/${chatConfig.effort} | $${result.cost?.toFixed(4) || '?'}`);
-    markReplied();
+    await finalizeResultDelivery(
+      !mediaContext.deliveryIncomplete && telegramDeliveryComplete,
+    );
   } catch (err) {
+    let deliverySettlementError = null;
+    try {
+      await deliveryFinalizer?.failIfPending();
+    } catch (settlementError) {
+      deliverySettlementError = settlementError;
+      logEvent('codex-telegram-delivery-failure-settlement-failed', {
+        chat_id: chatId,
+        msg_id: msg.message_id,
+        bot: BOT_NAME,
+        code: settlementError?.code || settlementError?.name || 'unknown',
+      });
+    }
     // If the user just aborted this session, silently finalise the stream
     // without the scary "⚠ stream interrupted" banner. The user has already
     // seen their "Остановлено." ack; adding a warning to the partial bubble
@@ -1955,6 +2426,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       await streamer.finalize('', errorSuffix ? { errorSuffix } : {}).catch(() => {});
       reactor.setState(reactorState);
     }
+    if (deliverySettlementError) throw deliverySettlementError;
     throw err;
   } finally {
     stopTyping();
@@ -2125,6 +2597,11 @@ function createBot(token) {
     handleAbortIfRequested: (...a) => handleAbortIfRequested(...a),
     getRewindHandler: () => rewindHandler,
     isRewindCommand,
+    resolveRuntime: ({ chatId, threadId }) => resolvePromptBackend({
+      config,
+      chatId,
+      threadId: threadId || null,
+    }),
     getQuestionHandlers: () => questionHandlers,
     shouldHandle,
     getSessionKey,
@@ -2249,6 +2726,10 @@ function createBot(token) {
       const data = ctx.callbackQuery.data;
       if (data.startsWith('cfg:')) {
         await handleConfigCallback(ctx);
+      } else if (data.startsWith('cxr:')) {
+        if (handleCodexReconciliationCallback) {
+          await handleCodexReconciliationCallback(ctx);
+        }
       } else if (data.startsWith('q:')) {
         if (questionHandlers) await questionHandlers.handleQuestionCallback(ctx);
       } else {
@@ -2298,9 +2779,9 @@ function createBot(token) {
         });
         return;
       }
-      // Mid-turn (turn still in flight) → fold into the running turn via the 0.9.0
-      // injector. Post-turn (idle) — OR the injector no-ops because the turn just
-      // settled at the boundary — → re-dispatch as a NEW turn (edit re-delivery).
+      // Claude can fold a same-message re-edit into its running turn. Codex
+      // defers the edited content until the same generation is idle, then
+      // re-dispatches it as a provider-pinned visible turn.
       const injected = maybeInjectEditCorrection?.(ctx.editedMessage);
       if (!injected) maybePostTurnEdit?.(ctx.editedMessage, oldText, botUsername, mentionRe);
     } catch (err) {
@@ -2376,6 +2857,11 @@ let startPollWatchdog = null;
 
 async function main() {
   const cgroupOomObserver = createCgroupOomObserver();
+  let codexManagerOptions = Object.freeze({
+    codexHostIdentity: null,
+    codexBootSessionIdentity: null,
+    codexRecoveryState: Object.freeze({ status: 'clear' }),
+  });
   loadConfig();
 
   let dbOverride;
@@ -2406,6 +2892,18 @@ async function main() {
   loadStickers();
   DB_PATH = dbOverride || path.join(DB_DIR, `${BOT_NAME}.db`);
   console.log(`[polygram] bot: ${BOT_NAME} (${Object.keys(config.chats).length} chats) db: ${DB_PATH}`);
+  let ipcRuntimeDir;
+  try {
+    ipcRuntimeDir = ipcServer.ensureRuntimeDirectory();
+    process.env.POLYGRAM_IPC_DIR = ipcRuntimeDir;
+    ipcServer.socketPathFor(BOT_NAME);
+  } catch (error) {
+    console.error(
+      `[fatal] IPC runtime directory is unsafe or unavailable (${error.code || 'IPC_DIR_INVALID'})`,
+    );
+    process.exit(2);
+    return;
+  }
   const sessionLauncher = process.env.ORCHESTRA_SESSION_LAUNCHER;
   const requireExistingServer = process.env.ORCHESTRA_TMUX_REQUIRE_SERVER === '1';
   console.log(`[polygram] session containment configured: ${sessionLauncher ? 'yes' : 'no'}`);
@@ -2449,6 +2947,39 @@ async function main() {
   try {
     db = dbClient.open(DB_PATH);
     console.log(`[db] opened ${DB_PATH}`);
+    try {
+      codexRuntimeController = createCodexRuntimeController({
+        config,
+        db,
+        defaultDaemonSecretRoots: [
+          DATA_DIR,
+          ipcRuntimeDir,
+          path.dirname(CONFIG_PATH),
+          path.join(process.env.HOME || DATA_DIR, '.claude'),
+        ],
+        logger: console,
+      });
+    } catch (error) {
+      codexRuntimeController = null;
+      console.warn(
+        `[codex] runtime unavailable; Claude remains enabled: ${error.message}`,
+      );
+    }
+    if (codexRuntimeController) {
+      try {
+        const codexBoot = codexRuntimeController.initialize();
+        codexManagerOptions = codexBoot.managerOptions;
+        if (codexBoot.recovery.status === 'quarantined') {
+          console.warn(
+            `[codex] runtime quarantined at boot (${codexBoot.recovery.reason || 'unknown'})`,
+          );
+        }
+      } catch (error) {
+        console.warn(
+          `[codex] runtime unavailable; Claude remains enabled: ${error.message}`,
+        );
+      }
+    }
     tg = createSender(db, console, config);
     richMediaFileIdCache = createMediaFileIdCache();
     richEditMessageText = createRichEditor({
@@ -2525,6 +3056,7 @@ async function main() {
     setImmediate(() => runEventsPrune('boot'));
     setInterval(() => runEventsPrune('interval'), 24 * 3_600_000).unref?.();
   }
+  scheduleCodexRetention({ db, logEvent, logger: console });
 
   // #5 secret redaction — background sweep (deterministic floor). Conservative:
   // DISABLED unless config.defaults.secret_sweep.enabled; dryRun defaults ON, so
@@ -2806,7 +3338,7 @@ async function main() {
   });
   const channelsClaudeBin = pinnedClaudeBin;
 
-  const processFactory = createProcessFactory({
+  const orchestraProcessFactory = createProcessFactory({
     config,
     spawnFn: buildSdkOptions,
     db,
@@ -2836,7 +3368,17 @@ async function main() {
     // normally supersedes this; kept so any context-less spawn still gets the backend
     // default rather than orchestra's neutral 100MB).
     maxOutboundFileBytes: resolveFileCaps({ localApi: !!config.bot?.apiRoot }).outBytes,
+    codexClientFactory: codexRuntimeController?.clientFactory,
+    codexCheckpointSink: codexRuntimeController?.checkpointSink,
+    codexExpectedStaticProfile: codexRuntimeController?.resolveReceipt,
+    codexHostIdentity: codexManagerOptions.codexHostIdentity,
+    codexBootSessionIdentity: codexManagerOptions.codexBootSessionIdentity,
   });
+  const processFactory = (sessionKey, spawnContext) => {
+    const proc = orchestraProcessFactory(sessionKey, spawnContext);
+    if (proc?.runtime === 'codex') codexRuntimeController.registerProcess(proc);
+    return proc;
+  };
   // Route in-process approval prompts through the SAME canUseTool plumbing
   // that SDK chats use:
   //   - SdkProcess: SDK callbacks fire 'approval-required' via its own
@@ -2883,6 +3425,7 @@ async function main() {
     logger: console,
     callbacks: sdkCallbacks,
     budget: cap,
+    ...codexManagerOptions,
   });
   // formatConfigInfoText MUST be wired BEFORE createHandleConfigCallback
   // — the latter destructures formatConfigInfoText from its deps at
@@ -2890,11 +3433,16 @@ async function main() {
   // caught this as the same class as the v3 BLOCKER.
   formatConfigInfoText = createFormatConfigInfoText({
     pm, db, getClaudeSessionId,
+    resolveRuntimeView: resolveSessionRuntimeView,
   });
   handleConfigCallback = createHandleConfigCallback({
-    config, db, dbWrite, pm, getSessionKey,
+    config, db, dbWrite, pm, intentLock, getSessionKey,
     formatConfigInfoText, buildConfigKeyboard, saveConfig,
+    resolveRuntimeView: resolveSessionRuntimeView,
     botName: BOT_NAME, logger: console,
+  });
+  handleCodexReconciliationCallback = createHandleCodexReconciliationCallback({
+    config, db, intentLock, getSessionKey, logger: console,
   });
   handleAbortIfRequested = createHandleAbort({
     pm, bot, tg, logEvent, isAbortRequest,
@@ -2922,6 +3470,14 @@ async function main() {
   } = createDispatcher({
     config, db, dbWrite, tg, botName: BOT_NAME, logEvent,
     handleMessage, sendToProcess,
+    recoverCodex: (input) => {
+      if (typeof recoverCodexRequest !== 'function') {
+        const error = new Error('Exact Codex recovery path is unavailable');
+        error.code = 'CODEX_RECOVERY_UNAVAILABLE';
+        throw error;
+      }
+      return recoverCodexRequest(input);
+    },
     classifyError, isAutoResumable,
     abortGrace, autoResumeTracker,
     chunkMarkdownText, deliverReplies,
@@ -2932,9 +3488,9 @@ async function main() {
     logger: console,
   }));
   // 0.12.0 post-turn edit re-delivery: constructed AFTER dispatchHandleMessage is assigned (above).
-  // An edit while a turn is in flight folds via maybeInjectEditCorrection; an edit after the turn
-  // (or when the injector no-ops at the boundary) re-dispatches as a new turn. The on-edit 👀 is a
-  // pre-turn ack for the cold-spawn gap; the synthetic turn's own reactor then takes over the msg.
+  // Claude keeps its same-message fold behavior. Codex defers edits to the
+  // exact live generation's idle boundary and then re-dispatches them as
+  // provider-pinned turns. The on-edit 👀 acknowledges the deferred action.
   maybePostTurnEdit = createEditRedelivery({
     pm, config, getSessionKey, shouldHandle, dispatchHandleMessage, bot,
     react: (chatId, msgId) => applyReactionToMessages({
@@ -2956,6 +3512,29 @@ async function main() {
     }).catch(() => {}),
     bot, logEvent, logger: console,
   });
+  recoverCodexRequest = async ({
+    sessionKey,
+    chatId,
+    msg,
+    bot: recoveryBot,
+    providerRecovery,
+  }) => {
+    if (providerRecovery?.provider !== 'codex') {
+      return { ok: false, reason: 'provider recovery is not exact Codex' };
+    }
+    await handleMessage(
+      sessionKey,
+      String(chatId),
+      {
+        ...msg,
+        _isReplay: true,
+        _requiredProvider: 'codex',
+        _codexAutoResume: true,
+      },
+      recoveryBot,
+    );
+    return { ok: true };
+  };
   dropRedeliverer = createDropRedeliverer({
     db, redeliver: redeliverAsFreshTurn, logEvent, logger: console,
   });
@@ -2965,10 +3544,11 @@ async function main() {
     logger: console,
   }));
   dispatchSlashCommand = createSlashCommands({
-    config, db, dbWrite, pm, pairings, parsePairingTtl,
+    config, db, dbWrite, pm, intentLock, pairings, parsePairingTtl,
     contextHintShown, formatContextReply, getClaudeSessionId,
     getOrSpawnForChat, parsePairCodeArgs,
     modelVersionsDesc: MODEL_VERSIONS_DESC, saveConfig,
+    resolveRuntimeView: resolveSessionRuntimeView,
     botName: BOT_NAME, logEvent, logger: console,
   });
   console.log('[polygram] using SDK ProcessManager');
@@ -3263,7 +3843,37 @@ async function main() {
         return msg;
       };
 
-      const plan = classifyReplay({ candidates, cleanShutdown, hasCompletedTurn, announceable });
+      const replaySessionKey = (row) => {
+        const chatConfig = config.chats[row.chat_id];
+        if (!chatConfig) return null;
+        const threadId = row.thread_id == null
+          ? null
+          : String(row.thread_id);
+        return getSessionKey(row.chat_id, threadId, chatConfig);
+      };
+      const getProviderRecovery = (row) => {
+        const sessionKey = replaySessionKey(row);
+        if (!sessionKey) {
+          return {
+            provider: 'unknown',
+            reason: 'session-configuration-missing',
+          };
+        }
+        return db.getReplayProviderRecovery({
+          sessionKey,
+          botName: BOT_NAME,
+          telegramChatId: String(row.chat_id),
+          telegramMessageId: String(row.msg_id),
+        });
+      };
+
+      const plan = classifyReplay({
+        candidates,
+        cleanShutdown,
+        hasCompletedTurn,
+        announceable,
+        getProviderRecovery,
+      });
 
       const result = await executeReplayPlan({
         plan,
@@ -3273,9 +3883,47 @@ async function main() {
           recover: async (row) => {
             const chatConfig = config.chats[row.chat_id];
             if (!chatConfig) return { ok: false };
+            const selected = resolvePromptBackend({
+              config,
+              chatId: row.chat_id,
+              threadId: row.thread_id == null ? null : String(row.thread_id),
+            }) === 'codex'
+              ? 'codex'
+              : 'claude';
+            if (selected !== 'claude') return { ok: false };
+            const msg = reconstruct(row);
+            msg._requiredProvider = 'claude';
             return redeliverAsFreshTurn({
-              chatId: row.chat_id, msg: reconstruct(row),
+              chatId: row.chat_id, msg,
               source: 'boot-replay', preMark: 'replay-attempted',
+            });
+          },
+          recoverCodex: async (row) => {
+            const chatConfig = config.chats[row.chat_id];
+            if (!chatConfig) return { ok: false };
+            const selected = resolvePromptBackend({
+              config,
+              chatId: row.chat_id,
+              threadId: row.thread_id == null ? null : String(row.thread_id),
+            }) === 'codex'
+              ? 'codex'
+              : 'claude';
+            if (selected !== 'codex') {
+              logEvent('codex-replay-deferred', {
+                chat_id: row.chat_id,
+                thread_id: row.thread_id ?? null,
+                msg_id: row.msg_id,
+                reason: 'runtime-selection-changed',
+              });
+              return { ok: false };
+            }
+            const msg = reconstruct(row);
+            msg._requiredProvider = 'codex';
+            return redeliverAsFreshTurn({
+              chatId: row.chat_id,
+              msg,
+              source: 'boot-replay-codex',
+              preMark: 'replay-attempted',
             });
           },
           // CLEAN path — one visibility notice per (chat, thread). plainText so
@@ -3295,11 +3943,12 @@ async function main() {
       });
 
       if (candidates.length > 0) {
-        console.log(`[replay] ${cleanShutdown ? 'clean restart' : 'crash'} — recovered ${result.recovered}, skipped ${result.skipped}, noticed ${result.noticed}${result.noticeFailed ? `, notice-failed ${result.noticeFailed}` : ''}`);
+        console.log(`[replay] ${cleanShutdown ? 'clean restart' : 'crash'} — recovered ${result.recovered}, skipped ${result.skipped}, noticed ${result.noticed}${result.noticeFailed ? `, notice-failed ${result.noticeFailed}` : ''}${result.deferred ? `, deferred ${result.deferred}` : ''}`);
         logEvent('replay-on-boot', {
           bot: BOT_NAME, clean: cleanShutdown,
           recovered: result.recovered, skipped: result.skipped,
           noticed: result.noticed, notice_failed: result.noticeFailed,
+          deferred: result.deferred || 0,
           total: candidates.length,
         });
       }

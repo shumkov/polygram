@@ -15,7 +15,7 @@ describe('polygram session containment wiring', () => {
     );
     assert.match(
       src,
-      /const processFactory = createProcessFactory\(\{[\s\S]*?\n\s+sessionLauncher,/,
+      /const orchestraProcessFactory = createProcessFactory\(\{[\s\S]*?\n\s+sessionLauncher,/,
     );
   });
 

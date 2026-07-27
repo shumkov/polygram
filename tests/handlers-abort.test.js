@@ -304,6 +304,191 @@ describe('handleAbortIfRequested — abort path', () => {
   });
 });
 
+describe('handleAbortIfRequested — Codex verified stop', () => {
+  function makeCodexStop({
+    state = 'Active',
+    inFlight = true,
+    drained = 0,
+    interruptResult = true,
+    interruptError = null,
+  } = {}) {
+    const order = [];
+    const loggerCalls = [];
+    const proc = {
+      backend: 'codex',
+      state,
+      inFlight,
+      probeBusyState: async () => {
+        throw new Error('Codex stop must not inspect a CLI pane');
+      },
+      hasBackgroundShell: async () => {
+        throw new Error('Codex stop must not inspect a tmux shell');
+      },
+      killBackgroundShells: async () => {
+        throw new Error('Codex stop must not use tmux shell controls');
+      },
+      hasActiveBackgroundWork: () => {
+        throw new Error('Codex stop must not use Claude background probes');
+      },
+    };
+    const m = makeDeps({
+      proc,
+      pm: {
+        has: () => true,
+        get: () => proc,
+        drainQueue: (_sessionKey, code) => {
+          order.push(['drainQueue', code]);
+          return drained;
+        },
+        interrupt: async () => {
+          order.push(['interrupt']);
+          if (interruptError) throw interruptError;
+          return interruptResult;
+        },
+        kill: async () => {
+          throw new Error('Codex stop must delegate verified cleanup to interrupt');
+        },
+      },
+      clearAutosteeredReactions: async () => {
+        order.push(['clearAutosteeredReactions']);
+      },
+      logger: {
+        error: (...args) => loggerCalls.push(args),
+      },
+    });
+    return { ...m, order, loggerCalls };
+  }
+
+  test('Active Codex drains and clears before exact verified stop, then acknowledges', async () => {
+    const m = makeCodexStop({ state: 'Active', inFlight: true, drained: 2 });
+    const handled = await createHandleAbort(m.deps)(
+      makeMsg('stop'),
+      '12345',
+      {},
+      'stop',
+    );
+
+    assert.equal(handled, true);
+    assert.deepEqual(m.order, [
+      ['drainQueue', 'INTERRUPTED'],
+      ['clearAutosteeredReactions'],
+      ['interrupt'],
+    ]);
+    assert.deepEqual(m.aborted, ['12345']);
+    assert.equal(m.tgCalls.length, 1);
+    assert.equal(m.tgCalls[0].method, 'setMessageReaction');
+    assert.equal(m.tgCalls[0].params.reaction[0].emoji, '👍');
+    const event = m.events.find((entry) => entry.kind === 'abort-requested');
+    assert.equal(event.detail.backend, 'codex');
+    assert.equal(event.detail.stop_verified, true);
+    assert.equal(event.detail.queue_drained, 2);
+  });
+
+  for (const [state, inFlight] of [
+    ['StartingTurn', true],
+    ['BackgroundWorking', false],
+  ]) {
+    test(`${state} Codex is stopped through manager interrupt without CLI probes`, async () => {
+      const m = makeCodexStop({ state, inFlight });
+      await createHandleAbort(m.deps)(makeMsg('stop'), '12345', {}, 'stop');
+
+      assert.equal(m.tgCalls.length, 1);
+      assert.deepEqual(m.order, [
+        ['drainQueue', 'INTERRUPTED'],
+        ['clearAutosteeredReactions'],
+        ['interrupt'],
+      ]);
+      assert.equal(m.events[0].detail.had_active, true);
+    });
+  }
+
+  test('queued-only Codex work is marked, drained, and acknowledged only after verified settlement', async () => {
+    const m = makeCodexStop({
+      state: 'Idle',
+      inFlight: false,
+      drained: 3,
+      interruptResult: true,
+    });
+    await createHandleAbort(m.deps)(makeMsg('stop'), '12345', {}, 'stop');
+
+    assert.deepEqual(m.aborted, ['12345']);
+    assert.equal(m.tgCalls.length, 1);
+    assert.deepEqual(m.order, [
+      ['drainQueue', 'INTERRUPTED'],
+      ['clearAutosteeredReactions'],
+      ['interrupt'],
+    ]);
+    assert.equal(m.events[0].detail.had_active, false);
+    assert.equal(m.events[0].detail.queue_drained, 3);
+  });
+
+  test('Codex interrupt false clears feedback and shows an error reaction, never 👍', async () => {
+    const m = makeCodexStop({
+      state: 'Active',
+      inFlight: true,
+      drained: 1,
+      interruptResult: false,
+    });
+    await createHandleAbort(m.deps)(makeMsg('stop'), '12345', {}, 'stop');
+
+    assert.equal(m.tgCalls.length, 1);
+    assert.equal(m.tgCalls[0].method, 'setMessageReaction');
+    assert.equal(m.tgCalls[0].params.reaction[0].emoji, '🤯');
+    assert.equal(m.tgCalls[0].meta.source, 'abort-error');
+    assert.deepEqual(m.order, [
+      ['drainQueue', 'INTERRUPTED'],
+      ['clearAutosteeredReactions'],
+      ['interrupt'],
+    ]);
+    const event = m.events.find((entry) => entry.kind === 'abort-requested');
+    assert.equal(event.detail.stop_verified, false);
+    assert.equal(event.detail.stop_error_code, 'CODEX_STOP_NOT_VERIFIED');
+  });
+
+  test('Codex interrupt failure is redacted, clears feedback, and shows only an error reaction', async () => {
+    const m = makeCodexStop({
+      interruptError: Object.assign(
+        new Error('secret prompt and /private/credential/path'),
+        { code: 'CODEX_TERMINAL_CLEANUP_TIMEOUT' },
+      ),
+    });
+    await createHandleAbort(m.deps)(makeMsg('stop'), '12345', {}, 'stop');
+
+    assert.equal(m.tgCalls.length, 1);
+    assert.equal(m.tgCalls[0].method, 'setMessageReaction');
+    assert.equal(m.tgCalls[0].params.reaction[0].emoji, '🤯');
+    assert.notEqual(m.tgCalls[0].params.reaction[0].emoji, '👍');
+    assert.deepEqual(m.order, [
+      ['drainQueue', 'INTERRUPTED'],
+      ['clearAutosteeredReactions'],
+      ['interrupt'],
+    ]);
+    const event = m.events.find((entry) => entry.kind === 'abort-requested');
+    assert.equal(event.detail.stop_verified, false);
+    assert.equal(
+      event.detail.stop_error_code,
+      'CODEX_TERMINAL_CLEANUP_TIMEOUT',
+    );
+    assert.doesNotMatch(JSON.stringify(m.events), /secret|private|credential/);
+    assert.doesNotMatch(JSON.stringify(m.loggerCalls), /secret|private|credential/);
+  });
+
+  test('Codex stop telemetry replaces an unrecognized error code', async () => {
+    const m = makeCodexStop({
+      interruptError: Object.assign(
+        new Error('provider detail'),
+        { code: 'SECRET_TOKEN_FROM_CHILD' },
+      ),
+    });
+    await createHandleAbort(m.deps)(makeMsg('stop'), '12345', {}, 'stop');
+
+    const event = m.events.find((entry) => entry.kind === 'abort-requested');
+    assert.equal(event.detail.stop_error_code, 'CODEX_STOP_FAILED');
+    assert.doesNotMatch(JSON.stringify(m.events), /SECRET_TOKEN_FROM_CHILD/);
+    assert.doesNotMatch(JSON.stringify(m.loggerCalls), /SECRET_TOKEN_FROM_CHILD/);
+  });
+});
+
   test('cli + probeBusyState THROWS → fail-toward-kill (review test-gap)', async () => {
     const m = makeDeps({
       proc: {

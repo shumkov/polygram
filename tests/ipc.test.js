@@ -5,6 +5,7 @@
 
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
@@ -18,6 +19,14 @@ let sockPath;
 
 function uniquePath() {
   return path.join(os.tmpdir(), `ipc-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.sock`);
+}
+
+function workspaceFixture() {
+  return fs.mkdtempSync(path.join(process.cwd(), '.ipc-runtime-test-'));
+}
+
+function removeFixture(dir) {
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 
 async function startServer(handlers) {
@@ -107,10 +116,192 @@ describe('ipc round-trip', () => {
   });
 });
 
-describe('socketPathFor', () => {
-  test('matches between client and server', () => {
-    assert.equal(ipcServer.socketPathFor('shumabit'), '/tmp/polygram-shumabit.sock');
-    assert.equal(ipcClient.socketPathFor('shumabit'), '/tmp/polygram-shumabit.sock');
+describe('IPC runtime directory', () => {
+  test('client and server derive matching non-temporary default paths', () => {
+    const expectedDir = path.join(process.cwd(), '.ipc');
+    assert.equal(ipcServer.runtimeDirectory(), expectedDir);
+    assert.equal(ipcClient.runtimeDirectory(), expectedDir);
+    assert.equal(
+      ipcServer.socketPathFor('shumabit'),
+      path.join(expectedDir, 'polygram-shumabit.sock'),
+    );
+    assert.equal(
+      ipcClient.socketPathFor('shumabit'),
+      path.join(expectedDir, 'polygram-shumabit.sock'),
+    );
+    assert.equal(
+      ipcServer.secretPathFor('shumabit'),
+      path.join(expectedDir, 'polygram-shumabit.secret'),
+    );
+    assert.equal(
+      ipcClient.secretPathFor('shumabit'),
+      path.join(expectedDir, 'polygram-shumabit.secret'),
+    );
+  });
+
+  test('creates the runtime directory owner-only and writes secrets 0600', () => {
+    const cwd = workspaceFixture();
+    try {
+      const options = { cwd, env: {} };
+      const runtimeDir = ipcServer.ensureRuntimeDirectory(options);
+      assert.equal(runtimeDir, path.join(cwd, '.ipc'));
+      assert.equal(fs.statSync(runtimeDir).mode & 0o777, 0o700);
+      if (typeof process.getuid === 'function') {
+        assert.equal(fs.statSync(runtimeDir).uid, process.getuid());
+      }
+
+      const secret = ipcServer.writeSecret('test-bot', options);
+      assert.ok(secret.length >= 32);
+      const secretPath = ipcServer.secretPathFor('test-bot', options);
+      assert.equal(fs.statSync(secretPath).mode & 0o777, 0o600);
+
+      fs.chmodSync(secretPath, 0o644);
+      ipcServer.writeSecret('test-bot', options);
+      assert.equal(fs.statSync(secretPath).mode & 0o777, 0o600);
+    } finally {
+      removeFixture(cwd);
+    }
+  });
+
+  test('accepts one canonical absolute owner-only override in both modules', () => {
+    const cwd = workspaceFixture();
+    const runtimeDir = path.join(cwd, 'ipc');
+    fs.mkdirSync(runtimeDir, { mode: 0o700 });
+    try {
+      const options = { cwd, env: { POLYGRAM_IPC_DIR: runtimeDir } };
+      assert.equal(ipcServer.runtimeDirectory(options), runtimeDir);
+      assert.equal(ipcClient.runtimeDirectory(options), runtimeDir);
+      assert.equal(
+        ipcServer.secretPathFor('bot', options),
+        ipcClient.secretPathFor('bot', options),
+      );
+    } finally {
+      removeFixture(cwd);
+    }
+  });
+
+  test('rejects relative and non-canonical IPC directory overrides', () => {
+    const cwd = workspaceFixture();
+    try {
+      assert.throws(
+        () => ipcServer.runtimeDirectory({
+          cwd,
+          env: { POLYGRAM_IPC_DIR: 'relative/ipc' },
+        }),
+        /IPC directory.*absolute/i,
+      );
+      assert.throws(
+        () => ipcServer.runtimeDirectory({
+          cwd,
+          env: { POLYGRAM_IPC_DIR: `${cwd}${path.sep}child${path.sep}..` },
+        }),
+        /IPC directory.*canonical/i,
+      );
+    } finally {
+      removeFixture(cwd);
+    }
+  });
+
+  test('rejects temporary locations for defaults and overrides', () => {
+    assert.throws(
+      () => ipcServer.runtimeDirectory({ cwd: os.tmpdir(), env: {} }),
+      /IPC directory.*temporary/i,
+    );
+    assert.throws(
+      () => ipcClient.runtimeDirectory({
+        cwd: process.cwd(),
+        env: { POLYGRAM_IPC_DIR: path.join(os.tmpdir(), 'polygram-ipc') },
+      }),
+      /IPC directory.*temporary/i,
+    );
+  });
+
+  test('rejects symlink runtime directories and non-0700 directories', () => {
+    const cwd = workspaceFixture();
+    const target = path.join(cwd, 'target');
+    const link = path.join(cwd, 'link');
+    const broad = path.join(cwd, 'broad');
+    fs.mkdirSync(target, { mode: 0o700 });
+    fs.symlinkSync(target, link);
+    fs.mkdirSync(broad, { mode: 0o755 });
+    try {
+      assert.throws(
+        () => ipcServer.runtimeDirectory({
+          cwd,
+          env: { POLYGRAM_IPC_DIR: link },
+        }),
+        /IPC directory.*symlink|IPC directory.*canonical/i,
+      );
+      assert.throws(
+        () => ipcServer.runtimeDirectory({
+          cwd,
+          env: { POLYGRAM_IPC_DIR: broad },
+        }),
+        /IPC directory.*0700/i,
+      );
+    } finally {
+      removeFixture(cwd);
+    }
+  });
+
+  test('rejects a runtime directory inside a writable untrusted parent', () => {
+    const cwd = workspaceFixture();
+    const unsafeParent = path.join(cwd, 'unsafe-parent');
+    const runtimeDir = path.join(unsafeParent, 'ipc');
+    fs.mkdirSync(unsafeParent, { mode: 0o777 });
+    fs.chmodSync(unsafeParent, 0o777);
+    fs.mkdirSync(runtimeDir, { mode: 0o700 });
+    try {
+      assert.throws(
+        () => ipcServer.runtimeDirectory({
+          cwd,
+          env: { POLYGRAM_IPC_DIR: runtimeDir },
+        }),
+        /IPC directory parent.*writable/i,
+      );
+    } finally {
+      removeFixture(cwd);
+    }
+  });
+
+  test('rejects bot names that could escape or reshape the runtime path', () => {
+    for (const botName of [
+      '',
+      '.',
+      '..',
+      '../other',
+      'nested/bot',
+      'nested\\bot',
+      'x'.repeat(65),
+    ]) {
+      assert.throws(
+        () => ipcServer.socketPathFor(botName),
+        /bot name/i,
+      );
+      assert.throws(
+        () => ipcClient.secretPathFor(botName),
+        /bot name/i,
+      );
+    }
+  });
+
+  test('rejects socket paths above the portable Unix-domain limit', () => {
+    const cwd = workspaceFixture();
+    const longParent = path.join(cwd, 'x'.repeat(80));
+    const runtimeDir = path.join(longParent, 'ipc');
+    fs.mkdirSync(longParent, { mode: 0o700 });
+    fs.mkdirSync(runtimeDir, { mode: 0o700 });
+    try {
+      assert.throws(
+        () => ipcServer.socketPathFor('bot', {
+          cwd,
+          env: { POLYGRAM_IPC_DIR: runtimeDir },
+        }),
+        /socket path.*limit/i,
+      );
+    } finally {
+      removeFixture(cwd);
+    }
   });
 });
 

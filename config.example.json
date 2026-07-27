@@ -63,6 +63,17 @@
     }
   },
 
+  "codex": {
+    "_comment": "Optional native macOS Codex app-server beta. Codex stays disabled unless a chat/topic explicitly sets pm:'codex' and exact startup preflight succeeds. Linux and Windows are rejected in this milestone. `home` must be a dedicated non-temporary 0700 CODEX_HOME already authenticated with ChatGPT; polygram never copies or reads credential contents. `binary` must be the canonical immutable path to the reviewed pinned Codex CLI, not a PATH symlink. Every directory containing daemon credentials or control data must be listed in daemonSecretRoots and must not overlap a Codex workspace or CODEX_HOME. Command network and model-native web search are disabled; product MCP tools and interactive approvals are unavailable. Keep long-running commands in the foreground. Detached/background servers are unsupported and may survive hard runtime loss.",
+    "home": "/Users/you/.codex-polygram",
+    "binary": "/Users/you/.local/share/codex/versions/0.145.0/codex",
+    "daemonSecretRoots": [
+      "/Users/you/.polygram",
+      "/Users/you/.claude",
+      "/Users/you/.codex"
+    ]
+  },
+
   "chats": {
     "123456789": {
       "name": "Admin DM",
@@ -75,6 +86,17 @@
       "_comment_maxFileBytes": "OPTIONAL per-chat (or per-topic; topic wins) file-size cap in BYTES. There is NO fixed default — the default is backend-derived: cloud Telegram = 50MB send / 20MB receive; with a local Bot API server (bot.apiRoot set) = 2GB both ways. This key only LOWERS that ceiling for this chat (Telegram rejects anything above the backend limit regardless); omit it to use the full backend default. To set one, add e.g. \"maxFileBytes\": 104857600 (=100MB) — only meaningful when apiRoot is set, since cloud already clamps to 50/20MB.",
       "_comment_compactionWarnings": "OPTIONAL per-chat (or per-topic; topic wins). CLI/channels backend (pm:'cli') only. Default OFF. When ON, polygram warns the chat as Claude's context fills so you can /compact on your terms BEFORE an auto-compaction interrupts a turn (auto-compaction detaches the channels MCP bridge mid-turn — see docs/0.12.0-compaction-warnings.md). Two forms: `true` (enable at the 75% default threshold) or `{ \"enabled\": true, \"thresholdPct\": 80 }` (custom 1-99 threshold). Proactive: at the threshold it posts 'context ~N% full, run /compact or /new at a break'. Reactive backstop: when claude auto-compacts anyway it posts 'compacting now, resend if quiet'. Manual /compact never warns. Requires the bot to allow /compact + /new commands.",
       "compactionWarnings": true
+    },
+
+    "987654321": {
+      "name": "Codex beta DM",
+      "bot": "admin-bot",
+      "_comment_pm": "Codex uses the pinned app-server SDK surface directly (no tmux). Native macOS beta only: command network and model-native web search are disabled; product MCP tools and interactive approvals are unavailable; long-running commands must stay in the foreground; detached/background servers are unsupported and may survive hard runtime loss. The model and effort are accepted only when returned by this deployment's authenticated ChatGPT-backed model catalog.",
+      "pm": "codex",
+      "codexModel": "gpt-5.6-sol",
+      "codexEffort": "xhigh",
+      "cwd": "/Users/you/codex-workspace",
+      "timeout": 600
     },
 
     "-1000000000001": {
@@ -104,7 +126,7 @@
       "isolateTopics": true,
       "_comment_topics": "rc.48: each topic entry is EITHER a string (legacy: just a label) OR an object with optional fields {name, agent, cwd, model, effort, permissionMode, isolateUserConfig}. Object form lets a topic override chat-level config. Per-topic permissionMode overrides chat-level — typical use: scope one topic to permissionMode:'default' (so settings.json gates apply) while the rest of the chat stays on bypassPermissions. Object form requires isolateTopics: true (each topic gets its own SDK Query); polygram emits a startup warning otherwise.",
       "_comment_isolateUserConfig": "0.10.0, tmux backend only: isolateUserConfig:true spawns the topic's claude TUI cut off from the user-level ~/.claude config — passes --strict-mcp-config (zero MCP servers load) and --setting-sources project,local (drops ~/.claude/settings.json; the spawn cwd's own .claude/settings.json still loads). Use it when a topic's agent would otherwise inherit slow user-global MCP servers whose cold-start (tens of seconds) wedges the TUI before it can accept a prompt. Settable at chat OR topic level (topic wins). Default false.",
-      "_comment_pm": "0.12.0: 'pm' selects the Process backend. Two canonical values: 'sdk' (default; per-token Console API billing; full SDK features) and 'cli' (subscription-priced claude CLI in tmux + Channels MCP bridge + hooks ndjson observability — see docs/0.12.0-cli-driver-plan.md). Settable at bot, chat, OR topic level (topic > chat > bot). Aliases preserved for back-compat with 0.10/0.11 configs: 'channels' and 'tmux' both resolve to 'cli' with a once-at-boot deprecation warn. CLI requires Pro/Max subscription, Claude Code v2.1.80+, and uses --dangerously-load-development-channels (research preview flag).",
+      "_comment_pm": "'pm' selects the session runtime. Canonical values: 'sdk' (default Claude API SDK), 'cli' (subscription-priced Claude CLI in tmux + Channels bridge), and 'codex' (subscription-backed pinned Codex app-server, no tmux). Settable at bot, chat, or topic scope (topic > chat > bot). Claude aliases 'channels' and 'tmux' still resolve to 'cli'. Codex uses separate codexModel/codexEffort fields and never consumes Claude model/effort values.",
       "topics": {
         "100": "Customer A",
         "200": {

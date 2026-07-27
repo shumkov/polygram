@@ -69,6 +69,20 @@ describe('createEditCorrectionInjector — happy path', () => {
 });
 
 describe('createEditCorrectionInjector — skip gates', () => {
+  test('Codex never uses the synchronous Claude edit injector while a turn is live', () => {
+    const fx = fixture({
+      pmEntry: {
+        backend: 'codex',
+        runtime: 'codex',
+        generationId: 'generation-a',
+        inFlight: true,
+      },
+    });
+    assert.equal(fx.injector(editMsg()), false);
+    assert.equal(fx.calls.inject.length, 0);
+    assert.equal(fx.calls.events.length, 0);
+  });
+
   test('skipped when SDK session evicted (pm.has=false)', () => {
     const fx = fixture({ pmEntry: null });
     const result = fx.injector(editMsg());

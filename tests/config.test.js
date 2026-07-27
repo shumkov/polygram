@@ -8,6 +8,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const Database = require('better-sqlite3');
 
 const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
@@ -118,6 +119,224 @@ describe('saveConfig — atomic write + bot-scoped merge', () => {
     const tmp = `${p}.tmp.${process.pid}`;
     assert.equal(fs.existsSync(tmp), false, 'temp file removed after rename');
     assert.equal(fs.existsSync(p), true);
+  });
+
+  test('preserves separate Claude and Codex runtime choices at bot/chat/topic scopes', () => {
+    const p = path.join(tmpDir, 'config.json');
+    fs.writeFileSync(p, JSON.stringify({
+      defaults: { model: 'default-claude', effort: 'medium' },
+      bots: {
+        'bot-A': { token: 'old-A', pm: 'sdk', model: 'bot-claude' },
+        'bot-B': { token: 'untouched-B', pm: 'cli' },
+      },
+      chats: {
+        '100': {
+          pm: 'sdk',
+          model: 'chat-claude',
+          effort: 'high',
+          topics: {
+            '7': { pm: 'sdk', model: 'topic-claude', effort: 'low' },
+          },
+        },
+        '200': { pm: 'cli', model: 'untouched-claude' },
+      },
+    }, null, 2));
+
+    saveConfig({
+      configPath: p,
+      botName: 'bot-A',
+      config: {
+        bots: {
+          'bot-A': {
+            token: 'old-A',
+            pm: 'codex',
+            model: 'bot-claude',
+            codexModel: 'bot-codex',
+            codexEffort: 'xhigh',
+          },
+        },
+        chats: {
+          '100': {
+            pm: 'codex',
+            model: 'chat-claude',
+            effort: 'high',
+            codexModel: 'chat-codex',
+            codexEffort: 'medium',
+            topics: {
+              '7': {
+                pm: 'codex',
+                model: 'topic-claude',
+                effort: 'low',
+                codexModel: 'topic-codex',
+                codexEffort: 'high',
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const after = JSON.parse(fs.readFileSync(p, 'utf8'));
+    assert.deepEqual(after.bots['bot-A'], {
+      token: 'old-A',
+      pm: 'codex',
+      model: 'bot-claude',
+      codexModel: 'bot-codex',
+      codexEffort: 'xhigh',
+    });
+    assert.equal(after.bots['bot-B'].pm, 'cli', 'other bot remains untouched');
+    assert.deepEqual(after.chats['100'].topics['7'], {
+      pm: 'codex',
+      model: 'topic-claude',
+      effort: 'low',
+      codexModel: 'topic-codex',
+      codexEffort: 'high',
+    });
+    assert.equal(after.chats['200'].model, 'untouched-claude',
+      'other chat remains untouched');
+    assert.equal(after.defaults.model, 'default-claude',
+      'ops-wide defaults remain untouched');
+  });
+});
+
+describe('migration 017 — config runtime changes', () => {
+  test('copies every row, admits runtime/pm, rejects unknown fields, and recreates the index', () => {
+    const db = new Database(':memory:');
+    try {
+      db.exec(`
+        CREATE TABLE config_changes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          chat_id TEXT NOT NULL,
+          thread_id TEXT,
+          field TEXT NOT NULL CHECK(field IN ('model','effort','agent')),
+          old_value TEXT,
+          new_value TEXT NOT NULL,
+          user_id INTEGER,
+          user TEXT,
+          source TEXT,
+          ts INTEGER NOT NULL
+        );
+        CREATE INDEX idx_config_recent ON config_changes(chat_id, ts DESC);
+      `);
+      const insert = db.prepare(`
+        INSERT INTO config_changes (
+          id, chat_id, thread_id, field, old_value, new_value,
+          user_id, user, source, ts
+        ) VALUES (
+          @id, @chat_id, @thread_id, @field, @old_value, @new_value,
+          @user_id, @user, @source, @ts
+        )
+      `);
+      insert.run({
+        id: 4,
+        chat_id: '-100',
+        thread_id: null,
+        field: 'model',
+        old_value: null,
+        new_value: 'opus',
+        user_id: 1,
+        user: 'Ivan',
+        source: 'command',
+        ts: 1000,
+      });
+      insert.run({
+        id: 9,
+        chat_id: '-100',
+        thread_id: '7',
+        field: 'effort',
+        old_value: 'medium',
+        new_value: 'high',
+        user_id: null,
+        user: null,
+        source: null,
+        ts: 1001,
+      });
+      const before = db.prepare('SELECT * FROM config_changes ORDER BY id').all();
+
+      const migration = fs.readFileSync(
+        path.join(__dirname, '..', 'migrations', '017-config-runtime-changes.sql'),
+        'utf8',
+      );
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        db.exec(migration);
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+
+      assert.deepEqual(
+        db.prepare('SELECT * FROM config_changes ORDER BY id').all(),
+        before,
+        'migration must preserve every column of every existing row',
+      );
+
+      const nextId = db.prepare(`
+        INSERT INTO config_changes (
+          chat_id, thread_id, field, old_value, new_value, ts
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      nextId.run('-100', '7', 'runtime', 'claude', 'codex', 1002);
+      nextId.run('-100', '7', 'pm', 'sdk', 'codex', 1003);
+
+      // Exact write shape retained by a downgraded pre-v17 binary.
+      const legacyWriter = db.prepare(`
+        INSERT INTO config_changes (
+          chat_id, thread_id, field, old_value, new_value,
+          user_id, user, source, ts
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      legacyWriter.run(
+        '-100',
+        '7',
+        'model',
+        'opus',
+        'sonnet',
+        1,
+        'Ivan',
+        'command',
+        1004,
+      );
+      assert.equal(
+        db.prepare('SELECT MAX(id) AS id FROM config_changes').get().id,
+        12,
+        'AUTOINCREMENT sequence continues after explicitly copied ids',
+      );
+      assert.deepEqual(
+        db.prepare(`
+          SELECT field, old_value, new_value, source
+            FROM config_changes
+           WHERE id = 12
+        `).get(),
+        {
+          field: 'model',
+          old_value: 'opus',
+          new_value: 'sonnet',
+          source: 'command',
+        },
+      );
+      assert.throws(
+        () => nextId.run('-100', null, 'bogus', null, 'x', 1005),
+        /CHECK constraint/,
+      );
+
+      const index = db.prepare(`
+        SELECT sql FROM sqlite_master
+        WHERE type = 'index' AND name = 'idx_config_recent'
+      `).get();
+      assert.match(index.sql, /config_changes\s*\(\s*chat_id\s*,\s*ts\s+DESC\s*\)/i);
+      assert.equal(
+        db.prepare(`
+          SELECT COUNT(*) AS n FROM sqlite_master
+          WHERE type = 'table' AND name = 'config_changes_v17'
+        `).get().n,
+        0,
+      );
+      assert.equal(db.pragma('integrity_check', { simple: true }), 'ok');
+    } finally {
+      db.close();
+    }
   });
 });
 

@@ -10,6 +10,27 @@ const {
   MODEL_VERSIONS_DESC,
 } = require('../lib/handlers/config-ui');
 
+const CODEX_VIEW = Object.freeze({
+  runtime: 'codex',
+  model: 'gpt-5.6-sol',
+  effort: 'high',
+  models: [
+    {
+      model: 'gpt-5.6-sol',
+      displayName: 'GPT-5.6 SOL',
+      defaultReasoningEffort: 'high',
+      supportedReasoningEfforts: ['high', 'xhigh'],
+    },
+    {
+      model: 'gpt-5.5',
+      displayName: 'GPT-5.5',
+      defaultReasoningEffort: 'high',
+      supportedReasoningEfforts: ['medium', 'high'],
+    },
+  ],
+  efforts: ['medium', 'high', 'xhigh'],
+});
+
 describe('buildConfigKeyboard', () => {
   test('show=all renders model + effort + rich-text rows with current values marked', () => {
     const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high' }, 'all');
@@ -99,6 +120,25 @@ describe('buildConfigKeyboard', () => {
       assert.ok(data.includes('cfg:effort:' + e), 'missing cfg:effort:' + e);
     }
   });
+
+  test('Codex card uses only authenticated model and per-model effort options', () => {
+    const kb = buildConfigKeyboard({
+      model: 'sonnet',
+      effort: 'max',
+      codexModel: 'gpt-5.6-sol',
+      codexEffort: 'xhigh',
+    }, 'all', null, false, CODEX_VIEW);
+    assert.deepEqual(
+      kb.inline_keyboard[0].map((button) => button.callback_data),
+      ['cfg:model:gpt-5.6-sol', 'cfg:model:gpt-5.5'],
+    );
+    assert.match(kb.inline_keyboard[0][0].text, /^✓ GPT-5\.6 SOL$/);
+    assert.deepEqual(
+      kb.inline_keyboard[1].map((button) => button.callback_data),
+      ['cfg:effort:high', 'cfg:effort:xhigh'],
+    );
+    assert.match(kb.inline_keyboard[1][1].text, /^✓ xhigh$/);
+  });
 });
 
 describe('createFormatConfigInfoText', () => {
@@ -179,6 +219,163 @@ describe('createFormatConfigInfoText', () => {
     const fmt = buildFormat();
     const out = fmt({ model: 'mystery', effort: 'medium', agent: 'x' }, 'all', 'sk');
     assert.match(out, /Model: mystery \(mystery\)/);
+  });
+
+  test('async runtime resolver renders explicit Codex selected, observed, and active-turn fields', async () => {
+    const calls = [];
+    const fmt = createFormatConfigInfoText({
+      pm: {
+        has: () => true,
+        get: () => ({
+          closed: false,
+          // These legacy fields are intentionally misleading. Codex UI must
+          // use the explicit settings projections instead.
+          model: 'must-not-render',
+          effort: 'must-not-render',
+        }),
+      },
+      db: {},
+      getClaudeSessionId: () => {
+        throw new Error('Codex card must not read the dormant Claude row');
+      },
+      resolveRuntimeView: async (context) => {
+        calls.push(context);
+        return {
+          ...CODEX_VIEW,
+          desiredSettings: {
+            model: 'gpt-5.6-sol',
+            effort: 'high',
+          },
+          observedThreadSettings: {
+            model: 'gpt-5.5',
+            effort: 'medium',
+          },
+          activeTurnSettings: {
+            model: 'gpt-5.5',
+            effort: 'medium',
+          },
+          nextTurnSettings: {
+            model: 'gpt-5.6-sol',
+            effort: 'high',
+          },
+          processStatus: 'loaded',
+        };
+      },
+    });
+    const out = await fmt({
+      model: 'sonnet',
+      effort: 'max',
+      agent: 'claude-agent',
+      codexModel: 'gpt-5.6-sol',
+      codexEffort: 'high',
+    }, 'all', '42:7');
+
+    assert.deepEqual(calls, [{
+      sessionKey: '42:7',
+      chatId: '42',
+      threadId: '7',
+    }]);
+    assert.match(out, /Current turn: gpt-5\.5\/medium/);
+    assert.match(out, /Next turn: gpt-5\.6-sol\/high/);
+    assert.match(out, /Observed thread: gpt-5\.5\/medium/);
+    assert.doesNotMatch(out, /must-not-render/);
+    assert.doesNotMatch(out, /controlled session replacement/);
+    assert.match(out, /^Runtime: Codex app-server$/m);
+    assert.match(out, /^Session: managed by Codex$/m);
+    assert.match(out, /Native macOS beta/);
+    assert.match(out, /network and web search are disabled/);
+    assert.match(out, /Product MCP tools and interactive approvals are unavailable/);
+    assert.match(out, /Detached\/background servers are unsupported/);
+    assert.match(out, /\*\*gpt-5\.6-sol\*\* — GPT-5\.6 SOL/);
+    assert.doesNotMatch(out, /Agent: claude-agent/);
+    assert.doesNotMatch(out, /deep analysis, code refactor/);
+  });
+
+  test('Codex card exposes a saved selection that the warm process has not accepted', () => {
+    const fmt = createFormatConfigInfoText({
+      pm: {
+        has: () => true,
+        get: () => ({ closed: false }),
+      },
+      db: {},
+      getClaudeSessionId: () => null,
+    });
+    const out = fmt({
+      codexModel: 'gpt-5.6-sol',
+      codexEffort: 'xhigh',
+    }, 'all', 'sk', null, false, {
+      ...CODEX_VIEW,
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      desiredSettings: {
+        model: 'gpt-5.6-sol',
+        effort: 'xhigh',
+      },
+      nextTurnSettings: {
+        model: 'gpt-5.6-sol',
+        effort: 'high',
+      },
+      observedThreadSettings: null,
+      activeTurnSettings: null,
+      processStatus: 'loaded',
+    });
+
+    assert.match(out, /Selected for next turn: gpt-5\.6-sol\/high/);
+    assert.match(
+      out,
+      /Saved selection awaiting live reconciliation: gpt-5\.6-sol\/xhigh/,
+    );
+  });
+
+  for (const [processStatus, expected] of [
+    ['not-loaded', /Selected for this chat's next session: gpt-5\.6-sol\/high/],
+    ['daemon-busy', /Selected: gpt-5\.6-sol\/high[\s\S]*not loaded; its next message may be busy/],
+    ['unavailable', /Selected: gpt-5\.6-sol\/high[\s\S]*Process: unavailable \(containment\)/],
+  ]) {
+    test(`Codex ${processStatus} card copy is explicit`, () => {
+      const fmt = createFormatConfigInfoText({
+        pm: { has: () => false, get: () => null },
+        db: {},
+        getClaudeSessionId: () => {
+          throw new Error('Codex card must not read Claude state');
+        },
+      });
+      const out = fmt({
+        codexModel: 'gpt-5.6-sol',
+        codexEffort: 'high',
+      }, 'all', 'sk', null, false, {
+        ...CODEX_VIEW,
+        desiredSettings: {
+          model: 'gpt-5.6-sol',
+          effort: 'high',
+        },
+        observedThreadSettings: null,
+        activeTurnSettings: null,
+        processStatus,
+        ...(processStatus === 'unavailable' && {
+          unavailableReason: 'containment',
+        }),
+      });
+      assert.match(out, expected);
+    });
+  }
+
+  test('an async Claude runtime view produces the exact legacy card', async () => {
+    const deps = {
+      pm: { has: () => false, get: () => null },
+      db: {},
+      getClaudeSessionId: () => 'sess-12345678-rest',
+    };
+    const legacy = createFormatConfigInfoText(deps);
+    const resolved = createFormatConfigInfoText({
+      ...deps,
+      resolveRuntimeView: async () => ({ runtime: 'claude' }),
+    });
+    const chat = { model: 'sonnet', effort: 'high', agent: 'shumabit' };
+    assert.equal(
+      await resolved(chat, 'all', '42'),
+      legacy(chat, 'all', '42'),
+    );
   });
 });
 

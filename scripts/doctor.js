@@ -17,15 +17,19 @@
  *   2  bad invocation / missing args
  *
  * Extended from OpenClaw's doctor.ts pattern: config, token, reachability,
- * membership checks, recent-error trail. Safe to run against a live bot
- * (no state changes) unless --roundtrip is passed, which posts a single
- * disable_notification=true message.
+ * membership checks, recent-error trail, and offline Codex deployment
+ * diagnostics. Safe to run against a live bot (no state changes) unless
+ * --roundtrip is passed, which posts a single disable_notification=true
+ * message. Codex checks never start app-server or run authenticated preflight.
  */
 
 const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
 
+const {
+  collectCodexDoctorChecks,
+} = require('../lib/codex/diagnostics');
 const {
   call, tell, socketPathFor, readSecret,
 } = require('../lib/ipc/client');
@@ -139,9 +143,21 @@ function checkDb() {
 }
 
 async function checkIpc() {
+  let ipcPath;
+  try {
+    ipcPath = socketPathFor(botName);
+  } catch (error) {
+    push(
+      'ipc-root',
+      'fail',
+      'runtime directory invalid',
+      { code: typeof error?.code === 'string' ? error.code : null },
+    );
+    return false;
+  }
   try {
     const res = await call({
-      path: socketPathFor(botName),
+      path: ipcPath,
       op: 'ping',
       callTimeoutMs: timeoutMs,
     });
@@ -149,14 +165,19 @@ async function checkIpc() {
       push('ipc', 'ok', `socket responsive, bot=${res.bot}`);
       return true;
     }
-    push('ipc', 'fail', JSON.stringify(res));
+    push('ipc', 'fail', 'socket returned an invalid ping response');
     return false;
   } catch (err) {
     // Distinguish "no socket" (bot not running) from "socket dead"
-    if (/ENOENT|ECONNREFUSED/.test(err.message)) {
-      push('ipc', 'warn', `bot not running — IPC socket absent at ${socketPathFor(botName)}`);
+    if (['ENOENT', 'ECONNREFUSED'].includes(err?.code)) {
+      push('ipc', 'warn', 'bot not running; IPC socket absent');
     } else {
-      push('ipc', 'fail', err.message);
+      push(
+        'ipc',
+        'fail',
+        'socket health check failed',
+        { code: typeof err?.code === 'string' ? err.code : null },
+      );
     }
     return false;
   }
@@ -258,6 +279,13 @@ function checkApprovals(db) {
   }
 }
 
+async function checkCodex(cfg, db) {
+  const codexChecks = await collectCodexDoctorChecks({ config: cfg, db });
+  for (const item of codexChecks) {
+    push(item.name, item.status, item.detail, item.extra);
+  }
+}
+
 async function checkRoundtrip() {
   if (!doRoundtrip) return;
   const marker = `polygram-doctor:${Date.now()}`;
@@ -300,6 +328,7 @@ async function checkRoundtrip() {
 async function main() {
   const cfg = checkConfig();
   const db = checkDb();
+  await checkCodex(cfg, db);
   await checkIpc();
   await checkTelegram(cfg);
   checkRecentErrors(db);
