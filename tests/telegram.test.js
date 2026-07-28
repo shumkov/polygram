@@ -228,6 +228,97 @@ describe('send — editMessageText with rich_message', () => {
   });
 });
 
+describe('send — sendRichMessage', () => {
+  beforeEach(() => { ({ db, dbPath } = freshDb('telegram-test')); });
+  afterEach(() => cleanupDb(dbPath, db));
+
+  const blocks = [{ type: 'paragraph', text: 'hi' }];
+
+  test('a blocks payload reaches the API untouched', async () => {
+    const bot = makeFakeBot({ result: { message_id: 5, date: 1 } });
+    await send({
+      bot, method: 'sendRichMessage',
+      params: { chat_id: '1', rich_message: { blocks } },
+      db, logger: silentLogger(),
+    });
+    assert.equal(bot.calls.length, 1);
+    assert.deepEqual(bot.calls[0].params.rich_message.blocks, blocks);
+  });
+
+  test('no transcript row is written here', async () => {
+    // The send is a try: any failure degrades to the plain chunked path,
+    // which writes its own rows. A row written here would survive a failed
+    // attempt and show the agent its own answer twice on the next preload.
+    const bot = makeFakeBot({ result: { message_id: 5, date: 1 } });
+    await send({
+      bot, method: 'sendRichMessage',
+      params: { chat_id: '1', rich_message: { blocks } },
+      db, logger: silentLogger(),
+    });
+    const rows = db.raw.prepare('SELECT * FROM messages WHERE chat_id = ?').all('1');
+    assert.equal(rows.length, 0, 'the rich sender owns this row, on success only');
+  });
+
+  test('empty blocks are refused before the API call', async () => {
+    const bot = makeFakeBot({ result: { message_id: 5, date: 1 } });
+    await assert.rejects(() => send({
+      bot, method: 'sendRichMessage',
+      params: { chat_id: '1', rich_message: { blocks: [] } },
+      db, logger: silentLogger(),
+    }), /rich_message\.blocks is empty/);
+    assert.equal(bot.calls.length, 0);
+  });
+
+  test('a missing rich_message is refused', async () => {
+    const bot = makeFakeBot({ result: { message_id: 5, date: 1 } });
+    await assert.rejects(() => send({
+      bot, method: 'sendRichMessage',
+      params: { chat_id: '1' },
+      db, logger: silentLogger(),
+    }), /rich_message is missing/);
+    assert.equal(bot.calls.length, 0);
+  });
+
+  test('a rich_message smuggled under another method is refused too', async () => {
+    // The guard keys on the payload, not the verb. Keyed on the method it
+    // would wave this through, and a new caller is exactly what that looks
+    // like — the capability regex already anticipates sendRichMessageDraft.
+    const bot = makeFakeBot({ result: { message_id: 5, date: 1 } });
+    await assert.rejects(() => send({
+      bot, method: 'sendMessage',
+      params: { chat_id: '1', text: 'decoy', rich_message: { blocks, html: '<b>x</b>' } },
+      db, logger: silentLogger(),
+    }), /html\/markdown is not supported/);
+    assert.equal(bot.calls.length, 0);
+  });
+
+  for (const field of ['html', 'markdown']) {
+    test(`rich_message.${field} is refused at the choke point`, async () => {
+      // Typed blocks are the only rich payload polygram renders. These
+      // alternatives hand Telegram a string it re-parses, reintroducing the
+      // markup-injection surface the block renderer exists to close, and
+      // nothing downstream sanitizes them.
+      const bot = makeFakeBot({ result: { message_id: 5, date: 1 } });
+      await assert.rejects(() => send({
+        bot, method: 'sendRichMessage',
+        params: { chat_id: '1', rich_message: { blocks, [field]: '<b>x</b>' } },
+        db, logger: silentLogger(),
+      }), /html\/markdown is not supported/);
+      assert.equal(bot.calls.length, 0);
+    });
+
+    test(`editMessageText also refuses rich_message.${field}`, async () => {
+      const bot = makeFakeBot({ result: { message_id: 5, date: 1 } });
+      await assert.rejects(() => send({
+        bot, method: 'editMessageText',
+        params: { chat_id: '1', message_id: 5, rich_message: { blocks, [field]: '<b>x</b>' } },
+        db, logger: silentLogger(),
+      }), /html\/markdown is not supported/);
+      assert.equal(bot.calls.length, 0);
+    });
+  }
+});
+
 describe('send — reactions skip DB row', () => {
   beforeEach(() => { ({ db, dbPath } = freshDb('telegram-test')); });
   afterEach(() => cleanupDb(dbPath, db));
