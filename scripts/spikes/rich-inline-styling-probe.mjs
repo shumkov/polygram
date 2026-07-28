@@ -293,6 +293,12 @@ export function candidateShapes() {
     // (`**see \`x\`**`), so if it cannot be expressed the mapping has to
     // decide which of the two to drop.
     { key: 'nested-bold-code', label: 'nested — bold containing code', text: ['[SPIKE TEST] nested — ', { type: 'bold', text: [{ type: 'code', text: STYLE_MARKER }] }] },
+
+    // A url node whose LABEL is itself styled. The earlier runs only ever
+    // sent url nodes with string text, so emitting nested labels would be
+    // shipping one shape on the evidence of another. The mapping flattens
+    // link text until this comes back preserved.
+    { key: 'c-url-styled-text', label: '(c) {type:"url"} with a styled label', text: ['[SPIKE TEST] c url styled — ', { type: 'url', text: [{ type: 'bold', text: STYLE_MARKER }], url: URL_FOR_PROBE }] },
   ];
 }
 

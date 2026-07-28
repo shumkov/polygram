@@ -170,4 +170,21 @@ describe('polygram inline-styling wiring', () => {
     assert.match(source, /onStylingRejected: \(\) => richStylingLatch\?\.recordStylingRejection\(\)/);
     assert.match(source, /onStylingAccepted: \(\) => richStylingLatch\?\.recordHealthyOutcome\(\)/);
   });
+
+  test('BOTH paths can feed the verdict, not just the reply tool', () => {
+    // The streamer styles every payload it renders. If only the dispatcher
+    // could record a rejection, a streamer-only chat against a styling-unaware
+    // server would refuse, degrade, and never learn — every bubble plain,
+    // forever, with the latch still showing green.
+    assert.equal((source.match(/onStylingRejected:/g) || []).length, 2,
+      'the editor and the sender both report');
+    assert.equal((source.match(/onStylingAccepted:/g) || []).length, 2);
+  });
+
+  test('the limit predicate reaches both senders', () => {
+    // Without it, an oversized reply that succeeds once flattened counts as
+    // evidence that the server refuses typed nodes.
+    assert.equal((source.match(/\bisRichLimitError,/g) || []).length, 3,
+      'imported once, passed to the editor and the sender');
+  });
 });

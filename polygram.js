@@ -122,6 +122,7 @@ const { chunkMarkdownText } = require('./lib/telegram/chunk');
 const {
   toTelegramRichBlocks, resolveRichTextEnabled, isRichCapabilityError, isRichContentError,
   isRichCapabilityErrorExplicit, isRichMessageFieldRejection, stripMediaMarkdown,
+  isRichLimitError,
 } = require('./lib/telegram/rich');
 const {
   makeRichMediaResolver,
@@ -3267,12 +3268,18 @@ async function main() {
       redactBotToken,
       isRichCapabilityError,
       isRichContentError,
+      isRichLimitError,
       getRichKnownUnsupported: () => richKnownUnsupported,
       setRichKnownUnsupported: () => { richKnownUnsupported = true; },
       getApiRoot: () => config.bot?.apiRoot || null,
       stripUrlCreds: stripUrlCredentials,
       sanitizeFallbackText: stripMediaMarkdown,
       capabilityLatch: richCapabilityLatch,
+      // The SAME verdict the reply-tool path feeds. One renderer, one
+      // server, one answer — a latch reachable from only one path would let
+      // the other keep authoring payloads this server has already refused.
+      onStylingRejected: () => richStylingLatch?.recordStylingRejection(),
+      onStylingAccepted: () => richStylingLatch?.recordHealthyOutcome(),
     });
     richSendMessage = createRichSender({
       tg,
@@ -3282,6 +3289,7 @@ async function main() {
       isRichCapabilityError,
       isRichCapabilityErrorExplicit,
       isRichContentError,
+      isRichLimitError,
       getRichKnownUnsupported: () => richSendKnownUnsupported,
       setRichKnownUnsupported: () => { richSendKnownUnsupported = true; },
       getApiRoot: () => config.bot?.apiRoot || null,
