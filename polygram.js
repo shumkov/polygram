@@ -53,6 +53,9 @@ const { extractAssistantText } = require('@shumkov/orchestra');
 const {
   createChannelsToolDispatcher, buildAllowedRoots,
 } = require('./lib/process/channels-tool-dispatcher');
+const {
+  createClaudeTmuxRunner,
+} = require('./lib/process/claude-environment');
 const { createTmuxRunner } = require('@shumkov/orchestra');
 const { sweepTmuxOrphans } = require('@shumkov/orchestra').orphanSweep;
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
@@ -3589,6 +3592,7 @@ async function main() {
     sessionPrefix: 'polygram',
     requireExistingServer,
   });
+  const claudeTmuxRunner = createClaudeTmuxRunner(tmuxRunner);
   // Verify the pinned claude CLI binary is present. The tmux
   // backend spawns this exact binary by absolute path (see
   // lib/claude-bin.js + TmuxProcess.start) — it never resolves
@@ -3724,7 +3728,7 @@ async function main() {
     spawnFn: buildSdkOptions,
     db,
     logger: console,
-    tmuxRunner,
+    tmuxRunner: claudeTmuxRunner,
     sessionLauncher,
     botName: BOT_NAME,
     // channels backend

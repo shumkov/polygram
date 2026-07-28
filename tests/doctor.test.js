@@ -25,17 +25,19 @@ const SCHEMA_SHA256 =
 
 function createDeployment(t, lease = null) {
   const root = realpathSync(
-    mkdtempSync(path.join(os.tmpdir(), 'polygram-doctor-')),
+    mkdtempSync(path.join(os.homedir(), '.polygram-doctor-')),
   );
   t.after(() => rmSync(root, { recursive: true, force: true }));
 
   const codexHome = path.join(root, 'codex-home');
+  const codexTmp = path.join(root, 'codex-tmp');
   const ipcRuntimeDir = path.join(root, 'polygram-ipc');
+  const workspace = path.join(root, 'workspace');
   const binary = path.join(root, 'codex');
-  mkdirSync(codexHome, { mode: 0o700 });
-  chmodSync(codexHome, 0o700);
-  mkdirSync(ipcRuntimeDir, { mode: 0o700 });
-  chmodSync(ipcRuntimeDir, 0o700);
+  for (const directory of [codexHome, codexTmp, ipcRuntimeDir, workspace]) {
+    mkdirSync(directory, { mode: 0o700 });
+    chmodSync(directory, 0o700);
+  }
   writeFileSync(binary, '#!/bin/sh\n', { mode: 0o700 });
   writeFileSync(
     path.join(codexHome, 'config.toml'),
@@ -43,6 +45,9 @@ function createDeployment(t, lease = null) {
       'default_permissions = "polygram-session"',
       'approval_policy = "never"',
       'web_search = "disabled"',
+      '',
+      '[permissions."polygram-session".filesystem]',
+      `${JSON.stringify(codexTmp)} = "deny"`,
       '',
       '[permissions."polygram-session".network]',
       'enabled = false',
@@ -70,6 +75,7 @@ function createDeployment(t, lease = null) {
         pm: 'codex',
         codexModel: 'gpt-5.6-sol',
         codexEffort: 'xhigh',
+        cwd: workspace,
       },
     },
   };
@@ -101,10 +107,17 @@ function createDeployment(t, lease = null) {
   return {
     binary,
     codexHome,
+    codexTmp,
     ipcRuntimeDir,
+    workspace,
     config,
     db,
     dependencies,
+    processEnv: {
+      HOME: root,
+      TMPDIR: path.join(root, 'inherited-tmp'),
+      POLYGRAM_CODEX_TMPDIR: codexTmp,
+    },
   };
 }
 
@@ -114,6 +127,7 @@ test('offline Codex doctor verifies the local pin, home, profile, identity, and 
     config: deployment.config,
     db: deployment.db,
     dependencies: deployment.dependencies,
+    processEnv: deployment.processEnv,
   });
   const statuses = Object.fromEntries(
     checks.map(({ name, status }) => [name, status]),
@@ -125,6 +139,7 @@ test('offline Codex doctor verifies the local pin, home, profile, identity, and 
     'codex-protocol': 'ok',
     'codex-profile': 'ok',
     'codex-ipc-root': 'ok',
+    'codex-tmpdir': 'ok',
     'codex-model-catalog': 'warn',
     'codex-identity': 'ok',
     'codex-lease': 'ok',
@@ -140,6 +155,148 @@ test('offline Codex doctor verifies the local pin, home, profile, identity, and 
     checks.every(({ detail }) => Buffer.byteLength(detail, 'utf8') <= 256),
     'every diagnostic detail is bounded',
   );
+});
+
+test('unsafe Codex temp roots fail closed without exposing their path', async (t) => {
+  const deployment = createDeployment(t);
+  chmodSync(deployment.codexTmp, 0o755);
+
+  const checks = await collectCodexDoctorChecks({
+    config: deployment.config,
+    db: deployment.db,
+    dependencies: deployment.dependencies,
+    processEnv: deployment.processEnv,
+  });
+  const temp = checks.find(({ name }) => name === 'codex-tmpdir');
+
+  assert.equal(temp.status, 'fail');
+  assert.doesNotMatch(
+    JSON.stringify(temp),
+    new RegExp(deployment.codexTmp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+  );
+});
+
+test('Codex temp is not reported protected when its profile deny is missing', async (t) => {
+  const deployment = createDeployment(t);
+  writeFileSync(
+    path.join(deployment.codexHome, 'config.toml'),
+    [
+      'default_permissions = "polygram-session"',
+      'approval_policy = "never"',
+      'web_search = "disabled"',
+      '',
+      '[permissions."polygram-session".network]',
+      'enabled = false',
+      '',
+    ].join('\n'),
+    { mode: 0o600 },
+  );
+
+  const checks = await collectCodexDoctorChecks({
+    config: deployment.config,
+    db: deployment.db,
+    dependencies: deployment.dependencies,
+    processEnv: deployment.processEnv,
+  });
+  const temp = checks.find(({ name }) => name === 'codex-tmpdir');
+
+  assert.equal(temp.status, 'fail');
+  assert.equal(temp.extra.protected, false);
+});
+
+test('Codex temp overlap is found through bot selection and default cwd inheritance', async (t) => {
+  const deployment = createDeployment(t);
+  delete deployment.config.chats[100].pm;
+  delete deployment.config.chats[100].cwd;
+  deployment.config.bots = {
+    'test-bot': { pm: 'codex' },
+  };
+  deployment.config.defaults = {
+    cwd: deployment.codexTmp,
+  };
+
+  const checks = await collectCodexDoctorChecks({
+    config: deployment.config,
+    db: deployment.db,
+    dependencies: deployment.dependencies,
+    processEnv: deployment.processEnv,
+  });
+  const temp = checks.find(({ name }) => name === 'codex-tmpdir');
+
+  assert.equal(temp.status, 'fail');
+  assert.equal(temp.extra.protected, false);
+});
+
+test('Codex temp overlap is found in a topic-specific cwd', async (t) => {
+  const deployment = createDeployment(t);
+  deployment.config.chats[100].topics = {
+    7: {
+      pm: 'codex',
+      cwd: deployment.codexTmp,
+    },
+  };
+
+  const checks = await collectCodexDoctorChecks({
+    config: deployment.config,
+    db: deployment.db,
+    dependencies: deployment.dependencies,
+    processEnv: deployment.processEnv,
+  });
+  const temp = checks.find(({ name }) => name === 'codex-tmpdir');
+
+  assert.equal(temp.status, 'fail');
+  assert.equal(temp.extra.protected, false);
+});
+
+test('Codex temp accepts an owned-profile parent deny that covers it', async (t) => {
+  const deployment = createDeployment(t);
+  const childTmp = path.join(deployment.codexTmp, 'app-server');
+  mkdirSync(childTmp, { mode: 0o700 });
+  chmodSync(childTmp, 0o700);
+  deployment.processEnv.POLYGRAM_CODEX_TMPDIR = childTmp;
+
+  const checks = await collectCodexDoctorChecks({
+    config: deployment.config,
+    db: deployment.db,
+    dependencies: deployment.dependencies,
+    processEnv: deployment.processEnv,
+  });
+  const temp = checks.find(({ name }) => name === 'codex-tmpdir');
+
+  assert.equal(temp.status, 'ok');
+  assert.equal(temp.extra.protected, true);
+});
+
+test('Codex temp rejects a deny forged under an indented unrelated TOML table', async (t) => {
+  const deployment = createDeployment(t);
+  writeFileSync(
+    path.join(deployment.codexHome, 'config.toml'),
+    [
+      'default_permissions = "polygram-session"',
+      'approval_policy = "never"',
+      'web_search = "disabled"',
+      '',
+      '[permissions."polygram-session".network]',
+      'enabled = false',
+      '',
+      '[permissions."polygram-session".filesystem]',
+      '  [permissions."unrelated".filesystem]',
+      `${JSON.stringify(deployment.codexTmp)} = "deny"`,
+      '',
+    ].join('\n'),
+    { mode: 0o600 },
+  );
+
+  const checks = await collectCodexDoctorChecks({
+    config: deployment.config,
+    db: deployment.db,
+    dependencies: deployment.dependencies,
+    processEnv: deployment.processEnv,
+  });
+  const temp = checks.find(({ name }) => name === 'codex-tmpdir');
+
+  assert.equal(temp.status, 'fail');
+  assert.equal(temp.extra.protected, false);
 });
 
 test('unsafe IPC runtime roots fail without exposing paths or raw errors', async (t) => {

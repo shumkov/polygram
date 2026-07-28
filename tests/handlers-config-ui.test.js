@@ -282,7 +282,8 @@ describe('createFormatConfigInfoText', () => {
     assert.doesNotMatch(out, /controlled session replacement/);
     assert.match(out, /^Runtime: Codex app-server$/m);
     assert.match(out, /^Session: managed by Codex$/m);
-    assert.match(out, /Native macOS beta/);
+    assert.match(out, /Native Codex beta/);
+    assert.doesNotMatch(out, /macOS/);
     assert.match(out, /network and web search are disabled/);
     assert.match(out, /Product MCP tools and interactive approvals are unavailable/);
     assert.match(out, /Detached\/background servers are unsupported/);

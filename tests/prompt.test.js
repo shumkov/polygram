@@ -392,7 +392,8 @@ describe('buildPrompt — full integration', () => {
     assert.match(p, /Reply with inline text/);
     assert.match(p, /streams and delivers your final response automatically/);
     assert.match(p, /Do NOT use Telegram MCP tools/);
-    assert.match(p, /native macOS beta/);
+    assert.match(p, /native Codex beta/);
+    assert.doesNotMatch(p, /macOS/);
     assert.match(p, /command network and model-native web search are disabled/);
     assert.match(p, /product MCP tools and interactive approvals are unavailable/);
     assert.match(p, /Keep long-running commands in the foreground/);

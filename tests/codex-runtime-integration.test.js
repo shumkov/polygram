@@ -78,6 +78,7 @@ function digest(value) {
 
 function ownedConfig({
   codexHome,
+  codexTmp,
   daemonSecretRoot,
   workspace,
 }) {
@@ -103,6 +104,7 @@ function ownedConfig({
         filesystem: {
           ':minimal': 'read',
           [codexHome]: 'deny',
+          [codexTmp]: 'deny',
           [daemonSecretRoot]: 'deny',
           ':workspace_roots': { '.': 'write' },
         },
@@ -403,6 +405,7 @@ function makeFixture(t, scenario = {}) {
     workspace: path.join(root, 'workspace'),
     daemonSecretRoot: path.join(root, 'daemon-secrets'),
     codexHome: path.join(root, 'codex-home'),
+    codexTmp: path.join(root, 'codex-tmp'),
     serviceHome: path.join(root, 'service-home'),
     serviceTmp: path.join(root, 'service-tmp'),
     binary: path.join(root, 'codex'),
@@ -412,6 +415,7 @@ function makeFixture(t, scenario = {}) {
     fixture.workspace,
     fixture.daemonSecretRoot,
     fixture.codexHome,
+    fixture.codexTmp,
     fixture.serviceHome,
     fixture.serviceTmp,
   ]) {
@@ -512,6 +516,7 @@ function createRuntime({
   const processEnv = {
     HOME: fixture.serviceHome,
     TMPDIR: fixture.serviceTmp,
+    POLYGRAM_CODEX_TMPDIR: fixture.codexTmp,
     LANG: 'en_US.UTF-8',
     LC_ALL: 'en_US.UTF-8',
   };
@@ -625,6 +630,12 @@ test('warm model settings reuse preflight, generation, and thread for the next t
     try { db.raw.close(); } catch {}
   });
   const first = await spawnCodex(runtime, db, config);
+  const spawned = JSON.parse(readFileSync(
+    path.join(fixture.workspace, 'fake-codex-spawn.json'),
+    'utf8',
+  ));
+  assert.equal(spawned.env.TMPDIR, fixture.codexTmp);
+  assert.equal(spawned.env.CODEX_HOME, fixture.codexHome);
   const generationId = first.proc.generationId;
   const threadId = first.proc.providerSessionId;
   const requestLog = path.join(
