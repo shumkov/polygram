@@ -848,7 +848,8 @@ function activeTurnDescriptor(turnId) {
 function completingTurnDescriptor(turnId, text) {
   return {
     ...activeTurnDescriptor(turnId),
-    lateDelayMs: 5,
+    // Keep activation observable even when coverage instrumentation delays the test.
+    lateDelayMs: 100,
     lateMessages: completedTurnMessages(turnId, text),
   };
 }
