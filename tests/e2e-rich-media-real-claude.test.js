@@ -108,7 +108,9 @@ test('e2e: real claude authors inline media per the rich hint → full media pip
     // seam, so hand it over as explicit display rules in the message. What's
     // under test is whether the HINT TEXT steers correct authoring, not the
     // injection plumbing (build-options.test.js covers that).
-    const hint = buildPolygramDisplayHint(true);
+    // inlineMedia: the media paragraphs are the rules this test asks claude to
+    // follow, and both delivering paths now ship them.
+    const hint = buildPolygramDisplayHint(true, { inlineMedia: true });
 
     // The plumbing is reliable; claude's discretion (e.g. describing the
     // images instead of embedding them) is the coin-flip — retry a fresh turn
