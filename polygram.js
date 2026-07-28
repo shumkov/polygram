@@ -1310,16 +1310,21 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     sessionCwd: _mediaTopicCfg.cwd || chatConfig.cwd || null,
   });
   // Same shared factory the reply-tool path uses, so the two trust boundaries
-  // are one piece of code. This path keeps its wider ceilings: it is the
-  // interactive streamer, not the reply tool, so `files:` parity does not
-  // apply to it.
+  // are one piece of code. This path keeps its wider per-message ceiling: it
+  // is the interactive streamer, not the reply tool, so `files:` fan-out
+  // parity does not apply to it.
   const resolveRichMedia = makeRichMediaResolver({
     allowedRoots: mediaAllowedRoots,
     chatId,
     threadId,
     config,
     fileIdCache: richMediaFileIdCache,
-    allowUrlMedia: !config.bot?.apiRoot,
+    // Closed on every server, not only self-hosted ones. A self-hosted Bot API
+    // server fetching the URL is an SSRF surface; the cloud API fetching it is
+    // an exfiltration beacon that leaves no trace on this host and bypasses
+    // any egress control on it. Neither display hint teaches URL media, so
+    // nothing legitimate authors it.
+    allowUrlMedia: false,
     maxMediaPerMessage: MAX_MEDIA_PER_MESSAGE,
     logEvent,
     botName: BOT_NAME,
@@ -3606,6 +3611,15 @@ async function main() {
       persistBubbleText,
       logger: console,
       botName: BOT_NAME,
+      // A consumed reply is finalized by the streamer, which resolves media
+      // against the interactive path's roots and ceilings rather than this
+      // call's. Rather than let the same reply obey different rules depending
+      // on whether a preview happened to be live, media renders only where
+      // the reply tool's own gates apply — here it degrades to its caption,
+      // exactly as it does on any other path that cannot upload it.
+      projectConsumedText: (text, { chatId, threadId }) => (
+        resolveRichTextEnabled(config, chatId, threadId) ? stripMediaMarkdown(text) : text
+      ),
     }),
     // Injected rather than imported by the dispatcher: rich-media.js requires
     // the dispatcher module, so the reverse direction would be a require cycle.

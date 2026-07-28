@@ -325,3 +325,98 @@ describe('live preview × rich media', () => {
     assert.equal(h.tg.edits.length, 0, 'the live preview was not touched');
   });
 });
+
+describe('what a consumed reply may deliver', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { stripMediaMarkdown } = require('../lib/telegram/rich');
+
+  const dirs = new Set();
+  test.after(() => {
+    for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function harnessWithProjection({ richEnabled = true } = {}) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-consume-'));
+    dirs.add(dir);
+    const file = path.join(dir, 'chart.png');
+    fs.writeFileSync(file, Buffer.alloc(32, 1));
+
+    const finalized = [];
+    const streamer = createStreamer({
+      send: async () => ({ message_id: 400 }),
+      edit: async () => {},
+      deleteMessage: async () => {},
+      minChars: 5,
+      throttleMs: 0,
+      logger: { error: () => {}, warn: () => {} },
+    });
+    const registry = createStreamerRegistry();
+    registry.register('chat:1', {
+      streamer, chatId: '1', deliveredTexts: [], getTurnId: () => null,
+    });
+    const realFinalize = streamer.finalize.bind(streamer);
+    streamer.finalize = async (text) => { finalized.push(text); return realFinalize(text); };
+
+    const makeDeliverText = createDeliverTextFactory({
+      registry,
+      logEvent: () => {},
+      persistBubbleText: () => {},
+      logger: { error: () => {} },
+      botName: 'testbot',
+      // polygram's wiring, verbatim in shape.
+      projectConsumedText: (text) => (richEnabled ? stripMediaMarkdown(text) : text),
+    });
+
+    return { streamer, file, finalized, makeDeliverText, registry };
+  }
+
+  test('media never rides in on the branch that bypasses the reply tool\'s gates', async () => {
+    // Consuming means the STREAMER renders the bubble, under the interactive
+    // path's media rules — a different roots set and a 5× wider fan-out,
+    // reached without any of the reply tool's checks. The same reply must not
+    // obey different rules depending on whether a preview happened to be live.
+    const h = harnessWithProjection();
+    await h.streamer.onChunk('Working on the chart');
+
+    const out = await h.makeDeliverText({
+      sessionKey: 'chat:1', chatId: '1', threadId: null, interim: false, turnId: null,
+    })({ text: `## Results\n\n![the chart](${h.file})` });
+
+    assert.equal(out.handled, true, 'the preview still consumes the reply');
+    assert.equal(h.finalized.length, 1);
+    assert.ok(!h.finalized[0].includes(h.file),
+      `the path reached the streamer: ${h.finalized[0]}`);
+    assert.ok(h.finalized[0].includes('the chart'), 'the caption survives');
+  });
+
+  test('a declining preview hands the NEXT strategy the text as authored', async () => {
+    // The projection is about what this branch delivers, not about what the
+    // reply is. Rich delivery must still see the media it is allowed to
+    // render — otherwise closing the bypass would delete the feature.
+    const h = harnessWithProjection();   // nothing streamed → nothing to consume
+
+    const strategy = h.makeDeliverText({
+      sessionKey: 'chat:1', chatId: '1', threadId: null, interim: false, turnId: null,
+    });
+    const text = `## Results\n\n![the chart](${h.file})`;
+    const out = await strategy({ text });
+
+    assert.equal(out.handled, false);
+    assert.equal(out.text, undefined,
+      'no rewrite on a decline — the chain passes the authored text along');
+  });
+
+  test('media-free text is byte-identical, flag on or off', async () => {
+    for (const richEnabled of [true, false]) {
+      const h = harnessWithProjection({ richEnabled });
+      await h.streamer.onChunk('Composing an answer');
+      await h.makeDeliverText({
+        sessionKey: 'chat:1', chatId: '1', threadId: null, interim: false, turnId: null,
+      })({ text: 'A perfectly ordinary answer with no media in it.' });
+      assert.deepEqual(h.finalized, ['A perfectly ordinary answer with no media in it.'],
+        `richEnabled=${richEnabled}`);
+    }
+  });
+});

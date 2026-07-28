@@ -86,6 +86,29 @@ describe('polygram rich-message wiring', () => {
       'the CLI hint should teach the media syntax this backend delivers');
   });
 
+  test('neither rich path accepts URL media, whatever the server', () => {
+    // The streamer's resolver used to allow URLs whenever there was no
+    // self-hosted apiRoot. That is the wrong way round: a self-hosted server
+    // fetching the URL is an SSRF surface, while the cloud API fetching it is
+    // an exfiltration beacon that leaves nothing on this host to find. A
+    // reply-tool reply consumed by a live preview is rendered by THIS
+    // resolver, so the reply tool's own refusal is only half the door.
+    const wiring = sectionBetween('const resolveRichMedia = makeRichMediaResolver({', '});');
+    assert.match(wiring, /allowUrlMedia: false/);
+    assert.doesNotMatch(wiring, /allowUrlMedia:\s*!config/,
+      'the apiRoot conditional is what left cloud bots open');
+  });
+
+  test('a preview that consumes a reply projects media out of it first', () => {
+    // Consuming means the streamer renders the bubble, under the interactive
+    // path's media rules rather than the reply tool's. Without this the same
+    // reply obeys different roots and a wider fan-out depending only on
+    // whether a preview happened to be live.
+    const wiring = sectionBetween('const makeDeliverText = composeDeliverTextFactories([', ']);');
+    assert.match(wiring, /projectConsumedText:/);
+    assert.match(wiring, /stripMediaMarkdown\(text\)/);
+  });
+
   test('the send verb has its own verdict, separate from the edit verb', () => {
     // A server implementing editMessageText{rich_message} but not the newer
     // sendRichMessage answers the latter with a bare 404. Sharing one flag

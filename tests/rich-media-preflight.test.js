@@ -558,3 +558,85 @@ describe('nested media aborts as one tree', () => {
     assert.deepEqual(tgCalls, [], 'not one byte of the group reached Telegram');
   });
 });
+
+describe('what actually gets uploaded', () => {
+  test('the upload carries the bytes the check read, not the path it read them from', async () => {
+    // A path-backed handle is re-opened by name when the request is built,
+    // and again on every retry — api.js sleeps up to 30 s on a 429. A file
+    // replaced inside that window would upload its new contents under a
+    // verdict given for the old ones. Binding to the bytes closes it.
+    const { dir, files } = workspace({ 'chart.png': 0 });
+    fs.writeFileSync(files['chart.png'], Buffer.from('the original bytes'));
+    const resolve = makeRichMediaResolver({ allowedRoots: [dir], chatId: '1' });
+    const preflight = createMediaPreflight({ allowedRoots: [dir] });
+    const [resolved] = resolve([{ src: files['chart.png'], caption: '' }]);
+
+    const uploads = [];
+    const materialized = materializeMediaBlocks(
+      [{ type: 'photo', photo: { type: 'photo', media: resolved.media } }],
+      (source, bytes) => { uploads.push({ source, bytes }); return { source, bytes }; },
+      preflight.preflightMedia,
+    );
+
+    // Whatever happens to the file now cannot change what is sent.
+    fs.writeFileSync(files['chart.png'], Buffer.from('SWAPPED'));
+
+    assert.equal(uploads.length, 1);
+    assert.ok(Buffer.isBuffer(uploads[0].bytes),
+      'a buffer, so a 429 retry re-sends rather than re-reads');
+    assert.equal(uploads[0].bytes.toString(), 'the original bytes');
+    assert.equal(uploads[0].source, fs.realpathSync(files['chart.png']),
+      'the source still travels — it is the filename Telegram is told');
+    assert.equal(materialized[0].photo.media.bytes.toString(), 'the original bytes');
+  });
+
+  test('a cached file_id uploads nothing at all', () => {
+    const { dir, files } = workspace();
+    const cache = createMediaFileIdCache();
+    const resolve = makeRichMediaResolver({ allowedRoots: [dir], chatId: '1', fileIdCache: cache });
+    const preflight = createMediaPreflight({ allowedRoots: [dir], fileIdCache: cache });
+    const [cold] = resolve([{ src: files['chart.png'], caption: '' }]);
+    cache.set('photo', cold.media.source, cold.media.fingerprint, 'photo-id');
+    const [warm] = resolve([{ src: files['chart.png'], caption: '' }]);
+
+    const checked = preflight.preflightMedia(warm.media, 'photo', { withBytes: true });
+
+    assert.equal(checked.value, 'photo-id', 'Telegram already holds the file');
+  });
+
+  test('a validation-only check reads no bytes', () => {
+    // rememberLocal and the rescue ladder call the preflight to decide, not
+    // to upload. Reading the file for them would be pure waste on a path that
+    // runs after every successful send.
+    const { dir, files } = workspace();
+    const resolve = makeRichMediaResolver({ allowedRoots: [dir], chatId: '1' });
+    const preflight = createMediaPreflight({ allowedRoots: [dir] });
+    const [resolved] = resolve([{ src: files['chart.png'], caption: '' }]);
+
+    const checked = preflight.preflightMedia(resolved.media, 'photo');
+
+    assert.deepEqual(checked.value, { source: fs.realpathSync(files['chart.png']) });
+    assert.equal(checked.value.bytes, undefined);
+  });
+
+  test('a file that vanishes between the stat and the open fails closed', () => {
+    // The two checks are not the same check: the first proves the NAME
+    // resolves somewhere allowed, the second proves the OPEN FILE is the one
+    // that was fingerprinted.
+    const { dir, files } = workspace();
+    const resolve = makeRichMediaResolver({ allowedRoots: [dir], chatId: '1' });
+    const [resolved] = resolve([{ src: files['chart.png'], caption: '' }]);
+    const preflight = createMediaPreflight({
+      allowedRoots: [dir],
+      // Passes the path-stat check, then the file is gone by the time it is
+      // opened — the shape a swap-under-us takes.
+      fileStat: (p) => {
+        const stat = fs.statSync(p, { bigint: true });
+        fs.unlinkSync(p);
+        return stat;
+      },
+    });
+
+    assert.equal(preflight.preflightMedia(resolved.media, 'photo', { withBytes: true }).ok, false);
+  });
+});

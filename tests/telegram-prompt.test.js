@@ -20,6 +20,7 @@ const {
   POLYGRAM_DISPLAY_HINT,
   TELEGRAM_TABLE_WIDTH_BUDGET,
   buildPolygramDisplayHint,
+  INLINE_MEDIA_PARAGRAPHS,
   appendDisplayHint,
 } = require('../lib/telegram/display-hint');
 
@@ -120,9 +121,14 @@ describe('rich media display hint', () => {
     // it: the reply path renders every non-media construct just as well.
     const withMedia = buildPolygramDisplayHint(true, { inlineMedia: true });
     const withoutMedia = buildPolygramDisplayHint(true);
+    // Subtract the paragraphs the gate adds, rather than pattern-matching for
+    // them: a newly added one would otherwise slip past the filter and this
+    // guard would fail for the wrong reason.
+    const added = INLINE_MEDIA_PARAGRAPHS.filter(l => l.trim());
+    assert.ok(added.length >= 2, 'the gate adds real guidance');
     const stripped = withMedia
       .split('\n')
-      .filter(l => !/Inline media:|Grouping media:/.test(l))
+      .filter(l => !added.includes(l))
       .join('\n')
       .replace(/\n{3,}/g, '\n\n');
     assert.equal(stripped, withoutMedia.replace(/\n{3,}/g, '\n\n'));
@@ -317,4 +323,15 @@ describe('integration with agent-loader composeSdkOptions', () => {
     assert.equal(final.preset, 'claude_code');
     assert.equal(final.append, POLYGRAM_DISPLAY_HINT);
   });
+});
+
+test('the media guidance warns against sending the same file twice', () => {
+  // Inline media and files: are independent delivery paths — a path in both
+  // is uploaded by each, and the user sees the image twice. Before media
+  // rendered here the inline copy was stripped, so the habit was harmless.
+  const hint = buildPolygramDisplayHint(true, { inlineMedia: true });
+  assert.match(hint, /not both/i);
+  assert.match(hint, /already delivered/i);
+  assert.doesNotMatch(buildPolygramDisplayHint(true), /not both/i,
+    'it belongs to the media guidance, not the base rich section');
 });
