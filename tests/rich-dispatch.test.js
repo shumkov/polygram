@@ -29,10 +29,11 @@ const os = require('node:os');
 const nodePath = require('node:path');
 
 const { createRichDeliveryFactory } = require('../lib/telegram/rich-dispatch');
-const { RICH_MAX_LEN } = require('../lib/telegram/rich');
+const { RICH_MAX_LEN, stripMediaMarkdown } = require('../lib/telegram/rich');
 const {
   createRichMediaResolver,
   createMediaDeliveryContext,
+  createMediaPreflight,
 } = require('../lib/telegram/rich-media');
 
 const TABLE = '| a | b |\n| --- | --- |\n| 1 | 2 |';
@@ -607,4 +608,81 @@ test('a wiring missing its preflight is refused outright', async () => {
   const payload = JSON.stringify(sendCalls[0].blocks);
   assert.ok(!payload.includes('photo'), 'no media may be sent without a preflight');
   assert.ok(!payload.includes(dir));
+});
+
+// ─── No branch renders a local path (the raw-render hazards) ───────────────
+//
+// Rendering on RAW text is what makes media possible, and it is also what
+// re-opens the leak the stripped-body render closed by construction. Two
+// distinct mechanisms, both reachable from ordinary agent output.
+
+test('a screenshot path with spaces never reaches the chat', async () => {
+  // The rich gate's image regex is looser than the CommonMark parser: a
+  // destination containing a space trips the gate but is not an image token,
+  // so it yields no descriptor and would survive as literal text WITH the
+  // path in it. macOS names every screenshot "Screenshot ... at ....png".
+  const { dir } = mediaWorkspace();
+  const cases = {
+    spaces: '/Users/ivan/Desktop/Screenshot 2026-07-29 at 10.00.00.png',
+    parens: '/Users/ivan/Desktop/shot (1).png',
+  };
+
+  for (const [label, p] of Object.entries(cases)) {
+    const { factory, sendCalls } = buildWithMedia();
+    const out = await deliverIn(factory, `Here you go:\n\n![shot](${p})`, [dir]);
+    const wire = JSON.stringify(sendCalls[0]?.blocks ?? out.text ?? '');
+    assert.ok(!wire.includes('/Users/ivan'), `${label}: path reached the chat as ${wire}`);
+  }
+});
+
+test('an uncaptioned image cannot smuggle its path through inline flattening', async () => {
+  // Inline tokens are flattened to plain text for headings, table cells and
+  // emphasis. An uncaptioned image there has no alt to flatten to, and
+  // falling back to its destination would print the path — the reply tool
+  // renders whatever an injected agent writes.
+  const { dir } = mediaWorkspace();
+  const secret = '/Users/ivan/.ssh/id_rsa';
+  const cases = {
+    heading: `# ![](${secret})`,
+    emphasis: `## Results\n\nsee **![](${secret})** here`,
+    table: `| a | b |\n| --- | --- |\n| ![](${secret}) | x |`,
+    linked: `## Results\n\n[![](${secret})](https://example.com)`,
+  };
+
+  for (const [label, text] of Object.entries(cases)) {
+    const { factory, sendCalls } = buildWithMedia();
+    const out = await deliverIn(factory, text, [dir]);
+    const wire = JSON.stringify(sendCalls[0]?.blocks ?? out.text ?? '');
+    assert.ok(!wire.includes('id_rsa'), `${label}: path reached the chat as ${wire}`);
+  }
+});
+
+test('a reply whose RAW text is over the cap is refused before the filesystem is touched', async () => {
+  // The stripped body is blind to the cost of media: image markdown collapses
+  // to a caption, so a megabyte of `![](…)` lines measures a few characters
+  // while charging a realpath+stat per descriptor on the daemon's busiest
+  // path. Only the raw measurement can see it.
+  const { dir, file } = mediaWorkspace();
+  let resolverCalls = 0;
+  const { factory, sendCalls } = build({
+    makeMediaWiring: ({ allowedRoots }) => ({
+      resolveMedia: (descriptors) => {
+        resolverCalls += 1;
+        return createRichMediaResolver({ allowedRoots, allowUrlMedia: false })(descriptors);
+      },
+      mediaContext: createMediaPreflight({ allowedRoots }),
+    }),
+  });
+  const flood = `![](${file})\n`.repeat(2000);
+  const text = `## Results\n\n${flood}`;
+
+  assert.ok(stripMediaMarkdown(text).length < RICH_MAX_LEN,
+    'fixture must pass the stripped-body gate — otherwise it proves nothing');
+  assert.ok(text.length > RICH_MAX_LEN, 'and be over the cap as authored');
+
+  const out = await deliverIn(factory, text, [dir]);
+
+  assert.equal(out.handled, false, 'the reply goes out plain');
+  assert.equal(resolverCalls, 0, 'and no descriptor was ever resolved');
+  assert.equal(sendCalls.length, 0);
 });
