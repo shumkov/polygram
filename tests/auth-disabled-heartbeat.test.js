@@ -114,11 +114,24 @@ describe('createHeartbeat — one file per bot in a shared data dir', () => {
     assert.notEqual(written[0], written[1], 'concurrent bots must not write the same temp path');
   });
 
-  test('a bot name that is a path traversal cannot escape the data dir', () => {
+  test('an unsafe bot name is rejected, not rewritten', () => {
     const dataDir = tmpDir();
-    const hb = createHeartbeat({ dataDir, botName: '../escaped', authDisabledGate: createAuthDisabledGate() });
-    hb.beat();
-    assert.equal(path.dirname(path.resolve(hb.file)), path.resolve(dataDir));
+    for (const bad of ['../escaped', 'a/b', '..', '.', 'has space', '']) {
+      assert.throws(
+        () => createHeartbeat({ dataDir, botName: bad, authDisabledGate: createAuthDisabledGate() }),
+        /botName/,
+        `expected ${JSON.stringify(bad)} to be rejected`,
+      );
+    }
+  });
+
+  // Rewriting unsafe names would map distinct bots onto one file — the same
+  // collision as sharing the filename outright, just reached a different way.
+  test('names that would sanitise to the same file cannot both be created', () => {
+    const dataDir = tmpDir();
+    const ok = createHeartbeat({ dataDir, botName: 'a_b', authDisabledGate: createAuthDisabledGate() });
+    assert.ok(ok.file.endsWith('heartbeat-a_b.json'));
+    assert.throws(() => createHeartbeat({ dataDir, botName: 'a/b', authDisabledGate: createAuthDisabledGate() }), /botName/);
   });
 });
 

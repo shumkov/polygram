@@ -342,7 +342,7 @@ only gates the operator DM, not visibility in logs/DB):
 ## Layer 3.3 — Heartbeat / Netdata visibility
 
 **This is the gap.** Unlike `water` (`lib/ops/heartbeat.js` →
-`heartbeat.json` → `/healthz` → Netdata httpcheck, plus a full
+`heartbeat-<botName>.json` → `/healthz` → Netdata httpcheck, plus a full
 `sla-watchdog.js`/`transport-watchdog.js` stack), this repo has **zero**
 existing health-check/heartbeat/Netdata infrastructure — its `ops/` directory
 is unrelated (launchd plist templates for local Mac process supervision, not
@@ -359,8 +359,8 @@ New `lib/ops/heartbeat.js`, minimal file-only equivalent of water's pattern
 (no `/healthz` endpoint, since there's no HTTP server to serve it from):
 
 ```js
-function createHeartbeat({ dataDir, authDisabledGate, intervalMs = 60_000, now = Date.now }) {
-  const file = path.join(dataDir, 'heartbeat.json');
+function createHeartbeat({ dataDir, botName, authDisabledGate, intervalMs = 60_000, now = Date.now }) {
+  const file = path.join(dataDir, `heartbeat-${botName}.json`);
   let timer = null;
 
   function snapshot() {
@@ -392,15 +392,22 @@ function createHeartbeat({ dataDir, authDisabledGate, intervalMs = 60_000, now =
 }
 ```
 
-- Written to `<DATA_DIR>/heartbeat.json` (`DATA_DIR = process.cwd()`,
-  `polygram.js:135` — each bot process's own working directory, mirroring
-  water's per-instance `dataDir` convention: shumabit and umi-assistant each
-  get their own file since they're separate processes/directories).
+- Written to `<DATA_DIR>/heartbeat-<botName>.json` (`DATA_DIR = process.cwd()`).
+  **The filename must carry the bot name.** An earlier version of this document
+  claimed shumabit and umi-assistant "each get their own file since they're
+  separate processes/directories" — that is false, and shipping on it was a bug.
+  Separate *processes*, yes; separate *directories*, no: the fleet starts every
+  `--bot` from one directory, so both wrote the same file through the same temp
+  path. The losing rename failed ENOENT every minute, and — worse — a live bot's
+  beat stood in for a dead one's, so the file could go stale unnoticed, which is
+  precisely the failure it exists to catch. `botName` is a required argument, and
+  unsafe names are rejected rather than sanitised (two names rewritten to the same
+  string would recreate the collision).
 - Wired in `polygram.js` main() next to the existing `runAuthCheck` boot +
   30-min-interval pattern: instantiate once, `start()` on boot.
   `authDisabledGate` and the heartbeat instance are both module-scope,
   created before `createDispatcher(...)` so the gate can be passed in.
-- **Explicitly out of scope for this repo's PR:** wiring `heartbeat.json`
+- **Explicitly out of scope for this repo's PR:** wiring `heartbeat-<botName>.json`
   into an actual Netdata alert (a `netdata_watch_units` / custom
   filecheck-or-cron-parses-JSON entry, analogous to water's
   `netdata_httpchecks` entries for `127.0.0.1:8090/healthz`). That's a
@@ -409,7 +416,7 @@ function createHeartbeat({ dataDir, authDisabledGate, intervalMs = 60_000, now =
 
 **Scope objection raised in review, kept anyway — flagging for sign-off:**
 the scope-simplicity reviewer argued this whole layer should be cut/deferred
-from this PR: nothing in this repo or its deployment reads `heartbeat.json`
+from this PR: nothing in this repo or its deployment reads the heartbeat file
 on merge day (the Netdata wiring is explicitly out of scope, per above), and
 the same data is already durably queryable via Layer 3.2's `db.logEvent`.
 That's a fair simplicity argument on its own — but building this now is an

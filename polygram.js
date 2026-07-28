@@ -2585,7 +2585,7 @@ async function main() {
   setInterval(() => runAuthCheck('interval'), 30 * 60_000).unref?.();
 
   // AUTH_DISABLED Netdata-visibility heartbeat (docs/AUTH_DISABLED_HANDLING_SPEC.md,
-  // Layer 3.3) — writes <DATA_DIR>/heartbeat.json every 60s with the
+  // Layer 3.3) — writes <DATA_DIR>/heartbeat-<botName>.json every 60s with the
   // authDisabledGate's occurrence counter. File-only (no HTTP server in this
   // repo to hang a /healthz route on); wiring the file into an actual Netdata
   // alert is a separate VPS-side ops change, out of scope here.

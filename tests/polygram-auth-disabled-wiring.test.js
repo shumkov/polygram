@@ -99,6 +99,18 @@ describe('polygram.js — AUTH_DISABLED DI + boot wiring', () => {
     assert.ok(startLine > constructLine, 'cannot start a heartbeat that has not been constructed');
   });
 
+  // shutdown() optional-chains the heartbeat because it may not exist yet. That is
+  // only safe while the signal handlers are registered after construction; if a
+  // refactor registers them earlier, the guard becomes load-bearing and the
+  // shutdown path needs re-checking rather than silently relying on line order.
+  test('signal handlers are registered after the heartbeat is constructed', () => {
+    const constructLine = findLineOf('authDisabledHeartbeat = createHeartbeat(');
+    const sigtermLine = findLineOf("process.on('SIGTERM'");
+    assert.ok(sigtermLine > 0, 'must find SIGTERM registration');
+    assert.ok(sigtermLine > constructLine,
+      'SIGTERM registered before construction would make shutdown\'s ?. guard load-bearing');
+  });
+
   test('authDisabledHeartbeat.start() is called on boot', () => {
     const startLine = findLineOf('authDisabledHeartbeat.start();');
     assert.ok(startLine > 0, 'authDisabledHeartbeat.start() must be called somewhere in main()\'s boot sequence');
