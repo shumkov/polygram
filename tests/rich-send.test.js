@@ -224,6 +224,8 @@ test('a content error falls back once without latching', async () => {
   const out = await sendRich(baseArgs);
 
   assert.equal(out.wentRich, false);
+  assert.equal(out.fallback, 'content-error',
+    'the class carries a side effect (cache eviction) — it may not be applied by accident');
   assert.equal(isLatched(), false, 'this payload was bad, not the server');
   assert.ok(events.some(e => e.kind === 'rich-content-fallback'));
   assert.equal(rows.length, 0, 'a failed attempt leaves no transcript row to duplicate');
@@ -237,6 +239,7 @@ test('an unknown error degrades instead of propagating', async () => {
   const out = await sendRich(baseArgs);
 
   assert.equal(out.wentRich, false, 'the caller delivers plain — the reply is not lost');
+  assert.equal(out.fallback, 'error');
   assert.equal(isLatched(), false);
   assert.ok(events.some(e => e.kind === 'rich-send-error'));
 });
@@ -303,6 +306,9 @@ test('a response without a message id is a fallback, not a delivery', async () =
   const out = await sendRich(baseArgs);
 
   assert.equal(out.wentRich, false, 'the caller must fall back rather than report success');
+  assert.equal(out.fallback, 'no-message-id',
+    'not content-error: that class evicts cached ids, and an unreadable response '
+    + 'says nothing about whether they are stale');
   assert.equal(rows.length, 0, 'no row rather than one keyed on a placeholder id');
   const ev = events.find(e => e.kind === 'rich-content-fallback');
   assert.ok(ev, `expected a content-class fallback: ${JSON.stringify(events.map(e => e.kind))}`);
@@ -535,4 +541,26 @@ test('requiring rich-send first still yields both modules complete', () => {
       code: 'RICH_MEDIA_SOURCE_CHANGED',
     });
   }
+});
+
+test('a landed message keeps its transcript row even if cache learning explodes', async () => {
+  // Ordering, not tolerance: the row and the event are what the agent's
+  // preloaded history is built from, and the cache is an optimization. Run
+  // ahead of them, one throwing caller-supplied dependency would cost a
+  // delivered reply its history — and the agent would answer twice.
+  const { blocks } = mediaFixture();
+  const { sendRich, rows, events } = makeSender();
+
+  const out = await sendRich({
+    ...baseArgs,
+    blocks,
+    mediaContext: {
+      preflightMedia: () => ({ ok: true, value: 'file-id' }),
+      learnRichResult: () => { throw new Error('cache exploded'); },
+    },
+  });
+
+  assert.equal(out.wentRich, true);
+  assert.equal(rows.length, 1, 'the transcript row survives');
+  assert.ok(events.some(e => e.kind === 'rich-message-sent'), 'and so does the telemetry');
 });

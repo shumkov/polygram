@@ -25,14 +25,19 @@ const {
   makeRichMediaResolver,
   makeReplyMediaWiring,
   createMediaPreflight,
+  createMediaDeliveryContext,
   createMediaFileIdCache,
   PHOTO_UPLOAD_CEILING,
   OTHER_MEDIA_UPLOAD_CEILING,
   MAX_TOTAL_MEDIA_BYTES,
   MAX_MEDIA_PER_MESSAGE,
 } = require('../lib/telegram/rich-media');
-const { MAX_FILES_PER_REPLY } = require('../lib/process/channels-tool-dispatcher');
+const {
+  MAX_FILES_PER_REPLY, validateAttachmentPath,
+} = require('../lib/process/channels-tool-dispatcher');
 const { materializeMediaBlocks } = require('../lib/telegram/rich-edit');
+const { toTelegramRichBlocks } = require('../lib/telegram/rich');
+const { createRichSender } = require('../lib/telegram/rich-send');
 
 const tempDirs = new Set();
 function workspace(files = { 'chart.png': 64 }) {
@@ -235,29 +240,36 @@ describe('createMediaPreflight', () => {
     );
   });
 
-  test('the whole tree aborts on the first mismatch, not just the changed item', () => {
+  test('the whole tree aborts on the first mismatch, whichever item changed', () => {
     // Stated so the failure mode is a decision: one swapped file costs ALL
     // media in that reply, and the strategy re-renders every item as
     // unavailable rather than sending a partially-swapped tree.
-    const { dir, files } = workspace({ 'a.png': 8, 'b.png': 8 });
-    const resolve = makeRichMediaResolver({ allowedRoots: [dir], chatId: '1' });
-    const preflight = createMediaPreflight({ allowedRoots: [dir] });
-    const [a, b] = resolve([
-      { src: files['a.png'], caption: '' },
-      { src: files['b.png'], caption: '' },
-    ]);
-    fs.writeFileSync(files['a.png'], Buffer.alloc(9, 3));
+    //
+    // Asserted on the THROW, not on which handles were built. Materialization
+    // walks in order, so whether an untouched sibling gets a handle first is
+    // an artifact of position — and a handle is lazy and path-backed, nothing
+    // is read until a request is serialized. The throw is what guarantees no
+    // request is ever built; both orderings are covered so neither passes by
+    // luck.
+    for (const changed of ['a.png', 'b.png']) {
+      const { dir, files } = workspace({ 'a.png': 8, 'b.png': 8 });
+      const resolve = makeRichMediaResolver({ allowedRoots: [dir], chatId: '1' });
+      const preflight = createMediaPreflight({ allowedRoots: [dir] });
+      const [a, b] = resolve([
+        { src: files['a.png'], caption: '' },
+        { src: files['b.png'], caption: '' },
+      ]);
+      fs.writeFileSync(files[changed], Buffer.alloc(9, 3));
 
-    const prepared = [];
-    assert.throws(() => materializeMediaBlocks(
-      [
-        { type: 'photo', photo: { type: 'photo', media: a.media } },
-        { type: 'photo', photo: { type: 'photo', media: b.media } },
-      ],
-      (source) => { prepared.push(source); return { source }; },
-      preflight.preflightMedia,
-    ), /source changed/i);
-    assert.deepEqual(prepared, [], 'the untouched file is not uploaded either');
+      assert.throws(() => materializeMediaBlocks(
+        [
+          { type: 'photo', photo: { type: 'photo', media: a.media } },
+          { type: 'photo', photo: { type: 'photo', media: b.media } },
+        ],
+        (source) => ({ source }),
+        preflight.preflightMedia,
+      ), /source changed/i, `changed=${changed}`);
+    }
   });
 
   test('eviction and learning act on the same cache the resolver reads', () => {
@@ -430,5 +442,119 @@ describe('the media-count ceiling', () => {
     );
     assert.equal(results.filter((r) => r.media).length, MAX_MEDIA_PER_MESSAGE,
       'and clamped at enforcement — Telegram rejects the whole reply past 50');
+  });
+});
+
+describe('the delivery context is built on the preflight', () => {
+  test('it forwards the stat and the validator it was given', () => {
+    // The extraction is only behavior-preserving if these arrive. A forward
+    // that drops fileStat leaves the delivery context stat'ing differently
+    // from the resolver that produced the fingerprints — every media send
+    // then degrades to "(media unavailable)" with nothing in the logs. The
+    // streamer suite passes either way, so it has to be pinned here.
+    const { dir, files } = workspace();
+    const seen = { stats: 0, validations: 0 };
+    const context = createMediaDeliveryContext({
+      allowedRoots: [dir],
+      tg: async () => ({}),
+      bot: {},
+      chatId: 'chat',
+      fileStat: (p) => { seen.stats += 1; return fs.statSync(p, { bigint: true }); },
+      validatePath: (p, roots) => {
+        seen.validations += 1;
+        return validateAttachmentPath(p, roots);
+      },
+    });
+
+    const [resolved] = makeRichMediaResolver({ allowedRoots: [dir], chatId: '1' })(
+      [{ src: files['chart.png'], caption: '' }],
+    );
+    const checked = context.preflightMedia(resolved.media, 'photo');
+
+    assert.equal(checked.ok, true);
+    assert.equal(seen.stats, 1, 'the injected stat was the one used');
+    assert.equal(seen.validations, 1, 'and so was the injected validator');
+  });
+});
+
+describe('symlink swapped between resolve and send', () => {
+  test('a link repointed outside the roots after resolution fails closed', () => {
+    // The claim is that the resolved realpath is what gets uploaded, so
+    // repointing the alias cannot smuggle a new target past a check that
+    // already passed. Preflight re-requires that the path still resolves to
+    // the same realpath, which is what makes that true.
+    const inside = workspace({ 'real.png': 32 });
+    const outside = workspace({ 'secret.png': 32 });
+    const link = path.join(inside.dir, 'link.png');
+    fs.symlinkSync(inside.files['real.png'], link);
+
+    const resolve = makeRichMediaResolver({ allowedRoots: [inside.dir], chatId: '1' });
+    const preflight = createMediaPreflight({ allowedRoots: [inside.dir] });
+    const [resolved] = resolve([{ src: link, caption: '' }]);
+    assert.equal(resolved.media.source, fs.realpathSync(inside.files['real.png']),
+      'resolution records the target realpath, never the alias');
+
+    // The agent owns its workspace, so it can repoint its own symlink.
+    fs.unlinkSync(link);
+    fs.symlinkSync(outside.files['secret.png'], link);
+
+    assert.equal(preflight.preflightMedia(resolved.media, 'photo').ok, true,
+      'the recorded realpath is unchanged and still in roots — it uploads that file');
+    assert.throws(
+      () => materializeMediaBlocks(
+        [{ type: 'photo', photo: { type: 'photo', media: { ...resolved.media, source: link } } }],
+        () => { throw new Error('nothing may be prepared for upload'); },
+        preflight.preflightMedia,
+      ),
+      /source changed/i,
+      'and an envelope naming the alias is refused: it no longer resolves to itself',
+    );
+  });
+});
+
+describe('nested media aborts as one tree', () => {
+  test('one swapped child of a collage stops the whole group uploading', async () => {
+    // The flat case is covered above; nesting is where a per-item abort would
+    // be easiest to write by accident, and a group that uploaded its
+    // unchanged half alongside a swapped one is the failure that matters —
+    // the user would see a before/after where "after" is something else.
+    const { dir, files } = workspace({ 'before.png': 32, 'after.png': 32 });
+    const resolveMedia = makeRichMediaResolver({ allowedRoots: [dir], chatId: '1' });
+    const preflight = createMediaPreflight({ allowedRoots: [dir] });
+
+    const { blocks, usedRich } = toTelegramRichBlocks(
+      `<tg-collage>\n\n![before](${files['before.png']})\n\n![after](${files['after.png']})\n\n</tg-collage>`,
+      { resolveMedia },
+    );
+    assert.equal(usedRich, true);
+    const collage = blocks.find((b) => b.type === 'collage');
+    assert.ok(collage, `fixture must produce a group: ${JSON.stringify(blocks)}`);
+    assert.equal(collage.blocks.length, 2);
+
+    fs.writeFileSync(files['after.png'], Buffer.alloc(64, 9));
+
+    // What matters is that no request is built: the throw escapes the whole
+    // map, so the params object never exists and neither child is sent. Note
+    // the unchanged sibling may already hold a lazy path-backed handle — that
+    // reads nothing, and nothing ever serializes it.
+    assert.throws(
+      () => materializeMediaBlocks(blocks, (source) => ({ source }), preflight.preflightMedia),
+      /source changed/i,
+    );
+
+    const tgCalls = [];
+    const sendRich = createRichSender({
+      tg: async (_bot, method, params) => { tgCalls.push({ method, params }); return { message_id: 1 }; },
+      botName: 'testbot',
+      isRichCapabilityError: () => false,
+      isRichContentError: () => false,
+      logger: { error: () => {}, warn: () => {} },
+    });
+    const out = await sendRich({
+      bot: {}, chatId: '1', blocks, sourceText: 'x', mediaContext: preflight,
+    });
+
+    assert.deepEqual(out, { wentRich: false, fallback: 'media-source-changed' });
+    assert.deepEqual(tgCalls, [], 'not one byte of the group reached Telegram');
   });
 });

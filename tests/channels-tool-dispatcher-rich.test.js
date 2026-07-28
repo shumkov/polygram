@@ -852,3 +852,33 @@ test('a reply that is only a resolvable photo still goes rich', async () => {
   assert.ok(richBlocksOf(h.tgCalls).some(b => b.type === 'photo'));
   assert.equal(h.deliverCalls.length, 0);
 });
+
+test('a collage of mixed media survives the reply-tool path as one group', async () => {
+  // G1 names media GROUPS, not just single photos, and the wrapper is the
+  // shape the display hint teaches for before/after comparisons. The
+  // renderer is shared with the streamer path, so what is at stake here is
+  // the integration: descriptors nested inside a wrapper must reach the same
+  // resolver, and the group must survive rendering, materialization, and the
+  // media count the soak reads.
+  const { dir } = mediaDir();
+  const before = path.join(dir, 'before.png');
+  const after = path.join(dir, 'after.mp4');
+  nodeFs.writeFileSync(before, Buffer.alloc(32, 1));
+  nodeFs.writeFileSync(after, Buffer.alloc(32, 2));
+  const h = buildMediaWired();
+
+  const res = await h.dispatcher({
+    sessionKey: 'sess-A', chatId: '12345', threadId: null,
+    toolName: 'reply', files: null, sessionCwd: dir,
+    text: `## Before and after\n\n<tg-collage>\n\n![before](${before})\n\n![after](${after})\n\n</tg-collage>`,
+  });
+
+  assert.equal(res.ok, true);
+  const collage = richBlocksOf(h.tgCalls).find(b => b.type === 'collage');
+  assert.ok(collage, `expected a collage block: ${JSON.stringify(richBlocksOf(h.tgCalls))}`);
+  assert.deepEqual(collage.blocks.map(b => b.type), ['photo', 'video'],
+    'each child keeps its own kind — a video is not a photo');
+  assert.deepEqual(h.uploads,
+    [nodeFs.realpathSync(before), nodeFs.realpathSync(after)],
+    'both children were materialized from their resolved realpaths');
+});
