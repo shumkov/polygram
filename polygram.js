@@ -772,7 +772,10 @@ let recoverCodexRequest = null;
 // heartbeat.start() is called in main() once DATA_DIR is settled; the gate
 // needs no runtime config, so it's constructed here directly.
 const authDisabledGate = createAuthDisabledGate();
-const authDisabledHeartbeat = createHeartbeat({ dataDir: DATA_DIR, authDisabledGate });
+// Constructed in main(), not here: the heartbeat filename carries BOT_NAME (every
+// bot shares DATA_DIR, which is process.cwd()), and BOT_NAME is only parsed once
+// main() runs.
+let authDisabledHeartbeat = null;
 
 // rc.59: once-per-cycle gate for the contextHint. A session is added
 // to this Set when the hint fires, removed when the SDK emits
@@ -3114,10 +3117,11 @@ async function main() {
   setInterval(() => runAuthCheck('interval'), 30 * 60_000).unref?.();
 
   // AUTH_DISABLED Netdata-visibility heartbeat (docs/AUTH_DISABLED_HANDLING_SPEC.md,
-  // Layer 3.3) — writes <DATA_DIR>/heartbeat.json every 60s with the
+  // Layer 3.3) — writes <DATA_DIR>/heartbeat-<botName>.json every 60s with the
   // authDisabledGate's occurrence counter. File-only (no HTTP server in this
   // repo to hang a /healthz route on); wiring the file into an actual Netdata
   // alert is a separate VPS-side ops change, out of scope here.
+  authDisabledHeartbeat = createHeartbeat({ dataDir: DATA_DIR, botName: BOT_NAME, authDisabledGate });
   authDisabledHeartbeat.start();
 
   // 0.8.0 Phase 1 step 11 + rc.50: defensive uncaughtException +
@@ -3703,7 +3707,7 @@ async function main() {
     // 4. Remaining shutdown: approvals sweeper, IPC, resolve hook waiters,
     //    kill pm subprocesses, close DB.
     if (approvalSweepTimer) clearInterval(approvalSweepTimer);
-    authDisabledHeartbeat.stop();
+    authDisabledHeartbeat?.stop();  // null if we shut down before main() armed it
     if (ipcCloser) ipcCloser.close().catch(() => {});
     try { fs.unlinkSync(ipcServer.secretPathFor(BOT_NAME)); } catch {}
     // Reject every parked canUseTool waiter so the SDK doesn't
