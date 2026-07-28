@@ -115,7 +115,7 @@ const { createStreamer } = require('./lib/telegram/streamer');
 const { chunkMarkdownText } = require('./lib/telegram/chunk');
 const {
   toTelegramRichBlocks, resolveRichTextEnabled, isRichCapabilityError, isRichContentError,
-  stripMediaMarkdown,
+  isRichCapabilityErrorExplicit, isRichMessageFieldRejection, stripMediaMarkdown,
 } = require('./lib/telegram/rich');
 const {
   createRichMediaResolver,
@@ -126,6 +126,14 @@ const {
   OTHER_MEDIA_UPLOAD_CEILING,
 } = require('./lib/telegram/rich-media');
 const { createRichEditor } = require('./lib/telegram/rich-edit');
+const { createRichCapabilityLatch } = require('./lib/telegram/rich-capability-latch');
+
+// What a reply consisting only of media the delivering path cannot render
+// degrades to. Silence would leave the user with nothing and the agent
+// believing it answered.
+const MEDIA_ONLY_FALLBACK_TEXT = '(media unavailable)';
+const { createRichSender } = require('./lib/telegram/rich-send');
+const { createRichDeliveryFactory } = require('./lib/telegram/rich-dispatch');
 const { buildPolygramDisplayHint } = require('./lib/telegram/display-hint');
 const { redactBotToken, stripUrlCredentials } = require('./lib/error/net');
 // F#23: shared agent-reply helper. parseResponse + sanitizer + chunked
@@ -339,6 +347,11 @@ function logEvent(kind, detail) {
 // process lifetime — retrying a permanently-missing endpoint on every
 // future send is wasteful. Transient errors must not set the latch.
 let richKnownUnsupported = false;
+// Separate verdict for the newer sendRichMessage verb. A server can implement
+// editMessageText{rich_message} and not this one, answering it with a bare
+// 404 — a single shared flag would let the reply tool's probe permanently
+// disable the streamer's working rich edits.
+let richSendKnownUnsupported = false;
 
 // Extracted to lib/telegram/rich-edit.js so the capability/content/
 // transient error-classification + fallback wiring is directly unit-
@@ -349,6 +362,10 @@ let richKnownUnsupported = false;
 // safe to reference early because it's a stable function that does its
 // own live lookups internally when called.
 let richEditMessageText;
+// Send-side counterpart, used by the reply tool. Same latch and the same
+// classification, but it never throws: its caller holds the only copy of the
+// reply and owns the plain fallback.
+let richSendMessage;
 let richMediaFileIdCache;
 
 // 0.15 secret redaction (agent-flagged path): the agent marks a secret it saw
@@ -2985,6 +3002,18 @@ async function main() {
     }
     tg = createSender(db, console, config);
     richMediaFileIdCache = createMediaFileIdCache();
+    // ONE latch decision for both rich paths. They set the same flag, so a
+    // counter owned by either would let that path latch on its first bare
+    // 404 while the other still believed two were required.
+    // One strike counter, one verdict per verb.
+    const richCapabilityLatch = createRichCapabilityLatch({
+      isExplicit: isRichCapabilityErrorExplicit,
+      isFieldRejection: isRichMessageFieldRejection,
+      setUnsupported: (verb) => {
+        if (verb === 'send') richSendKnownUnsupported = true;
+        else richKnownUnsupported = true;
+      },
+    });
     richEditMessageText = createRichEditor({
       tg,
       botName: BOT_NAME,
@@ -2997,6 +3026,25 @@ async function main() {
       getApiRoot: () => config.bot?.apiRoot || null,
       stripUrlCreds: stripUrlCredentials,
       sanitizeFallbackText: stripMediaMarkdown,
+      capabilityLatch: richCapabilityLatch,
+    });
+    richSendMessage = createRichSender({
+      tg,
+      botName: BOT_NAME,
+      logEvent,
+      redactBotToken,
+      isRichCapabilityError,
+      isRichCapabilityErrorExplicit,
+      isRichContentError,
+      getRichKnownUnsupported: () => richSendKnownUnsupported,
+      setRichKnownUnsupported: () => { richSendKnownUnsupported = true; },
+      getApiRoot: () => config.bot?.apiRoot || null,
+      stripUrlCreds: stripUrlCredentials,
+      // api.js leaves sendRichMessage untracked so a failed attempt can't
+      // leave a row the plain fallback then duplicates; the sender persists
+      // its own row, on success only.
+      insertSentRow: (row) => db.insertMessage(row),
+      capabilityLatch: richCapabilityLatch,
     });
     pairings = createPairingsStore(db.raw);
     approvals = createApprovalsStore(db.raw);
@@ -3337,6 +3385,29 @@ async function main() {
     // inbound on the CLI-channels reply path (handleMessage short-circuits at
     // `alreadyDelivered` before its own redact block, so it must fire here).
     redactInbound,
+    redactError: redactBotToken,
+    // Chat-level text hygiene for the chunked path. Deliberately independent
+    // of the rich strategy below: a rich-enabled chat must never render a
+    // local path, including when that strategy cannot be built or fails.
+    // A reply that is nothing BUT unrenderable media degrades to a line
+    // saying so rather than to silence.
+    projectFallbackText: (text, { chatId, threadId }) => {
+      if (!resolveRichTextEnabled(config, chatId, threadId)) return text;
+      const stripped = stripMediaMarkdown(text);
+      if (stripped.trim()) return stripped;
+      logEvent('deliver-media-only-degraded', { chat_id: chatId, thread_id: threadId, bot: BOT_NAME });
+      return MEDIA_ONLY_FALLBACK_TEXT;
+    },
+    // Rich delivery for the reply tool. Injected rather than imported by the
+    // dispatcher: rich-media.js requires the dispatcher module, so the reverse
+    // direction would be a require cycle.
+    makeDeliverText: createRichDeliveryFactory({
+      bot,
+      sendRich: (args) => richSendMessage(args),
+      isRichTextEnabled: (chatId, threadId) => resolveRichTextEnabled(config, chatId, threadId),
+      getRichKnownUnsupported: () => richSendKnownUnsupported,
+      redactError: redactBotToken,
+    }),
     logEvent,
     logger: console,
   });
@@ -3367,6 +3438,9 @@ async function main() {
     // CliProcess. Without it, cli chats lose the Telegram table/markdown display rules.
     // A resolver (not a static string) so each cli-backed chat gets its own richText
     // state — orchestra's factory calls this per spawn with the spawning chat/topic.
+    // No inline-media guidance: replies here are delivered by the reply tool, which
+    // renders rich text on media-stripped input, so an image would reach the user as
+    // its caption and nothing else.
     displayHint: (chatId, threadId) => buildPolygramDisplayHint(resolveRichTextEnabled(config, chatId, threadId)),
     // Backend-default outbound cap fallback (per-spawn buildSpawnContext override
     // normally supersedes this; kept so any context-less spawn still gets the backend
