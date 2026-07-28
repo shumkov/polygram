@@ -15,6 +15,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { createSdkCallbacks } = require('../lib/sdk/callbacks');
+const { sanitizeAssistantReply } = require('../lib/telegram/sanitize-reply');
 const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 
 const silentLogger = { log: () => {}, error: () => {} };
@@ -399,6 +400,37 @@ describe('onStreamChunk — routes to head pending streamer + heartbeats reactor
     const h = baseDeps();
     const cbs = createSdkCallbacks(h.deps);
     assert.doesNotThrow(() => cbs.onStreamChunk('k', 'x', { pendingQueue: [] }));
+  });
+
+  test('canned CLI strings never render in the live bubble', () => {
+    // The same safety net a delivered reply gets: the model occasionally emits
+    // CLI-context boilerplate verbatim, and on the streaming path it would
+    // appear in the preview bubble as the bot's answer.
+    const h = baseDeps({ sanitizeAssistantReply });
+    const onChunkCalls = [];
+    const head = { context: { streamer: { onChunk: (t) => { onChunkCalls.push(t); return Promise.resolve(); } } } };
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onStreamChunk('k', 'No response requested.', { pendingQueue: [head] });
+    assert.equal(onChunkCalls.length, 1);
+    assert.doesNotMatch(onChunkCalls[0], /No response requested\./);
+  });
+
+  test('a chunk arriving after finalize is dropped, but is recorded so it is diagnosable', () => {
+    // A finalized streamer silently swallows further chunks — correct, the
+    // bubble is settled — but from outside it reads as "streaming just
+    // stopped", with nothing in the log to say why.
+    const h = baseDeps();
+    let onChunkCalls = 0;
+    const head = {
+      context: { streamer: { state: 'finalized', onChunk: () => { onChunkCalls++; return Promise.resolve(); } } },
+    };
+    const cbs = createSdkCallbacks(h.deps);
+    cbs.onStreamChunk('12345:7', 'a late chunk', { chatId: '12345', pendingQueue: [head] });
+
+    const ev = h.events.find((e) => e.kind === 'stream-after-finalize');
+    assert.ok(ev, 'the drop must leave a trace');
+    assert.equal(ev.detail.chat_id, '12345');
+    assert.equal(onChunkCalls, 1, 'the streamer still owns the drop decision');
   });
 
   test('Codex cumulative snapshots replace rather than append in callback glue', () => {

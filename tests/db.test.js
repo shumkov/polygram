@@ -284,6 +284,48 @@ describe('outbound pending lifecycle', () => {
     assert.equal(sentRow.ts, 5000);
   });
 
+  // A streamed reply's row is written by the INITIAL send — the first ~30
+  // characters — and Telegram edits never revisit it, so the transcript (and
+  // the agent's preloaded history) would keep a torso of every streamed answer.
+  test('updateOutboundText brings a streamed bubble\'s row up to the final body', () => {
+    const res = db.insertOutboundPending({
+      chat_id: '1', text: 'The answer beg', bot_name: 'shumabit', pending_id: -7,
+    });
+    db.markOutboundSent(res.lastInsertRowid, { msg_id: 555, ts: 1000 });
+
+    db.updateOutboundText({ chat_id: '1', msg_id: 555, text: 'The answer begins and ends here.', ts: 2000 });
+
+    const row = db.raw.prepare('SELECT text, edited_ts, ts FROM messages WHERE msg_id=? AND chat_id=?').get(555, '1');
+    assert.equal(row.text, 'The answer begins and ends here.');
+    assert.equal(row.edited_ts, 2000);
+    assert.equal(row.ts, 1000, 'the send time is not rewritten');
+  });
+
+  test('updateOutboundText touches neither inbound rows nor another chat', () => {
+    db.insertMessage({
+      chat_id: '1', msg_id: 555, text: 'a user message', direction: 'in', bot_name: 'shumabit',
+    });
+    const other = db.insertOutboundPending({ chat_id: '2', text: 'other chat', bot_name: 'shumabit', pending_id: -8 });
+    db.markOutboundSent(other.lastInsertRowid, { msg_id: 555 });
+
+    const changed = db.updateOutboundText({ chat_id: '1', msg_id: 555, text: 'REWRITTEN' });
+
+    assert.equal(changed.changes, 0, 'an inbound row with the same id must not be rewritten');
+    assert.equal(
+      db.raw.prepare('SELECT text FROM messages WHERE chat_id=? AND msg_id=?').get('1', 555).text,
+      'a user message',
+    );
+    assert.equal(
+      db.raw.prepare('SELECT text FROM messages WHERE chat_id=? AND msg_id=?').get('2', 555).text,
+      'other chat',
+    );
+  });
+
+  test('updateOutboundText ignores incomplete arguments instead of throwing', () => {
+    assert.deepEqual(db.updateOutboundText({ chat_id: '1', msg_id: null, text: 'x' }), { changes: 0 });
+    assert.deepEqual(db.updateOutboundText({ chat_id: '1', msg_id: 5, text: null }), { changes: 0 });
+  });
+
   test('markOutboundFailed sets status + error (truncated)', () => {
     const res = db.insertOutboundPending({ chat_id: '1', text: 'hi', bot_name: 'shumabit', pending_id: -2 });
     const id = res.lastInsertRowid;

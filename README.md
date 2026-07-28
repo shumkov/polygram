@@ -264,6 +264,15 @@ Per-bot flags:
   `/pairings`, `/unpair`.
 - `streamMinChars` (default 30) — debounce before the first stream edit.
 - `streamThrottleMs` (default 1000, min 250) — stream edit cadence.
+- `streamPreview` (default false) — live preview of the answer on the CLI
+  backend. Also settable per chat and per topic (topic > chat > bot >
+  defaults). When on, the agent gets a `stream` tool it calls with the
+  answer-so-far while composing; the preview bubble becomes the reply, so
+  a streamed turn still produces exactly one bubble. Telegram rate-limits
+  edits per CHAT, so with this on the effective cadence is
+  `streamThrottleMs × (live previews in the chat)` — several busy forum
+  topics cost the chat what one does. Off, the cadence is
+  `streamThrottleMs` unchanged.
 - `voice: { enabled, provider: "openai"|"local", ... }` — Whisper
   transcription settings.
 - `approvals: { adminChatId, timeoutMs, gatedTools, ... }` — which tool
