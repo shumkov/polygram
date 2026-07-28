@@ -511,11 +511,37 @@ describe('what styling refuses to emit', () => {
     assert.equal(out, 'see the notes for detail');
   });
 
-  test('link labels stay strings until a probe says otherwise', () => {
-    // url nodes were only ever probed with string text. Emitting a nested
-    // label would be shipping one shape on the evidence of another.
-    assert.deepEqual(styledText('[**bold** label](https://ok.example/)'),
-      [{ type: 'url', text: 'bold label', url: 'https://ok.example/' }]);
+  test('a styled link label keeps its styling', () => {
+    // `[**bold** link](…)` is ordinary markdown. Held back at first because
+    // url nodes had only ever been probed with STRING text — emitting a
+    // nested label would have been shipping one shape on the evidence of
+    // another. A paced run with the control passing reported it preserved.
+    assert.deepEqual(styledText('[**bold** label](https://ok.example/)'), [{
+      type: 'url',
+      text: [{ type: 'bold', text: 'bold' }, ' label'],
+      url: 'https://ok.example/',
+    }]);
+  });
+
+  test('an unstyled label is still a plain string, not a one-element array', () => {
+    // Same contract as every other run: no array unless something is styled.
+    assert.deepEqual(styledText('[just text](https://ok.example/)'),
+      [{ type: 'url', text: 'just text', url: 'https://ok.example/' }]);
+  });
+
+  test('a styled label on a rejected scheme loses the node AND the styling', () => {
+    // The destination is what makes it a link; without one there is nothing
+    // to attach the styling to, and the text still has to reach the reader.
+    assert.equal(styledText('[**bold** label](file:///etc/passwd)'), 'bold label');
+  });
+
+  test('a label cannot dodge the nesting ceiling', () => {
+    // Counted at depth+1, so a link is not a fresh budget.
+    const deep = `[${'*'.repeat(25)}x${'*'.repeat(25)}](https://ok.example/)`;
+    const depthOf = (v, d = 0) => (Array.isArray(v)
+      ? Math.max(d, ...v.map((p) => depthOf(p, d)))
+      : (v && typeof v === 'object' ? depthOf(v.text, d + 1) : d));
+    assert.ok(depthOf(styledText(deep)) <= 8);
   });
 
   test('node count per block is bounded, and the overflow is still readable', () => {
