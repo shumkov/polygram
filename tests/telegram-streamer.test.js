@@ -44,3 +44,61 @@ test('truncateForLive leaves text under maxLen untouched', async () => {
   await streamer.onChunk(short);
   assert.equal(sentText, short);
 });
+
+// ─── finalizing on a dead turn ──────────────────────────────────────
+//
+// When a turn dies (error, /stop, a deploy mid-stream) the caller finalizes
+// with no final text. Passing '' REPLACED the drafted body — the user watched a
+// partial answer appear and then get wiped by the very failure that was
+// supposed to leave it standing, and with an error suffix they were left with
+// a bubble containing nothing but "⚠️ …". null keeps what was written.
+
+test('finalize(null) keeps the drafted body instead of blanking the bubble', async () => {
+  const edits = [];
+  const streamer = createStreamer({
+    send: async () => ({ message_id: 7 }),
+    edit: async (_id, text) => { edits.push(text); },
+    minChars: 5,
+    logger: { error: () => {} },
+  });
+
+  await streamer.onChunk('Half of an answer the user was reading');
+  const fin = await streamer.finalize(null);
+
+  assert.equal(fin.finalText, 'Half of an answer the user was reading');
+  assert.equal(fin.finalEditOk, true);
+});
+
+test('an error suffix APPENDS to the drafted body', async () => {
+  const edits = [];
+  const streamer = createStreamer({
+    send: async () => ({ message_id: 7 }),
+    edit: async (_id, text) => { edits.push(text); },
+    minChars: 5,
+    logger: { error: () => {} },
+  });
+
+  await streamer.onChunk('Half of an answer');
+  const fin = await streamer.finalize(null, { errorSuffix: 'stream interrupted' });
+
+  assert.equal(fin.finalText, 'Half of an answer\n\n⚠️ stream interrupted');
+  assert.equal(edits.at(-1), 'Half of an answer\n\n⚠️ stream interrupted');
+});
+
+test('latestText exposes the newest draft, not just what is on screen', async () => {
+  // A throttled edit may still be pending, so the bubble can lag the draft. A
+  // caller reconciling at turn end needs the draft, not the stale bubble.
+  const streamer = createStreamer({
+    send: async () => ({ message_id: 7 }),
+    edit: async () => {},
+    minChars: 5,
+    throttleMs: 100000,             // guarantees the follow-up edit stays pending
+    logger: { error: () => {} },
+  });
+
+  await streamer.onChunk('First part');
+  await streamer.onChunk('First part, second part');
+
+  assert.equal(streamer.currentText, 'First part', 'the bubble still shows the first chunk');
+  assert.equal(streamer.latestText, 'First part, second part');
+});
