@@ -16,11 +16,13 @@ const os = require('node:os');
 const path = require('node:path');
 
 const {
-  CODEX_BINARY_SHA256,
-  CODEX_CLI_PINNED_VERSION,
   CodexBinaryError,
   createPinnedCodexBinaryResolver,
 } = require('../lib/codex/binary');
+const { resolveCodexTargetPin } = require('@shumkov/orchestra');
+
+const DARWIN_PIN = resolveCodexTargetPin('darwin', 'arm64');
+const LINUX_PIN = resolveCodexTargetPin('linux', 'x64');
 
 function sha256(contents) {
   return createHash('sha256').update(contents).digest('hex');
@@ -41,17 +43,25 @@ function resolverFor(contents, version = 'codex-cli 9.9.9', overrides = {}) {
     cliVersion: version,
     binarySha256: sha256(contents),
     platform: 'darwin',
+    arch: 'arm64',
     ...overrides,
   });
 }
 
 describe('pinned Codex binary resolution', () => {
-  test('production pin is the reviewed Orchestra 0.145.0 pin', () => {
-    assert.equal(CODEX_CLI_PINNED_VERSION, 'codex-cli 0.145.0');
-    assert.equal(
-      CODEX_BINARY_SHA256,
-      '1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590',
-    );
+  test('production pins are the reviewed Orchestra target receipts', () => {
+    assert.deepEqual(DARWIN_PIN, {
+      target: 'aarch64-apple-darwin',
+      cliVersion: 'codex-cli 0.145.0',
+      binarySha256:
+        '1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590',
+    });
+    assert.deepEqual(LINUX_PIN, {
+      target: 'x86_64-unknown-linux-musl',
+      cliVersion: 'codex-cli 0.145.0',
+      binarySha256:
+        'a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14',
+    });
   });
 
   test('accepts only an exact canonical immutable executable and freezes its receipt', async (t) => {
@@ -61,6 +71,7 @@ describe('pinned Codex binary resolution', () => {
     const result = await resolve({ binaryPath: binary });
 
     assert.equal(result.path, binary);
+    assert.equal(result.target, DARWIN_PIN.target);
     assert.equal(result.version, version);
     assert.equal(result.sha256, sha256(contents));
     assert.equal(result.fingerprint.nlink, 1);
@@ -87,9 +98,10 @@ describe('pinned Codex binary resolution', () => {
 
   test('rejects missing configuration and a missing configured file actionably', async () => {
     const resolve = createPinnedCodexBinaryResolver({
-      cliVersion: CODEX_CLI_PINNED_VERSION,
-      binarySha256: CODEX_BINARY_SHA256,
+      cliVersion: DARWIN_PIN.cliVersion,
+      binarySha256: DARWIN_PIN.binarySha256,
       platform: 'darwin',
+      arch: 'arm64',
     });
     await assert.rejects(
       resolve({ env: {} }),
@@ -131,6 +143,7 @@ describe('pinned Codex binary resolution', () => {
         cliVersion: first.version,
         binarySha256: '0'.repeat(64),
         platform: 'darwin',
+        arch: 'arm64',
       })({ binaryPath: first.binary }),
       { code: 'CODEX_BINARY_MISMATCH' },
     );
@@ -161,15 +174,50 @@ describe('pinned Codex binary resolution', () => {
     );
   });
 
-  test('rejects unsupported host platforms before inspecting a path', async () => {
-    for (const [platform, binaryPath] of [
-      ['linux', '/usr/local/bin/codex'],
-      ['win32', 'C:\\codex.exe'],
+  test('accepts the reviewed Linux x64 target and carries it in the receipt', async (t) => {
+    const { binary, contents, version } = fixture(t);
+    const resolve = resolverFor(contents, version, {
+      platform: 'linux',
+      arch: 'x64',
+      resolveTargetPin(platform, arch) {
+        assert.deepEqual([platform, arch], ['linux', 'x64']);
+        return LINUX_PIN;
+      },
+    });
+
+    const result = await resolve({ binaryPath: binary });
+
+    assert.equal(result.target, LINUX_PIN.target);
+    assert.equal(result.version, version);
+    assert.equal(result.sha256, sha256(contents));
+  });
+
+  test('rejects an opposite-target checksum', async (t) => {
+    const { binary, version } = fixture(t);
+    const resolve = createPinnedCodexBinaryResolver({
+      cliVersion: version,
+      binarySha256: DARWIN_PIN.binarySha256,
+      platform: 'linux',
+      arch: 'x64',
+    });
+
+    await assert.rejects(
+      resolve({ binaryPath: binary }),
+      { code: 'CODEX_BINARY_MISMATCH' },
+    );
+  });
+
+  test('rejects unsupported host targets before inspecting a path', async () => {
+    for (const [platform, arch, binaryPath] of [
+      ['linux', 'arm64', '/usr/local/bin/codex'],
+      ['darwin', 'x64', '/usr/local/bin/codex'],
+      ['win32', 'x64', 'C:\\codex.exe'],
     ]) {
       const resolve = createPinnedCodexBinaryResolver({
         cliVersion: 'codex-cli 9.9.9',
         binarySha256: '0'.repeat(64),
         platform,
+        arch,
       });
       await assert.rejects(
         resolve({ binaryPath }),

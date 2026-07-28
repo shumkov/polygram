@@ -138,6 +138,21 @@ describe('buildSdkOptions — basic shape', () => {
     const out = fn('chat-1', baseCtx());
     assert.equal(out.env.CLAUDE_CHANNEL_BOT, 'shumabit');
   });
+
+  test('Codex-only temp selection never changes the Claude child environment', () => {
+    const fn = createBuildSdkOptions(baseDeps({
+      processEnv: {
+        HOME: '/Users/test',
+        PATH: '/bin',
+        TMPDIR: '/private/claude-tmp',
+        POLYGRAM_CODEX_TMPDIR: '/private/codex-tmp',
+      },
+    }));
+    const out = fn('chat-1', baseCtx());
+
+    assert.equal(out.env.TMPDIR, '/private/claude-tmp');
+    assert.equal(out.env.POLYGRAM_CODEX_TMPDIR, undefined);
+  });
 });
 
 describe('buildSdkOptions — richText-aware display hint', () => {

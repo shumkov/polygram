@@ -8,6 +8,7 @@ const {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -21,17 +22,20 @@ const {
   CODEX_PERMISSION_PROFILE_ID,
   CodexRuntimeProfileError,
   createCodexRuntimeProfileBuilder,
+  normalizeDeniedRoots,
 } = require('../lib/codex/runtime-profile');
-const {
-  CODEX_BINARY_SHA256,
-  CODEX_CLI_PINNED_VERSION,
-} = require('../lib/codex/binary');
 const {
   assertCodexSpawnProfile,
   codexProtocolSchema,
   createCodexSpawnProfile,
   preflightCodexRuntime,
+  resolveCodexTargetPin,
 } = require('@shumkov/orchestra');
+
+const TARGET_PIN = resolveCodexTargetPin();
+const OPPOSITE_TARGET = TARGET_PIN.target === 'x86_64-unknown-linux-musl'
+  ? 'aarch64-apple-darwin'
+  : 'x86_64-unknown-linux-musl';
 
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
@@ -57,6 +61,7 @@ function fixture(t) {
   const ipcRuntimeRoot = path.join(root, 'polygram-ipc');
   const serviceHome = path.join(root, 'service-home');
   const serviceTmp = path.join(root, 'service-tmp');
+  const codexTmp = path.join(root, 'codex-tmp');
   const codexHome = path.join(root, 'codex-home');
   for (const directory of [
     workspace,
@@ -64,6 +69,7 @@ function fixture(t) {
     ipcRuntimeRoot,
     serviceHome,
     serviceTmp,
+    codexTmp,
   ]) {
     mkdirSync(directory, { mode: 0o700 });
     chmodSync(directory, 0o700);
@@ -75,6 +81,7 @@ function fixture(t) {
     ipcRuntimeRoot,
     serviceHome,
     serviceTmp,
+    codexTmp,
     codexHome,
     processEnv: {
       HOME: serviceHome,
@@ -87,6 +94,18 @@ function fixture(t) {
 }
 
 function ownedConfig(f) {
+  const appServerTmp = realpathSync(
+    f.processEnv.POLYGRAM_CODEX_TMPDIR ?? f.processEnv.TMPDIR,
+  );
+  const deniedRoots = normalizeDeniedRoots([
+    f.codexHome,
+    f.daemonSecretRoot,
+    f.ipcRuntimeRoot,
+    appServerTmp,
+  ]);
+  const filesystem = { ':minimal': 'read' };
+  for (const root of deniedRoots.sort()) filesystem[root] = 'deny';
+  filesystem[':workspace_roots'] = { '.': 'write' };
   return {
     cli_auth_credentials_store: 'file',
     model_provider: 'openai',
@@ -106,13 +125,7 @@ function ownedConfig(f) {
     },
     permissions: {
       [CODEX_PERMISSION_PROFILE_ID]: {
-        filesystem: {
-          ':minimal': 'read',
-          [f.codexHome]: 'deny',
-          [f.daemonSecretRoot]: 'deny',
-          [f.ipcRuntimeRoot]: 'deny',
-          ':workspace_roots': { '.': 'write' },
-        },
+        filesystem,
         network: { enabled: false },
       },
     },
@@ -233,8 +246,9 @@ class FakeClient {
 function binaryReceipt() {
   return Object.freeze({
     path: '/Applications/Codex.app/Contents/Resources/codex',
-    version: CODEX_CLI_PINNED_VERSION,
-    sha256: CODEX_BINARY_SHA256,
+    target: TARGET_PIN.target,
+    version: TARGET_PIN.cliVersion,
+    sha256: TARGET_PIN.binarySha256,
     fingerprint: Object.freeze({
       dev: '1',
       ino: '2',
@@ -252,6 +266,7 @@ function createBuilder(f, results = projectedResults(f), clientOptions = {}) {
   const clients = [];
   const builder = createCodexRuntimeProfileBuilder({
     temporaryRoots: [],
+    resolveTargetPin: () => TARGET_PIN,
     clientFactory: (options) => {
       const client = new FakeClient(options, results, clientOptions);
       clients.push(client);
@@ -273,6 +288,34 @@ function prepareOptions(f, overrides = {}) {
     ...overrides,
   };
 }
+
+test('denied parent collapses redundant descendants without weakening coverage', () => {
+  const parent = '/home/shumabit/polygram';
+  const ipc = '/home/shumabit/polygram/.ipc';
+  const prefixSibling = '/home/shumabit/polygram-cache';
+  const other = '/run/shumabit-secrets';
+
+  const normalized = normalizeDeniedRoots([
+    ipc,
+    other,
+    parent,
+    prefixSibling,
+    ipc,
+  ]);
+
+  assert.deepEqual(normalized, [parent, prefixSibling, other]);
+  const remainsDenied = (candidate) => normalized.some((root) => {
+    const relative = path.relative(root, candidate);
+    return relative === ''
+      || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  });
+  assert.equal(
+    remainsDenied('/home/shumabit/polygram/.ipc/polygram-shumabit.sock'),
+    true,
+  );
+  assert.equal(remainsDenied('/home/shumabit/polygram-cache/token'), true);
+  assert.equal(remainsDenied('/home/shumabit/polygram-other/token'), false);
+});
 
 describe('owned Codex native-beta runtime profile', () => {
   test('provisions exact private files, characterizes projected policy, and builds a frozen static profile', async (t) => {
@@ -304,12 +347,16 @@ describe('owned Codex native-beta runtime profile', () => {
     assert.match(raw, new RegExp(
       `${f.ipcRuntimeRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*deny`,
     ));
+    assert.match(raw, new RegExp(
+      `${f.serviceTmp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*deny`,
+    ));
     assert.doesNotMatch(raw, /sandbox|mcp|plugin|TELEGRAM_BOT_TOKEN/);
 
     assert.equal(profile.runtime, 'codex');
     assert.equal(profile.binary, binaryReceipt().path);
-    assert.equal(profile.binarySha256, CODEX_BINARY_SHA256);
-    assert.equal(profile.cliVersion, CODEX_CLI_PINNED_VERSION);
+    assert.equal(profile.target, TARGET_PIN.target);
+    assert.equal(profile.binarySha256, TARGET_PIN.binarySha256);
+    assert.equal(profile.cliVersion, TARGET_PIN.cliVersion);
     assert.equal(
       profile.protocolSchemaSha256,
       codexProtocolSchema.generatedProtocolV2CanonicalSha256,
@@ -355,6 +402,68 @@ describe('owned Codex native-beta runtime profile', () => {
       }],
     );
     assert.equal(clients[0].closed, 1);
+  });
+
+  test('rejects an opposite-target binary receipt before starting a client', async (t) => {
+    const f = fixture(t);
+    const { builder, clients } = createBuilder(f);
+    const receipt = Object.freeze({
+      ...binaryReceipt(),
+      target: OPPOSITE_TARGET,
+    });
+
+    await assert.rejects(
+      builder.prepare(prepareOptions(f, { binaryReceipt: receipt })),
+      { code: 'CODEX_RUNTIME_PIN_MISMATCH' },
+    );
+    assert.equal(clients.length, 0);
+  });
+
+  test('prefers a Codex-only temp directory without mutating inherited state', async (t) => {
+    const f = fixture(t);
+    f.processEnv.POLYGRAM_CODEX_TMPDIR = f.codexTmp;
+    const inherited = { ...f.processEnv };
+    const { builder, clients } = createBuilder(f);
+
+    const profile = await builder.prepare(prepareOptions(f));
+    const raw = readFileSync(path.join(f.codexHome, 'config.toml'), 'utf8');
+
+    assert.equal(profile.env.TMPDIR, f.codexTmp);
+    assert.equal(clients[0].options.env.TMPDIR, f.codexTmp);
+    assert.match(raw, new RegExp(
+      `${f.codexTmp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*deny`,
+    ));
+    assert.deepEqual(f.processEnv, inherited);
+    assert.equal(profile.env.POLYGRAM_CODEX_TMPDIR, undefined);
+  });
+
+  test('canonicalizes the inherited macOS TMPDIR fallback', async (t) => {
+    const f = fixture(t);
+    f.processEnv.TMPDIR = `${f.serviceTmp}${path.sep}`;
+    const { builder } = createBuilder(f);
+
+    const profile = await builder.prepare(prepareOptions(f));
+
+    assert.equal(profile.env.TMPDIR, f.serviceTmp);
+    assert.equal(f.processEnv.TMPDIR, `${f.serviceTmp}${path.sep}`);
+  });
+
+  test('materializes one parent deny when the IPC root is already covered', async (t) => {
+    const f = fixture(t);
+    f.ipcRuntimeRoot = path.join(f.daemonSecretRoot, '.ipc');
+    mkdirSync(f.ipcRuntimeRoot, { mode: 0o700 });
+    chmodSync(f.ipcRuntimeRoot, 0o700);
+    const { builder } = createBuilder(f);
+
+    await builder.prepare(prepareOptions(f));
+    const raw = readFileSync(path.join(f.codexHome, 'config.toml'), 'utf8');
+
+    assert.match(raw, new RegExp(
+      `${f.daemonSecretRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*deny`,
+    ));
+    assert.doesNotMatch(raw, new RegExp(
+      `${f.ipcRuntimeRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*deny`,
+    ));
   });
 
   test('does not read, copy, rewrite, or expose credential contents', async (t) => {
@@ -439,6 +548,60 @@ describe('owned Codex native-beta runtime profile', () => {
     assert.equal(second.clients.length, 0);
   });
 
+  test('prior owned config requires an explicit backup before TMPDIR deny reprovision', async (t) => {
+    const f = fixture(t);
+    f.processEnv.POLYGRAM_CODEX_TMPDIR = f.codexTmp;
+    await createBuilder(f).builder.prepare(prepareOptions(f));
+    const configPath = path.join(f.codexHome, 'config.toml');
+    const tmpDeny = `${JSON.stringify(f.codexTmp)} = "deny"\n`;
+    const priorConfig = readFileSync(configPath, 'utf8').replace(tmpDeny, '');
+    assert.notEqual(priorConfig, readFileSync(configPath, 'utf8'));
+    writeFileSync(configPath, priorConfig, { mode: 0o600 });
+
+    const drifted = createBuilder(f);
+    await assert.rejects(
+      drifted.builder.prepare(prepareOptions(f)),
+      (error) => (
+        error?.code === 'CODEX_OWNED_CONFIG_DRIFT'
+        && /Back up config\.toml outside CODEX_HOME/.test(error.action)
+        && /remove or move the original/.test(error.action)
+        && /reprovision the exact owned config/.test(error.action)
+        && /never migrates or overwrites it automatically/.test(error.action)
+      ),
+    );
+    assert.equal(readFileSync(configPath, 'utf8'), priorConfig);
+    assert.equal(drifted.clients.length, 0);
+
+    const backupPath = path.join(
+      f.daemonSecretRoot,
+      'config.toml.before-tmpdir-deny',
+    );
+    const backupFromSecretRoot = path.relative(
+      f.daemonSecretRoot,
+      backupPath,
+    );
+    const backupFromCodexHome = path.relative(f.codexHome, backupPath);
+    assert.ok(
+      backupFromSecretRoot.length > 0
+      && !backupFromSecretRoot.startsWith('..')
+      && !path.isAbsolute(backupFromSecretRoot),
+    );
+    assert.ok(
+      backupFromCodexHome.startsWith('..')
+      || path.isAbsolute(backupFromCodexHome),
+    );
+    renameSync(configPath, backupPath);
+    const reprovisioned = createBuilder(f);
+    await reprovisioned.builder.prepare(prepareOptions(f));
+
+    assert.equal(readFileSync(backupPath, 'utf8'), priorConfig);
+    assert.match(readFileSync(configPath, 'utf8'), new RegExp(
+      `^${tmpDeny.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+      'm',
+    ));
+    assert.equal(reprovisioned.clients.length, 1);
+  });
+
   test('rejects temporary homes, unsafe modes, symlinked command dirs, and overlapping roots before client start', async (t) => {
     const cases = [{
       name: 'temporary home',
@@ -468,6 +631,87 @@ describe('owned Codex native-beta runtime profile', () => {
       name: 'overlapping secret root',
       setup: (f) => ({
         prepare: { daemonSecretRoots: [f.workspace] },
+      }),
+      code: 'CODEX_RUNTIME_ROOT_OVERLAP',
+    }, {
+      name: 'missing explicit daemon-secret roots',
+      setup: () => ({
+        prepare: { daemonSecretRoots: [] },
+      }),
+      code: 'CODEX_RUNTIME_PROFILE_INVALID',
+    }, {
+      name: 'unsafe Codex temp mode',
+      setup: (f) => {
+        chmodSync(f.codexTmp, 0o755);
+        return {
+          prepare: {
+            processEnv: {
+              ...f.processEnv,
+              POLYGRAM_CODEX_TMPDIR: f.codexTmp,
+            },
+          },
+        };
+      },
+      code: 'CODEX_TMPDIR_UNSAFE',
+    }, {
+      name: 'missing explicit Codex temp',
+      setup: (f) => ({
+        prepare: {
+          processEnv: {
+            ...f.processEnv,
+            POLYGRAM_CODEX_TMPDIR: path.join(f.root, 'missing-codex-tmp'),
+          },
+        },
+      }),
+      code: 'CODEX_TMPDIR_UNSAFE',
+    }, {
+      name: 'aliased explicit Codex temp',
+      setup: (f) => {
+        const alias = path.join(f.root, 'codex-tmp-alias');
+        symlinkSync(f.codexTmp, alias);
+        return {
+          prepare: {
+            processEnv: {
+              ...f.processEnv,
+              POLYGRAM_CODEX_TMPDIR: alias,
+            },
+          },
+        };
+      },
+      code: 'CODEX_TMPDIR_UNSAFE',
+    }, {
+      name: 'non-canonical explicit Codex temp',
+      setup: (f) => ({
+        prepare: {
+          processEnv: {
+            ...f.processEnv,
+            POLYGRAM_CODEX_TMPDIR: `${f.codexTmp}${path.sep}`,
+          },
+        },
+      }),
+      code: 'CODEX_TMPDIR_UNSAFE',
+    }, {
+      name: 'unsafe Codex temp parent chain',
+      setup: (f) => {
+        const unsafeParent = path.join(f.root, 'shared-temp');
+        const unsafeTmp = path.join(unsafeParent, 'codex');
+        mkdirSync(unsafeParent, { mode: 0o700 });
+        mkdirSync(unsafeTmp, { mode: 0o700 });
+        chmodSync(unsafeParent, 0o777);
+        chmodSync(unsafeTmp, 0o700);
+        f.processEnv.POLYGRAM_CODEX_TMPDIR = unsafeTmp;
+        return { prepare: {} };
+      },
+      code: 'CODEX_TMPDIR_UNSAFE',
+    }, {
+      name: 'Codex temp overlaps workspace',
+      setup: (f) => ({
+        prepare: {
+          processEnv: {
+            ...f.processEnv,
+            POLYGRAM_CODEX_TMPDIR: f.workspace,
+          },
+        },
       }),
       code: 'CODEX_RUNTIME_ROOT_OVERLAP',
     }];

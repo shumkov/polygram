@@ -93,6 +93,16 @@ describe('polygram production factory wiring', () => {
       'polygram must inject a per-chat display-hint resolver (orchestra defaults to empty); '
       + 'a static hint here silently drops richText for every pm:"cli" chat regardless of config');
   });
+  test('Claude CLI spawns use the Codex-selector-free tmux runner', () => {
+    assert.match(
+      src,
+      /const claudeTmuxRunner = createClaudeTmuxRunner\(tmuxRunner\)/,
+    );
+    assert.match(
+      src,
+      /createProcessFactory\(\{[\s\S]*?tmuxRunner:\s*claudeTmuxRunner/,
+    );
+  });
   test('Codex factory wiring uses only the runtime controller receipt boundary', () => {
     for (const field of [
       'codexClientFactory: codexRuntimeController?.clientFactory',

@@ -64,7 +64,7 @@
   },
 
   "codex": {
-    "_comment": "Optional native macOS Codex app-server beta. Codex stays disabled unless a chat/topic explicitly sets pm:'codex' and exact startup preflight succeeds. Linux and Windows are rejected in this milestone. `home` must be a dedicated non-temporary 0700 CODEX_HOME already authenticated with ChatGPT; polygram never copies or reads credential contents. `binary` must be the canonical immutable path to the reviewed pinned Codex CLI, not a PATH symlink. Every directory containing daemon credentials or control data must be listed in daemonSecretRoots and must not overlap a Codex workspace or CODEX_HOME. Command network and model-native web search are disabled; product MCP tools and interactive approvals are unavailable. Keep long-running commands in the foreground. Detached/background servers are unsupported and may survive hard runtime loss.",
+    "_comment": "Optional native macOS arm64 or Linux x64 Codex app-server beta. Codex stays disabled unless a chat/topic explicitly sets pm:'codex' and exact target-specific startup preflight succeeds; other host targets, including Windows, are rejected. `home` must be a dedicated non-temporary 0700 CODEX_HOME already authenticated with ChatGPT; polygram never copies or reads credential contents. `binary` must be the canonical immutable path to the reviewed target's pinned Codex CLI, not a PATH symlink. On Linux set POLYGRAM_CODEX_TMPDIR to an owner-only 0700 runtime directory; otherwise Codex inherits the daemon TMPDIR after the same safety checks. Every directory containing daemon credentials or control data must be listed in daemonSecretRoots and must not overlap a Codex workspace or CODEX_HOME. Command network and model-native web search are disabled; product MCP tools and interactive approvals are unavailable. Keep long-running commands in the foreground. Detached/background servers are unsupported and may survive hard runtime loss.",
     "home": "/Users/you/.codex-polygram",
     "binary": "/Users/you/.local/share/codex/versions/0.145.0/codex",
     "daemonSecretRoots": [
@@ -91,7 +91,7 @@
     "987654321": {
       "name": "Codex beta DM",
       "bot": "admin-bot",
-      "_comment_pm": "Codex uses the pinned app-server SDK surface directly (no tmux). Native macOS beta only: command network and model-native web search are disabled; product MCP tools and interactive approvals are unavailable; long-running commands must stay in the foreground; detached/background servers are unsupported and may survive hard runtime loss. The model and effort are accepted only when returned by this deployment's authenticated ChatGPT-backed model catalog.",
+      "_comment_pm": "Codex uses the pinned app-server SDK surface directly (no tmux). Native macOS arm64 and Linux x64 beta: command network and model-native web search are disabled; product MCP tools and interactive approvals are unavailable; long-running commands must stay in the foreground; detached/background servers are unsupported and may survive hard runtime loss. The model and effort are accepted only when returned by this deployment's authenticated ChatGPT-backed model catalog.",
       "pm": "codex",
       "codexModel": "gpt-5.6-sol",
       "codexEffort": "xhigh",
