@@ -588,3 +588,23 @@ test('a media wiring that throws costs media, never the reply', async () => {
   assert.equal(out.handled, true, 'the reply still goes out, just without its media');
   assert.ok(!JSON.stringify(sendCalls[0].blocks).includes(dir));
 });
+
+test('a wiring missing its preflight is refused outright', async () => {
+  // Half a wiring is the dangerous shape: the resolver would hand local
+  // sources and cached ids to the send, and materialization would take the
+  // unchecked branch — the exact TOCTOU the preflight exists to close.
+  const { dir, file } = mediaWorkspace();
+  const { factory, sendCalls } = build({
+    makeMediaWiring: ({ allowedRoots }) => ({
+      resolveMedia: createRichMediaResolver({ allowedRoots, allowUrlMedia: false }),
+      mediaContext: null,
+    }),
+  });
+
+  const out = await deliverIn(factory, `## Results\n\n![the chart](${file})`, [dir]);
+
+  assert.equal(out.handled, true, 'the reply still goes out — text-only');
+  const payload = JSON.stringify(sendCalls[0].blocks);
+  assert.ok(!payload.includes('photo'), 'no media may be sent without a preflight');
+  assert.ok(!payload.includes(dir));
+});
