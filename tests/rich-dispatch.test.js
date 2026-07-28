@@ -19,9 +19,16 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const nodePath = require('node:path');
 
 const { createRichDeliveryFactory } = require('../lib/telegram/rich-dispatch');
 const { RICH_MAX_LEN } = require('../lib/telegram/rich');
+const {
+  createRichMediaResolver,
+  createMediaDeliveryContext,
+} = require('../lib/telegram/rich-media');
 
 const TABLE = '| a | b |\n| --- | --- |\n| 1 | 2 |';
 
@@ -330,4 +337,72 @@ test('the rich payload is rendered from the stripped text, not the raw text', as
   await deliver(factory, `${TABLE}\n\n![cap](/Users/me/secret/shot.png)`);
   const payload = JSON.stringify(sendCalls[0].blocks);
   assert.ok(!payload.includes('secret'), 'no media path may reach the block tree');
+});
+
+// ─── Media blocks ──────────────────────────────────────────────────────────
+//
+// With a media wiring injected, rendering runs on the RAW text and image
+// syntax becomes a real photo/video/animation block. Without one the strategy
+// keeps the text-only behavior above: media collapses to its caption.
+
+const tempDirs = new Set();
+test.after(() => {
+  for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+function mediaWorkspace(name = 'chart.png') {
+  const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'polygram-rich-dispatch-'));
+  tempDirs.add(dir);
+  const file = nodePath.join(dir, name);
+  fs.writeFileSync(file, Buffer.alloc(64, 7));
+  return { dir, file };
+}
+
+// The real resolver and the real preflight, over a real temp workspace: the
+// trust boundary is the point of this path, and a fake one would prove
+// nothing about it.
+function buildWithMedia(overrides = {}) {
+  const wiringArgs = [];
+  const built = build({
+    makeMediaWiring: (args) => {
+      wiringArgs.push(args);
+      return {
+        resolveMedia: createRichMediaResolver({
+          allowedRoots: args.allowedRoots,
+          allowUrlMedia: false,
+        }),
+        mediaContext: createMediaDeliveryContext({
+          allowedRoots: args.allowedRoots,
+          tg: async () => ({}),
+          bot: {},
+          chatId: args.chatId,
+        }),
+      };
+    },
+    ...overrides,
+  });
+  return { ...built, wiringArgs };
+}
+
+const deliverIn = (factory, text, allowedRoots, extra = {}) => factory({
+  sessionKey: 'sess-A',
+  sessionCwd: allowedRoots[0],
+  chatId: '12345',
+  threadId: null,
+  allowedRoots,
+})({ text, chatId: '12345', threadId: null, replyToMessageId: null, meta: {}, ...extra });
+
+test('an inline photo inside the allowed roots becomes a photo block', async () => {
+  const { dir, file } = mediaWorkspace();
+  const { factory, sendCalls } = buildWithMedia();
+
+  const out = await deliverIn(factory, `## Results\n\n![the chart](${file})`, [dir]);
+
+  assert.equal(out.handled, true);
+  const blocks = sendCalls[0]?.blocks ?? [];
+  const photo = blocks.find((b) => b.type === 'photo');
+  assert.ok(photo, `expected a photo block, got ${JSON.stringify(blocks)}`);
+  assert.equal(photo.photo.media.source, fs.realpathSync(file),
+    'the uploaded source is the resolved realpath');
+  assert.equal(photo.caption.text, 'the chart');
 });

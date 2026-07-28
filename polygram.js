@@ -50,7 +50,9 @@ const { extractAssistantText } = require('@shumkov/orchestra');
 // and reused by createChannelsToolDispatcher inside main() — Claude replies
 // containing code blocks or HTML-style tags aren't split mid-element by the
 // size cap.
-const { createChannelsToolDispatcher, buildAllowedRoots } = require('./lib/process/channels-tool-dispatcher');
+const {
+  createChannelsToolDispatcher, buildAllowedRoots, MAX_FILES_PER_REPLY,
+} = require('./lib/process/channels-tool-dispatcher');
 const { createTmuxRunner } = require('@shumkov/orchestra');
 const { sweepTmuxOrphans } = require('@shumkov/orchestra').orphanSweep;
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
@@ -122,12 +124,12 @@ const {
   isRichCapabilityErrorExplicit, isRichMessageFieldRejection, stripMediaMarkdown,
 } = require('./lib/telegram/rich');
 const {
-  createRichMediaResolver,
+  makeRichMediaResolver,
+  createMediaPreflight,
   createMediaDeliveryContext,
   createMediaFileIdCache,
   collectMediaRescueEntries,
-  PHOTO_UPLOAD_CEILING,
-  OTHER_MEDIA_UPLOAD_CEILING,
+  MAX_MEDIA_PER_MESSAGE,
 } = require('./lib/telegram/rich-media');
 const { createRichEditor } = require('./lib/telegram/rich-edit');
 const { createRichCapabilityLatch } = require('./lib/telegram/rich-capability-latch');
@@ -1307,22 +1309,20 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     sessionKey,
     sessionCwd: _mediaTopicCfg.cwd || chatConfig.cwd || null,
   });
-  const maxMediaOverride = resolveMaxFileOverride(config, chatId, threadId);
-  const resolveRichMedia = createRichMediaResolver({
+  // Same shared factory the reply-tool path uses, so the two trust boundaries
+  // are one piece of code. This path keeps its wider ceilings: it is the
+  // interactive streamer, not the reply tool, so `files:` parity does not
+  // apply to it.
+  const resolveRichMedia = makeRichMediaResolver({
     allowedRoots: mediaAllowedRoots,
+    chatId,
+    threadId,
+    config,
     fileIdCache: richMediaFileIdCache,
-    maxPhotoBytes: Math.min(
-      PHOTO_UPLOAD_CEILING,
-      maxMediaOverride ?? PHOTO_UPLOAD_CEILING,
-    ),
-    maxOtherMediaBytes: Math.min(
-      OTHER_MEDIA_UPLOAD_CEILING,
-      maxMediaOverride ?? OTHER_MEDIA_UPLOAD_CEILING,
-    ),
     allowUrlMedia: !config.bot?.apiRoot,
-    logEvent: (kind, detail) => logEvent(kind, {
-      chat_id: chatId, thread_id: threadId, bot: BOT_NAME, ...detail,
-    }),
+    maxMediaPerMessage: MAX_MEDIA_PER_MESSAGE,
+    logEvent,
+    botName: BOT_NAME,
   });
   const toRichPayload = (text, opts) => {
     if (richKnownUnsupported || !resolveRichTextEnabled(config, chatId, threadId)) return null;
@@ -3615,6 +3615,36 @@ async function main() {
       isRichTextEnabled: (chatId, threadId) => resolveRichTextEnabled(config, chatId, threadId),
       getRichKnownUnsupported: () => richSendKnownUnsupported,
       redactError: redactBotToken,
+      // Media for one reply. `allowedRoots` arrives from the dispatcher, which
+      // computed it once for this call and validates `files:` against the very
+      // same array — a path the reply tool may upload is exactly a path image
+      // syntax may upload. Rebuilding roots from config here would widen them
+      // whenever config drifted away from the running session's cwd.
+      makeMediaWiring: ({ allowedRoots, chatId, threadId }) => ({
+        resolveMedia: makeRichMediaResolver({
+          allowedRoots,
+          chatId,
+          threadId,
+          config,
+          fileIdCache: richMediaFileIdCache,
+          // Unconditional, unlike the streamer path: `files:` cannot upload a
+          // URL at all, and a URL Telegram fetches server-side is an
+          // exfiltration beacon for prompt-injected content. The display hint
+          // teaches local paths only, so nothing legitimate is lost.
+          allowUrlMedia: false,
+          // The same ceiling `files:` enforces: above it that param errors,
+          // and silently accepting five times as many through image syntax
+          // would make the narrower limit meaningless.
+          maxMediaPerMessage: MAX_FILES_PER_REPLY,
+          logEvent,
+          botName: BOT_NAME,
+          transport: 'send',
+        }),
+        mediaContext: createMediaPreflight({
+          allowedRoots,
+          fileIdCache: richMediaFileIdCache,
+        }),
+      }),
     }),
   ]);
 
@@ -3685,10 +3715,14 @@ async function main() {
     // CliProcess. Without it, cli chats lose the Telegram table/markdown display rules.
     // A resolver (not a static string) so each cli-backed chat gets its own richText
     // state — orchestra's factory calls this per spawn with the spawning chat/topic.
-    // No inline-media guidance: replies here are delivered by the reply tool, which
-    // renders rich text on media-stripped input, so an image would reach the user as
-    // its caption and nothing else.
-    displayHint: (chatId, threadId) => buildPolygramDisplayHint(resolveRichTextEnabled(config, chatId, threadId)),
+    // inlineMedia: the reply tool now renders media blocks, so the syntax the
+    // hint teaches is syntax this backend delivers. The guidance is per-path
+    // for exactly that reason — it is the throttle on how much media agents
+    // author, and it may only be on where delivery can honor it.
+    displayHint: (chatId, threadId) => buildPolygramDisplayHint(
+      resolveRichTextEnabled(config, chatId, threadId),
+      { inlineMedia: true },
+    ),
     // Backend-default outbound cap fallback (per-spawn buildSpawnContext override
     // normally supersedes this; kept so any context-less spawn still gets the backend
     // default rather than orchestra's neutral 100MB).

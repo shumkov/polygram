@@ -71,19 +71,19 @@ describe('polygram rich-message wiring', () => {
     // string here means every cli chat is silently stuck in plain mode
     // regardless of its own richText config (the bug this test pins).
     const wiring = sectionBetween('const orchestraProcessFactory = createProcessFactory({', ');');
-    assert.match(wiring, /displayHint:\s*\(chatId, threadId\)\s*=>\s*buildPolygramDisplayHint\(resolveRichTextEnabled\(config, chatId, threadId\)\)/);
+    assert.match(wiring, /displayHint:\s*\(chatId, threadId\)\s*=>\s*buildPolygramDisplayHint\(\s*resolveRichTextEnabled\(config, chatId, threadId\),/);
     assert.doesNotMatch(wiring, /displayHint:\s*require\('\.\/lib\/telegram\/display-hint'\)\.POLYGRAM_DISPLAY_HINT/);
   });
 
-  test('the CLI-backend display hint does not promise inline media', () => {
-    // Replies on this backend go out through the reply tool, which renders
-    // rich text on media-stripped input — an image would reach the user as
-    // its caption and nothing else. The SDK path opts in separately because
-    // its streamer does deliver media.
+  test('the CLI-backend display hint teaches inline media, now that the reply tool renders it', () => {
+    // The hint is the exposure throttle for this feature: agents author the
+    // media syntax it teaches. It may only be on where the DELIVERING path
+    // resolves media — for this backend, the reply-tool rich strategy.
     const wiring = sectionBetween('const orchestraProcessFactory = createProcessFactory({', ');');
-    const call = /displayHint:[^\n]*/.exec(wiring)?.[0] ?? '';
-    assert.doesNotMatch(call, /inlineMedia/,
-      'the CLI hint must not teach syntax this backend discards');
+    // The whole option, up to wherever the next one starts.
+    const call = /displayHint:[\s\S]*?\n(?= {4}(?:\/\/|[a-zA-Z]))/.exec(wiring)?.[0] ?? '';
+    assert.match(call, /inlineMedia: true/,
+      'the CLI hint should teach the media syntax this backend now delivers');
   });
 
   test('the send verb has its own verdict, separate from the edit verb', () => {

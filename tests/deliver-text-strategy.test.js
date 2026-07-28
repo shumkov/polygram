@@ -18,7 +18,9 @@ const test = require('node:test');
 const { describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { createChannelsToolDispatcher } = require('../lib/process/channels-tool-dispatcher');
+const {
+  createChannelsToolDispatcher, buildAllowedRoots,
+} = require('../lib/process/channels-tool-dispatcher');
 const { parseResponse } = require('../lib/telegram/parse');
 const { sanitizeAssistantReply } = require('../lib/telegram/sanitize-reply');
 const { chunkMarkdownText } = require('../lib/telegram/chunk');
@@ -56,6 +58,12 @@ describe('dispatcher wiring', () => {
     assert.deepEqual(h.factoryArgs, [{
       sessionKey: 'chat:1', sessionCwd: '/work', chatId: '1', threadId: '7',
       interim: true, turnId: 'turn-9',
+      // Passed, not rebuilt by the strategy: the roots this reply's files:
+      // are validated against are the roots its media may upload from.
+      // (What they contain is buildAllowedRoots's business — pinned in
+      // channels-tool-dispatcher.test.js; that the two SIDES agree is pinned
+      // behaviorally in channels-tool-dispatcher-rich.test.js.)
+      allowedRoots: buildAllowedRoots({ sessionKey: 'chat:1', sessionCwd: '/work' }),
     }]);
   });
 
