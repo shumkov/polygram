@@ -159,6 +159,19 @@ describe('buildSdkOptions — richText-aware display hint', () => {
     assert.doesNotMatch(out.systemPrompt.append, /MUST NOT emit a table/);
   });
 
+  test('the SDK path keeps the inline-media guidance its streamer can deliver', () => {
+    // The hint is chosen per call site, not per chat: this path resolves and
+    // uploads local media, so removing the syntax here would take away a
+    // capability that still works. The reply-tool path asks for it without.
+    const deps = baseDeps({
+      config: { defaults: {}, bot: {}, chats: { '12345': { richText: true } } },
+    });
+    const fn = createBuildSdkOptions(deps);
+    const out = fn('chat-12345', baseCtx());
+    assert.match(out.systemPrompt.append, /!\[caption\]\(\/abs\/path/i);
+    assert.match(out.systemPrompt.append, /<tg-collage>/i);
+  });
+
   test('richText resolves through topic → chat → bot → default, same as delivery', () => {
     const deps = baseDeps({
       config: {
