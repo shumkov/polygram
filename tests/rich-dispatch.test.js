@@ -10,11 +10,16 @@
  * decline so the pipeline's chunked path still delivers.
  *
  * Fallback hygiene — in a rich-enabled chat, NO outcome may render an
- * absolute local path into the chat. Media blocks are out of scope for this
- * release, so image markdown degrades to its caption on both the rich and
- * the plain branch. This is a deliberate divergence from "flag-off behavior
- * is byte-identical": flag-off chats keep raw markdown, flag-on chats get
- * the leak closed.
+ * absolute local path into the chat. Media that resolves becomes a block;
+ * media that does not degrades to its caption, on both the rich and the
+ * plain branch. This is a deliberate divergence from "flag-off behavior is
+ * byte-identical": flag-off chats keep raw markdown, flag-on chats get the
+ * leak closed.
+ *
+ * Media renders only when the caller injects a wiring for the call (the
+ * tests below that pass one use the REAL resolver and preflight over a real
+ * temp workspace — the trust boundary is the point). Without one, the
+ * text-only behavior above still holds.
  */
 
 const test = require('node:test');
@@ -405,4 +410,181 @@ test('an inline photo inside the allowed roots becomes a photo block', async () 
   assert.equal(photo.photo.media.source, fs.realpathSync(file),
     'the uploaded source is the resolved realpath');
   assert.equal(photo.caption.text, 'the chart');
+});
+
+test('the send receives the preflight for this call, not a bare block tree', async () => {
+  // Without it, materialization takes the unchecked branch: cached ids and
+  // local sources used blindly, which is the exact TOCTOU the preflight closes.
+  const { dir, file } = mediaWorkspace();
+  const { factory, sendCalls } = buildWithMedia();
+
+  await deliverIn(factory, `## Results\n\n![the chart](${file})`, [dir]);
+
+  assert.equal(typeof sendCalls[0].mediaContext?.preflightMedia, 'function');
+});
+
+test('media outside the call\'s roots degrades to a caption, never a path', async () => {
+  // Same rejection reply(files:) would give the same path — that parity is
+  // the point, and it is enforced by both sides receiving one roots array.
+  const { dir } = mediaWorkspace();
+  const outside = mediaWorkspace('secret.png');
+  const { factory, sendCalls } = buildWithMedia();
+
+  const out = await deliverIn(factory, `## Results\n\n![a shot](${outside.file})`, [dir]);
+
+  assert.equal(out.handled, true, 'the heading still carries the reply');
+  const payload = JSON.stringify(sendCalls[0].blocks);
+  assert.ok(!payload.includes(outside.dir), `path leaked into blocks: ${payload}`);
+  assert.ok(payload.includes('a shot (media unavailable)'),
+    `expected an honest placeholder, got ${payload}`);
+});
+
+test('a reply whose only media is unresolvable demotes to plain', async () => {
+  // A rich bubble whose entire point was stripped out of it is worse than a
+  // plain one. With no other trigger, the reply goes to the chunked path.
+  const { dir } = mediaWorkspace();
+  const outside = mediaWorkspace('secret.png');
+  const { factory, sendCalls } = buildWithMedia();
+
+  const out = await deliverIn(factory, `![a shot](${outside.file})`, [dir]);
+
+  assert.equal(out.handled, false);
+  assert.equal(sendCalls.length, 0);
+  assert.equal(out.text, 'a shot', 'the caption is what the chunked path delivers');
+});
+
+test('without a media wiring, image syntax still cannot reach the renderer', async () => {
+  // Nothing could upload, so a photo block would be a placeholder bubble at
+  // best — and could be the only reason the reply went rich at all.
+  const { dir, file } = mediaWorkspace();
+  const { factory, sendCalls } = build();
+
+  const out = await deliverIn(factory, `## Results\n\n![the chart](${file})`, [dir]);
+
+  assert.equal(out.handled, true);
+  const payload = JSON.stringify(sendCalls[0].blocks);
+  assert.ok(!payload.includes(dir), 'no path may reach the block tree');
+  assert.ok(!payload.includes('photo'), 'and no media block either');
+});
+
+test('no roots for this call means no media wiring is even built', async () => {
+  const { file } = mediaWorkspace();
+  const { factory, wiringArgs, sendCalls } = buildWithMedia();
+
+  const out = await deliverIn(factory, `## Results\n\n![the chart](${file})`, []);
+
+  assert.deepEqual(wiringArgs, [], 'an empty roots array is not a boundary — it is a missing one');
+  assert.equal(out.handled, true, 'the reply still goes rich on its heading');
+  assert.ok(!JSON.stringify(sendCalls[0].blocks).includes('photo'));
+});
+
+// ─── The media-source-changed ladder ───────────────────────────────────────
+
+test('a file swapped mid-flight costs the media, not the structure', async () => {
+  // Three steps: rich with media → rich with honest placeholders → plain.
+  // Losing a whole table because one screenshot was rewritten is the worse
+  // trade, so the structure gets one more attempt.
+  const { dir, file } = mediaWorkspace();
+  const calls = [];
+  const outcomes = [
+    { wentRich: false, fallback: 'media-source-changed' },
+    { wentRich: true, result: { message_id: 4242 } },
+  ];
+  const { factory } = buildWithMedia({
+    sendRich: async (args) => { calls.push(args); return outcomes.shift(); },
+  });
+
+  const out = await deliverIn(factory, `## Results\n\n![the chart](${file})\n\nDone.`, [dir]);
+
+  assert.equal(out.handled, true);
+  assert.deepEqual(out.sent, [{ message_id: 4242 }]);
+  assert.equal(calls.length, 2, 'exactly one retry — not a loop');
+  assert.ok(JSON.stringify(calls[0].blocks).includes('photo'),
+    'the first attempt carried the real media');
+  const retried = JSON.stringify(calls[1].blocks);
+  assert.ok(!retried.includes('photo'), 'the retry carries no media');
+  assert.ok(retried.includes('the chart (media unavailable)'),
+    `the retry says so honestly: ${retried}`);
+  assert.ok(retried.includes('Results'), 'and keeps the structure it was sent for');
+});
+
+test('an uncaptioned item that vanished renders the bare placeholder', async () => {
+  const { dir, file } = mediaWorkspace();
+  const calls = [];
+  const outcomes = [
+    { wentRich: false, fallback: 'media-source-changed' },
+    { wentRich: true, result: { message_id: 1 } },
+  ];
+  const { factory } = buildWithMedia({
+    sendRich: async (args) => { calls.push(args); return outcomes.shift(); },
+  });
+
+  await deliverIn(factory, `## Results\n\n![](${file})`, [dir]);
+
+  assert.ok(JSON.stringify(calls[1].blocks).includes('(media unavailable)'));
+});
+
+test('a media-only reply collapses the ladder to two steps', async () => {
+  // Re-rendering with everything rejected leaves no rich trigger at all, so
+  // the demotion rule takes it to plain without a second send.
+  const { dir, file } = mediaWorkspace();
+  const calls = [];
+  const { factory } = buildWithMedia({
+    sendRich: async (args) => {
+      calls.push(args);
+      return { wentRich: false, fallback: 'media-source-changed' };
+    },
+  });
+
+  const out = await deliverIn(factory, `![the chart](${file})`, [dir]);
+
+  assert.equal(calls.length, 1, 'no second send: there is nothing rich left to send');
+  assert.equal(out.handled, false);
+  assert.equal(out.text, 'the chart', 'the chunked path delivers the caption');
+});
+
+test('a retry that also fails still delivers the reply', async () => {
+  const { dir, file } = mediaWorkspace();
+  const calls = [];
+  const { factory } = buildWithMedia({
+    sendRich: async (args) => {
+      calls.push(args);
+      return calls.length === 1
+        ? { wentRich: false, fallback: 'media-source-changed' }
+        : { wentRich: false, fallback: 'content-error' };
+    },
+  });
+
+  const out = await deliverIn(factory, `## Results\n\n![the chart](${file})`, [dir]);
+
+  assert.equal(calls.length, 2);
+  assert.equal(out.handled, false, 'the pipeline still has to deliver this');
+  assert.ok(!out.text.includes(dir), 'and never with the path in it');
+});
+
+test('other failure classes do not trigger the media retry', async () => {
+  // Re-rendering helps only when the media is the problem. Retrying a
+  // capability failure would be a second doomed call on every reply.
+  const { dir, file } = mediaWorkspace();
+  for (const fallback of ['capability', 'content-error', 'error', undefined]) {
+    const calls = [];
+    const { factory } = buildWithMedia({
+      sendRich: async (args) => { calls.push(args); return { wentRich: false, fallback }; },
+    });
+    const out = await deliverIn(factory, `## Results\n\n![the chart](${file})`, [dir]);
+    assert.equal(calls.length, 1, `fallback=${fallback} should not be retried`);
+    assert.equal(out.handled, false);
+  }
+});
+
+test('a media wiring that throws costs media, never the reply', async () => {
+  const { dir, file } = mediaWorkspace();
+  const { factory, sendCalls } = build({
+    makeMediaWiring: () => { throw new Error('roots exploded'); },
+  });
+
+  const out = await deliverIn(factory, `## Results\n\n![the chart](${file})`, [dir]);
+
+  assert.equal(out.handled, true, 'the reply still goes out, just without its media');
+  assert.ok(!JSON.stringify(sendCalls[0].blocks).includes(dir));
 });

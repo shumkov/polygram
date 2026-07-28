@@ -202,3 +202,126 @@ describe('the chain itself', () => {
     assert.equal(composeDeliverTextFactories(null), null);
   });
 });
+
+describe('live preview × rich media', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const {
+    makeRichMediaResolver, createMediaPreflight,
+  } = require('../lib/telegram/rich-media');
+
+  const dirs = new Set();
+  test.after(() => {
+    for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function workspace() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-compose-media-'));
+    dirs.add(dir);
+    const file = path.join(dir, 'chart.png');
+    fs.writeFileSync(file, Buffer.alloc(64, 1));
+    return { dir, file };
+  }
+
+  // The same two-strategy chain as above, with media wired into the rich half
+  // the way polygram wires it.
+  function mediaHarness({ previewEnabled = true } = {}) {
+    const tg = { nextId: 300, sent: [], edits: [], deleted: [] };
+    const richSends = [];
+    const streamer = createStreamer({
+      send: async (text) => {
+        const message_id = tg.nextId++;
+        tg.sent.push({ message_id, text });
+        return { message_id };
+      },
+      edit: async (msgId, text) => {
+        if (msgId == null) throw new Error('message_id required');
+        tg.edits.push({ msgId, text });
+      },
+      deleteMessage: async (id) => { tg.deleted.push(id); },
+      minChars: 5,
+      throttleMs: 0,
+      logger: { error: () => {}, warn: () => {} },
+    });
+    const registry = createStreamerRegistry();
+    if (previewEnabled) {
+      registry.register('chat:1', {
+        streamer, chatId: '1', deliveredTexts: [], getTurnId: () => null,
+      });
+    }
+
+    const makeDeliverText = composeDeliverTextFactories([
+      createDeliverTextFactory({
+        registry, logEvent: () => {}, persistBubbleText: () => {},
+        logger: { error: () => {} }, botName: 'testbot',
+      }),
+      createRichDeliveryFactory({
+        bot: {},
+        sendRich: async ({ blocks }) => {
+          richSends.push(blocks);
+          return { wentRich: true, result: { message_id: 999 } };
+        },
+        isRichTextEnabled: () => true,
+        logger: { error: () => {} },
+        makeMediaWiring: ({ allowedRoots, chatId, threadId }) => ({
+          resolveMedia: makeRichMediaResolver({
+            allowedRoots, chatId, threadId, allowUrlMedia: false,
+          }),
+          mediaContext: createMediaPreflight({ allowedRoots }),
+        }),
+      }),
+    ]);
+
+    const deliver = (allowedRoots, opts = {}) => makeDeliverText({
+      sessionKey: 'chat:1', chatId: '1', threadId: null,
+      interim: false, turnId: null, allowedRoots, ...opts,
+    });
+    return { tg, streamer, richSends, deliver };
+  }
+
+  test('a live preview still consumes a media-bearing reply', async () => {
+    // Media must not quietly switch the preview off: the bubble on screen is
+    // this answer, and a second rich bubble below it would be a duplicate.
+    const { dir, file } = workspace();
+    const h = mediaHarness();
+    await h.streamer.onChunk('Working on the chart');
+
+    const out = await h.deliver([dir])({ text: `## Results\n\n![the chart](${file})` });
+
+    assert.equal(out.handled, true);
+    assert.deepEqual(out.sent, [300], 'the reply IS the preview bubble');
+    assert.deepEqual(h.richSends, [], 'and rich did not send a second one');
+  });
+
+  test('what the preview declines still reaches rich WITH its media', async () => {
+    // The composed order must not cost media on the fallback path: this is
+    // the common shape (no preview live, or one too small to hold the answer).
+    const { dir, file } = workspace();
+    const h = mediaHarness({ previewEnabled: false });
+
+    const out = await h.deliver([dir])({ text: `## Results\n\n![the chart](${file})` });
+
+    assert.equal(out.handled, true);
+    assert.equal(h.richSends.length, 1);
+    const photo = h.richSends[0].find(b => b.type === 'photo');
+    assert.ok(photo, `expected a photo block: ${JSON.stringify(h.richSends[0])}`);
+    assert.equal(photo.photo.media.source, fs.realpathSync(file));
+    assert.equal(h.tg.sent.length, 0, 'no preview bubble was involved');
+  });
+
+  test('an interim status with media goes to rich, never into the live preview', async () => {
+    const { dir, file } = workspace();
+    const h = mediaHarness();
+    await h.streamer.onChunk('The real answer is still being written');
+
+    const out = await h.deliver([dir], { interim: true })({
+      text: `## Status\n\n![the chart](${file})`,
+    });
+
+    assert.equal(out.handled, true);
+    assert.equal(h.richSends.length, 1);
+    assert.ok(h.richSends[0].some(b => b.type === 'photo'));
+    assert.equal(h.tg.edits.length, 0, 'the live preview was not touched');
+  });
+});
