@@ -29,6 +29,9 @@ const {
   resolveSessionForSpawn,
 } = require('./lib/db/sessions');
 const { buildPrompt, resolvePromptBackend } = require('./lib/prompt');
+const { countInFlight } = require('./lib/queue-utils');
+const { createIpcHandlers } = require('./lib/ipc/handlers');
+const { classifyOrphanSweep } = require('./lib/ops/tmux-preflight');
 const { filterAttachments, resolveFileCaps, resolveMaxFileOverride, MAX_TOTAL_BYTES } = require('./lib/attachments');
 // 0.9.0: SDK ProcessManager is the only pm. CLI pm
 // (lib/process-manager.js) deleted in commit 6.
@@ -3144,6 +3147,12 @@ async function main() {
   }
   const sessionLauncher = process.env.ORCHESTRA_SESSION_LAUNCHER;
   const requireExistingServer = process.env.ORCHESTRA_TMUX_REQUIRE_SERVER === '1';
+  // Run against a dedicated tmux server (`tmux -L <name>`) instead of the shared
+  // default socket. Unset keeps today's behaviour. Env rather than config
+  // because the value has to match the tmux service unit that owns that server,
+  // and both are declared in the same systemd file; it is also per-app, while
+  // config here is per-bot and the two bots share one server.
+  const tmuxSocketName = process.env.ORCHESTRA_TMUX_SOCKET || null;
   console.log(`[polygram] session containment configured: ${sessionLauncher ? 'yes' : 'no'}`);
 
   // rc.50: claim our PID file BEFORE binding the bot token. If a
@@ -3162,24 +3171,47 @@ async function main() {
   // outlive their parent process — without this, the new daemon's
   // TmuxProcess.start() hits EEXIST on session spawn for any chat
   // routed to pm:'tmux'. See lib/tmux/orphan-sweep.js for rationale.
+  let sweepResult = null;
+  let sweepError = null;
   try {
     // Sweep must look for polygram's session prefix — orchestra's default runner
     // filters 'orchestra-<bot>-', which would never match our 'polygram-<bot>-'
     // sessions (dead safety net + EEXIST on cli respawn of a leaked session).
-    const sweep = await sweepTmuxOrphans({
+    sweepResult = await sweepTmuxOrphans({
       botName: BOT_NAME,
       runner: createTmuxRunner({
         logger: console,
         sessionPrefix: 'polygram',
         requireExistingServer,
+        socketName: tmuxSocketName,
       }),
+      socketName: tmuxSocketName,
       logger: console,
     });
-    if (sweep.swept.length > 0) {
-      console.log(`[orphan-sweep] killed ${sweep.swept.length} stale tmux session(s)`);
+    if (sweepResult.swept.length > 0) {
+      console.log(`[orphan-sweep] killed ${sweepResult.swept.length} stale tmux session(s)`);
     }
   } catch (err) {
-    console.warn?.(`[orphan-sweep] failed (non-fatal): ${err.message}`);
+    sweepError = err;
+    console.warn?.(`[orphan-sweep] failed: ${err.message}`);
+  }
+  // When we are forbidden from creating the tmux server, an unreachable one is
+  // terminal: every tmux-backed turn would fail while systemd still reported
+  // this unit healthy. Decide before the DB is opened or any inbound is polled.
+  {
+    const verdict = classifyOrphanSweep({
+      sweep: sweepResult,
+      error: sweepError,
+      requireExistingServer,
+    });
+    if (verdict.fatal) {
+      console.error(
+        `[fatal] tmux server required but unusable (${verdict.reason}). `
+        + `Start the tmux service${tmuxSocketName ? ` (socket '${tmuxSocketName}')` : ''} before this bot.`,
+      );
+      process.exit(2);
+      return;
+    }
   }
 
   try {
@@ -3552,6 +3584,7 @@ async function main() {
     logger: console,
     sessionPrefix: 'polygram',
     requireExistingServer,
+    socketName: tmuxSocketName,
   });
   // Verify the pinned claude CLI binary is present. The tmux
   // backend spawns this exact binary by absolute path (see
@@ -3912,6 +3945,12 @@ async function main() {
   const shutdown = async () => {
     if (isShuttingDown) return;
     const shutdownObservation = cgroupOomObserver.sample();
+    // Sample in-flight work at SIGNAL time, alongside the OOM observation and
+    // before anything below can change it. The drain's own `in_flight` is
+    // measured after the wait, and after a lost bridge has already rejected
+    // every pending handler — so it reads 0 whether the daemon was busy or
+    // idle, and cannot answer "how much work did this restart cost?".
+    const inFlightAtSignal = countInFlight(inFlightHandlers);
     isShuttingDown = true;
     console.log('\nShutting down...');
     // 1. Stop accepting new inbound first so nothing new queues behind the drain.
@@ -3995,8 +4034,7 @@ async function main() {
       await new Promise((r) => setTimeout(r, 100));
     }
     const drainElapsed = Date.now() - drainStart;
-    let remaining = 0;
-    for (const n of inFlightHandlers.values()) remaining += n;
+    const remaining = countInFlight(inFlightHandlers);
 
     // 3. A handled signal is normally deliberate, but a Linux supervisor can
     //    also stop the service after an OOM-killed child. Persist crash-like
@@ -4013,13 +4051,14 @@ async function main() {
         logEvent('shutdown-drain', {
           bot: BOT_NAME,
           in_flight: remaining,
+          in_flight_at_signal: inFlightAtSignal,
           replay_marked: res.replayMarked,
           elapsed_ms: drainElapsed,
           clean: res.clean,
           shutdown_reason: res.shutdownReason,
           ...(res.oomKillDelta != null ? { oom_kill_delta: res.oomKillDelta } : {}),
         });
-        console.log(`[shutdown] ${res.clean ? 'clean' : 'crash-like'} shutdown recorded (${res.shutdownReason}); drained ${drainElapsed}ms, ${remaining} in-flight, ${res.replayMarked} marked replay-pending`);
+        console.log(`[shutdown] ${res.clean ? 'clean' : 'crash-like'} shutdown recorded (${res.shutdownReason}); ${inFlightAtSignal} in-flight at signal, drained ${drainElapsed}ms, ${remaining} still in-flight, ${res.replayMarked} marked replay-pending`);
       } catch (err) {
         console.error(`[shutdown] persistence failed: ${err.message}`);
       }
@@ -4071,10 +4110,11 @@ async function main() {
     ipcCloser = await ipcServer.start({
       path: ipcServer.socketPathFor(BOT_NAME),
       secret: ipcSecret,
-      handlers: {
-        ping: async () => ({ pong: true, bot: BOT_NAME }),
-        send: (req) => handleSendOverIpc(req),
-      },
+      handlers: createIpcHandlers({
+        botName: BOT_NAME,
+        getInFlightHandlers: () => inFlightHandlers,
+        handleSendOverIpc: (req) => handleSendOverIpc(req),
+      }),
       logger: console,
     });
   } catch (err) {
