@@ -51,7 +51,7 @@ const { extractAssistantText } = require('@shumkov/orchestra');
 // containing code blocks or HTML-style tags aren't split mid-element by the
 // size cap.
 const {
-  createChannelsToolDispatcher, buildAllowedRoots, MAX_FILES_PER_REPLY,
+  createChannelsToolDispatcher, buildAllowedRoots,
 } = require('./lib/process/channels-tool-dispatcher');
 const { createTmuxRunner } = require('@shumkov/orchestra');
 const { sweepTmuxOrphans } = require('@shumkov/orchestra').orphanSweep;
@@ -125,7 +125,7 @@ const {
 } = require('./lib/telegram/rich');
 const {
   makeRichMediaResolver,
-  createMediaPreflight,
+  makeReplyMediaWiring,
   createMediaDeliveryContext,
   createMediaFileIdCache,
   collectMediaRescueEntries,
@@ -3615,35 +3615,18 @@ async function main() {
       isRichTextEnabled: (chatId, threadId) => resolveRichTextEnabled(config, chatId, threadId),
       getRichKnownUnsupported: () => richSendKnownUnsupported,
       redactError: redactBotToken,
-      // Media for one reply. `allowedRoots` arrives from the dispatcher, which
-      // computed it once for this call and validates `files:` against the very
-      // same array — a path the reply tool may upload is exactly a path image
-      // syntax may upload. Rebuilding roots from config here would widen them
-      // whenever config drifted away from the running session's cwd.
-      makeMediaWiring: ({ allowedRoots, chatId, threadId }) => ({
-        resolveMedia: makeRichMediaResolver({
-          allowedRoots,
-          chatId,
-          threadId,
-          config,
-          fileIdCache: richMediaFileIdCache,
-          // Unconditional, unlike the streamer path: `files:` cannot upload a
-          // URL at all, and a URL Telegram fetches server-side is an
-          // exfiltration beacon for prompt-injected content. The display hint
-          // teaches local paths only, so nothing legitimate is lost.
-          allowUrlMedia: false,
-          // The same ceiling `files:` enforces: above it that param errors,
-          // and silently accepting five times as many through image syntax
-          // would make the narrower limit meaningless.
-          maxMediaPerMessage: MAX_FILES_PER_REPLY,
-          logEvent,
-          botName: BOT_NAME,
-          transport: 'send',
-        }),
-        mediaContext: createMediaPreflight({
-          allowedRoots,
-          fileIdCache: richMediaFileIdCache,
-        }),
+      // Media for one reply. The envelope itself (no URL media, the `files:`
+      // fan-out ceiling, the shared stat) lives in rich-media.js so it is
+      // pinned by behavior rather than by this literal — nothing executes
+      // this file. `allowedRoots` arrives per call from the dispatcher, which
+      // computed it once and validates `files:` against that very array, so a
+      // path the reply tool may upload is exactly a path image syntax may
+      // upload.
+      makeMediaWiring: makeReplyMediaWiring({
+        config,
+        fileIdCache: richMediaFileIdCache,
+        logEvent,
+        botName: BOT_NAME,
       }),
     }),
   ]);

