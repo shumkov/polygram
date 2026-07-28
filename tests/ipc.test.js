@@ -11,6 +11,7 @@ const os = require('os');
 
 const ipcServer = require('../lib/ipc/server');
 const ipcClient = require('../lib/ipc/client');
+const { createIpcHandlers } = require('../lib/ipc/handlers');
 
 const silentLogger = { log: () => {}, error: () => {} };
 
@@ -51,6 +52,67 @@ describe('ipc round-trip', () => {
     });
     assert.equal(res.ok, true);
     assert.deepEqual(res.seen, 'hi');
+  });
+
+  // The deploy pre-flight asks a running daemon what it would interrupt. These
+  // drive the PRODUCTION handler set, not a hand-built map — otherwise they
+  // prove the transport works and nothing about which ops a daemon answers, and
+  // would keep passing if `busy` were dropped from the wiring.
+  test('busy op reports in-flight work over the wire', async () => {
+    const inFlight = new Map([['-1003369922517:37', 2], ['451328391', 0]]);
+    await startServer(createIpcHandlers({
+      botName: 'shumabit',
+      getInFlightHandlers: () => inFlight,
+      handleSendOverIpc: async () => ({}),
+    }));
+    const res = await ipcClient.call({ path: sockPath, op: 'busy' });
+    assert.equal(res.ok, true);
+    assert.equal(res.bot, 'shumabit');
+    assert.equal(res.in_flight, 2);
+    assert.deepEqual(res.sessions, [{ session_key: '-1003369922517:37', in_flight: 2 }]);
+  });
+
+  test('busy op on an idle daemon is a clear go-ahead', async () => {
+    await startServer(createIpcHandlers({
+      botName: 'umi-assistant',
+      getInFlightHandlers: () => new Map(),
+      handleSendOverIpc: async () => ({}),
+    }));
+    const res = await ipcClient.call({ path: sockPath, op: 'busy' });
+    assert.equal(res.ok, true);
+    assert.equal(res.in_flight, 0);
+    assert.deepEqual(res.sessions, []);
+  });
+
+  // The dispatcher's map is assigned during boot and replaced on reload. Binding
+  // it at wiring time would freeze the answer at whatever it was when the IPC
+  // server started — reporting an idle daemon forever, which is the worst
+  // possible lie for a pre-flight check.
+  test('busy op reads in-flight state at call time, not at wiring time', async () => {
+    let inFlight = null;
+    await startServer(createIpcHandlers({
+      botName: 'shumabit',
+      getInFlightHandlers: () => inFlight,
+      handleSendOverIpc: async () => ({}),
+    }));
+    const before = await ipcClient.call({ path: sockPath, op: 'busy' });
+    assert.equal(before.in_flight, 0);
+
+    inFlight = new Map([['-100:5', 3]]);
+    const after = await ipcClient.call({ path: sockPath, op: 'busy' });
+    assert.equal(after.in_flight, 3);
+  });
+
+  test('the production handler set still answers ping', async () => {
+    await startServer(createIpcHandlers({
+      botName: 'shumabit',
+      getInFlightHandlers: () => new Map(),
+      handleSendOverIpc: async () => ({}),
+    }));
+    const res = await ipcClient.call({ path: sockPath, op: 'ping' });
+    assert.equal(res.ok, true);
+    assert.equal(res.pong, true);
+    assert.equal(res.bot, 'shumabit');
   });
 
   test('id is echoed back in reply', async () => {
