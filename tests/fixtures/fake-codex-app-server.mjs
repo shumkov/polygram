@@ -150,10 +150,13 @@ function defaultResult(method, params) {
       model: params?.model ?? 'gpt-5.6-sol',
       modelProvider: 'openai',
       reasoningEffort: 'medium',
+      runtimeWorkspaceRoots: [cwd],
       sandbox: {
         type: 'workspaceWrite',
-        writableRoots: [cwd],
+        writableRoots: [],
         networkAccess: false,
+        excludeSlashTmp: true,
+        excludeTmpdirEnvVar: true,
       },
       activePermissionProfile: {
         id: 'polygram-session',

@@ -137,10 +137,13 @@ function threadResult(workspace, threadId = 'codex-thread-1') {
     model: 'gpt-5.6-sol',
     modelProvider: 'openai',
     reasoningEffort: 'medium',
+    runtimeWorkspaceRoots: [workspace],
     sandbox: {
       type: 'workspaceWrite',
-      writableRoots: [workspace],
+      writableRoots: [],
       networkAccess: false,
+      excludeSlashTmp: true,
+      excludeTmpdirEnvVar: true,
     },
     activePermissionProfile: {
       id: 'polygram-session',
