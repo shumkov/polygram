@@ -83,6 +83,7 @@ function ownedConfig({
 }) {
   return {
     cli_auth_credentials_store: 'file',
+    model_provider: 'openai',
     default_permissions: 'polygram-session',
     approval_policy: 'never',
     approvals_reviewer: 'user',
@@ -243,7 +244,7 @@ function writeScenario(fixture, overrides = {}) {
       },
     },
     model_provider: 'openai',
-    model_providers: { openai: {} },
+    model_providers: {},
   };
   const turnId = 'turn-text-1';
   writeFileSync(
