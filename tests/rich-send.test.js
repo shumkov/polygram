@@ -564,3 +564,24 @@ test('a landed message keeps its transcript row even if cache learning explodes'
   assert.equal(rows.length, 1, 'the transcript row survives');
   assert.ok(events.some(e => e.kind === 'rich-message-sent'), 'and so does the telemetry');
 });
+
+test('nothing downstream inspects media nested inside rich_message', async () => {
+  // The resolver's caps are the ONLY per-file limit on this payload, and that
+  // claim rests on api.js not walking rich_message. Asserted behaviorally,
+  // not by checking a table for a missing key: a future recursive walk would
+  // keep FILE_FIELD_BY_METHOD.sendRichMessage undefined and still change what
+  // reaches the wire.
+  const { coerceFileParams } = require('../lib/telegram/input-file');
+  const envelope = { source: '/definitely/not/a/real/file.png' };
+  const params = {
+    chat_id: '1',
+    rich_message: {
+      blocks: [{ type: 'photo', photo: { type: 'photo', media: envelope } }],
+    },
+  };
+
+  coerceFileParams('sendRichMessage', params);
+
+  assert.equal(params.rich_message.blocks[0].photo.media, envelope,
+    'the nested value is untouched — materialization is the only thing that converts it');
+});

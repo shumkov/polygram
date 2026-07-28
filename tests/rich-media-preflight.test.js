@@ -640,3 +640,93 @@ describe('what actually gets uploaded', () => {
     assert.equal(preflight.preflightMedia(resolved.media, 'photo', { withBytes: true }).ok, false);
   });
 });
+
+describe('the guarantees the whole boundary rests on', () => {
+  test('a file swapped between the check and the upload sends nothing', () => {
+    // The regression the descriptor binding exists for, stated end to end:
+    // preflight passes, the file is replaced, and the upload must not carry
+    // the new bytes — nor be attempted at all.
+    const { dir, files } = workspace();
+    const resolve = makeRichMediaResolver({ allowedRoots: [dir], chatId: '1' });
+    const [resolved] = resolve([{ src: files['chart.png'], caption: '' }]);
+
+    // A preflight whose path-stat check passes, and where the file changes
+    // before the descriptor is opened — the swap window itself.
+    const racing = createMediaPreflight({
+      allowedRoots: [dir],
+      fileStat: (p) => {
+        const stat = fs.statSync(p, { bigint: true });
+        fs.writeFileSync(p, Buffer.alloc(128, 9));   // swapped, post-check
+        return stat;
+      },
+    });
+
+    const uploads = [];
+    assert.throws(() => materializeMediaBlocks(
+      [{ type: 'photo', photo: { type: 'photo', media: resolved.media } }],
+      (source, bytes) => { uploads.push({ source, bytes }); return { source }; },
+      racing.preflightMedia,
+    ), /source changed/i);
+    assert.deepEqual(uploads, [], 'nothing was handed to the uploader');
+  });
+
+  test('both halves stat the same way, and that way is bigint', () => {
+    // The shared-stat test catches ONE half drifting. Both halves drifting
+    // together would agree with each other and pass it while throwing away
+    // sub-millisecond resolution — the whole point of the fingerprint, since
+    // a same-millisecond swap is exactly what an attacker controls.
+    const { dir, files } = workspace();
+    const [resolved] = makeRichMediaResolver({ allowedRoots: [dir], chatId: '1' })(
+      [{ src: files['chart.png'], caption: '' }],
+    );
+
+    const bigint = fs.statSync(files['chart.png'], { bigint: true });
+    const parts = resolved.media.fingerprint.split(':');
+    assert.equal(parts.length, 5, 'dev:ino:size:mtime:ctime');
+    assert.equal(parts[3], String(bigint.mtimeNs),
+      'nanosecond mtime — a float millisecond stat would land here instead');
+    assert.equal(parts[4], String(bigint.ctimeNs));
+    assert.notEqual(parts[3], String(bigint.mtimeMs));
+  });
+
+  test('a cached id learned by one session is unusable by another', () => {
+    // The cache is process-wide and keyed by realpath, and the send path now
+    // writes to it. Authorization must still come from THIS call's roots:
+    // the cache may save an upload, never grant one.
+    const shared = workspace({ 'shared.png': 32 });
+    const other = workspace();
+    const cache = createMediaFileIdCache();
+
+    const sessionA = makeReplyMediaWiring({ fileIdCache: cache })({
+      allowedRoots: [shared.dir], chatId: '1',
+    });
+    const [a] = sessionA.resolveMedia([{ src: shared.files['shared.png'], caption: '' }]);
+    assert.equal(sessionA.mediaContext.learnRichResult(
+      [{ type: 'photo', photo: { type: 'photo', media: a.media } }],
+      { rich_message: { blocks: [{ type: 'photo', photo: [{ file_id: 'A-id', width: 9, height: 9 }] }] } },
+    ), true, 'session A legitimately learned an id for a file it may send');
+
+    // Session B cannot see that file at all.
+    const sessionB = makeReplyMediaWiring({ fileIdCache: cache })({
+      allowedRoots: [other.dir], chatId: '2',
+    });
+    const [b] = sessionB.resolveMedia([{ src: shared.files['shared.png'], caption: '' }]);
+    assert.equal(b.rejected, 'path', 'B is refused by roots, cache or no cache');
+    assert.equal(
+      sessionB.mediaContext.preflightMedia({ ...a.media, fileId: 'A-id' }, 'photo').ok, false,
+      'and cannot spend A\'s id by naming the envelope directly',
+    );
+
+    // B's refusal also dropped A's entry — a rejected preflight evicts, and
+    // the key is the realpath, so one session's failure is another's cache
+    // miss. Recorded rather than fixed: the cache can only ever save an
+    // upload, so losing an entry costs bandwidth, not access. A session that
+    // is still authorized simply re-uploads.
+    assert.equal(cache.get('photo', a.media.source, a.media.fingerprint), null,
+      'churn is the worst B can do to A');
+    const [again] = sessionA.resolveMedia([{ src: shared.files['shared.png'], caption: '' }]);
+    assert.equal(again.media.fileId, undefined, 'no cached shortcut');
+    assert.equal(again.media.source, fs.realpathSync(shared.files['shared.png']),
+      'still authorized — it lost a shortcut, not access');
+  });
+});

@@ -210,6 +210,7 @@ describe('live preview × rich media', () => {
   const {
     makeRichMediaResolver, createMediaPreflight,
   } = require('../lib/telegram/rich-media');
+  const { stripMediaMarkdown } = require('../lib/telegram/rich');
 
   const dirs = new Set();
   test.after(() => {
@@ -255,6 +256,9 @@ describe('live preview × rich media', () => {
       createDeliverTextFactory({
         registry, logEvent: () => {}, persistBubbleText: () => {},
         logger: { error: () => {} }, botName: 'testbot',
+        // polygram's wiring: a consumed reply is finalized by the streamer,
+        // outside this call's media boundary, so media never rides in on it.
+        projectConsumedText: (text) => stripMediaMarkdown(text),
       }),
       createRichDeliveryFactory({
         bot: {},
@@ -292,6 +296,15 @@ describe('live preview × rich media', () => {
     assert.equal(out.handled, true);
     assert.deepEqual(out.sent, [300], 'the reply IS the preview bubble');
     assert.deepEqual(h.richSends, [], 'and rich did not send a second one');
+
+    // What the consumed bubble may contain: no media block, and above all no
+    // path. Consuming renders through the streamer, outside the reply tool's
+    // boundary, so media that rode in here would have been resolved under
+    // rules this call never agreed to.
+    const bubble = JSON.stringify(h.tg.sent.concat(h.tg.edits));
+    assert.ok(!bubble.includes(dir), `the workspace path reached the bubble: ${bubble}`);
+    assert.ok(!/"type":"(photo|video|animation|collage|slideshow)"/.test(bubble),
+      `a media block reached the consumed bubble: ${bubble}`);
   });
 
   test('what the preview declines still reaches rich WITH its media', async () => {

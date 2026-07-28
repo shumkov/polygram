@@ -675,10 +675,7 @@ test('the two modules load cleanly in either order', () => {
 
 const nodeFs = require('node:fs');
 const nodeOs = require('node:os');
-const {
-  makeRichMediaResolver, createMediaPreflight,
-} = require('../lib/telegram/rich-media');
-const { MAX_FILES_PER_REPLY } = require('../lib/process/channels-tool-dispatcher');
+const { makeReplyMediaWiring } = require('../lib/telegram/rich-media');
 
 const mediaDirs = new Set();
 test.after(() => {
@@ -695,6 +692,8 @@ function mediaDir(name = 'chart.png') {
 
 // polygram's own wiring, minus polygram: the strategy gets its media from the
 // roots the dispatcher hands it, and nothing else.
+const productionWiring = makeReplyMediaWiring({});
+
 function buildMediaWired() {
   const tgCalls = [];
   const factoryArgs = [];
@@ -727,19 +726,10 @@ function buildMediaWired() {
     isRichTextEnabled: () => true,
     getRichKnownUnsupported: () => latched,
     logger: quietLogger,
-    makeMediaWiring: ({ allowedRoots, chatId, threadId }) => {
-      wiringArgs.push({ allowedRoots, chatId, threadId });
-      return {
-        resolveMedia: makeRichMediaResolver({
-          allowedRoots,
-          chatId,
-          threadId,
-          allowUrlMedia: false,
-          maxMediaPerMessage: MAX_FILES_PER_REPLY,
-        }),
-        mediaContext: createMediaPreflight({ allowedRoots }),
-      };
-    },
+    // The SAME factory polygram passes to createRichDeliveryFactory. A
+    // reconstruction here would leave the production envelope free to drift
+    // while these end-to-end tests stayed green.
+    makeMediaWiring: (call) => { wiringArgs.push(call); return productionWiring(call); },
   });
 
   const dispatcher = createChannelsToolDispatcher({

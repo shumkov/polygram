@@ -616,22 +616,32 @@ test('a wiring missing its preflight is refused outright', async () => {
 // re-opens the leak the stripped-body render closed by construction. Two
 // distinct mechanisms, both reachable from ordinary agent output.
 
-test('a screenshot path with spaces never reaches the chat', async () => {
-  // The rich gate's image regex is looser than the CommonMark parser: a
-  // destination containing a space trips the gate but is not an image token,
-  // so it yields no descriptor and would survive as literal text WITH the
-  // path in it. macOS names every screenshot "Screenshot ... at ....png".
-  const { dir } = mediaWorkspace();
+test('image syntax the parser rejects never reaches the chat as text', async () => {
+  // The rich gate's image regex is looser than the CommonMark parser. A
+  // destination with a space (macOS names every screenshot that way), one
+  // with parentheses, and an unterminated fragment are all "an image" to the
+  // gate and none of them to the parser — so each yields no descriptor,
+  // dodges the media-only demotion, and would survive as literal text with
+  // the absolute path in it.
+  //
+  // The spaced case uses a REAL file inside the allowed roots: it is the
+  // ordinary case (the spec's own demo is a workspace screenshot), and it
+  // proves the leak is a rendering gap rather than merely unresolvable media.
+  const real = mediaWorkspace('Screenshot 2026-07-29 at 10.00.00.png');
   const cases = {
-    spaces: '/Users/ivan/Desktop/Screenshot 2026-07-29 at 10.00.00.png',
-    parens: '/Users/ivan/Desktop/shot (1).png',
+    'spaces (real file, in roots)': `Here you go:\n\n![the shot](${real.file})`,
+    parens: 'Here you go:\n\n![shot](/Users/ivan/Desktop/shot (1).png)',
+    'unterminated fragment': `${TABLE}\n\n![shot](/Users/ivan/Desktop/id_rsa`,
+    'wrapper around an unparseable path':
+      `## Results\n\n<tg-collage>\n\n![a](/Users/ivan/Desktop/a b.png)\n\n</tg-collage>`,
   };
 
-  for (const [label, p] of Object.entries(cases)) {
+  for (const [label, text] of Object.entries(cases)) {
     const { factory, sendCalls } = buildWithMedia();
-    const out = await deliverIn(factory, `Here you go:\n\n![shot](${p})`, [dir]);
+    const out = await deliverIn(factory, text, [real.dir]);
     const wire = JSON.stringify(sendCalls[0]?.blocks ?? out.text ?? '');
-    assert.ok(!wire.includes('/Users/ivan'), `${label}: path reached the chat as ${wire}`);
+    assert.ok(!wire.includes('/Users/ivan') && !wire.includes(real.dir),
+      `${label}: path reached the chat as ${wire}`);
   }
 });
 

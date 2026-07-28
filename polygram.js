@@ -3716,6 +3716,16 @@ async function main() {
     // teaches is syntax this backend delivers. The guidance is per-path for
     // exactly that reason — it is the throttle on how much media agents
     // author, and it may only be on where delivery can honor it.
+    //
+    // Enabling it with the code, rather than staging it behind a separate
+    // switch, is deliberate: the RELEASE is the throttle. Media ships only
+    // after the text-only rich path has soaked in production, so a chat that
+    // turns richText on gets code and guidance in the same instant by design.
+    //
+    // The hint also describes media in a chat whose send capability has since
+    // latched off, where replies degrade to plain text and captions. Accepted:
+    // the latch is process-lifetime and rare, and the alternative — rebuilding
+    // the system prompt on a capability change — would respawn live sessions.
     displayHint: (chatId, threadId) => buildPolygramDisplayHint(
       resolveRichTextEnabled(config, chatId, threadId),
       { inlineMedia: true },
