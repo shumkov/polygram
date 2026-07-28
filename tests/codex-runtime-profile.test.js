@@ -89,6 +89,7 @@ function fixture(t) {
 function ownedConfig(f) {
   return {
     cli_auth_credentials_store: 'file',
+    model_provider: 'openai',
     default_permissions: CODEX_PERMISSION_PROFILE_ID,
     approval_policy: 'never',
     approvals_reviewer: 'user',
@@ -150,7 +151,7 @@ function projectedConfig(f, overrides = {}) {
     }],
     mcpServers: { count: 0, keySha256: [] },
     plugins: { count: 0, keySha256: [] },
-    modelProviders: { count: 1, keySha256: [digest('openai')] },
+    modelProviders: { count: 0, keySha256: [] },
     ...overrides,
   };
 }
@@ -295,6 +296,7 @@ describe('owned Codex native-beta runtime profile', () => {
     );
 
     const raw = readFileSync(path.join(f.codexHome, 'config.toml'), 'utf8');
+    assert.match(raw, /model_provider = "openai"/);
     assert.match(raw, /default_permissions = "polygram-session"/);
     assert.match(raw, /approval_policy = "never"/);
     assert.match(raw, /allow_login_shell = false/);
@@ -317,6 +319,10 @@ describe('owned Codex native-beta runtime profile', () => {
     assert.equal(profile.model, 'gpt-5.6-sol');
     assert.equal(profile.effort, 'xhigh');
     assert.equal(profile.expectedConfig.modelProvider, 'openai');
+    assert.deepEqual(profile.expectedConfig.modelProviders, {
+      count: 0,
+      keySha256: [],
+    });
     assert.equal(profile.expectedConfig.mcpServers.count, 0);
     assert.equal(profile.expectedRequirements, null);
     assert.equal(profile.permissionProfileId, CODEX_PERMISSION_PROFILE_ID);
@@ -499,6 +505,20 @@ describe('owned Codex native-beta runtime profile', () => {
         config: {
           modelProvider: 'other',
           modelProviders: { count: 1, keySha256: [digest('other')] },
+        },
+      }),
+    }, {
+      name: 'custom OpenAI provider',
+      mutate: (f) => projectedResults(f, {
+        config: {
+          modelProviders: { count: 1, keySha256: [digest('openai')] },
+        },
+      }),
+    }, {
+      name: 'inconsistent custom-provider projection',
+      mutate: (f) => projectedResults(f, {
+        config: {
+          modelProviders: { count: 0, keySha256: [digest('openai')] },
         },
       }),
     }, {

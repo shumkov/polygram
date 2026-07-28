@@ -83,6 +83,7 @@ function ownedConfig({
 }) {
   return {
     cli_auth_credentials_store: 'file',
+    model_provider: 'openai',
     default_permissions: 'polygram-session',
     approval_policy: 'never',
     approvals_reviewer: 'user',
@@ -243,7 +244,7 @@ function writeScenario(fixture, overrides = {}) {
       },
     },
     model_provider: 'openai',
-    model_providers: { openai: {} },
+    model_providers: {},
   };
   const turnId = 'turn-text-1';
   writeFileSync(
@@ -847,7 +848,8 @@ function activeTurnDescriptor(turnId) {
 function completingTurnDescriptor(turnId, text) {
   return {
     ...activeTurnDescriptor(turnId),
-    lateDelayMs: 5,
+    // Keep activation observable even when coverage instrumentation delays the test.
+    lateDelayMs: 100,
     lateMessages: completedTurnMessages(turnId, text),
   };
 }
