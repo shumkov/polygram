@@ -118,9 +118,11 @@ should surface, not silently log to a DB the bot isn't watching.
 
 ## Native Codex beta diagnostics
 
-Codex is an opt-in native beta. Before selecting `pm: "codex"`, configure:
+Codex is an opt-in native beta supported on Darwin arm64 and Linux x64.
+Before selecting `pm: "codex"`, configure:
 
-- `codex.binary` as the canonical immutable executable for the pinned version;
+- `codex.binary` as the canonical immutable executable for the pinned
+  target-specific version and checksum;
 - `codex.home` as a dedicated, persistent, non-temporary `CODEX_HOME` with
   mode `0700`;
 - owner-only `config.toml` and `auth.json` files with mode `0600`; and
@@ -131,6 +133,44 @@ List every other daemon credential or control tree in
 `codex.daemonSecretRoots`, including the interactive `~/.codex` tree when it
 exists; the dedicated deployment home is separate and must not be reused.
 
+On Linux, `POLYGRAM_CODEX_TMPDIR` is mandatory. Set it to a canonical,
+service-owned directory with mode `0700`; do not use `/tmp`, a symlink, or a
+shared writable parent. A systemd unit can provision it without a reboot:
+
+```ini
+[Service]
+RuntimeDirectory=polygram-codex
+RuntimeDirectoryMode=0700
+Environment=POLYGRAM_CODEX_TMPDIR=/run/polygram-codex
+```
+
+Polygram passes this selector only to the Codex app-server child as `TMPDIR`.
+The exact generated `config.toml` includes the selected directory, or a
+normalized parent that covers it, as a `deny` root. Claude SDK and CLI child
+environments retain their existing `TMPDIR` and do not receive the selector.
+
+Existing generated `config.toml` files from before the Codex temp-root policy
+will fail with `CODEX_OWNED_CONFIG_DRIFT`. This is deliberate: Polygram never
+migrates or overwrites an owned config automatically. With the daemon stopped:
+
+1. Choose an owner-only backup directory outside `CODEX_HOME` that is already
+   listed in `codex.daemonSecretRoots`.
+2. Back up by moving the old file there, preserving it for inspection:
+
+   ```bash
+   codex_config=/path/to/codex-home/config.toml
+   codex_backup_dir=/path/to/denied-daemon-secret-root/codex-config-backups
+   install -d -m 0700 "$codex_backup_dir"
+   mv "$codex_config" "$codex_backup_dir/config.toml.before-tmpdir-deny"
+   ```
+
+3. Start Polygram again so it provisions the new exact owner-only
+   `config.toml`, then rerun doctor and retain the backup until the deployment
+   is verified.
+
+Do not edit the generated file in place or copy the old file back. This clean
+configuration migration and normal Linux canary setup require no reboot.
+
 Run the existing doctor against the intended config and database:
 
 ```bash
@@ -139,8 +179,11 @@ node scripts/doctor.js --bot my-bot --config /path/to/config.json --db /path/to/
 
 The Codex checks are local and content-free. They verify the binary pin,
 dedicated home, installed protocol schema, owned profile, protected IPC runtime
-directory, stable host and kernel boot-session identity, and the daemon-wide
-lease. They do not print
+directory, selected app-server temp directory (`codex-tmpdir`), stable host and
+kernel boot-session identity, and the daemon-wide lease. `codex-tmpdir`
+requires a canonical owner-only mode-`0700` directory that does not overlap
+runtime state or a configured workspace and is covered by the owned profile's
+deny roots. The checks do not print
 paths, credential contents, raw host/boot identities, generation IDs, prompts,
 command output, or raw failure text. They do not start app-server or perform
 authenticated model discovery. `codex-model-catalog` therefore remains a
@@ -161,7 +204,8 @@ This lease does not fence Claude, another Polygram daemon, or an
 uninstrumented host process.
 
 Detached and background development servers are unsupported in the native
-macOS beta. Healthy stop proves the exact Codex turn settled, tracked-terminal
-cleanup was accepted, and a fresh registry page was empty; it does not prove
-arbitrary descendants died. After transport or app-server hard loss, such a
-process may survive until the required host reboot.
+Codex beta on both supported targets. Healthy stop proves the exact Codex turn
+settled, tracked-terminal cleanup was accepted, and a fresh registry page was
+empty; it does not prove arbitrary descendants died. After transport or
+app-server hard loss, such a process may survive until the required host
+reboot.

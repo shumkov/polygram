@@ -443,6 +443,7 @@ function makeFixture(t, scenario = {}) {
 
 function createIntegrationOrchestra() {
   const observedFaults = [];
+  const targetPin = orchestra.resolveCodexTargetPin();
   const attestCodexHomeFn = (codexHome, expectedConfigSha256) => (
     orchestra.attestPinnedCodexHome(
       codexHome,
@@ -452,8 +453,9 @@ function createIntegrationOrchestra() {
   );
   const attestBinaryFn = async (binary) => ({
     path: binary,
-    sha256: orchestra.codexProtocolSchema.binarySha256,
-    version: orchestra.codexProtocolSchema.cliVersion,
+    target: targetPin.target,
+    sha256: targetPin.binarySha256,
+    version: targetPin.cliVersion,
     fingerprint: binaryFingerprint(binary),
   });
   class IntegrationClient extends orchestra.CodexAppServerClient {
@@ -520,10 +522,12 @@ function createRuntime({
     LANG: 'en_US.UTF-8',
     LC_ALL: 'en_US.UTF-8',
   };
+  const targetPin = orchestra.resolveCodexTargetPin();
   const binaryReceipt = Object.freeze({
     path: fixture.binary,
-    version: orchestra.codexProtocolSchema.cliVersion,
-    sha256: orchestra.codexProtocolSchema.binarySha256,
+    target: targetPin.target,
+    version: targetPin.cliVersion,
+    sha256: targetPin.binarySha256,
     fingerprint: Object.freeze(binaryFingerprint(fixture.binary)),
   });
   const runtimeProfileBuilder = createCodexRuntimeProfileBuilder({

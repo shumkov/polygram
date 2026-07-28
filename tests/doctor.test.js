@@ -22,6 +22,7 @@ const PINNED_SHA256 =
   '1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590';
 const SCHEMA_SHA256 =
   '1bc09dedc506075562d4d49b702ecab6d947dd5a8c2a9014a5cde592a0938efb';
+const PINNED_TARGET = 'aarch64-apple-darwin';
 
 function createDeployment(t, lease = null) {
   const root = realpathSync(
@@ -84,6 +85,7 @@ function createDeployment(t, lease = null) {
       assert.equal(binaryPath, binary);
       return {
         path: binary,
+        target: PINNED_TARGET,
         version: PINNED_VERSION,
         sha256: PINNED_SHA256,
       };
@@ -95,10 +97,16 @@ function createDeployment(t, lease = null) {
     protocolSchema: {
       cliVersion: PINNED_VERSION,
       binarySha256: PINNED_SHA256,
+      binarySha256ByTarget: {
+        [PINNED_TARGET]: PINNED_SHA256,
+      },
       generatedProtocolV2CanonicalSha256: SCHEMA_SHA256,
     },
-    pinnedVersion: PINNED_VERSION,
-    pinnedBinarySha256: PINNED_SHA256,
+    resolveTargetPin: () => Object.freeze({
+      target: PINNED_TARGET,
+      cliVersion: PINNED_VERSION,
+      binarySha256: PINNED_SHA256,
+    }),
     temporaryRoots: [],
     ipcTemporaryRoots: [],
     resolveIpcRuntimeDirectory: () => ipcRuntimeDir,
@@ -154,6 +162,50 @@ test('offline Codex doctor verifies the local pin, home, profile, identity, and 
   assert.ok(
     checks.every(({ detail }) => Buffer.byteLength(detail, 'utf8') <= 256),
     'every diagnostic detail is bounded',
+  );
+  assert.equal(
+    checks.find(({ name }) => name === 'codex-binary').extra.target,
+    PINNED_TARGET,
+  );
+});
+
+test('doctor rejects an opposite-target binary receipt', async (t) => {
+  const deployment = createDeployment(t);
+  deployment.dependencies.resolveBinary = async () => ({
+    path: deployment.binary,
+    target: 'x86_64-unknown-linux-musl',
+    version: PINNED_VERSION,
+    sha256: PINNED_SHA256,
+  });
+
+  const checks = await collectCodexDoctorChecks({
+    config: deployment.config,
+    db: deployment.db,
+    dependencies: deployment.dependencies,
+    processEnv: deployment.processEnv,
+  });
+
+  assert.equal(
+    checks.find(({ name }) => name === 'codex-binary').status,
+    'fail',
+  );
+});
+
+test('doctor rejects a protocol map that drifts from the selected target', async (t) => {
+  const deployment = createDeployment(t);
+  deployment.dependencies.protocolSchema.binarySha256ByTarget[PINNED_TARGET] =
+    '0'.repeat(64);
+
+  const checks = await collectCodexDoctorChecks({
+    config: deployment.config,
+    db: deployment.db,
+    dependencies: deployment.dependencies,
+    processEnv: deployment.processEnv,
+  });
+
+  assert.equal(
+    checks.find(({ name }) => name === 'codex-protocol').status,
+    'fail',
   );
 });
 
@@ -265,6 +317,43 @@ test('Codex temp accepts an owned-profile parent deny that covers it', async (t)
 
   assert.equal(temp.status, 'ok');
   assert.equal(temp.extra.protected, true);
+});
+
+test('Codex temp inspection honors the configured permission profile', async (t) => {
+  const deployment = createDeployment(t);
+  deployment.dependencies.profileId = 'custom-session';
+  writeFileSync(
+    path.join(deployment.codexHome, 'config.toml'),
+    [
+      'default_permissions = "custom-session"',
+      'approval_policy = "never"',
+      'web_search = "disabled"',
+      '',
+      '[permissions."custom-session".filesystem]',
+      `${JSON.stringify(deployment.codexTmp)} = "deny"`,
+      '',
+      '[permissions."custom-session".network]',
+      'enabled = false',
+      '',
+    ].join('\n'),
+    { mode: 0o600 },
+  );
+
+  const checks = await collectCodexDoctorChecks({
+    config: deployment.config,
+    db: deployment.db,
+    dependencies: deployment.dependencies,
+    processEnv: deployment.processEnv,
+  });
+
+  assert.equal(
+    checks.find(({ name }) => name === 'codex-profile').status,
+    'ok',
+  );
+  assert.equal(
+    checks.find(({ name }) => name === 'codex-tmpdir').status,
+    'ok',
+  );
 });
 
 test('Codex temp rejects a deny forged under an indented unrelated TOML table', async (t) => {

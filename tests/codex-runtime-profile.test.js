@@ -8,6 +8,7 @@ const {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -24,15 +25,17 @@ const {
   normalizeDeniedRoots,
 } = require('../lib/codex/runtime-profile');
 const {
-  CODEX_BINARY_SHA256,
-  CODEX_CLI_PINNED_VERSION,
-} = require('../lib/codex/binary');
-const {
   assertCodexSpawnProfile,
   codexProtocolSchema,
   createCodexSpawnProfile,
   preflightCodexRuntime,
+  resolveCodexTargetPin,
 } = require('@shumkov/orchestra');
+
+const TARGET_PIN = resolveCodexTargetPin();
+const OPPOSITE_TARGET = TARGET_PIN.target === 'x86_64-unknown-linux-musl'
+  ? 'aarch64-apple-darwin'
+  : 'x86_64-unknown-linux-musl';
 
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
@@ -94,17 +97,12 @@ function ownedConfig(f) {
   const appServerTmp = realpathSync(
     f.processEnv.POLYGRAM_CODEX_TMPDIR ?? f.processEnv.TMPDIR,
   );
-  const deniedRoots = [
+  const deniedRoots = normalizeDeniedRoots([
     f.codexHome,
     f.daemonSecretRoot,
     f.ipcRuntimeRoot,
     appServerTmp,
-  ].filter((candidate, index, roots) => !roots.some((root, rootIndex) => {
-    if (rootIndex === index) return false;
-    const relative = path.relative(root, candidate);
-    return relative === ''
-      || (!relative.startsWith('..') && !path.isAbsolute(relative));
-  }));
+  ]);
   const filesystem = { ':minimal': 'read' };
   for (const root of deniedRoots.sort()) filesystem[root] = 'deny';
   filesystem[':workspace_roots'] = { '.': 'write' };
@@ -248,8 +246,9 @@ class FakeClient {
 function binaryReceipt() {
   return Object.freeze({
     path: '/Applications/Codex.app/Contents/Resources/codex',
-    version: CODEX_CLI_PINNED_VERSION,
-    sha256: CODEX_BINARY_SHA256,
+    target: TARGET_PIN.target,
+    version: TARGET_PIN.cliVersion,
+    sha256: TARGET_PIN.binarySha256,
     fingerprint: Object.freeze({
       dev: '1',
       ino: '2',
@@ -267,6 +266,7 @@ function createBuilder(f, results = projectedResults(f), clientOptions = {}) {
   const clients = [];
   const builder = createCodexRuntimeProfileBuilder({
     temporaryRoots: [],
+    resolveTargetPin: () => TARGET_PIN,
     clientFactory: (options) => {
       const client = new FakeClient(options, results, clientOptions);
       clients.push(client);
@@ -354,8 +354,9 @@ describe('owned Codex native-beta runtime profile', () => {
 
     assert.equal(profile.runtime, 'codex');
     assert.equal(profile.binary, binaryReceipt().path);
-    assert.equal(profile.binarySha256, CODEX_BINARY_SHA256);
-    assert.equal(profile.cliVersion, CODEX_CLI_PINNED_VERSION);
+    assert.equal(profile.target, TARGET_PIN.target);
+    assert.equal(profile.binarySha256, TARGET_PIN.binarySha256);
+    assert.equal(profile.cliVersion, TARGET_PIN.cliVersion);
     assert.equal(
       profile.protocolSchemaSha256,
       codexProtocolSchema.generatedProtocolV2CanonicalSha256,
@@ -401,6 +402,21 @@ describe('owned Codex native-beta runtime profile', () => {
       }],
     );
     assert.equal(clients[0].closed, 1);
+  });
+
+  test('rejects an opposite-target binary receipt before starting a client', async (t) => {
+    const f = fixture(t);
+    const { builder, clients } = createBuilder(f);
+    const receipt = Object.freeze({
+      ...binaryReceipt(),
+      target: OPPOSITE_TARGET,
+    });
+
+    await assert.rejects(
+      builder.prepare(prepareOptions(f, { binaryReceipt: receipt })),
+      { code: 'CODEX_RUNTIME_PIN_MISMATCH' },
+    );
+    assert.equal(clients.length, 0);
   });
 
   test('prefers a Codex-only temp directory without mutating inherited state', async (t) => {
@@ -530,6 +546,60 @@ describe('owned Codex native-beta runtime profile', () => {
     );
     assert.equal(readFileSync(configPath, 'utf8'), drifted);
     assert.equal(second.clients.length, 0);
+  });
+
+  test('prior owned config requires an explicit backup before TMPDIR deny reprovision', async (t) => {
+    const f = fixture(t);
+    f.processEnv.POLYGRAM_CODEX_TMPDIR = f.codexTmp;
+    await createBuilder(f).builder.prepare(prepareOptions(f));
+    const configPath = path.join(f.codexHome, 'config.toml');
+    const tmpDeny = `${JSON.stringify(f.codexTmp)} = "deny"\n`;
+    const priorConfig = readFileSync(configPath, 'utf8').replace(tmpDeny, '');
+    assert.notEqual(priorConfig, readFileSync(configPath, 'utf8'));
+    writeFileSync(configPath, priorConfig, { mode: 0o600 });
+
+    const drifted = createBuilder(f);
+    await assert.rejects(
+      drifted.builder.prepare(prepareOptions(f)),
+      (error) => (
+        error?.code === 'CODEX_OWNED_CONFIG_DRIFT'
+        && /Back up config\.toml outside CODEX_HOME/.test(error.action)
+        && /remove or move the original/.test(error.action)
+        && /reprovision the exact owned config/.test(error.action)
+        && /never migrates or overwrites it automatically/.test(error.action)
+      ),
+    );
+    assert.equal(readFileSync(configPath, 'utf8'), priorConfig);
+    assert.equal(drifted.clients.length, 0);
+
+    const backupPath = path.join(
+      f.daemonSecretRoot,
+      'config.toml.before-tmpdir-deny',
+    );
+    const backupFromSecretRoot = path.relative(
+      f.daemonSecretRoot,
+      backupPath,
+    );
+    const backupFromCodexHome = path.relative(f.codexHome, backupPath);
+    assert.ok(
+      backupFromSecretRoot.length > 0
+      && !backupFromSecretRoot.startsWith('..')
+      && !path.isAbsolute(backupFromSecretRoot),
+    );
+    assert.ok(
+      backupFromCodexHome.startsWith('..')
+      || path.isAbsolute(backupFromCodexHome),
+    );
+    renameSync(configPath, backupPath);
+    const reprovisioned = createBuilder(f);
+    await reprovisioned.builder.prepare(prepareOptions(f));
+
+    assert.equal(readFileSync(backupPath, 'utf8'), priorConfig);
+    assert.match(readFileSync(configPath, 'utf8'), new RegExp(
+      `^${tmpDeny.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+      'm',
+    ));
+    assert.equal(reprovisioned.clients.length, 1);
   });
 
   test('rejects temporary homes, unsafe modes, symlinked command dirs, and overlapping roots before client start', async (t) => {
