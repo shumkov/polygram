@@ -336,6 +336,36 @@ describe('stripMediaMarkdown', () => {
     assert.equal(stripMediaMarkdown('![](/abs/p.png "titled")'), 'titled');
   });
 
+  test('a destination containing balanced parentheses leaves no path fragment', () => {
+    // Stopping at the FIRST ')' ends the match mid-path and leaves the rest
+    // of the filename behind as literal text — a partial path disclosure that
+    // reads as ordinary prose. Directory names like "Foo (2024)" and
+    // "screenshot (1).png" make this routine rather than adversarial.
+    assert.equal(stripMediaMarkdown('![cap](/Users/me/secret/a(b).png)'), 'cap');
+    assert.equal(stripMediaMarkdown('![cap](/Users/me/Docs (2024)/x.png)'), 'cap');
+    assert.equal(stripMediaMarkdown('see ![cap](/Users/me/a(b).png) here'), 'see cap here');
+  });
+
+  test('an angle-bracketed destination leaves no path fragment', () => {
+    assert.equal(stripMediaMarkdown('![cap](</Users/me/secret/a b.png>)'), 'cap');
+    assert.equal(stripMediaMarkdown('![cap](</Users/me/secret/a(b).png>)'), 'cap');
+    assert.equal(stripMediaMarkdown('![](</Users/me/secret/x.png>)'), '');
+  });
+
+  test('an unparseable image construct is removed rather than half-stripped', () => {
+    // No safe parse is available, so the conservative reading wins: drop the
+    // construct entirely instead of emitting whatever survived the regex.
+    for (const input of [
+      '![cap](/Users/me/secret/unclosed.png',
+      '![cap](</Users/me/secret/unclosed.png',
+      '![cap](/Users/me/secret/a(b.png)',
+    ]) {
+      const out = stripMediaMarkdown(input);
+      assert.ok(!out.includes('/Users/me'), `${input} -> ${JSON.stringify(out)}`);
+      assert.ok(!out.includes('.png'), `${input} -> ${JSON.stringify(out)}`);
+    }
+  });
+
   test('captionless media-only fallback projects to no text, preserving sidecar anchoring', () => {
     assert.equal(
       stripMediaMarkdown('![](/abs/first.png)\n\n![](/abs/second.gif)'),
