@@ -50,7 +50,9 @@ const { extractAssistantText } = require('@shumkov/orchestra');
 // and reused by createChannelsToolDispatcher inside main() — Claude replies
 // containing code blocks or HTML-style tags aren't split mid-element by the
 // size cap.
-const { createChannelsToolDispatcher, buildAllowedRoots } = require('./lib/process/channels-tool-dispatcher');
+const {
+  createChannelsToolDispatcher, buildAllowedRoots,
+} = require('./lib/process/channels-tool-dispatcher');
 const { createTmuxRunner } = require('@shumkov/orchestra');
 const { sweepTmuxOrphans } = require('@shumkov/orchestra').orphanSweep;
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
@@ -122,12 +124,12 @@ const {
   isRichCapabilityErrorExplicit, isRichMessageFieldRejection, stripMediaMarkdown,
 } = require('./lib/telegram/rich');
 const {
-  createRichMediaResolver,
+  makeRichMediaResolver,
+  makeReplyMediaWiring,
   createMediaDeliveryContext,
   createMediaFileIdCache,
   collectMediaRescueEntries,
-  PHOTO_UPLOAD_CEILING,
-  OTHER_MEDIA_UPLOAD_CEILING,
+  MAX_MEDIA_PER_MESSAGE,
 } = require('./lib/telegram/rich-media');
 const { createRichEditor } = require('./lib/telegram/rich-edit');
 const { createRichCapabilityLatch } = require('./lib/telegram/rich-capability-latch');
@@ -1307,22 +1309,25 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     sessionKey,
     sessionCwd: _mediaTopicCfg.cwd || chatConfig.cwd || null,
   });
-  const maxMediaOverride = resolveMaxFileOverride(config, chatId, threadId);
-  const resolveRichMedia = createRichMediaResolver({
+  // Same shared factory the reply-tool path uses, so the two trust boundaries
+  // are one piece of code. This path keeps its wider per-message ceiling: it
+  // is the interactive streamer, not the reply tool, so `files:` fan-out
+  // parity does not apply to it.
+  const resolveRichMedia = makeRichMediaResolver({
     allowedRoots: mediaAllowedRoots,
+    chatId,
+    threadId,
+    config,
     fileIdCache: richMediaFileIdCache,
-    maxPhotoBytes: Math.min(
-      PHOTO_UPLOAD_CEILING,
-      maxMediaOverride ?? PHOTO_UPLOAD_CEILING,
-    ),
-    maxOtherMediaBytes: Math.min(
-      OTHER_MEDIA_UPLOAD_CEILING,
-      maxMediaOverride ?? OTHER_MEDIA_UPLOAD_CEILING,
-    ),
-    allowUrlMedia: !config.bot?.apiRoot,
-    logEvent: (kind, detail) => logEvent(kind, {
-      chat_id: chatId, thread_id: threadId, bot: BOT_NAME, ...detail,
-    }),
+    // Closed on every server, not only self-hosted ones. A self-hosted Bot API
+    // server fetching the URL is an SSRF surface; the cloud API fetching it is
+    // an exfiltration beacon that leaves no trace on this host and bypasses
+    // any egress control on it. Neither display hint teaches URL media, so
+    // nothing legitimate authors it.
+    allowUrlMedia: false,
+    maxMediaPerMessage: MAX_MEDIA_PER_MESSAGE,
+    logEvent,
+    botName: BOT_NAME,
   });
   const toRichPayload = (text, opts) => {
     if (richKnownUnsupported || !resolveRichTextEnabled(config, chatId, threadId)) return null;
@@ -3606,6 +3611,15 @@ async function main() {
       persistBubbleText,
       logger: console,
       botName: BOT_NAME,
+      // A consumed reply is finalized by the streamer, which resolves media
+      // against the interactive path's roots and ceilings rather than this
+      // call's. Rather than let the same reply obey different rules depending
+      // on whether a preview happened to be live, media renders only where
+      // the reply tool's own gates apply — here it degrades to its caption,
+      // exactly as it does on any other path that cannot upload it.
+      projectConsumedText: (text, { chatId, threadId }) => (
+        resolveRichTextEnabled(config, chatId, threadId) ? stripMediaMarkdown(text) : text
+      ),
     }),
     // Injected rather than imported by the dispatcher: rich-media.js requires
     // the dispatcher module, so the reverse direction would be a require cycle.
@@ -3615,6 +3629,19 @@ async function main() {
       isRichTextEnabled: (chatId, threadId) => resolveRichTextEnabled(config, chatId, threadId),
       getRichKnownUnsupported: () => richSendKnownUnsupported,
       redactError: redactBotToken,
+      // Media for one reply. The envelope itself (no URL media, the `files:`
+      // fan-out ceiling, the shared stat) lives in rich-media.js so it is
+      // pinned by behavior rather than by this literal — nothing executes
+      // this file. `allowedRoots` arrives per call from the dispatcher, which
+      // computed it once and validates `files:` against that very array, so a
+      // path the reply tool may upload is exactly a path image syntax may
+      // upload.
+      makeMediaWiring: makeReplyMediaWiring({
+        config,
+        fileIdCache: richMediaFileIdCache,
+        logEvent,
+        botName: BOT_NAME,
+      }),
     }),
   ]);
 
@@ -3685,10 +3712,24 @@ async function main() {
     // CliProcess. Without it, cli chats lose the Telegram table/markdown display rules.
     // A resolver (not a static string) so each cli-backed chat gets its own richText
     // state — orchestra's factory calls this per spawn with the spawning chat/topic.
-    // No inline-media guidance: replies here are delivered by the reply tool, which
-    // renders rich text on media-stripped input, so an image would reach the user as
-    // its caption and nothing else.
-    displayHint: (chatId, threadId) => buildPolygramDisplayHint(resolveRichTextEnabled(config, chatId, threadId)),
+    // inlineMedia: the reply tool renders media blocks, so the syntax the hint
+    // teaches is syntax this backend delivers. The guidance is per-path for
+    // exactly that reason — it is the throttle on how much media agents
+    // author, and it may only be on where delivery can honor it.
+    //
+    // Enabling it with the code, rather than staging it behind a separate
+    // switch, is deliberate: the RELEASE is the throttle. Media ships only
+    // after the text-only rich path has soaked in production, so a chat that
+    // turns richText on gets code and guidance in the same instant by design.
+    //
+    // The hint also describes media in a chat whose send capability has since
+    // latched off, where replies degrade to plain text and captions. Accepted:
+    // the latch is process-lifetime and rare, and the alternative — rebuilding
+    // the system prompt on a capability change — would respawn live sessions.
+    displayHint: (chatId, threadId) => buildPolygramDisplayHint(
+      resolveRichTextEnabled(config, chatId, threadId),
+      { inlineMedia: true },
+    ),
     // Backend-default outbound cap fallback (per-spawn buildSpawnContext override
     // normally supersedes this; kept so any context-less spawn still gets the backend
     // default rather than orchestra's neutral 100MB).

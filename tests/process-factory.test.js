@@ -89,7 +89,7 @@ describe('polygram production factory wiring', () => {
       "polygram must pass pmDefault:'sdk' (orchestra defaults to 'cli')");
   });
   test('createProcessFactory is called with a per-chat Telegram displayHint resolver', () => {
-    assert.match(src, /displayHint:\s*\(chatId, threadId\)\s*=>\s*buildPolygramDisplayHint\(resolveRichTextEnabled\(config, chatId, threadId\)\)/,
+    assert.match(src, /displayHint:\s*\(chatId, threadId\)\s*=>\s*buildPolygramDisplayHint\(\s*resolveRichTextEnabled\(config, chatId, threadId\),/,
       'polygram must inject a per-chat display-hint resolver (orchestra defaults to empty); '
       + 'a static hint here silently drops richText for every pm:"cli" chat regardless of config');
   });

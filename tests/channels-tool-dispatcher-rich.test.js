@@ -664,3 +664,211 @@ test('the two modules load cleanly in either order', () => {
       `exports incomplete when loaded as ${path.basename(first)} then ${path.basename(second)}`);
   }
 });
+
+// ─── Media, through the real dispatcher ────────────────────────────────────
+//
+// The claim under test is path-acceptance parity: a path the reply tool may
+// upload via files: is exactly a path image syntax may upload, for the same
+// call. Comparing two roots arrays would prove nothing (both sides call one
+// function by construction) — so this drives both params through the real
+// dispatcher and watches what reaches Telegram.
+
+const nodeFs = require('node:fs');
+const nodeOs = require('node:os');
+const { makeReplyMediaWiring } = require('../lib/telegram/rich-media');
+
+const mediaDirs = new Set();
+test.after(() => {
+  for (const dir of mediaDirs) nodeFs.rmSync(dir, { recursive: true, force: true });
+});
+
+function mediaDir(name = 'chart.png') {
+  const dir = nodeFs.mkdtempSync(path.join(nodeOs.tmpdir(), 'polygram-dispatch-media-'));
+  mediaDirs.add(dir);
+  const file = path.join(dir, name);
+  nodeFs.writeFileSync(file, Buffer.alloc(64, 1));
+  return { dir, file };
+}
+
+// polygram's own wiring, minus polygram: the strategy gets its media from the
+// roots the dispatcher hands it, and nothing else.
+const productionWiring = makeReplyMediaWiring({});
+
+function buildMediaWired() {
+  const tgCalls = [];
+  const factoryArgs = [];
+  const wiringArgs = [];
+  const uploads = [];
+  let latched = false;
+
+  const send = async (_bot, method, params, meta) => {
+    tgCalls.push({ method, params, meta });
+    return { message_id: 500 + tgCalls.length, date: 1 };
+  };
+  const sendRich = createRichSender({
+    tg: send,
+    botName: 'testbot',
+    logEvent: () => {},
+    redactBotToken: (s) => s,
+    isRichCapabilityError,
+    isRichCapabilityErrorExplicit,
+    isRichContentError,
+    getRichKnownUnsupported: () => latched,
+    setRichKnownUnsupported: () => { latched = true; },
+    makeInputFile: (source) => { uploads.push(source); return { upload: source }; },
+    logger: quietLogger,
+  });
+  const { deliverReplies, calls: deliverCalls } = makeDeliverCapture();
+
+  const richFactory = createRichDeliveryFactory({
+    bot: fakeBot,
+    sendRich,
+    isRichTextEnabled: () => true,
+    getRichKnownUnsupported: () => latched,
+    logger: quietLogger,
+    // The SAME factory polygram passes to createRichDeliveryFactory. A
+    // reconstruction here would leave the production envelope free to drift
+    // while these end-to-end tests stayed green.
+    makeMediaWiring: (call) => { wiringArgs.push(call); return productionWiring(call); },
+  });
+
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot,
+    send,
+    chunkText: (text) => [text],
+    deliverReplies,
+    parseResponse: passthroughParse,
+    sanitizeAssistantReply: passthroughSanitize,
+    logger: quietLogger,
+    projectFallbackText: (text) => {
+      const stripped = stripMediaMarkdown(text);
+      return stripped.trim() ? stripped : MEDIA_ONLY_FALLBACK_TEXT;
+    },
+    makeDeliverText: (args) => { factoryArgs.push(args); return richFactory(args); },
+  });
+
+  return { dispatcher, tgCalls, deliverCalls, factoryArgs, wiringArgs, uploads };
+}
+
+const richBlocksOf = (tgCalls) => tgCalls
+  .find(c => c.method === 'sendRichMessage')?.params.rich_message.blocks ?? [];
+
+test('the resolver is built from THIS call\'s roots, not from anything config-derived', async () => {
+  const { dir } = mediaDir();
+  const h = buildMediaWired();
+
+  await h.dispatcher({
+    sessionKey: 'sess-A', chatId: '12345', threadId: '77',
+    toolName: 'reply', text: `## Results\n\n![c](${path.join(dir, 'chart.png')})`,
+    files: null, sessionCwd: dir,
+  });
+
+  assert.equal(h.wiringArgs.length, 1);
+  assert.deepEqual(h.wiringArgs[0].allowedRoots, h.factoryArgs[0].allowedRoots,
+    'the strategy passes the roots it was given straight through');
+  assert.ok(h.wiringArgs[0].allowedRoots.includes(dir),
+    'the running session\'s cwd is in the set');
+  assert.ok(h.wiringArgs[0].allowedRoots.some(r => r.endsWith(`${path.sep}sess-A`)),
+    'and so is THIS session\'s staging dir — not another session\'s, not the shared base');
+  assert.equal(h.wiringArgs[0].chatId, '12345');
+  assert.equal(h.wiringArgs[0].threadId, '77');
+});
+
+test('path-acceptance parity: what files: may upload, image syntax may upload', async () => {
+  // P is inside the session cwd, Q is not. Both params must agree about both.
+  const inside = mediaDir();
+  const outside = mediaDir('secret.png');
+
+  const accepted = buildMediaWired();
+  const acceptedRes = await accepted.dispatcher({
+    sessionKey: 'sess-A', chatId: '12345', threadId: null,
+    toolName: 'reply', text: `## Results\n\n![c](${inside.file})`,
+    files: [inside.file], sessionCwd: inside.dir,
+  });
+
+  assert.equal(acceptedRes.ok, true);
+  assert.ok(accepted.tgCalls.some(c => c.method === 'sendPhoto'), 'files: uploaded P');
+  assert.ok(richBlocksOf(accepted.tgCalls).some(b => b.type === 'photo'),
+    'and image syntax produced a block for the same path');
+  assert.deepEqual(accepted.uploads, [nodeFs.realpathSync(inside.file)]);
+
+  const rejected = buildMediaWired();
+  const rejectedRes = await rejected.dispatcher({
+    sessionKey: 'sess-B', chatId: '12345', threadId: null,
+    toolName: 'reply', text: `## Results\n\n![c](${outside.file})`,
+    files: [outside.file], sessionCwd: inside.dir,
+  });
+
+  assert.equal(rejectedRes.ok, false, 'files: refused Q');
+  assert.match(rejectedRes.error, /outside allowed roots/);
+  assert.ok(!rejected.tgCalls.some(c => c.method === 'sendPhoto'), 'nothing uploaded for Q');
+  assert.deepEqual(richBlocksOf(rejected.tgCalls).filter(b => b.type === 'photo'), [],
+    'and image syntax produced no block for it either');
+  assert.ok(!JSON.stringify(rejected.tgCalls.map(c => c.params)).includes(outside.dir),
+    'the rejected path never reached Telegram in any form');
+});
+
+test('end to end: a captioned workspace screenshot lands as a real photo block', async () => {
+  const { dir, file } = mediaDir();
+  const h = buildMediaWired();
+
+  const res = await h.dispatcher({
+    sessionKey: 'sess-A', chatId: '12345', threadId: null,
+    toolName: 'reply', text: `## Results\n\n![the chart](${file})\n\nDone.`,
+    files: null, sessionCwd: dir, sourceMsgId: 9,
+  });
+
+  assert.equal(res.ok, true);
+  assert.equal(h.deliverCalls.length, 0, 'no plain chunked delivery');
+  const blocks = richBlocksOf(h.tgCalls);
+  const photo = blocks.find(b => b.type === 'photo');
+  assert.ok(photo, `expected a photo block: ${JSON.stringify(blocks)}`);
+  assert.deepEqual(photo.photo.media, { upload: nodeFs.realpathSync(file) });
+  assert.equal(photo.caption.text, 'the chart');
+});
+
+test('a reply that is only a resolvable photo still goes rich', async () => {
+  // Media is a legitimate rich trigger: this reply has no other one, and
+  // it is exactly the visual-walkthrough case the feature exists for.
+  const { dir, file } = mediaDir();
+  const h = buildMediaWired();
+
+  const res = await h.dispatcher({
+    sessionKey: 'sess-A', chatId: '12345', threadId: null,
+    toolName: 'reply', text: `![the chart](${file})`, files: null, sessionCwd: dir,
+  });
+
+  assert.equal(res.ok, true);
+  assert.ok(richBlocksOf(h.tgCalls).some(b => b.type === 'photo'));
+  assert.equal(h.deliverCalls.length, 0);
+});
+
+test('a collage of mixed media survives the reply-tool path as one group', async () => {
+  // G1 names media GROUPS, not just single photos, and the wrapper is the
+  // shape the display hint teaches for before/after comparisons. The
+  // renderer is shared with the streamer path, so what is at stake here is
+  // the integration: descriptors nested inside a wrapper must reach the same
+  // resolver, and the group must survive rendering, materialization, and the
+  // media count the soak reads.
+  const { dir } = mediaDir();
+  const before = path.join(dir, 'before.png');
+  const after = path.join(dir, 'after.mp4');
+  nodeFs.writeFileSync(before, Buffer.alloc(32, 1));
+  nodeFs.writeFileSync(after, Buffer.alloc(32, 2));
+  const h = buildMediaWired();
+
+  const res = await h.dispatcher({
+    sessionKey: 'sess-A', chatId: '12345', threadId: null,
+    toolName: 'reply', files: null, sessionCwd: dir,
+    text: `## Before and after\n\n<tg-collage>\n\n![before](${before})\n\n![after](${after})\n\n</tg-collage>`,
+  });
+
+  assert.equal(res.ok, true);
+  const collage = richBlocksOf(h.tgCalls).find(b => b.type === 'collage');
+  assert.ok(collage, `expected a collage block: ${JSON.stringify(richBlocksOf(h.tgCalls))}`);
+  assert.deepEqual(collage.blocks.map(b => b.type), ['photo', 'video'],
+    'each child keeps its own kind — a video is not a photo');
+  assert.deepEqual(h.uploads,
+    [nodeFs.realpathSync(before), nodeFs.realpathSync(after)],
+    'both children were materialized from their resolved realpaths');
+});

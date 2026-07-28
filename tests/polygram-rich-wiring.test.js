@@ -71,19 +71,42 @@ describe('polygram rich-message wiring', () => {
     // string here means every cli chat is silently stuck in plain mode
     // regardless of its own richText config (the bug this test pins).
     const wiring = sectionBetween('const orchestraProcessFactory = createProcessFactory({', ');');
-    assert.match(wiring, /displayHint:\s*\(chatId, threadId\)\s*=>\s*buildPolygramDisplayHint\(resolveRichTextEnabled\(config, chatId, threadId\)\)/);
+    assert.match(wiring, /displayHint:\s*\(chatId, threadId\)\s*=>\s*buildPolygramDisplayHint\(\s*resolveRichTextEnabled\(config, chatId, threadId\),/);
     assert.doesNotMatch(wiring, /displayHint:\s*require\('\.\/lib\/telegram\/display-hint'\)\.POLYGRAM_DISPLAY_HINT/);
   });
 
-  test('the CLI-backend display hint does not promise inline media', () => {
-    // Replies on this backend go out through the reply tool, which renders
-    // rich text on media-stripped input — an image would reach the user as
-    // its caption and nothing else. The SDK path opts in separately because
-    // its streamer does deliver media.
+  test('the CLI-backend display hint teaches inline media, because the reply tool renders it', () => {
+    // The hint is the exposure throttle for this feature: agents author the
+    // media syntax it teaches. It may only be on where the DELIVERING path
+    // resolves media — for this backend, the reply-tool rich strategy.
     const wiring = sectionBetween('const orchestraProcessFactory = createProcessFactory({', ');');
-    const call = /displayHint:[^\n]*/.exec(wiring)?.[0] ?? '';
-    assert.doesNotMatch(call, /inlineMedia/,
-      'the CLI hint must not teach syntax this backend discards');
+    // The whole option, up to wherever the next one starts.
+    const call = /displayHint:[\s\S]*?\n(?= {4}(?:\/\/|[a-zA-Z]))/.exec(wiring)?.[0] ?? '';
+    assert.match(call, /inlineMedia: true/,
+      'the CLI hint should teach the media syntax this backend delivers');
+  });
+
+  test('neither rich path accepts URL media, whatever the server', () => {
+    // The streamer's resolver used to allow URLs whenever there was no
+    // self-hosted apiRoot. That is the wrong way round: a self-hosted server
+    // fetching the URL is an SSRF surface, while the cloud API fetching it is
+    // an exfiltration beacon that leaves nothing on this host to find. A
+    // reply-tool reply consumed by a live preview is rendered by THIS
+    // resolver, so the reply tool's own refusal is only half the door.
+    const wiring = sectionBetween('const resolveRichMedia = makeRichMediaResolver({', '});');
+    assert.match(wiring, /allowUrlMedia: false/);
+    assert.doesNotMatch(wiring, /allowUrlMedia:\s*!config/,
+      'the apiRoot conditional is what left cloud bots open');
+  });
+
+  test('a preview that consumes a reply projects media out of it first', () => {
+    // Consuming means the streamer renders the bubble, under the interactive
+    // path's media rules rather than the reply tool's. Without this the same
+    // reply obeys different roots and a wider fan-out depending only on
+    // whether a preview happened to be live.
+    const wiring = sectionBetween('const makeDeliverText = composeDeliverTextFactories([', ']);');
+    assert.match(wiring, /projectConsumedText:/);
+    assert.match(wiring, /stripMediaMarkdown\(text\)/);
   });
 
   test('the send verb has its own verdict, separate from the edit verb', () => {
