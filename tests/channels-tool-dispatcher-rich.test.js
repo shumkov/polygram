@@ -778,6 +778,8 @@ test('the resolver is built from THIS call\'s roots, not from anything config-de
     'the strategy passes the roots it was given straight through');
   assert.ok(h.wiringArgs[0].allowedRoots.includes(dir),
     'the running session\'s cwd is in the set');
+  assert.ok(h.wiringArgs[0].allowedRoots.some(r => r.endsWith(`${path.sep}sess-A`)),
+    'and so is THIS session\'s staging dir — not another session\'s, not the shared base');
   assert.equal(h.wiringArgs[0].chatId, '12345');
   assert.equal(h.wiringArgs[0].threadId, '77');
 });
