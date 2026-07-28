@@ -74,26 +74,47 @@ describe('the reply that prompted this', () => {
     assert.equal(paragraph.text, 'The In stock count is 42 — see the dashboard.');
   });
 
-  test('list items stay flat until a probe says otherwise', async () => {
-    // Deliberate, and the reason is evidence rather than taste: one live run
-    // reported list-item styling PRESERVED and an identical repeat reported
-    // it REJECTED, which is rate pressure's signature, not a field's answer.
-    // Shipping on the optimistic reading would put a whole class of replies
-    // one server mood away from failing.
+  test('task list items carry their styling too', async () => {
+    // Held back at first: one live run reported this field PRESERVED and an
+    // identical repeat REJECTED. A paced run with the control passing
+    // reported PRESERVED, so it ships on evidence rather than on the
+    // optimistic reading of a contradiction.
     const { blocks } = styled(REPLY);
     const list = blocks.find((b) => b.type === 'list');
-    const itemText = list.items[0].blocks[0].text;
-    assert.equal(typeof itemText, 'string',
-      'a paragraph nested in a list item must not inherit styling yet');
-    assert.match(itemText, /Restock SKU-118 \(urgent\)/);
+
+    assert.deepEqual(list.items[0].blocks[0].text, [
+      '[ ] Restock ',
+      { type: 'code', text: 'SKU-118' },
+      ' (',
+      { type: 'bold', text: 'urgent' },
+      ')',
+    ]);
+    assert.equal(list.items[0].has_checkbox, true, 'and it is still a checkbox item');
   });
 
-  test('table cells stay flat for the same reason', async () => {
-    const { blocks } = styled('| a | b |\n| --- | --- |\n| **bold** | `code` |');
+  test('a list item never ships its markers as literal characters', async () => {
+    // marked wraps a list item's inline run in a 'text' token whose .text is
+    // the RAW source and whose .tokens carry the parsed children. Taking the
+    // former is how `**urgent**` reaches the chat verbatim — a trap the
+    // flattener already had a branch for, and the styled walk has to as well.
+    // A plain bullet list is not itself a rich trigger, so the heading is
+    // scaffolding — what is under test is the ITEM.
+    const { blocks } = styled('# S\n\n- Restock `SKU-118` (**urgent**)');
+    const text = blocks.find((b) => b.type === 'list').items[0].blocks[0].text;
+    const literal = JSON.stringify(text);
+    assert.ok(!literal.includes('**') && !literal.includes('`'),
+      `markers shipped as literal text: ${literal}`);
+  });
+
+  test('table cells carry it, header and body alike', async () => {
+    const { blocks } = styled('| **a** | b |\n| --- | --- |\n| **bold** | `code` |');
     const table = blocks.find((b) => b.type === 'table');
-    for (const row of table.cells) {
-      for (const cell of row) assert.equal(typeof cell.text, 'string');
-    }
+
+    assert.deepEqual(table.cells[0][0].text, [{ type: 'bold', text: 'a' }]);
+    assert.equal(table.cells[0][0].is_header, true);
+    assert.deepEqual(table.cells[1][0].text, [{ type: 'bold', text: 'bold' }]);
+    assert.deepEqual(table.cells[1][1].text, [{ type: 'code', text: 'code' }]);
+    assert.equal(table.cells[0][1].text, 'b', 'an unstyled cell is still a plain string');
   });
 });
 
@@ -171,12 +192,13 @@ describe('richTextOf', () => {
     assert.equal(typeof out, 'string');
   });
 
-  test('strikethrough stays flattened until it is probed', () => {
-    // GFM emits it and marked tokenizes it, but the reference names no
-    // strikethrough node — so it is not claimed without evidence.
-    const out = tokensOf('~~gone~~ but here');
-    assert.equal(typeof out, 'string', `expected flattening, got ${JSON.stringify(out)}`);
-    assert.equal(out, 'gone but here');
+  test('strikethrough maps under the spelling the server accepted', () => {
+    // The reference names no strikethrough node, so this one is probe-backed
+    // rather than inferred: `strikethrough` round-tripped and `strike` was
+    // refused, and a rejected spelling would cost the whole payload.
+    assert.deepEqual(tokensOf('~~gone~~ but here'), [
+      { type: 'strikethrough', text: 'gone' }, ' but here',
+    ]);
   });
 
   test('an empty construct contributes nothing rather than an empty node', () => {
