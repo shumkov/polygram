@@ -57,7 +57,7 @@ function visibleBubbles(tg) {
     });
 }
 
-function harness({ failEdit = false, maxLen = 4096, interim = false } = {}) {
+function harness({ failEdit = false, maxLen = 4096, interim = false, turnId = null } = {}) {
   const tg = fakeTelegram({ failEdit });
   const events = [];
   const rows = [];
@@ -72,7 +72,9 @@ function harness({ failEdit = false, maxLen = 4096, interim = false } = {}) {
   });
   const registry = createStreamerRegistry();
   const deliveredTexts = [];
-  const release = registry.register('chat:1', { streamer, chatId: '1', deliveredTexts });
+  const release = registry.register('chat:1', {
+    streamer, chatId: '1', deliveredTexts, getTurnId: () => turnId,
+  });
   const makeDeliverText = createDeliverTextFactory({
     registry,
     logEvent: (kind, detail) => events.push({ kind, detail }),
@@ -81,7 +83,7 @@ function harness({ failEdit = false, maxLen = 4096, interim = false } = {}) {
     botName: 'testbot',
   });
   const deliver = (opts = {}) => makeDeliverText({
-    sessionKey: 'chat:1', chatId: '1', threadId: null, interim, ...opts,
+    sessionKey: 'chat:1', chatId: '1', threadId: null, interim, turnId, ...opts,
   });
   return { tg, events, rows, streamer, registry, deliveredTexts, release, deliver, makeDeliverText };
 }
@@ -220,6 +222,140 @@ describe('turn shapes', () => {
     ]);
   });
 
+  test('reply → stream MORE than the reply said → turn ends: the extra survives', async () => {
+    // The 10th shape, and the one a bidirectional coverage test gets wrong:
+    // the reply carried A, the draft holds A AND B. B is content nobody
+    // delivered, so treating the shorter reply as covering the draft deletes B
+    // for good — the user never sees it and there is no other copy.
+    const h = harness();
+    await h.deliver()({ text: 'Part A.' });
+    await h.streamer.onChunk('Part A. And here is part B, which no reply carried.');
+
+    const res = await reconcileStreamer(h.streamer, h.deliveredTexts, {
+      logEvent: (kind, detail) => h.events.push({ kind, detail }),
+    });
+
+    assert.equal(res.action, 'finalized');
+    assert.deepEqual(h.tg.deleted, []);
+    assert.equal(
+      visibleBubbles(h.tg).at(-1).text,
+      'Part A. And here is part B, which no reply carried.',
+    );
+  });
+
+  test('a reply that fails to deliver never counts as coverage', async () => {
+    // The draft repeating a FAILED reply is the only copy the user will get.
+    const h = harness();
+    // The pipeline declined to consume (no preview live yet), so the text went
+    // to the chunked path — where it failed.
+    await h.deliver()({ text: 'The answer.' });
+    h.registry.settlePending('chat:1', false);
+    await h.streamer.onChunk('The answer.');
+
+    const res = await reconcileStreamer(h.streamer, h.deliveredTexts, {});
+    assert.equal(res.action, 'finalized', 'nothing was delivered, so nothing is covered');
+    assert.deepEqual(h.tg.deleted, []);
+  });
+
+  test('a reply that DID deliver counts as coverage', async () => {
+    const h = harness();
+    await h.deliver()({ text: 'The answer.' });
+    h.registry.settlePending('chat:1', true);
+    await h.streamer.onChunk('The answer.');
+
+    const res = await reconcileStreamer(h.streamer, h.deliveredTexts, {});
+    assert.equal(res.action, 'discarded');
+  });
+
+  test('an interim status never counts as coverage', async () => {
+    // Otherwise a later draft holding the status AND the answer looks covered,
+    // and the answer is deleted along with the status it repeats.
+    const h = harness();
+    await h.deliver({ interim: true })({ text: 'Looking into that now…' });
+    h.registry.settlePending('chat:1', true);
+    assert.deepEqual(h.deliveredTexts, []);
+
+    await h.streamer.onChunk('Looking into that now… and here is the answer.');
+    const res = await reconcileStreamer(h.streamer, h.deliveredTexts, {});
+    assert.equal(res.action, 'finalized');
+  });
+
+  test('a late reply from an earlier turn does not consume this turn\'s preview', async () => {
+    const h = harness({ turnId: 'turn-2' });
+    await h.streamer.onChunk('Turn 2 is composing its answer');
+
+    const out = await h.deliver({ turnId: 'turn-1' })({ text: 'Turn 1\'s late answer.' });
+
+    assert.equal(out.handled, false, 'stale text must not finalize the current preview');
+    assert.equal(
+      visibleBubbles(h.tg)[0].text, 'Turn 2 is composing its answer',
+      'the live preview is untouched',
+    );
+    assert.ok(h.events.some((e) => e.kind === 'stream-preview-turn-mismatch'));
+  });
+
+  test('a reply naming THIS turn consumes normally', async () => {
+    const h = harness({ turnId: 'turn-2' });
+    await h.streamer.onChunk('Turn 2 is composing');
+    const out = await h.deliver({ turnId: 'turn-2' })({ text: 'Turn 2 answer.' });
+    assert.equal(out.handled, true);
+  });
+
+  test('concurrent replies are serialized, so one preview settles once', async () => {
+    const h = harness();
+    await h.streamer.onChunk('A draft two replies will race for');
+
+    const [a, b] = await Promise.all([
+      h.deliver()({ text: 'First reply.' }),
+      h.deliver()({ text: 'Second reply.' }),
+    ]);
+
+    const consumed = [a, b].filter((r) => r.handled);
+    assert.equal(consumed.length, 1, 'exactly one reply may consume the bubble');
+    assert.equal(h.tg.sent.length, 1, 'and no second preview was opened mid-settle');
+  });
+
+  test('a bubble removed during finalize falls through instead of returning a null id', async () => {
+    // A rich edit can resolve by REMOVING the bubble. finalEditOk is true but
+    // there is no message_id to hand back, and {ok:true, message_id:null} tells
+    // the agent it has an edit handle it does not have.
+    const h = harness();
+    await h.streamer.onChunk('A draft whose bubble disappears');
+    const realFinalize = h.streamer.finalize;
+    h.streamer.finalize = async (...args) => {
+      const fin = await realFinalize.call(h.streamer, ...args);
+      return { ...fin, msgId: null };
+    };
+
+    const out = await h.deliver()({ text: 'The answer.' });
+    assert.equal(out.handled, false, 'the pipeline must deliver it properly instead');
+  });
+
+  test('the preview is not re-opened after a turn-completion exit settled it', async () => {
+    // A reply landing between reconciliation and registry release used to reset
+    // the streamer to idle; the next chunk then opened a bubble no exit would
+    // ever reconcile.
+    const h = harness();
+    await h.streamer.onChunk('A draft the turn end will finalize');
+    await reconcileStreamer(h.streamer, h.deliveredTexts, {});
+    assert.equal(h.streamer.state, 'finalized');
+
+    await h.deliver()({ text: 'A straggler reply.' });
+
+    assert.equal(h.streamer.state, 'finalized', 'the settled streamer must stay settled');
+    await h.streamer.onChunk('a straggler chunk');
+    assert.equal(h.tg.sent.length, 1, 'no orphan bubble was opened');
+  });
+
+  test('a detached pre-interim preview gets its transcript row brought up to date', async () => {
+    const h = harness();
+    await h.streamer.onChunk('The first bubble, which stays on screen');
+    await h.deliver({ interim: true })({ text: 'A status.' });
+    assert.deepEqual(h.rows, [
+      { chatId: '1', msgId: 100, text: 'The first bubble, which stays on screen' },
+    ]);
+  });
+
   test('no preview live: the reply falls through to normal delivery untouched', async () => {
     const h = harness();
     const out = await h.deliver()({ text: 'A short answer with no streaming behind it.' });
@@ -254,21 +390,53 @@ describe('reconcileStreamer', () => {
     assert.equal((await reconcileStreamer(null, [], {})).action, 'none');
   });
 
-  test('leaves an over-long draft standing rather than destroying the only copy', async () => {
+  test('an over-long orphan is redelivered whole, not left as a truncation', async () => {
+    // The bubble shows at most 4,096 characters with an ellipsis. Leaving that
+    // as the answer silently truncates it, so the draft takes the same escape
+    // the consume rule does: chunked delivery, then delete the stump.
+    const h = harness({ maxLen: 40 });
+    await h.streamer.onChunk('y'.repeat(200));
+    const redelivered = [];
+
+    const res = await reconcileStreamer(h.streamer, [], {
+      logEvent: (kind, detail) => h.events.push({ kind, detail }),
+      redeliver: async (text) => { redelivered.push(text); return true; },
+    });
+
+    assert.equal(res.action, 'redelivered');
+    assert.deepEqual(redelivered, ['y'.repeat(200)], 'the WHOLE draft, not the truncation');
+    assert.deepEqual(h.tg.deleted, [100], 'the stump goes once its content is safe elsewhere');
+    assert.equal(
+      h.events.find((e) => e.kind === 'stream-orphan-redelivered').detail.reason, 'overflow',
+    );
+  });
+
+  test('a failed redelivery leaves the bubble standing rather than destroying the only copy', async () => {
     const h = harness({ maxLen: 40 });
     await h.streamer.onChunk('y'.repeat(200));
     const res = await reconcileStreamer(h.streamer, [], {
       logEvent: (kind, detail) => h.events.push({ kind, detail }),
+      redeliver: async () => false,
     });
     assert.equal(res.action, 'finalize-failed');
     assert.deepEqual(h.tg.deleted, [], 'deleting would leave the user with nothing');
     assert.equal(h.events.find((e) => e.kind === 'stream-orphan-finalize-failed').detail.overflow, true);
   });
 
-  test('coverage is whitespace-insensitive and works either direction', () => {
+  test('with no redelivery path at all, the bubble still stands', async () => {
+    const h = harness({ maxLen: 40 });
+    await h.streamer.onChunk('y'.repeat(200));
+    const res = await reconcileStreamer(h.streamer, [], {});
+    assert.equal(res.action, 'finalize-failed');
+    assert.deepEqual(h.tg.deleted, []);
+  });
+
+  test('coverage requires a reply to contain the COMPLETE draft', () => {
     assert.equal(isCoveredByDelivered('the  answer\n', ['The reply said: the answer, in full']), true);
-    assert.equal(isCoveredByDelivered('the full answer text', ['the full answer']), true,
-      'a reply trimmed slightly shorter still covers the draft');
+    assert.equal(
+      isCoveredByDelivered('the full answer text', ['the full answer']), false,
+      'a shorter reply does NOT cover a longer draft — the tail is content nobody delivered',
+    );
     assert.equal(isCoveredByDelivered('something else entirely', ['the answer']), false);
     assert.equal(isCoveredByDelivered('   ', ['anything']), true, 'nothing to lose');
     assert.equal(isCoveredByDelivered('a draft', []), false, 'no replies means nothing covered it');

@@ -78,6 +78,10 @@ describe('Codex Telegram delivery settlement', () => {
   test('every successful result exit finalizes before returning', () => {
     for (const marker of [
       "if (result.text === 'NO_REPLY')",
+      // A turn that produced no result.text because the agent wrote its answer
+      // into the live preview instead of replying — reconciliation delivered
+      // it, so the turn succeeded and must settle like any other.
+      'if (previewAnswered)',
       'if (toolOnlyTurn)',
       "logEvent('telegram-empty-response-fallback'",
       'if (result.alreadyDelivered)',
@@ -89,7 +93,7 @@ describe('Codex Telegram delivery settlement', () => {
     }
 
     const calls = source.match(/await finalizeResultDelivery\(/g) || [];
-    assert.equal(calls.length, 7, 'all seven successful result exits must finalize exactly once');
+    assert.equal(calls.length, 8, 'all eight successful result exits must finalize exactly once');
   });
 
   test('short text delivery records chunk failures before settlement', () => {

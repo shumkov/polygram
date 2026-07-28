@@ -113,7 +113,7 @@ const { createStore: createPairingsStore, parseTtl: parsePairingTtl } = require(
 const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/telegram/voice');
 const { createStreamer, DEFAULT_THROTTLE_MS } = require('./lib/telegram/streamer');
 const {
-  createStreamerRegistry, createDeliverTextFactory, reconcileStreamer,
+  createStreamerRegistry, createDeliverTextFactory, createTurnSettler,
   resolveStreamPreviewEnabled,
 } = require('./lib/telegram/live-preview');
 const { chunkMarkdownText } = require('./lib/telegram/chunk');
@@ -352,6 +352,25 @@ async function getReactionAllowlist(bot, chatId) {
 // semantics; never throws.
 function logEvent(kind, detail) {
   dbWrite(() => db.logEvent(kind, detail), `log ${kind}`);
+}
+
+// The chunked deliverer, wrapped so the live-preview coverage set learns
+// whether a reply actually landed.
+//
+// A reply the preview strategy passed through counts as delivered only once it
+// lands. Recording it at hand-off would let a FAILED reply make a later draft
+// look redundant, and the draft — the only copy the user would ever get — would
+// be deleted at turn end.
+async function deliverRepliesTracked(opts) {
+  const sessionKey = opts?.meta?.sessionKey;
+  try {
+    const res = await deliverReplies(opts);
+    streamerRegistry.settlePending(sessionKey, (res?.failed?.length || 0) === 0);
+    return res;
+  } catch (err) {
+    streamerRegistry.settlePending(sessionKey, false);
+    throw err;
+  }
 }
 
 // A streamed bubble's `messages` row is written by the INITIAL send — the first
@@ -1233,6 +1252,10 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   });
 
   const botCfg = config.bot || {};
+  // Whether this chat has live previews at all. Resolved once per turn: it
+  // gates every behavior this feature ADDS, so a chat that never opted in
+  // behaves exactly as it did before the feature existed.
+  const streamPreviewEnabled = resolveStreamPreviewEnabled(config, chatId, threadId);
   // 0.7.0: per-chat / per-bot link-preview opt-out (port from OpenClaw).
   // chat-level wins over bot-level. Default (both undefined) preserves
   // Telegram's native auto-preview behavior.
@@ -1432,15 +1455,21 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     },
     minChars: botCfg.streamMinChars,
     // Telegram's edit limits are per CHAT, but forum topics share one chat_id
-    // and each live topic's preview edits on its own clock. Scale the interval
-    // by however many previews are live in this chat right now, so N busy
-    // topics cost the chat the same edit budget as one — a 429 sleep here would
-    // stall the turn against the tool-ack timeout. Evaluated per edit because
-    // topics start and finish mid-turn.
-    throttleMs: () => {
-      const base = botCfg.streamThrottleMs || DEFAULT_THROTTLE_MS;
-      return base * Math.max(1, streamerRegistry.liveCount(chatId));
-    },
+    // and each live topic's preview edits on its own clock. With live previews
+    // on, scale the interval by however many are live in this chat right now,
+    // so N busy topics cost the chat the same edit budget as one — a 429 sleep
+    // here would stall the turn against the tool-ack timeout. Evaluated per
+    // edit because topics start and finish mid-turn.
+    //
+    // Without the feature the value is passed through untouched: scaling is a
+    // behavior change, and a chat that never opted in must edit exactly as it
+    // did before this branch.
+    throttleMs: streamPreviewEnabled
+      ? () => {
+        const base = botCfg.streamThrottleMs != null ? botCfg.streamThrottleMs : DEFAULT_THROTTLE_MS;
+        return base * Math.max(1, streamerRegistry.liveCount(chatId));
+      }
+      : botCfg.streamThrottleMs,
     // rc.44: preserve intermediate bubbles by default. These are
     // regular text segments the model emits across an agentic
     // multi-step turn ("Let me check..." → tool runs → "Found it.
@@ -1471,17 +1500,42 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // bubble?", shared by every turn-completion exit so no exit can invent its
   // own. `reason: 'no-reply'` marks the one case where the agent explicitly
   // chose silence and a draft must NOT be delivered.
-  const finishStreamer = async (reason = null) => {
-    const res = await reconcileStreamer(streamer, deliveredTexts, {
-      reason,
-      logEvent,
-      detail: {
-        chat_id: chatId, thread_id: threadId, msg_id: msg.message_id, bot: BOT_NAME,
-      },
-    });
-    if (res.action === 'finalized') persistBubbleText(chatId, res.msgId, res.text);
-    return res;
-  };
+  //
+  // Gated on the feature: for a chat without live previews there is no `stream`
+  // tool, so nothing can be holding a draft that the pre-branch code wouldn't
+  // have handled — and running the new rule there would change settled
+  // behavior for chats that never asked for the feature.
+  const finishStreamer = createTurnSettler({
+    streamer,
+    deliveredTexts,
+    enabled: streamPreviewEnabled,
+    persistBubbleText,
+    logEvent,
+    chatId,
+    detail: {
+      chat_id: chatId, thread_id: threadId, msg_id: msg.message_id, bot: BOT_NAME,
+    },
+    // An orphaned draft too long for one bubble takes the same escape the
+    // consume rule does: deliver the whole thing as chunks rather than leave
+    // the user with a truncation.
+    redeliver: async (text) => {
+      const chunks = chunkMarkdownText(
+        resolveRichTextEnabled(config, chatId, threadId) ? stripMediaMarkdown(text) : text,
+        TG_CHUNK_BUDGET,
+      );
+      const r = await deliverReplies({
+        bot,
+        send: (b, method, params, m) => tg(b, method, params, m),
+        chatId,
+        threadId,
+        chunks,
+        replyToMessageId: msg.message_id,
+        meta: outMetaBase,
+        logger: { error: (m) => console.error(`[${label}] ${m}`) },
+      });
+      return r.failed.length === 0;
+    },
+  });
 
   // 0.7.2: clean up bubbles superseded by forceNewMessage() — the
   // intermediate text segments that fired across a tool-heavy turn.
@@ -1822,25 +1876,44 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // Registered HERE and not at creation: the early returns above (autosteer
       // fold, codex duplicate/ambiguous) abandon their streamer without ever
       // dispatching, and registering those would let a later turn's reply find
-      // a preview that was never going to exist.
-      releaseStreamerRegistration = streamerRegistry.register(sessionKey, {
-        streamer, chatId, deliveredTexts,
-      });
-      await new Promise((dispatched) => {
-        sendPromise = sendToProcess(sessionKey, prompt, {
-          // 0.13 D1 (S8): the typing controller rides the per-turn context so
-          // the question lifecycle (callbacks.js onQuestionAsked/-Resumed) can
-          // pause it while the bot waits on the USER and resume on the answer.
-          streamer, reactor, typing: stopTyping, sourceMsgId: msg.message_id,
-          codexDispatchReservationId: codexDispatch?.reservationId,
-          codexDispatchGenerationId: codexDispatch?.generationId,
-          // 0.7.4 (item B): fire THINKING when Claude actually starts
-          // emitting — not the moment we wrote stdin.
-          onFirstStream: () => reactor.setState('THINKING'),
-        }, { onDispatched: dispatched })
-          .catch((e) => ({ __sendError: e }))
-          .finally(dispatched);
-      });
+      // a preview that was never going to exist. Only for chats that have live
+      // previews — an entry for a chat without them would still be counted by
+      // the per-chat throttle scaling.
+      //
+      // dispatchedTurnId is filled by the engine's onTurnId callback below,
+      // before any tool call for this turn can reach us; it lets a reply be
+      // checked against the turn it actually names.
+      let dispatchedTurnId = null;
+      if (streamPreviewEnabled) {
+        releaseStreamerRegistration = streamerRegistry.register(sessionKey, {
+          streamer, chatId, deliveredTexts,
+          getTurnId: () => dispatchedTurnId,
+        });
+      }
+      try {
+        await new Promise((dispatched) => {
+          sendPromise = sendToProcess(sessionKey, prompt, {
+            // 0.13 D1 (S8): the typing controller rides the per-turn context so
+            // the question lifecycle (callbacks.js onQuestionAsked/-Resumed) can
+            // pause it while the bot waits on the USER and resume on the answer.
+            streamer, reactor, typing: stopTyping, sourceMsgId: msg.message_id,
+            codexDispatchReservationId: codexDispatch?.reservationId,
+            codexDispatchGenerationId: codexDispatch?.generationId,
+            // 0.7.4 (item B): fire THINKING when Claude actually starts
+            // emitting — not the moment we wrote stdin.
+            onFirstStream: () => reactor.setState('THINKING'),
+            onTurnId: (id) => { dispatchedTurnId = id; },
+          }, { onDispatched: dispatched })
+            .catch((e) => ({ __sendError: e }))
+            .finally(dispatched);
+        });
+      } catch (err) {
+        // A throw between registering and the turn's own try/finally would
+        // strand a 'live' entry, inflating liveCount for every other topic in
+        // the chat for the life of the process.
+        releaseStreamerRegistration();
+        throw err;
+      }
     }
   } finally {
     releaseIntent();
@@ -2110,7 +2183,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // Covers BOTH exits below (tool-only completion and the empty-response
       // fallback): the turn produced no text to deliver, so whatever the
       // preview holds is the only thing written this turn.
-      await finishStreamer();
+      const settled = await finishStreamer();
+      // If the preview HELD an answer and we just delivered it, the turn was
+      // not empty — apologizing for silence underneath the answer the user is
+      // reading is worse than saying nothing.
+      const previewAnswered = settled.action === 'finalized'
+        || settled.action === 'redelivered'
+        || settled.action === 'finalize-failed';
       // 0.8.0-rc.7: tool-only completion is NOT an error. Under SDK
       // pm, a turn that ends after running tools (no closing text
       // block) leaves result.text empty even though the bot DID
@@ -2121,6 +2200,19 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // the emoji visually) and silently mark replied.
       const toolOnlyTurn = (result.metrics?.numToolUses ?? 0) > 0
         && (result.metrics?.numAssistantMessages ?? 0) > 0;
+      if (previewAnswered) {
+        // The preview held an answer and reconciliation just delivered it. The
+        // turn produced no `result.text` only because the agent wrote into the
+        // preview instead of replying — the user has their answer.
+        logEvent('stream-orphan-answered-turn', {
+          chat_id: chatId, msg_id: msg.message_id, bot: BOT_NAME,
+          action: settled.action,
+        });
+        await reactor.clear().catch(() => {});
+        clearAutosteeredReactions(sessionKey).catch(() => {});
+        await finalizeResultDelivery();
+        return;
+      }
       if (toolOnlyTurn) {
         await reactor.clear().catch(() => {});
         clearAutosteeredReactions(sessionKey).catch(() => {});
@@ -2508,12 +2600,38 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // fresh bubble with the full answer below.
     const abortedByUser = isSessionRecentlyAborted(sessionKey);
     const quietFinalize = abortedByUser || isShuttingDown;
-    if (quietFinalize) {
+    // A turn that already delivered replies and THEN failed must not restate
+    // them: finalize(null) publishes whatever the draft holds, which on a CLI
+    // turn is usually the answer a reply already sent. That is precisely the
+    // duplicate the shared rule exists to prevent, so when this turn delivered
+    // anything, the error paths settle through it instead (spec §3.3's "every
+    // exit" beats §3.2.3's literal wording). With nothing delivered, the old
+    // direct finalize is still exactly right — it is what carries the error
+    // suffix onto the partial bubble.
+    const settleErrorExit = async (errorSuffix) => {
+      if (deliveredTexts.length > 0) {
+        await finishStreamer().catch(() => {});
+        if (errorSuffix) {
+          await tg(bot, 'sendMessage', {
+            chat_id: chatId,
+            text: `⚠️ ${errorSuffix}`,
+            ...(threadId && { message_thread_id: threadId }),
+          }, { ...outMetaBase, source: 'turn-error-suffix' }).catch(() => {});
+        }
+        return;
+      }
       // null, not '': finalize falls back to the drafted body. Passing ''
       // REPLACED whatever had streamed with an empty bubble — the user watched
       // a partial answer appear and then get wiped by the very failure that
       // was supposed to leave it standing.
-      await streamer.finalize(null).catch(() => {});
+      const fin = await streamer.finalize(null, errorSuffix ? { errorSuffix } : {})
+        .catch(() => null);
+      // The bubble now shows the drafted body; bring its transcript row along,
+      // or the row keeps the ~30-character stub the initial send wrote.
+      if (fin?.finalEditOk) persistBubbleText(chatId, fin.msgId, fin.finalText);
+    };
+    if (quietFinalize) {
+      await settleErrorExit(null);
       if (abortedByUser) {
         // 0.8.0-rc.13: clear the in-flight emoji on abort so the user
         // sees a clean message after their /stop ack — pre-rc.13 the
@@ -2537,7 +2655,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       const { errorSuffix, reactorState } = classifyTurnEndError(err);
       // null keeps the drafted body so the suffix APPENDS to what the user was
       // reading instead of replacing it with a bare "⚠️ …".
-      await streamer.finalize(null, errorSuffix ? { errorSuffix } : {}).catch(() => {});
+      await settleErrorExit(errorSuffix);
       reactor.setState(reactorState);
     }
     if (deliverySettlementError) throw deliverySettlementError;
@@ -3488,7 +3606,7 @@ async function main() {
     bot,
     send: tg,
     chunkText: chunkMarkdownText,
-    deliverReplies,
+    deliverReplies: deliverRepliesTracked,
     makeDeliverText,
     // Review F#1: required so [sticker:NAME] / [react:EMOJI] / canned-string
     // (`No response requested.`) protections fire on channels replies too.

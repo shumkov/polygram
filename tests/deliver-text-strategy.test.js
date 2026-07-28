@@ -158,10 +158,11 @@ describe('dispatcher wiring', () => {
     const h = dispatcherHarness({ makeDeliverText: () => null });
     await h.dispatcher({
       sessionKey: 'chat:1', chatId: '1', threadId: '7', toolName: 'reply',
-      text: 'hi there', sessionCwd: '/work', interim: true,
+      text: 'hi there', sessionCwd: '/work', interim: true, turnId: 'turn-9',
     });
     assert.deepEqual(h.factoryArgs, [{
-      sessionKey: 'chat:1', sessionCwd: '/work', chatId: '1', threadId: '7', interim: true,
+      sessionKey: 'chat:1', sessionCwd: '/work', chatId: '1', threadId: '7',
+      interim: true, turnId: 'turn-9',
     }]);
   });
 
