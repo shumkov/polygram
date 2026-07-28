@@ -66,3 +66,18 @@ test('nested lists and blockquoted lists flatten the same way', () => {
 test('a bare text token without nested tokens still emits its text', () => {
   assert.equal(_plainTextOf([{ type: 'text', text: 'plain leaf' }]), 'plain leaf');
 });
+
+test('task items never ship their [ ]/[x] markers alongside the real checkbox', () => {
+  // Production repro 2026-07-29: every checklist rendered a checkbox AND
+  // the literal marker ("[ ] first step"). The 0.24.1 flatten fix recurses
+  // into the item's child tokens, which still CONTAIN the marker — marked
+  // strips it only from the container's .text, the field the old code read.
+  const { blocks } = toTelegramRichBlocks('## Plan\n\n- [ ] first step\n- [x] done step');
+  const texts = collectText(blocks).join('\n');
+  assert.ok(texts.includes('first step'));
+  assert.ok(texts.includes('done step'));
+  assert.ok(!/\[[ xX]\]/.test(texts), `marker leaked: ${texts}`);
+  const list = blocks.find((b) => b.type === 'list');
+  assert.equal(list.items[0].has_checkbox, true);
+  assert.equal(list.items[1].is_checked, true);
+});
