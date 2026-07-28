@@ -46,10 +46,23 @@
  *
  * Usage:
  *   node scripts/spikes/rich-inline-styling-probe.mjs \
- *     [--config PATH] [--bot NAME] [--chat ID] [--topic THREAD_ID] [--confirm]
+ *     [--config PATH] [--bot NAME] [--chat ID] [--topic THREAD_ID] \
+ *     [--only KEY,KEY] [--paced [MS]] [--confirm]
  *
  * `--topic` is optional here (unlike the topic gate): routing is already
  * settled. Pass it to keep the noise out of a chat's main timeline.
+ *
+ * `--paced [MS]` (default 2500 ms) sleeps between sends. A first run had
+ * list-item and table-cell probes come back PRESERVED and a repeat run had
+ * them REJECTED, with everything else identical — which is the signature of
+ * rate pressure, not of a field that does not support styling. Under a burst
+ * a rejection cannot be attributed, so a contradictory result has to be
+ * re-asked slowly before it is believed.
+ *
+ * `--only KEY,KEY` runs just those probes. The bare-string control is ALWAYS
+ * included whatever the filter says: without it a blanket rejection cannot be
+ * told apart from "this chat/server/token is the variable", which is the very
+ * ambiguity that made the contradictory run unreadable.
  */
 
 import fs from 'node:fs';
@@ -68,16 +81,28 @@ function parseArgs(argv) {
   const out = {
     config: path.join(os.homedir(), '.polygram', 'config.json'),
     bot: null, chat: null, topic: null, confirm: false,
+    only: null, pacedMs: 0,
   };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--config') out.config = argv[++i];
     else if (argv[i] === '--bot') out.bot = argv[++i];
     else if (argv[i] === '--chat') out.chat = argv[++i];
     else if (argv[i] === '--topic') out.topic = argv[++i];
-    else if (argv[i] === '--confirm') out.confirm = true;
+    else if (argv[i] === '--only') out.only = argv[++i];
+    else if (argv[i] === '--paced') {
+      // Optional value: `--paced` alone means the default cadence.
+      const next = argv[i + 1];
+      if (next && !next.startsWith('--') && Number.isFinite(Number(next))) {
+        out.pacedMs = Number(argv[++i]);
+      } else out.pacedMs = DEFAULT_PACE_MS;
+    } else if (argv[i] === '--confirm') out.confirm = true;
   }
   return out;
 }
+
+// Slow enough that consecutive sends are not competing for the same
+// per-chat budget, short enough that a 15-probe run is still a minute.
+const DEFAULT_PACE_MS = 2500;
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -250,6 +275,12 @@ export function candidateShapes() {
     { key: 'c-url', label: '(c) array + {type:"url", url}', text: ['[SPIKE TEST] c url — ', { type: 'url', text: STYLE_MARKER, url: URL_FOR_PROBE }] },
     { key: 'c-plain-node', label: '(c) explicit {type:"plain"} node', text: ['[SPIKE TEST] c plain — ', { type: 'plain', text: STYLE_MARKER }] },
 
+    // `~~del~~` is ordinary GFM and marked emits it, but the reference names
+    // no strikethrough node — so it stays flattened unless a run says
+    // otherwise. Two plausible spellings, since one failing proves nothing.
+    { key: 'c-strikethrough', label: '(c) array + {type:"strikethrough"}', text: ['[SPIKE TEST] c strike — ', { type: 'strikethrough', text: STYLE_MARKER }] },
+    { key: 'c-strike-alt', label: '(c) alternate spelling {type:"strike"}', text: ['[SPIKE TEST] c strike alt — ', { type: 'strike', text: STYLE_MARKER }] },
+
     // (d) alternate spellings. (c) failing says this spelling is wrong, not
     // that typed nodes are unsupported — so ask the other plausible ones
     // before concluding anything.
@@ -266,6 +297,34 @@ export function candidateShapes() {
 }
 
 const styledRun = (prefix) => [prefix, { type: 'bold', text: STYLE_MARKER }];
+
+/** The control is what makes every other row readable, so it is never filtered out. */
+export const ALWAYS_KEYS = ['a-string'];
+
+/**
+ * Apply an `--only` selection to ONE probe list, validating against every key
+ * that exists across all of them — a key valid for the field list must not
+ * read as a typo while filtering the shape list.
+ *
+ * An unknown key is an error rather than an empty run: `--only field-tablecell`
+ * silently probing nothing, and reporting a clean verdict for it, is worse
+ * than refusing to start.
+ */
+export function selectProbes(list, only, knownKeys = null) {
+  if (!only) return list;
+  const wanted = new Set(String(only).split(',').map((k) => k.trim()).filter(Boolean));
+  const known = new Set(knownKeys || list.map((p) => p.key));
+  const unknown = [...wanted].filter((k) => !known.has(k));
+  if (unknown.length) {
+    throw new Error(`--only names unknown probe(s): ${unknown.join(', ')}. Known: ${[...known].join(', ')}`);
+  }
+  return list.filter((p) => wanted.has(p.key) || ALWAYS_KEYS.includes(p.key));
+}
+
+/** Every probe key that exists, in run order. */
+export function allProbeKeys() {
+  return [...candidateShapes(), ...candidateFields()].map((p) => p.key);
+}
 
 /**
  * The other FIELDS we would wire. Same shape as (c); what is under test is
@@ -323,12 +382,20 @@ async function main() {
   console.log(`bot=${botName} chat=${chatId}${args.chat ? ' (explicit --chat)' : ''} `
     + `topic=${args.topic ?? '(none)'} apiRoot=${redact(apiRoot) || 'cloud'} confirm=${args.confirm}`);
 
-  const shapes = candidateShapes();
-  const fields = candidateFields();
+  const known = allProbeKeys();
+  const shapes = selectProbes(candidateShapes(), args.only, known);
+  const fields = selectProbes(candidateFields(), args.only, known);
+  const total = shapes.length + fields.length;
+  const paceLabel = args.pacedMs > 0
+    ? `${args.pacedMs}ms between sends (~${Math.round((total - 1) * args.pacedMs / 1000)}s total)`
+    : 'no pacing (burst)';
+
+  if (args.only) console.log(`only=${args.only} (+ the always-on control)`);
+  console.log(`pacing: ${paceLabel}`);
 
   if (!args.confirm) {
     console.log('\nDRY RUN — nothing will be sent. Pass --confirm to run for real.');
-    console.log(`Would send ${shapes.length + fields.length} messages, one per probe:\n`);
+    console.log(`Would send ${total} messages, one per probe:\n`);
     for (const s of shapes) {
       console.log(`  ${s.key.padEnd(22)} ${s.label}`);
       console.log(`  ${' '.repeat(22)} text = ${JSON.stringify(s.text)}`);
@@ -338,6 +405,13 @@ async function main() {
       console.log(`  ${' '.repeat(22)} block = ${JSON.stringify(f.block)}`);
     }
     console.log('\nEach send is independent: a rejection records and moves on.');
+    if (args.pacedMs > 0) {
+      console.log(`Paced: ${args.pacedMs}ms between sends, so a rejection can be read as`);
+      console.log('the field refusing the shape rather than the chat refusing the burst.');
+    } else {
+      console.log('UNPACED: a rejection here cannot be told apart from rate pressure.');
+      console.log('Use --paced when a result needs to be believed.');
+    }
     console.log('The ECHO is what gets read — an accepted send whose echo is a bare');
     console.log('string means the styling was dropped in transit, which is the');
     console.log('outcome worth knowing and the one acceptance alone cannot show.');
@@ -353,8 +427,19 @@ async function main() {
     return bot.api.raw.sendRichMessage(params);
   };
 
+  // Sleep BEFORE each send but the first, so the last probe is not followed
+  // by a pointless wait.
+  let sent = 0;
+  const pace = async () => {
+    if (args.pacedMs > 0 && sent > 0) {
+      await new Promise((resolve) => setTimeout(resolve, args.pacedMs));
+    }
+    sent += 1;
+  };
+
   // ── Paragraph text shapes ───────────────────────────────────────────────
   for (const shape of shapes) {
+    await pace();
     try {
       const res = await send([{ type: 'paragraph', text: shape.text }]);
       const echoed = res?.rich_message?.blocks?.[0]?.text;
@@ -380,6 +465,7 @@ async function main() {
 
   // ── The fields we would wire ────────────────────────────────────────────
   for (const field of fields) {
+    await pace();
     try {
       const res = await send([field.block]);
       const echoed = field.read(res?.rich_message?.blocks?.[0]);
@@ -441,7 +527,12 @@ async function main() {
   // JSON tail so the outcome can be relayed without transcribing prose.
   console.log(`\n${JSON.stringify({
     probe: 'rich-inline-styling', bot: botName, chat: String(chatId),
-    topic: args.topic ?? null, verdict, styledFields, flattened, canonical, results,
+    topic: args.topic ?? null,
+    // Provenance: a verdict from a burst run and one from a paced run are not
+    // the same evidence, and the difference is invisible once the JSON is
+    // pasted somewhere else.
+    pacedMs: args.pacedMs || 0, only: args.only ?? null,
+    verdict, styledFields, flattened, canonical, results,
   }, null, 2)}`);
 
   process.exit(exitCode);
