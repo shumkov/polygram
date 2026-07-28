@@ -96,8 +96,11 @@ describe('POLYGRAM_DISPLAY_HINT — content', () => {
 });
 
 describe('rich media display hint', () => {
-  test('rich mode teaches the unchanged syntax, typed extensions, wrappers, and text rule', () => {
-    const richHint = buildPolygramDisplayHint(true);
+  test('opting into inline media restores the full media guidance', () => {
+    // The streamer resolves and uploads local media, so chats delivered that
+    // way must keep learning the syntax — removing it fleet-wide would take
+    // away a capability that still works there.
+    const richHint = buildPolygramDisplayHint(true, { inlineMedia: true });
     assert.match(richHint, /!\[caption\]\(\/abs\/path/i);
     assert.match(richHint, /\.jpe?g/i);
     assert.match(richHint, /\.png/i);
@@ -110,6 +113,46 @@ describe('rich media display hint', () => {
     assert.match(richHint, /<tg-collage>/i);
     assert.match(richHint, /<tg-slideshow>/i);
     assert.match(richHint, /at least a sentence/i);
+  });
+
+  test('the two variants differ ONLY by the media guidance', () => {
+    // Guards against the gate accidentally taking structural guidance with
+    // it: the reply path renders every non-media construct just as well.
+    const withMedia = buildPolygramDisplayHint(true, { inlineMedia: true });
+    const withoutMedia = buildPolygramDisplayHint(true);
+    const stripped = withMedia
+      .split('\n')
+      .filter(l => !/Inline media:|Grouping media:/.test(l))
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n');
+    assert.equal(stripped, withoutMedia.replace(/\n{3,}/g, '\n\n'));
+  });
+
+  test('rich mode does not teach media the reply path cannot deliver', () => {
+    // The hint is the exposure throttle. Most agent output now goes through
+    // the reply tool, which renders rich blocks on media-stripped text — an
+    // image reaches the user as its caption and nothing else. Teaching the
+    // syntax while that is true makes the agent author constructs that
+    // silently vanish, which is exactly the mismatch this hint exists to
+    // prevent.
+    // Asserted as a property, not as three strings from the paragraph that
+    // was deleted: a reworded re-add ("![alt](/abs/path)", ".jpg only") has
+    // to fail this too, or the guard only protects against a verbatim revert.
+    const richHint = buildPolygramDisplayHint(true);
+    assert.doesNotMatch(richHint, /!\[[^\]]*\]\(/, 'no image markdown of any form');
+    assert.doesNotMatch(richHint, /<tg-(collage|slideshow)/i, 'no media wrapper tags');
+    assert.doesNotMatch(richHint, /\.(jpe?g|png|webp|mp4|gif)\b/i, 'no media file extensions');
+    assert.doesNotMatch(richHint, /\]\(\/(abs|Users|home|tmp)/, 'no absolute-path example');
+  });
+
+  test('rich mode still teaches every construct that does render', () => {
+    const richHint = buildPolygramDisplayHint(true);
+    assert.match(richHint, /## Ready to apply/, 'headings');
+    assert.match(richHint, /- \[ \]/, 'task lists');
+    assert.match(richHint, /<details><summary>/i, 'collapsible detail');
+    assert.match(richHint, /blockquote/i);
+    assert.match(richHint, /divider/i);
+    assert.match(richHint, /markdown table/i);
   });
 
   test('plain mode remains media-free and equals the legacy default export', () => {

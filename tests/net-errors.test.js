@@ -170,6 +170,21 @@ describe('stripUrlCredentials — apiRoot basic auth', () => {
     assert.equal(stripUrlCredentials('http://localhost:8082'), 'http://localhost:8082');
   });
 
+  test('a password containing an unencoded @ is removed whole, not truncated', () => {
+    // Cutting at the FIRST '@' leaves the rest of the password in the output
+    // — the sanitized string then still carries most of the secret it was
+    // called to remove.
+    assert.equal(stripUrlCredentials('https://alice:p@ss@example.com/x'), 'https://example.com/x');
+    assert.equal(stripUrlCredentials('http://a:b@c@d@localhost:8082'), 'http://localhost:8082');
+  });
+
+  test('an @ after the authority is left alone', () => {
+    assert.equal(
+      stripUrlCredentials('https://api.telegram.org/bot123/send@me'),
+      'https://api.telegram.org/bot123/send@me',
+    );
+  });
+
   test('null/undefined/empty pass through', () => {
     assert.equal(stripUrlCredentials(null), null);
     assert.equal(stripUrlCredentials(undefined), undefined);
