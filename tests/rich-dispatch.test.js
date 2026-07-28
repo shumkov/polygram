@@ -590,6 +590,27 @@ test('a media wiring that throws costs media, never the reply', async () => {
   assert.ok(!JSON.stringify(sendCalls[0].blocks).includes(dir));
 });
 
+test('styled text cannot smuggle a path past the media guard', async () => {
+  // The guard walks block text looking for surviving image markdown. Styled
+  // text is an ARRAY of strings and nodes, so a string-only check skips it
+  // entirely — and the mundane case (a spaced screenshot path in a sentence
+  // that also contains bold) ships the absolute path.
+  const { dir } = mediaWorkspace();
+  const { factory, sendCalls } = buildWithMedia({
+    toRichBlocks: (text, opts) => require('../lib/telegram/rich')
+      .toTelegramRichBlocks(text, { ...opts, inlineStyling: true }),
+  });
+
+  const out = await deliverIn(
+    factory,
+    '## Results\n\nThe **build** shot: ![shot](/Users/ivan/Desktop/a b.png)',
+    [dir],
+  );
+
+  const wire = JSON.stringify(sendCalls[0]?.blocks ?? out.text ?? '');
+  assert.ok(!wire.includes('/Users/ivan'), `absolute path reached the chat: ${wire}`);
+});
+
 test('a wiring missing its preflight is refused outright', async () => {
   // Half a wiring is the dangerous shape: the resolver would hand local
   // sources and cached ids to the send, and materialization would take the

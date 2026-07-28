@@ -122,6 +122,7 @@ const { chunkMarkdownText } = require('./lib/telegram/chunk');
 const {
   toTelegramRichBlocks, resolveRichTextEnabled, isRichCapabilityError, isRichContentError,
   isRichCapabilityErrorExplicit, isRichMessageFieldRejection, stripMediaMarkdown,
+  isRichLimitError,
 } = require('./lib/telegram/rich');
 const {
   makeRichMediaResolver,
@@ -133,6 +134,7 @@ const {
 } = require('./lib/telegram/rich-media');
 const { createRichEditor } = require('./lib/telegram/rich-edit');
 const { createRichCapabilityLatch } = require('./lib/telegram/rich-capability-latch');
+const { createRichStylingLatch } = require('./lib/telegram/rich-styling-latch');
 
 // What a reply consisting only of media the delivering path cannot render
 // degrades to. Silence would leave the user with nothing and the agent
@@ -398,6 +400,14 @@ let richKnownUnsupported = false;
 // 404 — a single shared flag would let the reply tool's probe permanently
 // disable the streamer's working rich edits.
 let richSendKnownUnsupported = false;
+// A THIRD verdict, and deliberately not one of the two above. Those answer
+// "can this server do rich at all", and tripping either costs every heading,
+// table and task list. This one answers "does it accept typed RichText nodes
+// inside block text", and tripping it costs bold, italic, code spans and
+// links. A server that predates typed nodes still renders rich perfectly
+// well, so the failure mode here must be "no styling", never "no rich".
+let richInlineStylingUnsupported = false;
+let richStylingLatch = null;
 
 // Extracted to lib/telegram/rich-edit.js so the capability/content/
 // transient error-classification + fallback wiring is directly unit-
@@ -1331,7 +1341,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   });
   const toRichPayload = (text, opts) => {
     if (richKnownUnsupported || !resolveRichTextEnabled(config, chatId, threadId)) return null;
-    const payload = toTelegramRichBlocks(text, { ...opts, resolveMedia: resolveRichMedia });
+    // Re-read per payload, like the gate above: a latch that trips on the
+    // reply-tool path takes the streamer with it on the next flush.
+    const payload = toTelegramRichBlocks(text, {
+      ...opts,
+      resolveMedia: resolveRichMedia,
+      inlineStyling: !richInlineStylingUnsupported,
+    });
     if (!opts.partial && payload?.usedRich) {
       return {
         ...payload,
@@ -3237,6 +3253,14 @@ async function main() {
         else richKnownUnsupported = true;
       },
     });
+    richStylingLatch = createRichStylingLatch({
+      setUnsupported: () => {
+        richInlineStylingUnsupported = true;
+        logEvent('rich-styling-latched', { bot: BOT_NAME });
+        console.warn('[telegram] inline styling disabled for this process — '
+          + 'a styled payload was refused and the same content landed flattened, twice');
+      },
+    });
     richEditMessageText = createRichEditor({
       tg,
       botName: BOT_NAME,
@@ -3244,12 +3268,18 @@ async function main() {
       redactBotToken,
       isRichCapabilityError,
       isRichContentError,
+      isRichLimitError,
       getRichKnownUnsupported: () => richKnownUnsupported,
       setRichKnownUnsupported: () => { richKnownUnsupported = true; },
       getApiRoot: () => config.bot?.apiRoot || null,
       stripUrlCreds: stripUrlCredentials,
       sanitizeFallbackText: stripMediaMarkdown,
       capabilityLatch: richCapabilityLatch,
+      // The SAME verdict the reply-tool path feeds. One renderer, one
+      // server, one answer — a latch reachable from only one path would let
+      // the other keep authoring payloads this server has already refused.
+      onStylingRejected: () => richStylingLatch?.recordStylingRejection(),
+      onStylingAccepted: () => richStylingLatch?.recordHealthyOutcome(),
     });
     richSendMessage = createRichSender({
       tg,
@@ -3259,6 +3289,7 @@ async function main() {
       isRichCapabilityError,
       isRichCapabilityErrorExplicit,
       isRichContentError,
+      isRichLimitError,
       getRichKnownUnsupported: () => richSendKnownUnsupported,
       setRichKnownUnsupported: () => { richSendKnownUnsupported = true; },
       getApiRoot: () => config.bot?.apiRoot || null,
@@ -3628,6 +3659,13 @@ async function main() {
       sendRich: (args) => richSendMessage(args),
       isRichTextEnabled: (chatId, threadId) => resolveRichTextEnabled(config, chatId, threadId),
       getRichKnownUnsupported: () => richSendKnownUnsupported,
+      // No config knob: the automatic flatten-and-retry below IS the control,
+      // and it needs no operator to notice anything. A knob would add a state
+      // where styling is off while the server accepts it, which nothing in
+      // the system can detect or correct.
+      isInlineStylingEnabled: () => !richInlineStylingUnsupported,
+      onStylingRejected: () => richStylingLatch?.recordStylingRejection(),
+      onStylingAccepted: () => richStylingLatch?.recordHealthyOutcome(),
       redactError: redactBotToken,
       // Media for one reply. The envelope itself (no URL media, the `files:`
       // fan-out ceiling, the shared stat) lives in rich-media.js so it is

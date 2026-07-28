@@ -275,3 +275,61 @@ test('redaction survives non-string input', async () => {
   assert.equal(redact(null), '');
   assert.equal(redact(undefined), '');
 });
+
+// ─── Selection and pacing ──────────────────────────────────────────────────
+//
+// A first run reported list items and table cells PRESERVED and a repeat run
+// reported them REJECTED, everything else identical — the signature of rate
+// pressure rather than of a field that cannot do styling. These two knobs
+// exist so that question can be re-asked in a way that answers it.
+
+test('a focused run still carries the control', async () => {
+  // Without it, a rejection cannot be told apart from "this chat/server/token
+  // is the variable" — which is exactly the ambiguity that made the
+  // contradictory run unreadable in the first place.
+  const { selectProbes, candidateFields, allProbeKeys, ALWAYS_KEYS } = await load();
+  const selected = selectProbes(candidateFields(), 'field-table-cell', allProbeKeys());
+  assert.deepEqual(selected.map((p) => p.key), ['field-table-cell']);
+  assert.deepEqual(ALWAYS_KEYS, ['a-string'], 'the control is the always-on probe');
+});
+
+test('the control survives filtering of the list it belongs to', async () => {
+  const { selectProbes, candidateShapes, allProbeKeys } = await load();
+  const selected = selectProbes(candidateShapes(), 'c-code', allProbeKeys());
+  assert.deepEqual(selected.map((p) => p.key), ['a-string', 'c-code']);
+});
+
+test('a key from another list is not mistaken for a typo', async () => {
+  // Both lists are filtered by the same selection, so validating each against
+  // only its own keys would reject a perfectly valid field key while
+  // filtering the shapes.
+  const { selectProbes, candidateShapes, allProbeKeys } = await load();
+  assert.doesNotThrow(() => selectProbes(candidateShapes(), 'field-table-cell', allProbeKeys()));
+});
+
+test('an unknown key refuses the run instead of probing nothing', async () => {
+  // `--only field-tablecell` quietly selecting zero probes, and the verdict
+  // then reporting cleanly on them, is worse than not starting.
+  const { selectProbes, candidateFields, allProbeKeys } = await load();
+  assert.throws(
+    () => selectProbes(candidateFields(), 'field-tablecell', allProbeKeys()),
+    /unknown probe/i,
+  );
+});
+
+test('no selection runs everything', async () => {
+  const { selectProbes, candidateShapes } = await load();
+  const all = candidateShapes();
+  assert.equal(selectProbes(all, null).length, all.length);
+  assert.equal(selectProbes(all, '').length, all.length);
+});
+
+test('strikethrough is probed under both plausible spellings', async () => {
+  // `~~del~~` is ordinary GFM and marked emits it, but the reference names no
+  // strikethrough node — so the mapping may only claim it on evidence, and
+  // one spelling failing proves nothing about the other.
+  const { candidateShapes } = await load();
+  const keys = candidateShapes().map((s) => s.key);
+  assert.ok(keys.includes('c-strikethrough'));
+  assert.ok(keys.includes('c-strike-alt'));
+});

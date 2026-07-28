@@ -141,3 +141,50 @@ describe('polygram rich-message wiring', () => {
     );
   });
 });
+
+describe('polygram inline-styling wiring', () => {
+  const source = require('node:fs').readFileSync(
+    require('node:path').join(__dirname, '..', 'polygram.js'), 'utf8');
+
+  test('styling has its own verdict, separate from both capability latches', () => {
+    // Tripping either capability latch costs every heading, table and task
+    // list. Tripping this one costs bold, italic, code spans and links. A
+    // server that predates typed nodes still does rich perfectly well, so
+    // conflating them would trade the feature for a sub-feature.
+    assert.match(source, /let richInlineStylingUnsupported = false;/);
+    assert.match(source, /createRichStylingLatch\(\{/);
+    assert.doesNotMatch(source, /richKnownUnsupported = true;[\s\S]{0,80}inlineStyling/,
+      'a styling rejection must never set a rich capability flag');
+  });
+
+  test('both rich paths read the same styling verdict', () => {
+    // The renderer is shared, so a verdict that reached only one path would
+    // leave the other authoring payloads the server has already refused.
+    assert.match(source, /inlineStyling: !richInlineStylingUnsupported/,
+      'the streamer payload builder consults it');
+    assert.match(source, /isInlineStylingEnabled: \(\) => !richInlineStylingUnsupported/,
+      'and so does the reply-tool strategy');
+  });
+
+  test('the verdict is fed by confirmed rejections, not by any content error', () => {
+    assert.match(source, /onStylingRejected: \(\) => richStylingLatch\?\.recordStylingRejection\(\)/);
+    assert.match(source, /onStylingAccepted: \(\) => richStylingLatch\?\.recordHealthyOutcome\(\)/);
+  });
+
+  test('BOTH paths can feed the verdict, not just the reply tool', () => {
+    // The streamer styles every payload it renders. If only the dispatcher
+    // could record a rejection, a streamer-only chat against a styling-unaware
+    // server would refuse, degrade, and never learn — every bubble plain,
+    // forever, with the latch still showing green.
+    assert.equal((source.match(/onStylingRejected:/g) || []).length, 2,
+      'the editor and the sender both report');
+    assert.equal((source.match(/onStylingAccepted:/g) || []).length, 2);
+  });
+
+  test('the limit predicate reaches both senders', () => {
+    // Without it, an oversized reply that succeeds once flattened counts as
+    // evidence that the server refuses typed nodes.
+    assert.equal((source.match(/\bisRichLimitError,/g) || []).length, 3,
+      'imported once, passed to the editor and the sender');
+  });
+});
