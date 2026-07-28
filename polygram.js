@@ -138,6 +138,7 @@ const { createRichCapabilityLatch } = require('./lib/telegram/rich-capability-la
 const MEDIA_ONLY_FALLBACK_TEXT = '(media unavailable)';
 const { createRichSender } = require('./lib/telegram/rich-send');
 const { createRichDeliveryFactory } = require('./lib/telegram/rich-dispatch');
+const { composeDeliverTextFactories } = require('./lib/telegram/deliver-strategy');
 const { buildPolygramDisplayHint } = require('./lib/telegram/display-hint');
 const { redactBotToken, stripUrlCredentials } = require('./lib/error/net');
 // F#23: shared agent-reply helper. parseResponse + sanitizer + chunked
@@ -3585,18 +3586,37 @@ async function main() {
       console.warn(`[polygram] WARNING: ${binCheck.reason}`);
     }
   }
-  // Live-preview reconciliation for the CLI reply path: a reply that lands
-  // while this session's preview is live turns that bubble INTO the reply,
-  // instead of a second bubble appearing under a preview that already says the
-  // same thing. Logic lives in lib/telegram/live-preview.js so the turn-shape
-  // matrix is unit-testable; this is the wiring.
-  const makeDeliverText = createDeliverTextFactory({
-    registry: streamerRegistry,
-    logEvent,
-    persistBubbleText,
-    logger: console,
-    botName: BOT_NAME,
-  });
+  // The reply-tool text-delivery chain. Two independent decisions about the
+  // same reply, in the order that makes them independent:
+  //
+  //   1. The live preview. Only it knows whether a bubble is already on screen
+  //      holding this answer, so it gets first refusal — when it consumes, the
+  //      reply IS that bubble (the streamer's own toRichPayload renders rich
+  //      there, so consuming loses nothing).
+  //   2. Rich delivery. Everything the preview did not consume — an interim
+  //      status, a late reply, a body too long for one bubble, a chat with no
+  //      preview at all — flows here, and then to the chunked path.
+  //
+  // Neither feature may switch the other off, which a single strategy slot
+  // could not express.
+  const makeDeliverText = composeDeliverTextFactories([
+    createDeliverTextFactory({
+      registry: streamerRegistry,
+      logEvent,
+      persistBubbleText,
+      logger: console,
+      botName: BOT_NAME,
+    }),
+    // Injected rather than imported by the dispatcher: rich-media.js requires
+    // the dispatcher module, so the reverse direction would be a require cycle.
+    createRichDeliveryFactory({
+      bot,
+      sendRich: (args) => richSendMessage(args),
+      isRichTextEnabled: (chatId, threadId) => resolveRichTextEnabled(config, chatId, threadId),
+      getRichKnownUnsupported: () => richSendKnownUnsupported,
+      redactError: redactBotToken,
+    }),
+  ]);
 
   // 0.11.0: channels backend wiring. Used when a chat opts in via
   // `pm: 'channels'` config. Falls back to SDK gracefully if the pinned
@@ -3629,16 +3649,6 @@ async function main() {
       logEvent('deliver-media-only-degraded', { chat_id: chatId, thread_id: threadId, bot: BOT_NAME });
       return MEDIA_ONLY_FALLBACK_TEXT;
     },
-    // Rich delivery for the reply tool. Injected rather than imported by the
-    // dispatcher: rich-media.js requires the dispatcher module, so the reverse
-    // direction would be a require cycle.
-    makeDeliverText: createRichDeliveryFactory({
-      bot,
-      sendRich: (args) => richSendMessage(args),
-      isRichTextEnabled: (chatId, threadId) => resolveRichTextEnabled(config, chatId, threadId),
-      getRichKnownUnsupported: () => richSendKnownUnsupported,
-      redactError: redactBotToken,
-    }),
     logEvent,
     logger: console,
   });
