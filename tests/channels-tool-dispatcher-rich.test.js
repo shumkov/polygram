@@ -838,7 +838,7 @@ test('end to end: a captioned workspace screenshot lands as a real photo block',
 });
 
 test('a reply that is only a resolvable photo still goes rich', async () => {
-  // Media is now a legitimate rich trigger: this reply has no other one, and
+  // Media is a legitimate rich trigger: this reply has no other one, and
   // it is exactly the visual-walkthrough case the feature exists for.
   const { dir, file } = mediaDir();
   const h = buildMediaWired();

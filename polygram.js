@@ -3698,9 +3698,9 @@ async function main() {
     // CliProcess. Without it, cli chats lose the Telegram table/markdown display rules.
     // A resolver (not a static string) so each cli-backed chat gets its own richText
     // state — orchestra's factory calls this per spawn with the spawning chat/topic.
-    // inlineMedia: the reply tool now renders media blocks, so the syntax the
-    // hint teaches is syntax this backend delivers. The guidance is per-path
-    // for exactly that reason — it is the throttle on how much media agents
+    // inlineMedia: the reply tool renders media blocks, so the syntax the hint
+    // teaches is syntax this backend delivers. The guidance is per-path for
+    // exactly that reason — it is the throttle on how much media agents
     // author, and it may only be on where delivery can honor it.
     displayHint: (chatId, threadId) => buildPolygramDisplayHint(
       resolveRichTextEnabled(config, chatId, threadId),

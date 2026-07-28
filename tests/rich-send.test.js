@@ -424,8 +424,8 @@ test('a changed source is never mistaken for a missing capability', async () => 
 });
 
 test('a rejected preflight declines without a throw and without a bubble', async () => {
-  // Pinning the G3 breach directly: a synchronous throw out of here surfaces
-  // to the agent as {ok:false} with nothing delivered.
+  // A synchronous throw out of here surfaces to the agent as {ok:false} with
+  // nothing delivered — strictly worse than a flat reply.
   const { mediaContext, blocks } = mediaFixture();
   const { sendRich, tgCalls } = makeSender();
   const alwaysRejects = { ...mediaContext, preflightMedia: () => ({ ok: false }) };
@@ -474,7 +474,7 @@ test('a success teaches the shared cache, so the next reply reuses the id', asyn
     tg: async (_bot, _method, params) => ({
       message_id: 777,
       date: 1,
-      // The live gate established that the response echoes the blocks.
+      // The server echoes the sent blocks; that echo is what the cache learns from.
       rich_message: {
         blocks: [{ type: 'photo', photo: [{ file_id: 'learned-id', width: 40, height: 30 }] }],
       },

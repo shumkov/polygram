@@ -75,7 +75,7 @@ describe('polygram rich-message wiring', () => {
     assert.doesNotMatch(wiring, /displayHint:\s*require\('\.\/lib\/telegram\/display-hint'\)\.POLYGRAM_DISPLAY_HINT/);
   });
 
-  test('the CLI-backend display hint teaches inline media, now that the reply tool renders it', () => {
+  test('the CLI-backend display hint teaches inline media, because the reply tool renders it', () => {
     // The hint is the exposure throttle for this feature: agents author the
     // media syntax it teaches. It may only be on where the DELIVERING path
     // resolves media — for this backend, the reply-tool rich strategy.
@@ -83,7 +83,7 @@ describe('polygram rich-message wiring', () => {
     // The whole option, up to wherever the next one starts.
     const call = /displayHint:[\s\S]*?\n(?= {4}(?:\/\/|[a-zA-Z]))/.exec(wiring)?.[0] ?? '';
     assert.match(call, /inlineMedia: true/,
-      'the CLI hint should teach the media syntax this backend now delivers');
+      'the CLI hint should teach the media syntax this backend delivers');
   });
 
   test('the send verb has its own verdict, separate from the edit verb', () => {
