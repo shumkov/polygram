@@ -704,3 +704,19 @@ describe('the streamer gets the rung too', () => {
     assert.equal(accepted, 1);
   });
 });
+
+test('a styled task item shows one checkbox, marker-only leader included', () => {
+  // The marker strip landed on main for the flat path (PR #44). A styled run
+  // keeps the marker in its LEADING STRING, which that strip never had to
+  // look at — so a task item whose text is entirely styled would have shown
+  // `[x]` beside the real checkbox.
+  const { blocks } = toTelegramRichBlocks('- [x] **Done** already', { inlineStyling: true });
+  const item = blocks[0].items[0];
+  assert.deepEqual(item.blocks[0].text, [{ type: 'bold', text: 'Done' }, ' already']);
+  assert.equal(item.has_checkbox, true);
+  assert.equal(item.is_checked, true);
+
+  // A leader that is ONLY the marker must not leave an empty string behind.
+  const onlyMarker = toTelegramRichBlocks('- [ ] **Done**', { inlineStyling: true });
+  assert.deepEqual(onlyMarker.blocks[0].items[0].blocks[0].text, [{ type: 'bold', text: 'Done' }]);
+});
