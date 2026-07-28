@@ -84,6 +84,21 @@ describe('polygram.js — AUTH_DISABLED DI + boot wiring', () => {
       + 'which would defeat cross-chat dedupe in production even though tests would still pass');
   });
 
+  // The heartbeat filename carries BOT_NAME (every bot shares DATA_DIR, which is
+  // process.cwd()), and createHeartbeat throws without one. BOT_NAME is null until
+  // main() parses argv, so constructing at module scope kills the daemon at boot.
+  test('the heartbeat is constructed after BOT_NAME is parsed and before start()', () => {
+    const botNameLine = findLineOf('BOT_NAME = parseBotArg(process.argv);');
+    const constructLine = findLineOf('authDisabledHeartbeat = createHeartbeat(');
+    const startLine = findLineOf('authDisabledHeartbeat.start();');
+
+    assert.ok(botNameLine > 0, 'must find where BOT_NAME is assigned');
+    assert.ok(constructLine > 0, 'authDisabledHeartbeat must be constructed somewhere');
+    assert.ok(constructLine > botNameLine,
+      'constructing before BOT_NAME is parsed passes null and throws on boot');
+    assert.ok(startLine > constructLine, 'cannot start a heartbeat that has not been constructed');
+  });
+
   test('authDisabledHeartbeat.start() is called on boot', () => {
     const startLine = findLineOf('authDisabledHeartbeat.start();');
     assert.ok(startLine > 0, 'authDisabledHeartbeat.start() must be called somewhere in main()\'s boot sequence');
@@ -93,7 +108,8 @@ describe('polygram.js — AUTH_DISABLED DI + boot wiring', () => {
   test('authDisabledHeartbeat.stop() is called during graceful shutdown, alongside approvalSweepTimer', () => {
     const sweepTimerLine = findLineOf('if (approvalSweepTimer) clearInterval(approvalSweepTimer);');
     assert.ok(sweepTimerLine > 0, 'must find the existing shutdown()-timer-cleanup anchor');
-    const stopLine = findLineOf('authDisabledHeartbeat.stop();');
+    // Optional-chained: shutdown can run before main() constructs the heartbeat.
+    const stopLine = findLineOf('authDisabledHeartbeat?.stop();');
     assert.ok(stopLine > 0, 'authDisabledHeartbeat.stop() must be called in shutdown() — an unref()\'d interval '
       + 'can\'t hang the process, but leaving it running lets a heartbeat write race the DB-close/PID-release steps');
     assert.ok(Math.abs(stopLine - sweepTimerLine) <= 3,

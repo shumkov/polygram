@@ -27,11 +27,11 @@ describe('createHeartbeat — beat()', () => {
     const gate = createAuthDisabledGate({ now: () => 12345 });
     gate.noteFailure();
     gate.noteFailure();
-    const hb = createHeartbeat({ dataDir, authDisabledGate: gate, now: () => 99999 });
+    const hb = createHeartbeat({ dataDir, botName: 'shumabit', authDisabledGate: gate, now: () => 99999 });
 
     hb.beat();
 
-    const written = JSON.parse(fs.readFileSync(path.join(dataDir, 'heartbeat.json'), 'utf8'));
+    const written = JSON.parse(fs.readFileSync(hb.file, 'utf8'));
     assert.equal(written.ts, 99999);
     assert.equal(written.authDisabled, 2);
     assert.equal(written.authDisabledLastAt, 12345);
@@ -40,25 +40,25 @@ describe('createHeartbeat — beat()', () => {
   test('beat() returns the same snapshot it writes', () => {
     const dataDir = tmpDir();
     const gate = createAuthDisabledGate();
-    const hb = createHeartbeat({ dataDir, authDisabledGate: gate });
+    const hb = createHeartbeat({ dataDir, botName: 'shumabit', authDisabledGate: gate });
     const snap = hb.beat();
-    const written = JSON.parse(fs.readFileSync(path.join(dataDir, 'heartbeat.json'), 'utf8'));
+    const written = JSON.parse(fs.readFileSync(hb.file, 'utf8'));
     assert.deepEqual(snap, written);
   });
 
   test('write is atomic (temp file does not linger after a successful beat)', () => {
     const dataDir = tmpDir();
     const gate = createAuthDisabledGate();
-    const hb = createHeartbeat({ dataDir, authDisabledGate: gate });
+    const hb = createHeartbeat({ dataDir, botName: 'shumabit', authDisabledGate: gate });
     hb.beat();
     const entries = fs.readdirSync(dataDir);
-    assert.deepEqual(entries, ['heartbeat.json']);
+    assert.deepEqual(entries, [path.basename(hb.file)]);
   });
 
   test('a write failure is caught, logged, and does not throw out of beat()', (t) => {
     const dataDir = tmpDir();
     const gate = createAuthDisabledGate();
-    const hb = createHeartbeat({ dataDir, authDisabledGate: gate });
+    const hb = createHeartbeat({ dataDir, botName: 'shumabit', authDisabledGate: gate });
 
     const originalWrite = fs.writeFileSync;
     fs.writeFileSync = () => { throw new Error('disk full'); };
@@ -74,26 +74,74 @@ describe('createHeartbeat — beat()', () => {
   });
 });
 
+// Every bot on a host runs from the same DATA_DIR (polygram.js derives it from
+// process.cwd(), and the fleet starts each --bot from one directory), so the
+// heartbeat path must be per-bot. Sharing it lets a live bot's beat masquerade as
+// a dead one's, which defeats the file's only purpose, and makes the two daemons
+// race on one temp name — the losing rename ENOENTs every minute.
+describe('createHeartbeat — one file per bot in a shared data dir', () => {
+  test('two bots in one data dir keep separate heartbeats', () => {
+    const dataDir = tmpDir();
+    const a = createHeartbeat({
+      dataDir, botName: 'shumabit', authDisabledGate: createAuthDisabledGate(), now: () => 111,
+    });
+    const b = createHeartbeat({
+      dataDir, botName: 'umi-assistant', authDisabledGate: createAuthDisabledGate(), now: () => 222,
+    });
+
+    a.beat();
+    b.beat();
+
+    assert.notEqual(a.file, b.file, 'each bot must own its heartbeat path');
+    assert.equal(JSON.parse(fs.readFileSync(a.file, 'utf8')).ts, 111);
+    assert.equal(JSON.parse(fs.readFileSync(b.file, 'utf8')).ts, 222,
+      'the second bot must not have overwritten the first');
+  });
+
+  test('bots do not share a temp file (the rename that loses the race ENOENTs)', (t) => {
+    const dataDir = tmpDir();
+    const a = createHeartbeat({ dataDir, botName: 'shumabit', authDisabledGate: createAuthDisabledGate() });
+    const b = createHeartbeat({ dataDir, botName: 'umi-assistant', authDisabledGate: createAuthDisabledGate() });
+
+    const written = [];
+    const realWrite = fs.writeFileSync;
+    t.mock.method(fs, 'writeFileSync', (p, ...rest) => { written.push(p); return realWrite(p, ...rest); });
+
+    a.beat();
+    b.beat();
+
+    assert.equal(written.length, 2);
+    assert.notEqual(written[0], written[1], 'concurrent bots must not write the same temp path');
+  });
+
+  test('a bot name that is a path traversal cannot escape the data dir', () => {
+    const dataDir = tmpDir();
+    const hb = createHeartbeat({ dataDir, botName: '../escaped', authDisabledGate: createAuthDisabledGate() });
+    hb.beat();
+    assert.equal(path.dirname(path.resolve(hb.file)), path.resolve(dataDir));
+  });
+});
+
 describe('createHeartbeat — start()/stop() lifecycle', () => {
   test('start() beats immediately and on the interval; stop() halts it', (t) => {
     t.mock.timers.enable({ apis: ['setInterval'] });
     const dataDir = tmpDir();
     const gate = createAuthDisabledGate();
-    const hb = createHeartbeat({ dataDir, authDisabledGate: gate, intervalMs: 1000 });
+    const hb = createHeartbeat({ dataDir, botName: 'shumabit', authDisabledGate: gate, intervalMs: 1000 });
 
     hb.start();
-    assert.ok(fs.existsSync(path.join(dataDir, 'heartbeat.json')), 'beats immediately on start()');
+    assert.ok(fs.existsSync(hb.file), 'beats immediately on start()');
 
-    const before = fs.readFileSync(path.join(dataDir, 'heartbeat.json'), 'utf8');
+    const before = fs.readFileSync(hb.file, 'utf8');
     gate.noteFailure();
     t.mock.timers.tick(1000);
-    const after = fs.readFileSync(path.join(dataDir, 'heartbeat.json'), 'utf8');
+    const after = fs.readFileSync(hb.file, 'utf8');
     assert.notEqual(before, after, 'a subsequent interval tick beats again');
 
     hb.stop();
-    const afterStop = fs.readFileSync(path.join(dataDir, 'heartbeat.json'), 'utf8');
+    const afterStop = fs.readFileSync(hb.file, 'utf8');
     gate.noteFailure();
     t.mock.timers.tick(5000);
-    assert.equal(fs.readFileSync(path.join(dataDir, 'heartbeat.json'), 'utf8'), afterStop, 'no further beats after stop()');
+    assert.equal(fs.readFileSync(hb.file, 'utf8'), afterStop, 'no further beats after stop()');
   });
 });
