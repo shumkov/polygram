@@ -404,6 +404,33 @@ describe('owned Codex native-beta runtime profile', () => {
     assert.equal(clients[0].closed, 1);
   });
 
+  test('VPS Codex 0.145.0 disabled empty project layer is accepted', async (t) => {
+    const f = fixture(t);
+    const results = projectedResults(f, {
+      layers: [{
+        type: 'project',
+        version: `sha256:${digest({})}`,
+        disabled: true,
+        configSha256: digest({}),
+      }, {
+        type: 'user',
+        version: `sha256:${digest(ownedConfig(f))}`,
+        disabled: false,
+        configSha256: digest(ownedConfig(f)),
+      }, {
+        type: 'system',
+        version: `sha256:${digest({})}`,
+        disabled: false,
+        configSha256: digest({}),
+      }],
+    });
+    const { builder } = createBuilder(f, results);
+
+    const profile = await builder.prepare(prepareOptions(f));
+
+    assert.deepEqual(profile.expectedLayers, results['config/read'].layers);
+  });
+
   test('rejects an opposite-target binary receipt before starting a client', async (t) => {
     const f = fixture(t);
     const { builder, clients } = createBuilder(f);
@@ -795,6 +822,31 @@ describe('owned Codex native-beta runtime profile', () => {
         }],
       }),
     }, {
+      name: 'owned user layer disabled',
+      mutate: (f) => projectedResults(f, {
+        layers: [{
+          type: 'user',
+          version: 'user-v1',
+          disabled: true,
+          configSha256: digest(ownedConfig(f)),
+        }],
+      }),
+    }, {
+      name: 'empty system layer disabled',
+      mutate: (f) => projectedResults(f, {
+        layers: [{
+          type: 'system',
+          version: 'system-v1',
+          disabled: true,
+          configSha256: digest({}),
+        }, {
+          type: 'user',
+          version: 'user-v1',
+          disabled: false,
+          configSha256: digest(ownedConfig(f)),
+        }],
+      }),
+    }, {
       name: 'unexpected project layer',
       mutate: (f) => projectedResults(f, {
         layers: [{
@@ -804,9 +856,59 @@ describe('owned Codex native-beta runtime profile', () => {
           configSha256: digest(ownedConfig(f)),
         }, {
           type: 'project',
-          version: 'project-v1',
+          version: `sha256:${digest({})}`,
           disabled: false,
           configSha256: digest({}),
+        }],
+      }),
+    }, {
+      name: 'disabled project layer with configuration',
+      mutate: (f) => projectedResults(f, {
+        layers: [{
+          type: 'project',
+          version: `sha256:${digest({ trust_level: 'trusted' })}`,
+          disabled: true,
+          configSha256: digest({ trust_level: 'trusted' }),
+        }, {
+          type: 'user',
+          version: 'user-v1',
+          disabled: false,
+          configSha256: digest(ownedConfig(f)),
+        }],
+      }),
+    }, {
+      name: 'duplicate disabled project layer',
+      mutate: (f) => projectedResults(f, {
+        layers: [{
+          type: 'project',
+          version: `sha256:${digest({})}`,
+          disabled: true,
+          configSha256: digest({}),
+        }, {
+          type: 'project',
+          version: `sha256:${digest({})}`,
+          disabled: true,
+          configSha256: digest({}),
+        }, {
+          type: 'user',
+          version: 'user-v1',
+          disabled: false,
+          configSha256: digest(ownedConfig(f)),
+        }],
+      }),
+    }, {
+      name: 'disabled project layer version drift',
+      mutate: (f) => projectedResults(f, {
+        layers: [{
+          type: 'project',
+          version: 'project-v1',
+          disabled: true,
+          configSha256: digest({}),
+        }, {
+          type: 'user',
+          version: 'user-v1',
+          disabled: false,
+          configSha256: digest(ownedConfig(f)),
         }],
       }),
     }, {
