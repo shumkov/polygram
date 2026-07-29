@@ -255,6 +255,24 @@ test('a rejection naming the rich_message FIELD disables both verbs at once', as
   assert.equal(fleet.editUnsupported(), true);
 });
 
+test('a field rejection heard on the EDIT verb disables the reply path too — INTENDED', async () => {
+  // Deliberately pinned so it is not re-litigated as a leak in the per-verb
+  // rule. The rule is about EVIDENCE, not about which path collected it:
+  // `rich_message` is the same field on both requests, so a server that
+  // answers "unknown field rich_message" to an edit would answer it to a send.
+  // Continuing to author rich replies at that server would cost a failed
+  // attempt and a fallback on every single one.
+  //
+  // The narrower direction — a bare 404 or a missing METHOD on the edit verb —
+  // is what must NOT touch the reply path, and the tests above pin that.
+  const fleet = buildFleet();
+
+  await fleet.edit(err('Bad Request: unknown field rich_message'));
+
+  assert.equal(fleet.editUnsupported(), true, 'the verb that heard it');
+  assert.equal(fleet.sendUnsupported(), true, 'and the verb that carries the same field');
+});
+
 test('a missing-METHOD rejection disables only the verb that is missing', async () => {
   // "method sendRichMessage not found" says nothing about editMessageText.
   const fleet = buildFleet();

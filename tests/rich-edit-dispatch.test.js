@@ -94,13 +94,73 @@ test('a checklist past the rich cap plans plain but still names the RICH ceiling
 
 test('the cap is measured on the STRIPPED body, like every other gate', () => {
   const { strategy } = build();
-  // Media markdown that collapses to a two-char caption: the stripped body is
-  // what a decline delivers and what the rich renderer sees, so it is what the
-  // ceiling applies to.
-  const media = `![ab](${'/x'.repeat(200)}.png)`;
-  const out = plan(strategy, `${CHECKED}\n${media}`);
+  // Raw text PAST the rich ceiling that strips to well under it: measuring the
+  // source instead of the body would refuse this edit outright. One long
+  // caption-less image line per media item, so the projection is what shrinks
+  // it — not the checklist.
+  const media = Array.from({ length: 40 }, (_, i) => `![ab](/${'x'.repeat(1000)}-${i}.png)`).join('\n');
+  const raw = `${CHECKED}\n${media}`;
+  assert.ok(raw.length > RICH_MAX_LEN, 'the SOURCE busts the ceiling by construction');
+  const out = plan(strategy, raw);
+  assert.ok(out.text.length < RICH_MAX_LEN, 'the stripped body does not');
+  assert.equal(out.mode, 'rich', 'measured after the strip, not before');
+});
+
+// ─── the gate is a pattern; the tree is the verdict ───────────────────────
+
+test('a table-row pattern that builds no table is prose — plain, on the plain cap', () => {
+  // `---|` satisfies the table-row gate but marked needs a header row, so the
+  // render is paragraphs and nothing else. Left alone, 5k of prose would ship
+  // as a rich document AND take the 32k ceiling on structure it never had.
+  const { strategy } = build();
+  const out = plan(strategy, `---|\n${'ordinary prose. '.repeat(320)}`);
+  assert.equal(out.mode, 'plain');
+  assert.equal(out.maxLen, 4000, 'no structure, no rich ceiling');
+});
+
+test('a divider IS structure — 6k of prose plus one `---` keeps the rich ceiling', () => {
+  // Deliberate, not an oversight: the same trigger set the REPLY path uses, so
+  // an edit renders the way the reply that created the bubble did. The check
+  // above is about patterns that produced NO structure, not about which
+  // structures count.
+  const { strategy } = build();
+  const out = plan(strategy, `${'ordinary prose. '.repeat(400)}\n\n---\n`);
   assert.equal(out.mode, 'rich');
-  assert.ok(out.text.length < CHECKED.length + 20, 'measured after the strip, not before');
+  assert.equal(out.maxLen, RICH_MAX_LEN);
+  assert.ok(out.blocks.some(b => b.type === 'divider'), 'the divider is the structure');
+});
+
+test('a blockquote-only 6k body is rich too, by the same rule', () => {
+  const { strategy } = build();
+  const out = plan(strategy, `> ${'quoted prose. '.repeat(430)}`);
+  assert.equal(out.mode, 'rich');
+  assert.equal(out.maxLen, RICH_MAX_LEN);
+  assert.ok(out.blocks.some(b => b.type === 'blockquote'));
+});
+
+test('a heading-triggered body is rich — the gate and the tree agree', () => {
+  const { strategy } = build();
+  const out = plan(strategy, `# Report\n\n${'prose. '.repeat(50)}`);
+  assert.equal(out.mode, 'rich');
+  assert.ok(out.blocks.some(b => b.type === 'heading'));
+});
+
+// ─── fragments: an edit is complete text, not a stream tick ───────────────
+
+test('a bare `![alt` literal survives an edit projection', () => {
+  // The streaming projection cuts it because the path may still be arriving.
+  // Nothing is arriving here, so cutting it eats the end of a finished
+  // sentence — and there is no path in it to leak.
+  const { strategy } = build();
+  const out = plan(strategy, `${CHECKED}\n\nthe syntax is ![alt`);
+  assert.match(out.text, /the syntax is !\[alt/);
+});
+
+test('an unterminated fragment that DOES carry a path still dies', () => {
+  const { strategy } = build();
+  const out = plan(strategy, `${CHECKED}\n\nhere it is ![a](/Users/me/secret`);
+  assert.doesNotMatch(out.text, /\/Users\/me\/secret/);
+  assert.match(out.text, /here it is/, 'only the fragment goes, not the line');
 });
 
 // ─── media stays out ──────────────────────────────────────────────────────
@@ -108,7 +168,10 @@ test('the cap is measured on the STRIPPED body, like every other gate', () => {
 test('rendering runs on media-stripped text — no resolver, no local paths in blocks', () => {
   const seen = [];
   const { strategy } = build({
-    toRichBlocks: (markdown, opts) => { seen.push({ markdown, opts }); return { blocks: [{ type: 'paragraph', text: markdown }], usedRich: true }; },
+    // A heading, not a paragraph: this test is about what the renderer is
+    // HANDED, and a paragraph-only tree is now demoted before the assertions
+    // about the handed text could run.
+    toRichBlocks: (markdown, opts) => { seen.push({ markdown, opts }); return { blocks: [{ type: 'heading', text: markdown }], usedRich: true }; },
   });
   const out = plan(strategy, `${CHECKED}\n![shot](/tmp/secret-path.png)`);
   assert.equal(out.mode, 'rich');
@@ -148,7 +211,7 @@ test('inline styling is re-read per edit and passed to the renderer', () => {
   const seen = [];
   const { strategy } = build({
     isInlineStylingEnabled: () => styling,
-    toRichBlocks: (markdown, opts) => { seen.push(opts.inlineStyling); return { blocks: [{ type: 'paragraph', text: markdown }], usedRich: true }; },
+    toRichBlocks: (markdown, opts) => { seen.push(opts.inlineStyling); return { blocks: [{ type: 'heading', text: markdown }], usedRich: true }; },
   });
   plan(strategy, CHECKED);
   styling = false;   // the styling latch trips mid-session

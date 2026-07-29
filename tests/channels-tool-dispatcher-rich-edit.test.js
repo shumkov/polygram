@@ -29,6 +29,7 @@ const { createChannelsToolDispatcher } = require('../lib/process/channels-tool-d
 const { createRichEditStrategy } = require('../lib/telegram/rich-edit-dispatch');
 const { createRichEditor } = require('../lib/telegram/rich-edit');
 const { RICH_MAX_LEN } = require('../lib/telegram/rich');
+const { redactBotToken } = require('../lib/error/net');
 
 const fakeBot = {};
 const quietLogger = { warn: () => {}, error: () => {}, log: () => {}, debug: () => {} };
@@ -176,6 +177,60 @@ test('a planner that throws costs the styling, never the edit', async () => {
   assert.equal(sent.filter(c => c.method === 'editMessageText').length, 1);
 });
 
+test('the planner-failure fallback is PROJECTED, not the raw text', async () => {
+  // The seed is what a broken planner delivers. In a rich-enabled chat the
+  // invariant is that no branch renders a local path — including this one, the
+  // branch nobody looks at. Same projection the chunked reply path uses.
+  const strategy = { plan: () => { throw new Error('planner broke'); }, edit: async () => ({ wentRich: true }) };
+  const { own, edit, sent } = build({
+    richEdit: strategy,
+    projectFallbackText: (text) => text.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1'),
+  });
+  await own();
+  const res = await edit('progress ![shot](/tmp/secret-path.png)');
+  assert.equal(res.ok, true);
+  const params = sent.filter(c => c.method === 'editMessageText').at(-1).params;
+  assert.equal(params.text, 'progress shot');
+  assert.doesNotMatch(params.text, /secret-path/, 'a broken planner must not leak what a working one strips');
+});
+
+test('a projection that throws still delivers the edit', async () => {
+  const { own, edit, sent } = build({
+    projectFallbackText: () => { throw new Error('projection broke'); },
+  });
+  await own();
+  assert.equal((await edit('halfway there')).ok, true);
+  assert.equal(sent.filter(c => c.method === 'editMessageText').at(-1).params.text, 'halfway there');
+});
+
+test('a rich plan with no blocks is demoted WHOLE — mode and ceiling together', async () => {
+  // Taking the mode on trust means finding out from inside the try, after the
+  // edit landed, and reporting ok:false on a delivered edit. Keeping the rich
+  // CEILING while demoting the mode would be worse: a 10k plain edit.
+  const strategy = {
+    plan: ({ text }) => ({ mode: 'rich', text, maxLen: RICH_MAX_LEN }),   // blocks omitted
+    edit: async () => { throw new Error('edit() must never be reached'); },
+  };
+  const { own, edit, sent } = build({ richEdit: strategy, maxChunkLen: 4000 });
+  await own();
+  const short = await edit(CHECKED);
+  assert.equal(short.ok, true, 'delivered by the plain path instead');
+  assert.equal(sent.filter(c => c.method === 'editMessageText').length, 1);
+  const long = await edit('z'.repeat(10_000));
+  assert.equal(long.ok, false);
+  assert.match(long.error, /4000/, 'the plain cap came back with the plain mode');
+});
+
+test('an empty blocks array is not a rich plan either', async () => {
+  const strategy = {
+    plan: ({ text }) => ({ mode: 'rich', text, blocks: [], maxLen: RICH_MAX_LEN }),
+    edit: async () => { throw new Error('edit() must never be reached'); },
+  };
+  const { own, edit } = build({ richEdit: strategy });
+  await own();
+  assert.equal((await edit(CHECKED)).ok, true, 'an empty payload is one Telegram refuses anyway');
+});
+
 test('an edit whose body strips to nothing is refused with something actionable', async () => {
   const strategy = {
     plan: (args) => ({ mode: 'plain', text: '', maxLen: 4000, planned: args }),
@@ -229,19 +284,59 @@ test('a transient rich-edit error becomes {ok:false}, not a dispatcher crash', a
   assert.match(res.error, /bad gateway/);
 });
 
-test('a rich-edit failure is redacted before the agent sees it', async () => {
+test('a rich-edit failure is redacted before the agent sees it — and before it is logged', async () => {
   // Network error shapes embed the request URL, which carries the bot token.
+  // Wired with the PRODUCTION redactor (polygram passes redactBotToken here),
+  // because a test that supplies its own proves the dispatcher calls SOMETHING,
+  // not that the thing it calls removes a real token.
   const { strategy } = stubStrategy({
-    edit: async () => { throw new Error('request to https://api.telegram.org/bot123:SECRET/editMessageText failed'); },
+    edit: async () => { throw new Error('request to https://api.telegram.org/bot8012345678:AAH9xQ-fake_TOKEN_value/editMessageText failed'); },
   });
+  const logged = [];
   const { own, edit } = build({
     richEdit: strategy,
-    redactError: (s) => String(s).replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot<redacted>'),
+    redactError: redactBotToken,
+    logger: { ...quietLogger, error: (m) => logged.push(String(m)) },
   });
   await own();
   const res = await edit(CHECKED);
   assert.equal(res.ok, false);
-  assert.doesNotMatch(res.error, /SECRET/);
+  assert.doesNotMatch(res.error, /AAH9xQ-fake_TOKEN_value/, 'the agent never sees the token');
+  assert.ok(logged.length > 0, 'the failure is logged');
+  for (const line of logged) {
+    assert.doesNotMatch(line, /AAH9xQ-fake_TOKEN_value/, 'nor does the operator log');
+  }
+});
+
+test('a server-refused rich edit past the plain cap explains itself', async () => {
+  // The one over-cap case no pre-flight can catch: the plan was rich and legal,
+  // the SERVER refused the render, and rich-edit's plain fallback then carried
+  // a body past the single-bubble cap. Telegram's raw "message is too long"
+  // reads as an arithmetic error by the agent; the real story is that the
+  // structure it counted on was refused.
+  const { strategy } = stubStrategy({
+    edit: async () => { throw new Error('Bad Request: message is too long'); },
+  });
+  const { own, edit } = build({ richEdit: strategy, maxChunkLen: 4000 });
+  await own();
+  const res = await edit(`${CHECKED}\n${'- [ ] step\n'.repeat(1000)}`);
+  assert.equal(res.ok, false);
+  assert.match(res.error, /rich rendering was refused/i);
+  assert.match(res.error, /4000/, 'names the cap the fallback ran into');
+  assert.match(res.error, /reply/, 'says what to do instead');
+  assert.match(res.error, /message is too long/, 'the underlying error is still there to debug with');
+});
+
+test('a rich edit that fails UNDER the plain cap keeps the plain error', async () => {
+  const { strategy } = stubStrategy({
+    edit: async () => { throw new Error('TG 400: message to edit not found'); },
+  });
+  const { own, edit } = build({ richEdit: strategy, maxChunkLen: 4000 });
+  await own();
+  const res = await edit(CHECKED);
+  assert.equal(res.ok, false);
+  assert.doesNotMatch(res.error, /rich rendering was refused/i, 'length was never the problem here');
+  assert.match(res.error, /message to edit not found/);
 });
 
 // ─── ownership is unchanged ───────────────────────────────────────────────
@@ -314,6 +409,48 @@ test('persisting the transcript can never cost a delivered edit', async () => {
   await own();
   const res = await edit(CHECKED);
   assert.equal(res.ok, true, 'the edit landed; the row is the lesser loss');
+});
+
+// ─── the caps, through the REAL planner ───────────────────────────────────
+
+test('real planner: a 40k rich-shaped edit is refused against 32768, with zero tg calls', async () => {
+  // The stubbed cap tests pin the seam; this one pins the number the agent
+  // actually gets in production, from the planner that actually decides it.
+  const calls = [];
+  const strategy = createRichEditStrategy({
+    editRich: async (args) => { calls.push(args); return { wentRich: true }; },
+    isRichTextEnabled: () => true,
+    logger: quietLogger,
+  });
+  const { own, edit, sent } = build({ richEdit: strategy, maxChunkLen: 4000 });
+  await own();
+  const before = sent.length;
+  const body = `# Report\n\n${'prose. '.repeat(6000)}`;              // ~42k, heading-triggered
+  const res = await edit(body);
+  assert.equal(res.ok, false);
+  assert.match(res.error, new RegExp(`${body.length} > ${RICH_MAX_LEN}`),
+    'the real ceiling, on the real body length');
+  assert.equal(calls.length, 0, 'the rich editor was never called');
+  assert.equal(sent.length, before, 'and nothing reached Telegram');
+});
+
+test('real planner: prose that only LOOKS structural is refused against 4000', async () => {
+  // `---|` satisfies the table-row pattern but builds no table, so the render
+  // is paragraph-only: prose, on the plain cap — not a 32k rich document.
+  const calls = [];
+  const strategy = createRichEditStrategy({
+    editRich: async (args) => { calls.push(args); return { wentRich: true }; },
+    isRichTextEnabled: () => true,
+    logger: quietLogger,
+  });
+  const { own, edit, sent } = build({ richEdit: strategy, maxChunkLen: 4000 });
+  await own();
+  const before = sent.length;
+  const res = await edit(`---|\n${'ordinary prose. '.repeat(400)}`);   // ~6.4k
+  assert.equal(res.ok, false);
+  assert.match(res.error, /> 4000/, 'no structure means no rich ceiling');
+  assert.equal(calls.length, 0);
+  assert.equal(sent.length, before);
 });
 
 // ─── the canonical flow, through the real strategy + the real rich editor ──

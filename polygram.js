@@ -405,7 +405,11 @@ let richKnownUnsupported = false;
 // Separate verdict for the newer sendRichMessage verb. A server can implement
 // editMessageText{rich_message} and not this one, answering it with a bare
 // 404 — a single shared flag would let the reply tool's probe permanently
-// disable the streamer's working rich edits.
+// disable the streamer's working rich edits. Separate does not mean sealed:
+// verb-specific evidence (a bare 404, a missing METHOD) stays per verb, while
+// a rejection of the shared `rich_message` FIELD condemns both by design —
+// the same field rides both requests, so a server that cannot read it on one
+// cannot read it on the other.
 let richSendKnownUnsupported = false;
 // A THIRD verdict, and deliberately not one of the two above. Those answer
 // "can this server do rich at all", and tripping either costs every heading,
@@ -3280,7 +3284,9 @@ async function main() {
     // ONE latch decision for both rich paths. They set the same flag, so a
     // counter owned by either would let that path latch on its first bare
     // 404 while the other still believed two were required.
-    // One strike counter, one verdict per verb.
+    // One strike counter; verdicts follow the evidence — per verb for a bare
+    // 404 or a missing method, both verbs for a rejection of the shared
+    // rich_message field.
     const richCapabilityLatch = createRichCapabilityLatch({
       isExplicit: isRichCapabilityErrorExplicit,
       isFieldRejection: isRichMessageFieldRejection,
