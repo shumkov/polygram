@@ -411,6 +411,51 @@ describe('stripMediaMarkdown', () => {
     const md = '```\n![x](/keep/me\n```';
     assert.equal(stripMediaMarkdown(md), md);
   });
+
+  // keepPathlessFragments: for text that is COMPLETE on arrival — a tool edit
+  // rather than a stream tick — nothing can finish a dangling "![alt", so the
+  // streaming rule that cuts it just eats the tail of a finished sentence.
+  // Only a fragment that can actually expose a path still goes.
+  describe('keepPathlessFragments (complete text, not a stream tick)', () => {
+    const strip = (md) => stripMediaMarkdown(md, { keepPathlessFragments: true });
+
+    test('a pathless opener survives as the literal the author wrote', () => {
+      assert.equal(strip('the syntax is ![alt'), 'the syntax is ![alt');
+      assert.equal(strip('write ![alt] to caption'), 'write ![alt] to caption');
+      assert.equal(strip('then ![alt]('), 'then ![alt](');
+    });
+
+    test('a fragment carrying a path still dies, and takes only itself', () => {
+      assert.equal(strip('Here it is ![shot](/Users/me/secret/pa'), 'Here it is ');
+      assert.equal(strip('broken ![x](/etc/passwd\nnext line'), 'broken \nnext line');
+    });
+
+    test('a Windows-style separator counts as a path', () => {
+      assert.equal(strip('shot ![x](C:\\Users\\me\\secret'), 'shot ');
+    });
+
+    test('an unreadable tail hiding a COMPLETE path is still dropped whole', () => {
+      // The first construct fails to parse (its `]` is not followed by `(`),
+      // so the parser stops there — and everything after is kept or dropped as
+      // one piece. Keeping it would publish /real/path.png as literal text,
+      // which no rule about fragments should ever buy.
+      const out = strip('![a] ![b](/real/path.png)');
+      assert.ok(!out.includes('/real/path.png'), out);
+    });
+
+    test('complete constructs still degrade to their captions, exactly as before', () => {
+      assert.equal(strip('see ![the fix](/abs/p.png) here'), 'see the fix here');
+      assert.equal(
+        strip('<tg-collage>\n![a](/x.png)\n</tg-collage>'),
+        stripMediaMarkdown('<tg-collage>\n![a](/x.png)\n</tg-collage>'),
+        'the option changes unterminated fragments and nothing else',
+      );
+    });
+
+    test('the default is untouched — every streaming caller keeps the old cut', () => {
+      assert.equal(stripMediaMarkdown('typing ![alt'), 'typing ');
+    });
+  });
 });
 
 // ─── Resolver trust boundary ─────────────────────────────────────────

@@ -148,6 +148,7 @@ const { createRichStylingLatch } = require('./lib/telegram/rich-styling-latch');
 const MEDIA_ONLY_FALLBACK_TEXT = '(media unavailable)';
 const { createRichSender } = require('./lib/telegram/rich-send');
 const { createRichDeliveryFactory } = require('./lib/telegram/rich-dispatch');
+const { createRichEditStrategy } = require('./lib/telegram/rich-edit-dispatch');
 const { composeDeliverTextFactories } = require('./lib/telegram/deliver-strategy');
 const { buildPolygramDisplayHint } = require('./lib/telegram/display-hint');
 const { redactBotToken, stripUrlCredentials } = require('./lib/error/net');
@@ -404,7 +405,11 @@ let richKnownUnsupported = false;
 // Separate verdict for the newer sendRichMessage verb. A server can implement
 // editMessageText{rich_message} and not this one, answering it with a bare
 // 404 — a single shared flag would let the reply tool's probe permanently
-// disable the streamer's working rich edits.
+// disable the streamer's working rich edits. Separate does not mean sealed:
+// verb-specific evidence (a bare 404, a missing METHOD) stays per verb, while
+// a rejection of the shared `rich_message` FIELD condemns both by design —
+// the same field rides both requests, so a server that cannot read it on one
+// cannot read it on the other.
 let richSendKnownUnsupported = false;
 // A THIRD verdict, and deliberately not one of the two above. Those answer
 // "can this server do rich at all", and tripping either costs every heading,
@@ -3279,7 +3284,9 @@ async function main() {
     // ONE latch decision for both rich paths. They set the same flag, so a
     // counter owned by either would let that path latch on its first bare
     // 404 while the other still believed two were required.
-    // One strike counter, one verdict per verb.
+    // One strike counter; verdicts follow the evidence — per verb for a bare
+    // 404 or a missing method, both verbs for a rejection of the shared
+    // rich_message field.
     const richCapabilityLatch = createRichCapabilityLatch({
       isExplicit: isRichCapabilityErrorExplicit,
       isFieldRejection: isRichMessageFieldRejection,
@@ -3720,6 +3727,28 @@ async function main() {
     }),
   ]);
 
+  // The edit tool's counterpart to the reply chain above. An agent that posts
+  // a checklist through `reply` gets a rich bubble; without this it could
+  // never tick an item off, because every edit re-sent that bubble as flat
+  // text. Same renderer, same per-chat gate, same capability latch — the EDIT
+  // verb's latch, which is the one richEditMessageText itself consults.
+  const richEditStrategy = createRichEditStrategy({
+    editRich: ({ chatId, threadId, messageId, blocks, sourceText }) => richEditMessageText({
+      bot, chatId, threadId, messageId, blocks, sourceText,
+      // A tool edit is a finished bubble, not a streaming tick.
+      phase: 'final',
+      // No mediaContext on purpose: this path renders media-stripped text, so
+      // there is nothing to preflight, evict or rescue. Media in an edit
+      // degrades to caption text, exactly as on every other path that cannot
+      // upload it.
+    }),
+    isRichTextEnabled: (chatId, threadId) => resolveRichTextEnabled(config, chatId, threadId),
+    getRichKnownUnsupported: () => richKnownUnsupported,
+    isInlineStylingEnabled: () => !richInlineStylingUnsupported,
+    redactError: redactBotToken,
+    logger: console,
+  });
+
   // 0.11.0: channels backend wiring. Used when a chat opts in via
   // `pm: 'channels'` config. Falls back to SDK gracefully if the pinned
   // claude binary isn't present (see factory.js — channelsClaudeBin
@@ -3751,6 +3780,11 @@ async function main() {
       logEvent('deliver-media-only-degraded', { chat_id: chatId, thread_id: threadId, bot: BOT_NAME });
       return MEDIA_ONLY_FALLBACK_TEXT;
     },
+    richEdit: richEditStrategy,
+    // An edit rewrites the bubble; nothing revisited its row, so the
+    // transcript kept whatever the original send captured — a checklist would
+    // be stored unticked forever. Same helper the streamer finalizes with.
+    persistEditedText: persistBubbleText,
     logEvent,
     logger: console,
   });
