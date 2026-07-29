@@ -148,6 +148,7 @@ const { createRichStylingLatch } = require('./lib/telegram/rich-styling-latch');
 const MEDIA_ONLY_FALLBACK_TEXT = '(media unavailable)';
 const { createRichSender } = require('./lib/telegram/rich-send');
 const { createRichDeliveryFactory } = require('./lib/telegram/rich-dispatch');
+const { createRichEditStrategy } = require('./lib/telegram/rich-edit-dispatch');
 const { composeDeliverTextFactories } = require('./lib/telegram/deliver-strategy');
 const { buildPolygramDisplayHint } = require('./lib/telegram/display-hint');
 const { redactBotToken, stripUrlCredentials } = require('./lib/error/net');
@@ -3720,6 +3721,28 @@ async function main() {
     }),
   ]);
 
+  // The edit tool's counterpart to the reply chain above. An agent that posts
+  // a checklist through `reply` gets a rich bubble; without this it could
+  // never tick an item off, because every edit re-sent that bubble as flat
+  // text. Same renderer, same per-chat gate, same capability latch — the EDIT
+  // verb's latch, which is the one richEditMessageText itself consults.
+  const richEditStrategy = createRichEditStrategy({
+    editRich: ({ chatId, threadId, messageId, blocks, sourceText }) => richEditMessageText({
+      bot, chatId, threadId, messageId, blocks, sourceText,
+      // A tool edit is a finished bubble, not a streaming tick.
+      phase: 'final',
+      // No mediaContext on purpose: this path renders media-stripped text, so
+      // there is nothing to preflight, evict or rescue. Media in an edit
+      // degrades to caption text, exactly as on every other path that cannot
+      // upload it.
+    }),
+    isRichTextEnabled: (chatId, threadId) => resolveRichTextEnabled(config, chatId, threadId),
+    getRichKnownUnsupported: () => richKnownUnsupported,
+    isInlineStylingEnabled: () => !richInlineStylingUnsupported,
+    redactError: redactBotToken,
+    logger: console,
+  });
+
   // 0.11.0: channels backend wiring. Used when a chat opts in via
   // `pm: 'channels'` config. Falls back to SDK gracefully if the pinned
   // claude binary isn't present (see factory.js — channelsClaudeBin
@@ -3751,6 +3774,11 @@ async function main() {
       logEvent('deliver-media-only-degraded', { chat_id: chatId, thread_id: threadId, bot: BOT_NAME });
       return MEDIA_ONLY_FALLBACK_TEXT;
     },
+    richEdit: richEditStrategy,
+    // An edit rewrites the bubble; nothing revisited its row, so the
+    // transcript kept whatever the original send captured — a checklist would
+    // be stored unticked forever. Same helper the streamer finalizes with.
+    persistEditedText: persistBubbleText,
     logEvent,
     logger: console,
   });
