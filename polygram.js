@@ -134,7 +134,7 @@ const { chunkMarkdownText } = require('./lib/telegram/chunk');
 const {
   toTelegramRichBlocks, resolveRichTextEnabled, isRichCapabilityError, isRichContentError,
   isRichCapabilityErrorExplicit, isRichMessageFieldRejection, stripMediaMarkdown,
-  isRichLimitError,
+  isRichLimitError, blocksAreStyled,
 } = require('./lib/telegram/rich');
 const {
   makeRichMediaResolver,
@@ -1604,11 +1604,14 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // captures them. See stripInlineTagsForStreamer above.
     transformText: stripInlineTagsForStreamer,
     toRichPayload,
-    // "Still writing" on the growing bubble. Re-read per render like
-    // toRichPayload is: the styling latch can trip mid-turn, and a typed
-    // italic node injected after it has would make every payload look styled
-    // to a server that just said it refuses them.
-    toComposingMarker: () => composingMarker({ styled: !richInlineStylingUnsupported }),
+    // "Still writing" on the growing bubble. The marker matches the styling
+    // of what it decorates rather than what the transport can carry: rich-edit
+    // records a styling verdict for any payload blocksAreStyled() calls
+    // styled, and a typed node on flat content would make those verdicts —
+    // strike runs reset, flatten retries paid — be about polygram's own
+    // decoration. Reading the latch instead is not enough: it says what is
+    // POSSIBLE, and the content is what is actually there.
+    toComposingMarker: ({ blocks }) => composingMarker({ styled: blocksAreStyled(blocks || []) }),
     onRichUpgrade: () => {
       // Record the visible transition when an existing plain bubble
       // becomes rich during streaming.
@@ -1621,7 +1624,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     onNonCumulativeSnapshot: ({ prevLen, newLen }) => {
       logEvent('stream-noncumulative', {
         chat_id: chatId, thread_id: threadId, bot: BOT_NAME,
-        turn_id: dispatchedTurnId,
+        session_key: sessionKey, turn_id: dispatchedTurnId,
         prev_len: prevLen, new_len: newLen,
       });
     },

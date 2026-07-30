@@ -312,7 +312,12 @@ describe('composing marker — caps are measured on content', () => {
     assert.equal(h.lastEdit().payload.length, maxLen);
   });
 
-  test('plain: an over-cap body is truncated as before and still drops the marker', async () => {
+  test('plain: an over-cap body keeps the marker by riding inside the elision', async () => {
+    // A preview past the cap is ALREADY a lossy view — the full text arrives
+    // at finalize. Reserving the marker's room inside that elision costs no
+    // content anyone would otherwise have read, and a long reply is exactly
+    // the case where "still writing" is worth most. Dropping the marker here
+    // would mean the bubbles that stream longest never show it.
     const maxLen = 200;
     const h = makeHarness({ maxLen });
     await h.streamer.onChunk('начало');
@@ -321,8 +326,68 @@ describe('composing marker — caps are measured on content', () => {
     await h.advance(500);
 
     const payload = h.lastEdit().payload;
-    assert.equal(payload.length, maxLen);
-    assert.ok(payload.endsWith('...'), 'the live-truncation contract is unchanged');
+    assert.equal(payload.length, maxLen, 'the bubble still fits exactly one message');
+    assert.ok(payload.endsWith(COMPOSING_MARKER_SUFFIX));
+    const content = payload.slice(0, -COMPOSING_MARKER_SUFFIX.length);
+    assert.ok(content.endsWith('...'), 'the live-truncation contract is unchanged');
+  });
+});
+
+describe('composing marker — it must not speak for the agent', () => {
+  // rich-edit.js records a styling verdict whenever blocksAreStyled(blocks)
+  // is true, and rich-styling-latch.recordHealthyOutcome() resets the strike
+  // run. A marker that is styled regardless of its content would make
+  // polygram's own decoration the thing those verdicts are about.
+  const FLAT_BLOCKS = [{ type: 'heading', text: 'Отчёт' }, { type: 'paragraph', text: 'Простой текст.' }];
+  const STYLED_BLOCKS = [{ type: 'paragraph', text: [{ type: 'bold', text: 'важно' }] }];
+
+  function harnessFor(blocks) {
+    const seen = [];
+    const h = makeHarness({
+      toRichPayload: () => ({ blocks, usedRich: true }),
+      toComposingMarker: (ctx) => {
+        seen.push(ctx);
+        const { blocksAreStyled } = require('../lib/telegram/rich');
+        return composingMarker({ styled: blocksAreStyled(ctx?.blocks || []) });
+      },
+    });
+    return { h, seen };
+  }
+
+  test('the builder is handed the content blocks it has to agree with', async () => {
+    const { h, seen } = harnessFor(FLAT_BLOCKS);
+    await h.streamer.onChunk('первый фрагмент');
+    await h.advance(500);
+    await h.streamer.onChunk('первый фрагмент и ещё');
+    await h.advance(500);
+
+    assert.ok(seen.length > 0, 'the marker builder must be called for a rich render');
+    assert.deepEqual(seen[seen.length - 1].blocks, FLAT_BLOCKS);
+  });
+
+  test('flat content gets a flat marker — the payload stays unstyled', async () => {
+    const { blocksAreStyled } = require('../lib/telegram/rich');
+    const { h } = harnessFor(FLAT_BLOCKS);
+    await h.streamer.onChunk('первый фрагмент');
+    await h.advance(500);
+    await h.streamer.onChunk('первый фрагмент и ещё');
+    await h.advance(500);
+
+    const { blocks } = h.lastEdit().payload;
+    assert.ok(carriesMarker(h.lastEdit().payload), 'precondition: the marker is there');
+    assert.equal(blocksAreStyled(blocks), false,
+      'polygram decoration must never be the reason a payload counts as styled');
+  });
+
+  test('styled content gets the styled marker', async () => {
+    const { h } = harnessFor(STYLED_BLOCKS);
+    await h.streamer.onChunk('первый фрагмент');
+    await h.advance(500);
+    await h.streamer.onChunk('первый фрагмент и ещё');
+    await h.advance(500);
+
+    const { blocks } = h.lastEdit().payload;
+    assert.deepEqual(blocks[blocks.length - 1], composingMarker({ styled: true }).block);
   });
 });
 

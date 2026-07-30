@@ -39,6 +39,9 @@ describe('polygram append-only guard wiring', () => {
     assert.match(wiring, /chat_id: chatId/);
     assert.match(wiring, /thread_id: threadId/);
     assert.match(wiring, /turn_id: dispatchedTurnId/);
+    // Every other polygram stream-* row carries it; a soak grouping by
+    // conversation should not have to special-case this one.
+    assert.match(wiring, /session_key: sessionKey/);
     // The two lengths are the evidence the snapshot GREW while losing text —
     // the property that makes this a contract violation and not a truncation.
     assert.match(wiring, /prev_len: prevLen/);
@@ -65,16 +68,17 @@ describe('polygram append-only guard wiring', () => {
 
 describe('polygram composing-marker wiring', () => {
   test('the streamer is given the marker builder', () => {
-    assert.match(source, /toComposingMarker: \(\) => composingMarker\(/,
+    assert.match(source, /toComposingMarker: \(\{ blocks \}\) => composingMarker\(/,
       'without it the growing bubble never says it is still being written');
   });
 
-  test('the marker shape follows the styling latch, per render', () => {
-    // A hard-coded typed node would make blocksAreStyled() true on every
-    // payload. Against a server that refuses typed nodes, each partial edit
-    // would take the styled→refused→flatten retry — two API calls per edit,
-    // and styling verdicts recorded against markup polygram injected rather
-    // than anything the agent wrote.
-    assert.match(source, /toComposingMarker: \(\) => composingMarker\(\{ styled: !richInlineStylingUnsupported \}\)/);
+  test('the marker matches the styling of the content it decorates', () => {
+    // Not the latch: that says what the transport CAN carry. blocksAreStyled
+    // reads the shape of what is actually being sent, and rich-edit records a
+    // styling verdict for anything it calls styled — so a typed node on flat
+    // content makes those verdicts (strike runs reset, flatten retries paid)
+    // be about markup polygram injected rather than the agent's own.
+    assert.match(source, /toComposingMarker: \(\{ blocks \}\) => composingMarker\(\{ styled: blocksAreStyled\(blocks \|\| \[\]\) \}\)/);
+    assert.doesNotMatch(source, /composingMarker\(\{ styled: !richInlineStylingUnsupported \}\)/);
   });
 });
