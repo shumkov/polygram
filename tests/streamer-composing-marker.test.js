@@ -1,7 +1,7 @@
 /**
  * The composing-tail marker on a growing preview bubble.
  *
- * A bubble that is still being written says so ("⏳ пишу дальше…"); a bubble
+ * A bubble that is still being written says so (the composing marker); a bubble
  * that is finished must never say it, not on the final frame and not on an
  * intermediate bubble left standing after the stream moved on. The marker is
  * presentation only: it is appended after the payload is planned, it never
@@ -170,7 +170,7 @@ describe('composing marker — the bubble must stop claiming it', () => {
   test('finalize still edits when the body is unchanged but the marker is on screen', async () => {
     // The no-op branches exist so an already-correct bubble is not re-edited.
     // With a marker showing, the bubble is NOT already correct — suppressing
-    // the edit here strands "⏳ пишу дальше…" on the final answer forever.
+    // the edit here strands the composing marker on the final answer forever.
     const h = makeHarness();
     await h.streamer.onChunk('Ответ целиком.');
     await h.advance(500);
@@ -562,5 +562,14 @@ describe('composingMarker shapes', () => {
 
   test('the plain suffix is a separate italic line', () => {
     assert.equal(COMPOSING_MARKER_SUFFIX, `\n\n_${COMPOSING_MARKER_TEXT}_`);
+  });
+
+  test('the marker is language-neutral — symbols only, no words', () => {
+    // The bot chats in whatever language the user does; a marker with words
+    // in it is wrong in every chat but one. Symbols carry "still writing"
+    // in all of them.
+    assert.doesNotMatch(COMPOSING_MARKER_TEXT, /\p{L}/u,
+      'no alphabetic characters in any script');
+    assert.ok(COMPOSING_MARKER_TEXT.length > 0, 'but it is not empty');
   });
 });
