@@ -29,11 +29,15 @@ function makeHarness({
   let now = 0;
   const timers = [];
 
-  const send = async (text) => {
+  // The send callback takes the same payload shapes as edit: a plain string,
+  // or a rich open when the first qualifying chunk already renders as
+  // structure. sendReturns lets a test model a server that answers a rich
+  // open with a plain bubble ({ wentRich: false }).
+  const send = async (payload) => {
     const id = nextId++;
-    sent.push({ id, text });
+    sent.push({ id, payload });
     return sendReturns
-      ? sendReturns(id, text, sent.length - 1)
+      ? sendReturns(id, payload, sent.length - 1)
       : { message_id: id };
   };
   // editReturns: optional (msgId, payload) => value|undefined — lets a
@@ -78,6 +82,13 @@ function makeHarness({
 
   return { streamer, sent, edits, advance };
 }
+
+// A bubble OPENS rich as soon as its first chunk renders as structure, so a
+// test about the plain→rich EDIT transition has to start from prose. The
+// trailing paragraph keeps the list out of partial mode's held-back tail,
+// which is what makes the growth render rich on a mid-stream flush.
+const PLAIN_OPENER = 'Report incoming.';
+const RICH_GROWTH = `${PLAIN_OPENER}\n\n- [ ] task\n\nAnd more after it.`;
 
 describe('streamer — progressive rich streaming (integration with real toTelegramRichBlocks)', () => {
   test('plain content never produces a rich edit', async () => {
@@ -177,26 +188,142 @@ describe('streamer — progressive rich streaming (integration with real toTeleg
 
   test('once rich, growing content keeps producing rich edits (no downgrade)', async () => {
     const h = makeHarness({ toRichPayload: toTelegramRichBlocks });
-    await h.streamer.onChunk('# Report\n\n- [ ] a');
+    // Trailing paragraph on both ticks so the list is inside the rendered
+    // tree rather than the held-back tail, and the growth is visible.
+    await h.streamer.onChunk('# Report\n\n- [ ] a\n\ntail.');
     await h.advance(500);
-    await h.streamer.onChunk('# Report\n\n- [ ] a\n- [ ] b\n- [ ] c');
+    await h.streamer.onChunk('# Report\n\n- [ ] a\n- [ ] b\n- [ ] c\n\ntail.');
     await h.advance(500);
+    assert.ok(h.edits.length >= 1, 'the growth must produce an edit for this to mean anything');
     for (const e of h.edits) {
       assert.equal(typeof e.payload, 'object', 'every edit after the upgrade must stay rich');
     }
+    const list = h.edits[h.edits.length - 1].payload.blocks.find((b) => b.type === 'list');
+    assert.equal(list.items.length, 3, 'the completed items appended in place');
   });
 
   test('identical rich block trees do not re-trigger an edit (no-op guard)', async () => {
     const h = makeHarness({ toRichPayload: toTelegramRichBlocks });
-    await h.streamer.onChunk('# same heading'); // initial send — always plain, not an edit
+    await h.streamer.onChunk('# same heading'); // structure already — opens rich
     await h.advance(500);
-    await h.streamer.onChunk('# same heading — grown'); // first flush → rich upgrade edit #1
+    await h.streamer.onChunk('# same heading — grown'); // changed tree → rich edit #1
     await h.advance(500);
     const editCountAfterUpgrade = h.edits.length;
     assert.ok(editCountAfterUpgrade >= 1);
     await h.streamer.onChunk('# same heading — grown'); // identical latestText as last edit
     await h.advance(500);
     assert.equal(h.edits.length, editCountAfterUpgrade, 'no structural change → no extra edit');
+  });
+});
+
+describe('streamer — the bubble OPENS rich', () => {
+  // The preview used to stream PLAIN for the whole turn and convert to the
+  // rich document in one jump at finalize — a table sat as literal Markdown
+  // pipes for as long as the turn ran. A bubble whose first qualifying chunk
+  // already renders as structure opens rich, and every later flush appends
+  // completed blocks to a document that was rich from its first frame.
+  const OPEN_BODY = '# Report\n\n- [ ] one\n\nand prose after.';
+
+  test('the first qualifying chunk opens the bubble rich instead of sending plain text', async () => {
+    const h = makeHarness({ toRichPayload: toTelegramRichBlocks });
+    await h.streamer.onChunk(OPEN_BODY);
+    const open = h.sent[0].payload;
+    assert.equal(typeof open, 'object', 'the preview must not start life as plain text');
+    assert.equal(open.rich, true);
+    assert.equal(open.sourceText, OPEN_BODY);
+    assert.ok(open.blocks.some((b) => b.type === 'heading'));
+    assert.ok(h.streamer.isRichMode);
+  });
+
+  test('the rich open seeds the dedup key, so an unchanged flush edits nothing', async () => {
+    // Without the seed the next flush sees no rich state and re-sends the
+    // very tree already on screen — and, worse, a flush that renders plain
+    // would overwrite the rich document with a plain edit.
+    const h = makeHarness({ toRichPayload: toTelegramRichBlocks });
+    await h.streamer.onChunk(OPEN_BODY);
+    await h.advance(500);
+    await h.streamer.onChunk(OPEN_BODY);
+    await h.advance(500);
+    assert.deepEqual(h.edits, [], 'nothing changed shape — nothing to edit');
+    assert.ok(h.streamer.isRichMode);
+    assert.ok(h.streamer.currentRichBlocks.some((b) => b.type === 'heading'));
+  });
+
+  test('a bubble that opens rich never fires the plain→rich upgrade event', async () => {
+    let upgrades = 0;
+    const h = makeHarness({
+      toRichPayload: toTelegramRichBlocks,
+      onRichUpgrade: () => { upgrades++; },
+    });
+    await h.streamer.onChunk(OPEN_BODY);
+    await h.advance(500);
+    await h.streamer.onChunk('# Report\n\n- [ ] one\n- [x] two\n\nand prose after.');
+    await h.advance(500);
+    await h.streamer.finalize('# Report\n\n- [ ] one\n- [x] two');
+    assert.equal(upgrades, 0,
+      'there was no plain shape to flip; counting this turns the metric into noise');
+  });
+
+  test('a send that downgrades the rich open leaves the streamer PLAIN', async () => {
+    // The capability latch can trip on this very first call. Believing the
+    // bubble is rich would have the next flush edit a plain message with a
+    // payload it thinks is already on screen.
+    const h = makeHarness({
+      toRichPayload: toTelegramRichBlocks,
+      sendReturns: (id) => ({ message_id: id, wentRich: false }),
+    });
+    await h.streamer.onChunk(OPEN_BODY);
+    assert.equal(h.streamer.isRichMode, false);
+    assert.equal(h.streamer.currentText, OPEN_BODY);
+  });
+
+  test('after a downgraded open, the first rich edit IS a genuine upgrade', async () => {
+    let upgrades = 0;
+    const h = makeHarness({
+      toRichPayload: toTelegramRichBlocks,
+      onRichUpgrade: () => { upgrades++; },
+      sendReturns: (id) => ({ message_id: id, wentRich: false }),
+    });
+    await h.streamer.onChunk(OPEN_BODY);
+    await h.advance(500);
+    await h.streamer.onChunk('# Report\n\n- [ ] one\n- [x] two\n\nand prose after.');
+    await h.advance(500);
+    assert.equal(upgrades, 1, 'this bubble really did change shape');
+    assert.equal(typeof h.edits[h.edits.length - 1].payload, 'object');
+  });
+
+  test('the rich open carries the plain bubble a downgrading caller has to send instead', async () => {
+    // A refused rich open falls back to a plain send, and the plain path has
+    // the SMALLER cap — so it needs the truncated text, not the rich source
+    // it could not deliver.
+    const h = makeHarness({ toRichPayload: toTelegramRichBlocks, maxLen: 60, richMaxLen: 32768 });
+    const body = `# Report\n\n${'x'.repeat(500)}\n\nand prose after.`;
+    await h.streamer.onChunk(body);
+    const open = h.sent[0].payload;
+    assert.equal(open.sourceText, body, 'rich content is never char-truncated');
+    assert.equal(open.plainText.length, 60);
+    assert.ok(open.plainText.endsWith('...'));
+  });
+
+  test('a first chunk past the RICH cap opens plain, truncated to the plain cap', async () => {
+    const h = makeHarness({ toRichPayload: toTelegramRichBlocks, maxLen: 4096, richMaxLen: 1000 });
+    await h.streamer.onChunk(`# Report\n\n${'x'.repeat(5000)}\n\ntail.`);
+    assert.equal(typeof h.sent[0].payload, 'string');
+    assert.equal(h.sent[0].payload.length, 4096);
+    assert.equal(h.streamer.isRichMode, false);
+  });
+
+  test('a rich-opened bubble finalizes in place — one bubble, same id', async () => {
+    const h = makeHarness({ toRichPayload: toTelegramRichBlocks });
+    const body = '# Report\n\n- [ ] one\n- [x] two';
+    await h.streamer.onChunk(OPEN_BODY);
+    await h.advance(500);
+    const result = await h.streamer.finalize(body);
+    assert.equal(result.streamed, true);
+    assert.equal(result.finalEditOk, true);
+    assert.equal(result.overflow, false);
+    assert.equal(result.msgId, h.sent[0].id);
+    assert.equal(h.sent.length, 1, 'the opened bubble IS the reply');
   });
 });
 
@@ -253,9 +380,9 @@ describe('streamer — rich streaming edge cases (mock toRichPayload)', () => {
     const h = makeHarness({ toRichPayload: toTelegramRichBlocks, onRichUpgrade: () => { upgrades++; } });
 
     // Turn 1: goes rich.
-    await h.streamer.onChunk('# Report'); // initial send, plain
+    await h.streamer.onChunk(PLAIN_OPENER); // initial send, plain
     await h.advance(500);
-    await h.streamer.onChunk('# Report\n\n- [ ] task one'); // upgrade to rich
+    await h.streamer.onChunk(RICH_GROWTH); // upgrade to rich
     await h.advance(500);
     assert.ok(h.streamer.isRichMode, 'turn 1 should be rich');
     assert.equal(upgrades, 1);
@@ -267,9 +394,9 @@ describe('streamer — rich streaming edge cases (mock toRichPayload)', () => {
     // Turn 2: IDENTICAL content to turn 1's final rich state. If
     // currentRichJson leaked across turns, the no-op guard (json ===
     // currentRichJson) would wrongly suppress this edit.
-    await h.streamer.onChunk('# Report'); // initial send for the NEW bubble
+    await h.streamer.onChunk(PLAIN_OPENER); // initial send for the NEW bubble
     await h.advance(500);
-    await h.streamer.onChunk('# Report\n\n- [ ] task one'); // same content as turn 1
+    await h.streamer.onChunk(RICH_GROWTH); // same content as turn 1
     await h.advance(500);
 
     assert.ok(h.streamer.isRichMode, 'turn 2 should independently reach rich mode');
@@ -279,14 +406,14 @@ describe('streamer — rich streaming edge cases (mock toRichPayload)', () => {
 
   test('many onChunk calls within one throttle window collapse to a single rich edit', async () => {
     const h = makeHarness({ toRichPayload: toTelegramRichBlocks });
-    await h.streamer.onChunk('# Report'); // initial send
+    await h.streamer.onChunk(PLAIN_OPENER); // initial send
     await h.advance(500);
     const editsBefore = h.edits.length;
     // Simulate token-by-token streaming: many onChunk calls with NO
     // advance() between them — the debounce (pendingEdit guard) should
     // collapse them to one flush when the throttle window is finally
     // advanced, not one edit per chunk.
-    const growing = '# Report\n\n- [ ] step';
+    const growing = RICH_GROWTH;
     for (let i = 1; i <= growing.length; i++) {
       await h.streamer.onChunk(growing.slice(0, i));
     }
@@ -298,10 +425,11 @@ describe('streamer — rich streaming edge cases (mock toRichPayload)', () => {
 
   test('a thrown rich edit is retried by finalize when the block tree is unchanged', async () => {
     let attempts = 0;
-    const renderRich = (text) => ({
-      usedRich: true,
-      blocks: [{ type: 'heading', text, size: 1 }],
-    });
+    // Structure only once a heading appears, so the bubble opens plain and
+    // the first rich payload reaches Telegram as the EDIT this test is about.
+    const renderRich = (text) => (text.startsWith('#')
+      ? { usedRich: true, blocks: [{ type: 'heading', text, size: 1 }] }
+      : null);
     const h = makeHarness({
       toRichPayload: renderRich,
       editReturns: () => {
@@ -311,7 +439,7 @@ describe('streamer — rich streaming edge cases (mock toRichPayload)', () => {
       },
     });
     const body = '# Final report';
-    await h.streamer.onChunk('# Draft');
+    await h.streamer.onChunk('Draft in progress');
     await h.streamer.onChunk(body);
     await h.advance(500);
 
@@ -426,10 +554,11 @@ describe('streamer — rich streaming edge cases (mock toRichPayload)', () => {
     let releaseEdit;
     const pendingEdit = new Promise((resolve) => { releaseEdit = resolve; });
     const h = makeHarness({
-      toRichPayload: (text) => ({
-        usedRich: true,
-        blocks: [{ type: 'heading', text, size: 1 }],
-      }),
+      // Heading-only structure, so the second bubble's prose opens plain —
+      // which is the state the superseded edit must not overwrite.
+      toRichPayload: (text) => (text.startsWith('#')
+        ? { usedRich: true, blocks: [{ type: 'heading', text, size: 1 }] }
+        : null),
       editReturns: () => pendingEdit,
     });
     await h.streamer.onChunk('# First draft');
@@ -514,12 +643,12 @@ describe('streamer — rich finalization limits', () => {
   test('a short rich reply finalizes with no extra edit when already matching (no-op)', async () => {
     const short = '- [ ] one task';
     const h = makeHarness({ toRichPayload: toTelegramRichBlocks });
-    await h.streamer.onChunk(short); // initial send — plain
+    await h.streamer.onChunk(short); // the first chunk is already structure — opens rich
     await h.advance(500);
-    await h.streamer.onChunk(short); // flush — upgrades to rich (currentRichJson now set)
+    await h.streamer.onChunk(short); // unchanged — nothing to edit
     await h.advance(500);
     const editCountBeforeFinalize = h.edits.length;
-    assert.ok(editCountBeforeFinalize >= 1, 'the bubble must already be in rich mode before this assertion is meaningful');
+    assert.ok(h.streamer.isRichMode, 'the bubble must already be in rich mode before this assertion is meaningful');
     const result = await h.streamer.finalize(short); // same body — should be a no-op
     assert.equal(result.finalEditOk, true);
     assert.equal(h.edits.length, editCountBeforeFinalize, 'body already matches the last rich edit — no-op');
@@ -546,9 +675,9 @@ describe('streamer — wentRich fallback contract', () => {
       onRichUpgrade: () => { upgrades++; },
       editReturns: () => ({ result: { message_id: 1 }, wentRich: false }),
     });
-    await h.streamer.onChunk('# Report');
+    await h.streamer.onChunk(PLAIN_OPENER);
     await h.advance(500);
-    await h.streamer.onChunk('# Report\n\n- [ ] task');
+    await h.streamer.onChunk(RICH_GROWTH);
     await h.advance(500);
     assert.equal(upgrades, 0, 'onRichUpgrade must not fire for a bubble that actually rendered plain');
   });
@@ -558,9 +687,9 @@ describe('streamer — wentRich fallback contract', () => {
       toRichPayload: toTelegramRichBlocks,
       editReturns: () => ({ result: { message_id: 1 }, wentRich: false }),
     });
-    await h.streamer.onChunk('# Report');
+    await h.streamer.onChunk(PLAIN_OPENER);
     await h.advance(500);
-    await h.streamer.onChunk('# Report\n\n- [ ] task');
+    await h.streamer.onChunk(RICH_GROWTH);
     await h.advance(500);
     assert.equal(h.streamer.isRichMode, false, 'the bubble is actually plain — isRichMode must reflect that');
   });
@@ -579,8 +708,8 @@ describe('streamer — wentRich fallback contract', () => {
           : { result: { message_id: 1 }, wentRich: true };
       },
     });
-    const body = '# Report\n\n- [ ] task';
-    await h.streamer.onChunk('# Report');
+    const body = RICH_GROWTH;
+    await h.streamer.onChunk(PLAIN_OPENER);
     await h.advance(500);
     await h.streamer.onChunk(body); // 1st rich attempt -> falls back
     await h.advance(500);
@@ -603,9 +732,9 @@ describe('streamer — wentRich fallback contract', () => {
       onRichUpgrade: () => { upgrades++; },
       editReturns: () => ({ result: { message_id: 1 }, wentRich: true }),
     });
-    await h.streamer.onChunk('# Report');
+    await h.streamer.onChunk(PLAIN_OPENER);
     await h.advance(500);
-    await h.streamer.onChunk('# Report\n\n- [ ] task');
+    await h.streamer.onChunk(RICH_GROWTH);
     await h.advance(500);
     assert.equal(upgrades, 1);
     assert.ok(h.streamer.isRichMode);
@@ -617,9 +746,9 @@ describe('streamer — wentRich fallback contract', () => {
     // remains treated as rich success for simple test doubles.
     let upgrades = 0;
     const h = makeHarness({ toRichPayload: toTelegramRichBlocks, onRichUpgrade: () => { upgrades++; } });
-    await h.streamer.onChunk('# Report');
+    await h.streamer.onChunk(PLAIN_OPENER);
     await h.advance(500);
-    await h.streamer.onChunk('# Report\n\n- [ ] task');
+    await h.streamer.onChunk(RICH_GROWTH);
     await h.advance(500);
     assert.equal(upgrades, 1);
     assert.ok(h.streamer.isRichMode);
@@ -630,7 +759,7 @@ describe('streamer — wentRich fallback contract', () => {
       toRichPayload: toTelegramRichBlocks,
       editReturns: () => ({ result: { message_id: 1 }, wentRich: false }),
     });
-    const body = '# Report\n\n- [ ] task';
+    const body = RICH_GROWTH;
     await h.streamer.onChunk(body.slice(0, 5));
     await h.advance(500);
     const result = await h.streamer.finalize(body);
@@ -732,7 +861,8 @@ describe('streamer — steered intermediate-bubble media seals', () => {
     assert.ok(seal.payload.blocks.some((block) => block.type === 'photo'));
     assert.ok(renderCalls.some((call) => call.text === 'bubble-a-media' && call.partial === false));
     assert.equal(h.streamer.msgId, h.sent[1].id);
-    assert.equal(h.streamer.currentText, 'bubble-b');
+    assert.deepEqual(h.streamer.currentRichBlocks, [{ type: 'paragraph', text: '🖼 bubble-b' }],
+      'the new bubble opened rich and shows its own content, untouched by the seal');
   });
 
   test('force boundary skips a final tree with no accepted media', async () => {
@@ -750,7 +880,8 @@ describe('streamer — steered intermediate-bubble media seals', () => {
     await h.streamer.drainSeals();
 
     assert.equal(h.edits.some((call) => call.payload?.phase === 'seal'), false);
-    assert.equal(h.streamer.currentText, 'bubble-b');
+    assert.deepEqual(h.streamer.currentRichBlocks, [{ type: 'paragraph', text: '🖼 bubble-b' }],
+      'the new bubble opened rich and shows its own content, untouched by the seal');
   });
 
   test('seal waits for an old placeholder edit so it cannot overwrite materialized media', async () => {
@@ -782,7 +913,8 @@ describe('streamer — steered intermediate-bubble media seals', () => {
     assert.equal(h.edits[1].payload.phase, 'seal');
     assert.equal(h.edits[1].msgId, h.sent[0].id);
     assert.equal(h.streamer.msgId, h.sent[1].id);
-    assert.equal(h.streamer.currentText, 'bubble-b');
+    assert.deepEqual(h.streamer.currentRichBlocks, [{ type: 'paragraph', text: '🖼 bubble-b' }],
+      'the new bubble opened rich and shows its own content, untouched by the seal');
   });
 
   test('a pending initial send is sealed after its late message id arrives', async () => {
@@ -807,7 +939,8 @@ describe('streamer — steered intermediate-bubble media seals', () => {
     assert.equal(seal.msgId, h.sent[0].id);
     assert.equal(seal.payload.hadReplyAnchor, true);
     assert.equal(h.streamer.msgId, activeId, 'late old send completion must not replace the active id');
-    assert.equal(h.streamer.currentText, 'bubble-b');
+    assert.deepEqual(h.streamer.currentRichBlocks, [{ type: 'paragraph', text: '🖼 bubble-b' }],
+      'the new bubble opened rich and shows its own content, untouched by the seal');
   });
 
   test('seal jobs drain in force-boundary order when the first seal is slow', async () => {
@@ -834,7 +967,8 @@ describe('streamer — steered intermediate-bubble media seals', () => {
     firstSeal.resolve({ result: { message_id: 1 }, wentRich: true });
     await h.streamer.drainSeals();
     assert.deepEqual(sealSources, ['bubble-a', 'bubble-b']);
-    assert.equal(h.streamer.currentText, 'bubble-c');
+    assert.deepEqual(h.streamer.currentRichBlocks, [{ type: 'paragraph', text: '🖼 bubble-c' }],
+      'the new bubble opened rich and shows its own content, untouched by the seal');
   });
 
   test('terse mode archives a late initial send and never seals it', async () => {
@@ -881,7 +1015,8 @@ describe('streamer — steered intermediate-bubble media seals', () => {
     await h.streamer.onChunk('bubble-b');
     await h.streamer.flushDraft();
 
-    assert.equal(h.streamer.currentText, 'bubble-b');
+    assert.deepEqual(h.streamer.currentRichBlocks, [{ type: 'paragraph', text: '🖼 bubble-b' }],
+      'the new bubble opened rich and shows its own content, untouched by the seal');
     assert.equal(h.streamer.msgId, h.sent[1].id);
     assert.equal(errors.length, 1);
     assert.equal(errors[0].includes('/validated/private-shot.png'), false);

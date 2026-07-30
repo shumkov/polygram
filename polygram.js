@@ -146,7 +146,7 @@ const { createRichStylingLatch } = require('./lib/telegram/rich-styling-latch');
 // degrades to. Silence would leave the user with nothing and the agent
 // believing it answered.
 const MEDIA_ONLY_FALLBACK_TEXT = '(media unavailable)';
-const { createRichSender } = require('./lib/telegram/rich-send');
+const { createRichSender, sendRichWithStylingRetry } = require('./lib/telegram/rich-send');
 const { createRichDeliveryFactory } = require('./lib/telegram/rich-dispatch');
 const { createRichEditStrategy } = require('./lib/telegram/rich-edit-dispatch');
 const { composeDeliverTextFactories } = require('./lib/telegram/deliver-strategy');
@@ -411,6 +411,22 @@ let richKnownUnsupported = false;
 // the same field rides both requests, so a server that cannot read it on one
 // cannot read it on the other.
 let richSendKnownUnsupported = false;
+// A verdict for the STREAMED OPEN alone, held to a lower evidence bar than
+// either latch above, and never fed back into them.
+//
+// A server that does rich edits but answers sendRichMessage with a bare 404
+// never trips the send latch on this path: two ambiguous 404s in a row are
+// what latch it, and the rich EDIT one flush later reports a healthy outcome
+// that resets the run every time. So without this, every preview for the
+// process lifetime pays a doomed round-trip and files a capability-strike the
+// soak would read as a server going bad.
+//
+// One failure is enough here because the open is the one rich attempt with a
+// guaranteed-working alternative: the bubble opens plain and the next flush
+// renders it rich through the edit verb. The reply tool has no such second
+// chance, which is why it keeps the two-strike rule and why this verdict must
+// not touch it.
+let richStreamOpenUnsupported = false;
 // A THIRD verdict, and deliberately not one of the two above. Those answer
 // "can this server do rich at all", and tripping either costs every heading,
 // table and task list. This one answers "does it accept typed RichText nodes
@@ -1411,23 +1427,64 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // becomes rich during streaming.
       logEvent('rich-streaming-upgrade', { chat_id: chatId, thread_id: threadId, bot: BOT_NAME });
     },
-    send: async (text) => {
+    send: async (payload) => {
+      const openRich = payload && typeof payload === 'object' && payload.rich;
       const hadReplyAnchor = !firstBubbleSent;
+      // allow_sending_without_reply: long-running turns give the user
+      // plenty of time to delete their original message. Without this
+      // flag, Telegram rejects the reply with MESSAGE_NOT_FOUND and the
+      // whole streamed answer is lost.
+      const replyParams = hadReplyAnchor
+        ? { message_id: msg.message_id, allow_sending_without_reply: true }
+        : null;
+      // One bubble per call whichever verb carries it, so the anchor is
+      // spent here rather than once per transport — a rich open that has
+      // to downgrade still quotes the user exactly once.
+      firstBubbleSent = true;
+      if (openRich && !richStreamOpenUnsupported) {
+        // sendRichMessage is the only verb that opens a bubble rich; a
+        // plain send followed by a rich edit would flicker. It never
+        // throws and reports whether rich actually landed, so a refusal
+        // just opens plain here and the next flush retries via the edit
+        // path (which is where the plain→rich upgrade metric belongs).
+        const out = await sendRichWithStylingRetry({
+          sendRich: richSendMessage,
+          request: {
+            bot, chatId, threadId,
+            blocks: payload.blocks,
+            sourceText: payload.sourceText,
+            replyParams,
+            mediaContext,
+            // The soak needs to tell a streamed open from a reply-tool send:
+            // they use one verb, one latch and one renderer, but only one of
+            // them has a working second attempt when it fails.
+            meta: { ...outMetaBase, source: 'bot-reply-stream-open-rich' },
+          },
+          onStylingRejected: () => richStylingLatch?.recordStylingRejection(),
+          onStylingAccepted: () => richStylingLatch?.recordHealthyOutcome(),
+          logger: { error: (m) => console.error(`[${label}] ${m}`) },
+        });
+        if (out?.wentRich) {
+          return { ...out.result, _hadReplyAnchor: hadReplyAnchor, wentRich: true };
+        }
+        if (out?.fallback === 'capability') {
+          // Stop probing. See richStreamOpenUnsupported — the streamer's
+          // rich path continues through the edit verb from the next flush.
+          richStreamOpenUnsupported = true;
+          logEvent('rich-stream-open-unsupported', {
+            chat_id: chatId, thread_id: threadId, bot: BOT_NAME,
+          });
+        }
+      }
       const params = {
-        chat_id: chatId, text: sanitizeLiveText(text),
+        chat_id: chatId,
+        text: sanitizeLiveText(openRich ? payload.plainText : payload),
         ...(threadId && { message_thread_id: threadId }),
       };
-      if (!firstBubbleSent) {
-        // allow_sending_without_reply: long-running turns give the user
-        // plenty of time to delete their original message. Without this
-        // flag, Telegram rejects the reply with MESSAGE_NOT_FOUND and the
-        // whole streamed answer is lost.
-        params.reply_parameters = { message_id: msg.message_id, allow_sending_without_reply: true };
-        firstBubbleSent = true;
-      }
+      if (replyParams) params.reply_parameters = replyParams;
       const res = await tg(bot, 'sendMessage', params, outMetaBase);
       return res && typeof res === 'object'
-        ? { ...res, _hadReplyAnchor: hadReplyAnchor }
+        ? { ...res, _hadReplyAnchor: hadReplyAnchor, wentRich: false }
         : res;
     },
     edit: async (messageId, payload) => {
