@@ -90,6 +90,9 @@ function makeDeps(overrides = {}) {
           if (overrides.auditError) throw overrides.auditError;
           dbCalls.push(...rows.map((row) => ['logConfigChange', row]));
         },
+        logEvent: (kind, detail) => {
+          dbCalls.push(['logEvent', kind, detail]);
+        },
       },
       dbWrite: (fn) => fn(),
       pm: {
@@ -1594,6 +1597,126 @@ describe('handleConfigCallback — richtext toggle', () => {
     assert.equal(m.deps.config.chats['-100'].topics['5'].richText, false,
       'another topic\'s own value must not be touched');
     assert.equal(saves, 0);
+  });
+
+  test('the sweep is audited — which topics lost an override, and what it was', async () => {
+    // Config the user never asked to change must be reconstructible after the
+    // fact: nobody tapped topic 5's card, but its value moved.
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: {
+              3: { name: 'General', richText: true },
+              5: { name: 'Music', richText: false },
+              9: { name: 'Ads' },
+            },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:off', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    const swept = m.dbCalls.filter(
+      (c) => c[0] === 'logEvent' && c[1] === 'config-topic-override-swept',
+    );
+    assert.equal(swept.length, 1, 'exactly one sweep event per sweep');
+    const detail = swept[0][2];
+    assert.equal(detail.chat_id, '-100');
+    assert.equal(detail.field, 'richText');
+    assert.deepEqual(detail.topics, [
+      { thread_id: '3', old_value: true },
+      { thread_id: '5', old_value: false },
+    ], 'only the topics that actually carried an override, with what they carried');
+    assert.doesNotMatch(JSON.stringify(detail), /General|Music|Ads/,
+      'topic names are not audit data');
+  });
+
+  test('the already-current cleanup is audited the same way', async () => {
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: { 3: { name: 'General', richText: true } },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:on', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    assert.match(ctx._acks[0].text, /Already on/);
+    const swept = m.dbCalls.filter(
+      (c) => c[0] === 'logEvent' && c[1] === 'config-topic-override-swept',
+    );
+    assert.equal(swept.length, 1);
+    assert.deepEqual(swept[0][2].topics, [{ thread_id: '3', old_value: true }]);
+  });
+
+  test('nothing swept, nothing logged', async () => {
+    for (const [name, chatConfig, data] of [
+      ['a clean non-isolated chat', { model: 'sonnet', isolateTopics: false, topics: { 3: { name: 'General' } } }, 'cfg:richtext:on'],
+      ['a no-op tap', { model: 'sonnet', isolateTopics: false, richText: true, topics: { 3: { name: 'General' } } }, 'cfg:richtext:on'],
+      ['an isolated chat', { model: 'sonnet', isolateTopics: true, topics: { 3: { name: 'Music', richText: true } } }, 'cfg:richtext:on'],
+    ]) {
+      const m = makeDeps({
+        config: { bot: { allowConfigCommands: true }, chats: { '-100': chatConfig } },
+        getSessionKey: (chatId, threadId) => (
+          chatConfig.isolateTopics && threadId ? `${chatId}:${threadId}` : String(chatId)
+        ),
+      });
+      const fn = createHandleConfigCallback(m.deps);
+      const ctx = makeCtx({ data, chatId: '-100', existingRows: 3 });
+      ctx.callbackQuery.message.message_thread_id = 3;
+      await fn(ctx);
+      assert.equal(
+        m.dbCalls.some((c) => c[0] === 'logEvent' && c[1] === 'config-topic-override-swept'),
+        false,
+        `${name} must not log a sweep`,
+      );
+    }
+  });
+
+  test('a rolled-back sweep is not audited as one', async () => {
+    // The event says these overrides are gone. If the save failed they are
+    // still there, and an audit row claiming otherwise is worse than none.
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: { 3: { name: 'General', richText: true } },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+      saveConfig: async () => { throw new Error('disk full'); },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:off', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    assert.equal(m.deps.config.chats['-100'].topics['3'].richText, true);
+    assert.equal(
+      m.dbCalls.some((c) => c[0] === 'logEvent' && c[1] === 'config-topic-override-swept'),
+      false,
+    );
   });
 
   test('a failed save during an already-current cleanup changes nothing', async () => {
