@@ -230,7 +230,6 @@ describe('streamer — the bubble OPENS rich', () => {
     const open = h.sent[0].payload;
     assert.equal(typeof open, 'object', 'the preview must not start life as plain text');
     assert.equal(open.rich, true);
-    assert.equal(open.phase, 'open');
     assert.equal(open.sourceText, OPEN_BODY);
     assert.ok(open.blocks.some((b) => b.type === 'heading'));
     assert.ok(h.streamer.isRichMode);

@@ -134,6 +134,28 @@ describe('turn shapes', () => {
     assert.equal(h.events.find((e) => e.kind === 'stream-preview-consumed').detail.msg_id, 100);
   });
 
+  test('stream… that OPENED rich → reply that renders PLAIN: one bubble, plain final text, same id', async () => {
+    // The crossing case. The preview was created by sendRichMessage; the
+    // reply that consumes it has no structure left to render, so finalize
+    // takes the plain branch on a bubble that is currently a rich document.
+    // The bubble must come DOWN to plain in place — a second bubble, or a
+    // rich document left standing over a plain answer, would both be wrong.
+    const h = harness({ toRichPayload: toTelegramRichBlocks });
+    await h.streamer.onChunk('# Answer\n\n- [ ] one\n\nand prose.');
+    assert.equal(h.tg.sent[0].payload.rich, true, 'the bubble opened rich');
+
+    const out = await h.deliver()({ text: 'Never mind, the short version is no.' });
+
+    assert.equal(out.handled, true);
+    assert.deepEqual(out.sent, [100], 'the id handed back is the one it opened with');
+    assert.equal(h.tg.sent.length, 1);
+    assert.equal(typeof h.tg.edits[h.tg.edits.length - 1].payload, 'string',
+      'the final edit is plain — the rich document does not survive a plain answer');
+    assert.deepEqual(visibleBubbles(h.tg), [
+      { message_id: 100, text: 'Never mind, the short version is no.' },
+    ]);
+  });
+
   test('stream… → reply that fits: the transcript row is brought up to the final body', async () => {
     // The row was written by the INITIAL send — the first fragment. Without
     // this the transcript keeps a torso of every streamed answer.
