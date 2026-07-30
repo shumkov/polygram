@@ -14,6 +14,16 @@ const {
   MODEL_OPTIONS,
   EFFORT_OPTIONS,
 } = require('../lib/handlers/config-callback');
+const { resolveRichTextEnabled } = require('../lib/telegram/rich');
+
+// What buildSpawnContext (polygram.js) derives the session's thread from: the
+// session key, which collapses every topic of a non-isolated chat onto the chat.
+// The authoring hint is resolved with THAT thread, so a toggle only reaches the
+// agent if it changes the value at this scope.
+function sessionThreadId(sessionKey) {
+  const key = String(sessionKey);
+  return key.includes(':') ? key.split(':')[1] : null;
+}
 
 const silentLogger = { log: () => {}, error: () => {} };
 const CODEX_VIEW = Object.freeze({
@@ -79,6 +89,9 @@ function makeDeps(overrides = {}) {
         logConfigChanges: (rows) => {
           if (overrides.auditError) throw overrides.auditError;
           dbCalls.push(...rows.map((row) => ['logConfigChange', row]));
+        },
+        logEvent: (kind, detail) => {
+          dbCalls.push(['logEvent', kind, detail]);
         },
       },
       dbWrite: (fn) => fn(),
@@ -1127,6 +1140,37 @@ describe('handleConfigCallback — runtime switching', () => {
     assert.equal(audit[1].thread_id, '3');
   });
 
+  test('a chat on the button-less SDK backend can still switch away', async () => {
+    // Dropping the SDK button removes a way IN, not a way OUT: sdk chats exist
+    // in config files, and their card must still work.
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: { '12345': { pm: 'sdk', model: 'sonnet', effort: 'high' } },
+      },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:cli', existingRows: 4 });
+    await fn(ctx);
+    assert.match(ctx._acks[0].text, /Claude/);
+    assert.equal(m.deps.config.chats['12345'].pm, 'cli');
+  });
+
+  test('a stale card tapping the removed SDK button changes nothing', async () => {
+    // Cards already sent keep their old buttons. sdk is no longer an offered
+    // target, so the tap is refused like any other unknown runtime.
+    const m = makeDeps();
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:sdk', existingRows: 4 });
+    await fn(ctx);
+    assert.match(ctx._acks[0].text, /Invalid runtime/);
+    assert.equal(m.dbCalls.length, 0);
+    assert.equal(
+      m.pmCalls.some((call) => call[0] === 'replaceRuntime'),
+      false,
+    );
+  });
+
   test('same canonical runtime and invalid targets are no-ops', async () => {
     const m = makeDeps({
       config: {
@@ -1138,7 +1182,7 @@ describe('handleConfigCallback — runtime switching', () => {
 
     const same = makeCtx({ data: 'cfg:runtime:cli', existingRows: 4 });
     await fn(same);
-    assert.match(same._acks[0].text, /Already Claude CLI/);
+    assert.match(same._acks[0].text, /Already Claude$/);
 
     const invalid = makeCtx({ data: 'cfg:runtime:other', existingRows: 4 });
     await fn(invalid);
@@ -1267,12 +1311,15 @@ describe('handleConfigCallback — richtext toggle', () => {
     assert.equal(m.pmCalls.length, 0);
   });
 
-  test('ack text distinguishes live delivery from the next-spawn authoring lag', async () => {
+  test('ack text carries no session-lag caveat — the toggle applies on the next message', async () => {
+    // The hint used to be stuck until something respawned the session, so the
+    // ack warned about it. Display-hint drift now respawns on the next message,
+    // which makes the caveat both wrong and noise.
     const m = makeDeps();
     const fn = createHandleConfigCallback(m.deps);
     const ctx = makeCtx({ data: 'cfg:richtext:on', existingRows: 3 });
     await fn(ctx);
-    assert.match(ctx._acks[0].text, /next session/i);
+    assert.equal(ctx._acks[0].text, 'Rich text → on');
   });
 
   test('ack text for turning off is plain, no session-lag caveat', async () => {
@@ -1323,7 +1370,75 @@ describe('handleConfigCallback — richtext toggle', () => {
     assert.equal(m.deps.config.chats['-100'].richText, undefined, 'chat root must not change');
   });
 
-  test('a non-isolated topic toggle updates the topic value that delivery resolves', async () => {
+  test('an isolated topic toggle drifts that topic session\'s own hint', async () => {
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': { model: 'sonnet', isolateTopics: true, topics: { '3': { name: 'Music' } } },
+        },
+      },
+      getSessionKey: (chatId, threadId) => (threadId ? `${chatId}:${threadId}` : String(chatId)),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:on', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    const config = m.deps.config;
+    const key = m.deps.getSessionKey('-100', '3');
+    assert.equal(
+      resolveRichTextEnabled(config, '-100', sessionThreadId(key)), true,
+      'the topic has its own session, so its hint resolves the topic value and drifts',
+    );
+    assert.equal(resolveRichTextEnabled(config, '-100', '3'), true, 'delivery agrees');
+  });
+
+  test('a non-isolated topic toggle writes at CHAT level, where the session resolves it', async () => {
+    // The trap this pins: a topic-level write flips delivery (resolved per
+    // message with the real thread) while the session's authoring hint —
+    // resolved with the collapsed session thread, i.e. null — never changes.
+    // No drift, no respawn, and an ack that promises a change that never comes.
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: { '3': { name: 'General' } },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:on', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    const config = m.deps.config;
+    assert.equal(config.chats['-100'].richText, true, 'the write lands at chat level');
+    assert.equal(
+      config.chats['-100'].topics['3'].richText, undefined,
+      'no topic override may shadow it',
+    );
+    const key = m.deps.getSessionKey('-100', '3');
+    assert.equal(
+      resolveRichTextEnabled(config, '-100', sessionThreadId(key)), true,
+      'the shared session\'s hint now resolves the new value — this is the drift',
+    );
+    assert.equal(resolveRichTextEnabled(config, '-100', '3'), true,
+      'and delivery in the topic agrees with it');
+    const log = m.dbCalls.find((c) => c[0] === 'logConfigChange');
+    assert.equal(log[1].thread_id, null, 'the audit records the scope actually written');
+    assert.equal(ctx._acks[0].text, 'Rich text → on');
+  });
+
+  test('a stale topic override from the old behavior stops shadowing the chat value', async () => {
+    // Every non-isolated topic toggle before this fix wrote here, so live
+    // configs carry these. Left in place, the override keeps winning for
+    // delivery and the chat-level write does nothing the user can see.
     const m = makeDeps({
       config: {
         bot: { allowConfigCommands: true },
@@ -1342,10 +1457,318 @@ describe('handleConfigCallback — richtext toggle', () => {
     ctx.callbackQuery.message.message_thread_id = 3;
     await fn(ctx);
 
-    assert.equal(m.deps.config.chats['-100'].topics['3'].richText, false);
-    assert.equal(m.deps.config.chats['-100'].richText, undefined, 'the topic toggle must not alter every topic');
-    const log = m.dbCalls.find((c) => c[0] === 'logConfigChange');
-    assert.equal(log[1].thread_id, '3');
+    const config = m.deps.config;
+    assert.equal(config.chats['-100'].richText, false);
+    assert.equal(config.chats['-100'].topics['3'].richText, undefined,
+      'the stale override is cleared, not left to win');
+    assert.equal(config.chats['-100'].topics['3'].name, 'General',
+      'and nothing else about the topic is touched');
+    // Both resolutions must land on the chat-level value: delivery (real
+    // thread, resolved topic-first) and the session's authoring hint (the
+    // collapsed session thread).
+    assert.equal(resolveRichTextEnabled(config, '-100', '3'), false, 'delivery');
+    const key = m.deps.getSessionKey('-100', '3');
+    assert.equal(resolveRichTextEnabled(config, '-100', sessionThreadId(key)), false, 'hint');
     assert.equal(ctx._acks[0].text, 'Rich text → off');
+  });
+
+  test('a chat-level write clears stale overrides in EVERY topic, not just the tapped one', async () => {
+    // In a chat without isolateTopics there is one session and one value; a
+    // topic-level richText cannot be honored by anything and only shadows
+    // delivery in its own topic. The write converges the whole chat.
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: {
+              3: { name: 'General', richText: true },
+              5: { name: 'Music', richText: false },
+              9: { name: 'Ads' },
+            },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:off', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    const chat = m.deps.config.chats['-100'];
+    assert.equal(chat.richText, false);
+    for (const tid of ['3', '5', '9']) {
+      assert.equal(chat.topics[tid].richText, undefined, `topic ${tid} override must be gone`);
+      assert.equal(resolveRichTextEnabled(m.deps.config, '-100', tid), false,
+        `topic ${tid} delivery must follow the chat value`);
+    }
+    assert.equal(chat.topics['5'].name, 'Music', 'names survive the cleanup');
+  });
+
+  test('an already-current tap still normalizes scope, keeping the ack true', async () => {
+    // The value the user taps is already what this topic delivers — but only
+    // because of an override the session cannot see. Short-circuiting without
+    // cleaning leaves delivery and the authoring hint disagreeing forever.
+    let saves = 0;
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: {
+              3: { name: 'General', richText: true },
+              5: { name: 'Music', richText: true },
+            },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+      saveConfig: () => { saves += 1; },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:on', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    assert.match(ctx._acks[0].text, /Already on/);
+    const config = m.deps.config;
+    assert.equal(config.chats['-100'].richText, true,
+      'the value the ack states must survive at the scope that keeps it');
+    assert.equal(config.chats['-100'].topics['3'].richText, undefined);
+    assert.equal(config.chats['-100'].topics['5'].richText, undefined);
+    assert.equal(resolveRichTextEnabled(config, '-100', '3'), true,
+      'delivery in the tapped topic is unchanged — the ack does not lie');
+    const key = m.deps.getSessionKey('-100', '3');
+    assert.equal(resolveRichTextEnabled(config, '-100', sessionThreadId(key)), true,
+      'and the session hint now agrees with it');
+    assert.equal(saves, 1, 'the cleanup must be persisted, not left in memory');
+  });
+
+  test('an already-current tap with nothing stale stays a pure no-op', async () => {
+    let saves = 0;
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: { '-100': { model: 'sonnet', isolateTopics: false, richText: true, topics: { 3: { name: 'General' } } } },
+      },
+      getSessionKey: (chatId) => String(chatId),
+      saveConfig: () => { saves += 1; },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:on', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    assert.match(ctx._acks[0].text, /Already on/);
+    assert.equal(saves, 0, 'nothing to clean means nothing to write');
+    assert.equal(m.dbCalls.length, 0);
+  });
+
+  test('an isolated chat keeps its per-topic overrides on an already-current tap', async () => {
+    // Here the overrides are legitimate: each topic has its own session, which
+    // resolves and honors its own value.
+    let saves = 0;
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: true,
+            topics: { 3: { name: 'Music', richText: true }, 5: { name: 'Ads', richText: false } },
+          },
+        },
+      },
+      getSessionKey: (chatId, threadId) => (threadId ? `${chatId}:${threadId}` : String(chatId)),
+      saveConfig: () => { saves += 1; },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:on', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    assert.match(ctx._acks[0].text, /Already on/);
+    assert.equal(m.deps.config.chats['-100'].topics['3'].richText, true);
+    assert.equal(m.deps.config.chats['-100'].topics['5'].richText, false,
+      'another topic\'s own value must not be touched');
+    assert.equal(saves, 0);
+  });
+
+  test('the sweep is audited — which topics lost an override, and what it was', async () => {
+    // Config the user never asked to change must be reconstructible after the
+    // fact: nobody tapped topic 5's card, but its value moved.
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: {
+              3: { name: 'General', richText: true },
+              5: { name: 'Music', richText: false },
+              9: { name: 'Ads' },
+            },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:off', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    const swept = m.dbCalls.filter(
+      (c) => c[0] === 'logEvent' && c[1] === 'config-topic-override-swept',
+    );
+    assert.equal(swept.length, 1, 'exactly one sweep event per sweep');
+    const detail = swept[0][2];
+    assert.equal(detail.chat_id, '-100');
+    assert.equal(detail.field, 'richText');
+    assert.deepEqual(detail.topics, [
+      { thread_id: '3', old_value: true },
+      { thread_id: '5', old_value: false },
+    ], 'only the topics that actually carried an override, with what they carried');
+    assert.doesNotMatch(JSON.stringify(detail), /General|Music|Ads/,
+      'topic names are not audit data');
+  });
+
+  test('the already-current cleanup is audited the same way', async () => {
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: { 3: { name: 'General', richText: true } },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:on', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    assert.match(ctx._acks[0].text, /Already on/);
+    const swept = m.dbCalls.filter(
+      (c) => c[0] === 'logEvent' && c[1] === 'config-topic-override-swept',
+    );
+    assert.equal(swept.length, 1);
+    assert.deepEqual(swept[0][2].topics, [{ thread_id: '3', old_value: true }]);
+  });
+
+  test('nothing swept, nothing logged', async () => {
+    for (const [name, chatConfig, data] of [
+      ['a clean non-isolated chat', { model: 'sonnet', isolateTopics: false, topics: { 3: { name: 'General' } } }, 'cfg:richtext:on'],
+      ['a no-op tap', { model: 'sonnet', isolateTopics: false, richText: true, topics: { 3: { name: 'General' } } }, 'cfg:richtext:on'],
+      ['an isolated chat', { model: 'sonnet', isolateTopics: true, topics: { 3: { name: 'Music', richText: true } } }, 'cfg:richtext:on'],
+    ]) {
+      const m = makeDeps({
+        config: { bot: { allowConfigCommands: true }, chats: { '-100': chatConfig } },
+        getSessionKey: (chatId, threadId) => (
+          chatConfig.isolateTopics && threadId ? `${chatId}:${threadId}` : String(chatId)
+        ),
+      });
+      const fn = createHandleConfigCallback(m.deps);
+      const ctx = makeCtx({ data, chatId: '-100', existingRows: 3 });
+      ctx.callbackQuery.message.message_thread_id = 3;
+      await fn(ctx);
+      assert.equal(
+        m.dbCalls.some((c) => c[0] === 'logEvent' && c[1] === 'config-topic-override-swept'),
+        false,
+        `${name} must not log a sweep`,
+      );
+    }
+  });
+
+  test('a rolled-back sweep is not audited as one', async () => {
+    // The event says these overrides are gone. If the save failed they are
+    // still there, and an audit row claiming otherwise is worse than none.
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: { 3: { name: 'General', richText: true } },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+      saveConfig: async () => { throw new Error('disk full'); },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:off', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    assert.equal(m.deps.config.chats['-100'].topics['3'].richText, true);
+    assert.equal(
+      m.dbCalls.some((c) => c[0] === 'logEvent' && c[1] === 'config-topic-override-swept'),
+      false,
+    );
+  });
+
+  test('a failed save during an already-current cleanup changes nothing', async () => {
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: { 3: { name: 'General', richText: true } },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+      saveConfig: async () => { throw new Error('disk full'); },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:on', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    const chat = m.deps.config.chats['-100'];
+    assert.equal(chat.topics['3'].richText, true, 'the override is put back');
+    assert.equal(chat.richText, undefined, 'and no chat-level value is left behind');
+    assert.match(ctx._acks[0].text, /Already on/);
+  });
+
+  test('a failed save restores both the chat write and the cleared topic override', async () => {
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: { '3': { name: 'General', richText: true } },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+      saveConfig: async () => { throw new Error('disk full'); },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:off', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    const config = m.deps.config;
+    assert.equal(config.chats['-100'].richText, undefined, 'the chat write is rolled back');
+    assert.equal(config.chats['-100'].topics['3'].richText, true,
+      'and the override is put back — a failed save must change nothing');
+    assert.match(ctx._acks[0].text, /Couldn't save/);
   });
 });
