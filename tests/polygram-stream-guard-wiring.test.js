@@ -63,3 +63,19 @@ describe('polygram append-only guard wiring', () => {
       'the reply-attribution path reads the same binding');
   });
 });
+
+describe('polygram composing-marker wiring', () => {
+  test('the streamer is given the marker builder', () => {
+    assert.match(source, /toComposingMarker: \(\) => composingMarker\(/,
+      'without it the growing bubble never says it is still being written');
+  });
+
+  test('the marker shape follows the styling latch, per render', () => {
+    // A hard-coded typed node would make blocksAreStyled() true on every
+    // payload. Against a server that refuses typed nodes, each partial edit
+    // would take the styled→refused→flatten retry — two API calls per edit,
+    // and styling verdicts recorded against markup polygram injected rather
+    // than anything the agent wrote.
+    assert.match(source, /toComposingMarker: \(\) => composingMarker\(\{ styled: !richInlineStylingUnsupported \}\)/);
+  });
+});

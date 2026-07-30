@@ -156,6 +156,7 @@ const { createRichSender, sendRichWithStylingRetry } = require('./lib/telegram/r
 const { createRichDeliveryFactory } = require('./lib/telegram/rich-dispatch');
 const { createRichEditStrategy } = require('./lib/telegram/rich-edit-dispatch');
 const { composeDeliverTextFactories } = require('./lib/telegram/deliver-strategy');
+const { composingMarker } = require('./lib/telegram/composing-marker');
 const { buildPolygramDisplayHint } = require('./lib/telegram/display-hint');
 const { redactBotToken, stripUrlCredentials } = require('./lib/error/net');
 // F#23: shared agent-reply helper. parseResponse + sanitizer + chunked
@@ -1603,6 +1604,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // captures them. See stripInlineTagsForStreamer above.
     transformText: stripInlineTagsForStreamer,
     toRichPayload,
+    // "Still writing" on the growing bubble. Re-read per render like
+    // toRichPayload is: the styling latch can trip mid-turn, and a typed
+    // italic node injected after it has would make every payload look styled
+    // to a server that just said it refuses them.
+    toComposingMarker: () => composingMarker({ styled: !richInlineStylingUnsupported }),
     onRichUpgrade: () => {
       // Record the visible transition when an existing plain bubble
       // becomes rich during streaming.
