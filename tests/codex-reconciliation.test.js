@@ -650,6 +650,28 @@ describe('Codex ambiguity reconciliation', () => {
   });
   afterEach(() => cleanupDb(dbPath, db));
 
+  test('/config ignores an ambiguous internal thread/start attempt without a Telegram message', () => {
+    db.raw.prepare(`
+      UPDATE codex_turn_attempts
+         SET method = 'thread/start',
+             delivery_state = 'response-observed',
+             response_outcome = 'error'
+       WHERE attempt_id = 'attempt-a'
+    `).run();
+    markGenerationDead();
+
+    assert.deepEqual(
+      db.listUnresolvedCodexAttempts({ session_key: 'chat-a' }),
+      [],
+      'internal lifecycle attempts are durable recovery state, not Telegram reconciliation items',
+    );
+    assert.equal(
+      db.getCodexAttempt('attempt-a').recovery_state,
+      'ambiguous',
+      'filtering the Telegram projection must not delete or settle recovery evidence',
+    );
+  });
+
   test('incorporated records one immutable owner decision', () => {
     db.reconcileCodexAttempt({
       attempt_id: 'attempt-a',

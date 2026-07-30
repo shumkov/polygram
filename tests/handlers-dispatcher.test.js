@@ -356,6 +356,21 @@ describe('createDispatcher — error → terminal status mapping', () => {
     assert.match(calls.tg[0].params.text, /error: boom/);
   });
 
+  test('tmux spawn telemetry retains error codes and the stderr tail', async () => {
+    const stderr = `${'x'.repeat(600)}duplicate session: opaque`;
+    const error = Object.assign(new Error('tmux spawn failed'), {
+      code: 'TMUX_SPAWN_FAILED',
+      cause: { code: 1 },
+      stderr,
+    });
+    const { calls } = await runAndFail(error, {});
+    const event = calls.events.find((entry) => entry.kind === 'handler-error');
+
+    assert.equal(event.detail.code, 'TMUX_SPAWN_FAILED');
+    assert.equal(event.detail.cause_code, 1);
+    assert.equal(event.detail.stderr_tail, stderr.slice(-500));
+  });
+
   test('SESSION_PROCESS_LOST clears the saved session before guidance and never auto-resumes', async () => {
     const err = Object.assign(new Error('contained process tree exited'), {
       code: 'SESSION_PROCESS_LOST',
@@ -731,7 +746,7 @@ describe('createDispatcher — poisoned-session reset after startup-gate death (
   });
 });
 
-describe('createDispatcher — startup auto-retry (silent recovery from TMUX_SESSION_GONE)', () => {
+describe('createDispatcher — startup auto-retry for pre-delivery failures', () => {
   // 2026-06-04 (option a). The dev-channels startup gate intermittently fails
   // (claude exits before the channel goes live) ~once every 9h on shumorobot.
   // Today that surfaces "🔄 That chat got stuck starting up, so I reset it. Send
@@ -785,6 +800,29 @@ describe('createDispatcher — startup auto-retry (silent recovery from TMUX_SES
       'the user sees NO "reset it, resend" message — the retry recovered transparently');
   });
 
+  test('TMUX_SPAWN_FAILED → silently retries once because the message was never delivered', async () => {
+    const handled = [];
+    let n = 0;
+    const handleMessage = (sk, chatId, msg) => {
+      handled.push(msg);
+      n += 1;
+      return n === 1
+        ? Promise.reject(gateErr('TMUX_SPAWN_FAILED'))
+        : Promise.resolve();
+    };
+    const fx = fixture({ handleMessage, startupRetryDelayMs: 0 });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, { ...baseMsg }, {});
+    await flush();
+
+    assert.equal(handled.length, 2);
+    assert.equal(handled[1]._startupRetried, true);
+    assert.ok(fx.calls.events.some((event) => (
+      event.kind === 'startup-auto-retry'
+      && event.detail.code === 'TMUX_SPAWN_FAILED'
+    )));
+    assert.equal(resetReplySent(fx.calls), false);
+  });
+
   test('GUARD: second startup-gate death (already retried) → NO third dispatch, shows the reset reply', async () => {
     const handled = [];
     const handleMessage = (sk, chatId, msg) => {
@@ -803,7 +841,7 @@ describe('createDispatcher — startup auto-retry (silent recovery from TMUX_SES
       'a persistent startup failure still surfaces the friendly reset reply');
   });
 
-  test('GUARD: a non-TMUX_SESSION_GONE failure is never startup-retried', async () => {
+  test('GUARD: a mid-turn failure is never startup-retried', async () => {
     const handled = [];
     const handleMessage = (sk, chatId, msg) => {
       handled.push(msg);
@@ -813,7 +851,7 @@ describe('createDispatcher — startup auto-retry (silent recovery from TMUX_SES
     fx.dispatcher.dispatchHandleMessage('sk', 100, { ...baseMsg }, {});
     await flush();
 
-    assert.equal(handled.length, 1, 'only TMUX_SESSION_GONE triggers the startup retry');
+    assert.equal(handled.length, 1, 'only known pre-delivery failures trigger the startup retry');
     assert.ok(!fx.calls.events.some((e) => e.kind === 'startup-auto-retry'));
   });
 });
