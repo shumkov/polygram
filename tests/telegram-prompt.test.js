@@ -116,6 +116,16 @@ describe('rich media display hint', () => {
     assert.match(richHint, /at least a sentence/i);
   });
 
+  test('warns that media never survives a streamed message (own reply instead)', () => {
+    const richHint = buildPolygramDisplayHint(true, { inlineMedia: true });
+    assert.match(richHint, /media.{0,120}(stream|live preview)|(stream|live preview).{0,120}media/is,
+      'ties media to the streaming limitation');
+    assert.match(richHint, /own\s+(separate\s+)?reply|separate\s+(reply|message)/i,
+      'tells the agent to deliver media as its own reply');
+    assert.match(richHint, /caption/i,
+      'names the degradation so the consequence is concrete');
+  });
+
   test('the two variants differ ONLY by the media guidance', () => {
     // Guards against the gate accidentally taking structural guidance with
     // it: the reply path renders every non-media construct just as well.
