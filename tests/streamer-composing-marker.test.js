@@ -247,6 +247,84 @@ describe('composing marker — the bubble must stop claiming it', () => {
       'the held-back trailing block belongs on a bubble that is finished');
   });
 
+  test('a marker sent by a flush that lands mid-detach is still sealed away', async () => {
+    // currentMarkerShown described what the last edit CONFIRMED, committed
+    // after the await and behind a generation check. Detach during that await
+    // and the snapshot records "no marker" for a bubble that is displaying
+    // one — permanently, since nothing will edit it again. The post-open
+    // marker frame makes this the ordinary shape of every bubble, not a rare
+    // interleaving.
+    const edits = [];
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    let gated = false;
+    let now = 0;
+    const timers = [];
+
+    const streamer = createStreamer({
+      send: async () => ({ message_id: 555 }),
+      edit: async (msgId, payload) => {
+        edits.push({ msgId, payload });
+        if (!gated) { gated = true; await gate; }
+      },
+      minChars: 1,
+      throttleMs: 500,
+      clock: () => now,
+      schedule: (fn, delay) => { const t = { fn, fireAt: now + delay }; timers.push(t); return t; },
+      cancel: (t) => { const i = timers.indexOf(t); if (i !== -1) timers.splice(i, 1); },
+      logger: { log: () => {}, error: () => {}, warn: () => {} },
+      toComposingMarker: () => composingMarker(),
+    });
+
+    await streamer.onChunk('Первое сообщение.');
+    now += 500;
+    const due = timers.splice(0, timers.length);
+    const inflight = Promise.all(due.map((t) => t.fn()));
+
+    // The marker edit is in flight; the turn moves to a new assistant message.
+    streamer.forceNewMessage();
+    release();
+    await inflight;
+    await streamer.drainSeals();
+
+    assert.ok(edits.some((e) => carriesMarker(e.payload)), 'precondition: a marker went out');
+    const last = edits.filter((e) => e.msgId === 555).pop();
+    assert.ok(!carriesMarker(last.payload),
+      'the detached bubble must not be left displaying a marker nobody will ever remove');
+  });
+
+  test('a rich bubble is never sealed by overwriting it with truncated plain text', async () => {
+    // toRichPayload can render rich while partial and decline at partial:false
+    // — rich.js demotes a media-only document whose media did not resolve, and
+    // that check is gated on !partial so it cannot fire during the live ticks.
+    // Falling back to a plain edit there would replace a long rich document
+    // with maxLen characters of text: a cosmetic marker is not worth content
+    // the reader already read.
+    const long = 'я'.repeat(9000);
+    const h = makeHarness({
+      maxLen: 4096,
+      richMaxLen: 32768,
+      toRichPayload: (text, opts) => (opts.partial
+        ? { blocks: [{ type: 'paragraph', text }], usedRich: true }
+        : { blocks: [], usedRich: false }),
+    });
+
+    await h.streamer.onChunk(long);
+    await h.advance(500);
+    await h.streamer.onChunk(`${long}!`);
+    await h.advance(500);
+    const detachedId = h.streamer.msgId;
+    assert.ok(carriesMarker(h.lastEdit().payload), 'precondition: rich bubble showing the marker');
+
+    h.streamer.forceNewMessage();
+    await h.streamer.onChunk('Второе сообщение.');
+    await h.streamer.drainSeals();
+
+    const plainSeal = h.edits.find((e) => e.msgId === detachedId && typeof e.payload === 'string');
+    assert.equal(plainSeal, undefined,
+      'a rich document must not be overwritten by a truncated plain render');
+  });
+
   test('a detached bubble that never showed the marker is not re-edited', async () => {
     // The seal costs a Telegram edit. It is justified by a marker on screen,
     // not by detaching, and every SDK multi-message turn detaches.

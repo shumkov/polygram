@@ -299,6 +299,53 @@ describe('streamer — ticking a checkbox is not losing text', () => {
   });
 });
 
+describe('streamer — nothing unseen may be pinned', () => {
+  // An unterminated ``` fence is ONE top-level block, and partial mode holds
+  // the whole thing back (toTelegramRichBlocks returns zero blocks for a
+  // snapshot that is nothing but an open fence). A blank line inside it is
+  // not a boundary the reader ever saw, so pinning there freezes the preview
+  // the moment the model edits a line of its own snippet — the same freeze
+  // the checkbox exemption fixed, through a different door.
+  test('a blank line inside an unterminated code fence is not a boundary', async () => {
+    const events = [];
+    const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
+
+    await h.streamer.onChunk('Вот решение.\n\n```js\nfunction f() {\n  const x = 1;\n\n  return x;');
+    await h.advance(500);
+    // Revising a line ABOVE the blank line inside the fence — text the reader
+    // has never been shown, because the whole fence is still held back.
+    await h.streamer.onChunk('Вот решение.\n\n```js\nfunction f() {\n  const x = 42;\n\n  return x;\n}\n```\n\nГотово.');
+    await h.advance(500);
+
+    assert.equal(events.length, 0, 'the reader has seen none of the fence — none of it may be pinned');
+  });
+
+  test('the paragraph before the fence is still pinned', async () => {
+    const events = [];
+    const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
+
+    await h.streamer.onChunk('Вот решение.\n\n```js\nfunction f() {\n  const x = 1;\n\n  return x;');
+    await h.advance(500);
+    await h.streamer.onChunk('```js\nfunction f() {\n  const x = 1;\n\n  return x;\n}\n```\n\nГотово.');
+    await h.advance(500);
+
+    assert.equal(events.length, 1, 'losing the intro paragraph is still losing seen text');
+  });
+
+  test('CRLF text is guarded, not silently exempt', async () => {
+    const events = [];
+    const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
+
+    await h.streamer.onChunk('Первый абзац.\r\n\r\nВторой абзац.\r\n\r\nТретий нача');
+    await h.advance(500);
+    await h.streamer.onChunk('Второй абзац.\r\n\r\nТретий абзац целиком, и даже больше текста.');
+    await h.advance(500);
+
+    assert.equal(events.length, 1,
+      'a \\r\\n document must not turn the guard off — lastIndexOf(\\n\\n) alone never matches it');
+  });
+});
+
 describe('committedPrefix', () => {
   test('is empty when nothing has been completed', () => {
     assert.equal(committedPrefix(''), '');
