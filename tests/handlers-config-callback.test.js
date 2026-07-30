@@ -67,7 +67,15 @@ function makeDeps(overrides = {}) {
         chats: { '12345': { model: 'sonnet', effort: 'high' } },
       },
       db: {
-        logConfigChange: (args) => dbCalls.push(['logConfigChange', args]),
+        logConfigChange: (args) => {
+          if (typeof overrides.logConfigChange === 'function') {
+            return overrides.logConfigChange(args, dbCalls);
+          }
+          if (overrides.logConfigChangeError) {
+            throw overrides.logConfigChangeError;
+          }
+          dbCalls.push(['logConfigChange', args]);
+        },
         logConfigChanges: (rows) => {
           if (overrides.auditError) throw overrides.auditError;
           dbCalls.push(...rows.map((row) => ['logConfigChange', row]));
@@ -75,6 +83,10 @@ function makeDeps(overrides = {}) {
       },
       dbWrite: (fn) => fn(),
       pm: {
+        get: (key) => {
+          pmCalls.push(['get', key]);
+          return overrides.currentProcess ?? null;
+        },
         applyFlagSettings: async (key, settings) => {
           pmCalls.push(['applyFlagSettings', key, settings]);
           return true;
@@ -96,11 +108,45 @@ function makeDeps(overrides = {}) {
             nextTurn: settings,
           };
         },
+        replaceRuntime: async (key, spawnContext) => {
+          pmCalls.push(['replaceRuntime', key, spawnContext]);
+          if (overrides.replaceRuntimeError) {
+            throw overrides.replaceRuntimeError;
+          }
+          return {
+            sessionKey: key,
+            runtime: spawnContext.runtime,
+            backend: spawnContext.backend,
+          };
+        },
       },
       intentLock: overrides.intentLock || createAsyncLock(),
       getSessionKey: (chatId) => String(chatId),
       formatConfigInfoText: (cfg, show) => `Model: ${cfg.model}, Effort: ${cfg.effort} (${show})`,
       buildConfigKeyboard: () => ({ inline_keyboard: [] }),
+      prepareRuntimeSelection: async (context) => {
+        pmCalls.push(['prepareRuntimeSelection', context]);
+        if (overrides.prepareRuntimeSelectionError) {
+          throw overrides.prepareRuntimeSelectionError;
+        }
+        return CODEX_VIEW;
+      },
+      discardRuntimeSelection: (sessionKey) => {
+        pmCalls.push(['discardRuntimeSelection', sessionKey]);
+        return true;
+      },
+      buildSpawnContext: async (key, options) => {
+        const chat = overrides.config?.chats?.[key]
+          ?? overrides.config?.chats?.[String(key).split(':')[0]]
+          ?? null;
+        const selected = chat?.pm === 'codex' ? 'codex' : chat?.pm === 'cli' ? 'cli' : 'sdk';
+        const context = {
+          runtime: selected === 'codex' ? 'codex' : 'claude',
+          backend: selected,
+        };
+        pmCalls.push(['buildSpawnContext', key, context, options]);
+        return context;
+      },
       botName: 'test-bot',
       logger: silentLogger,
       ...overrides,
@@ -564,6 +610,543 @@ describe('handleConfigCallback — Codex model and effort', () => {
     assert.equal(
       m.pmCalls.some((call) => call[0] === 'selectModelSettings'),
       true,
+    );
+  });
+});
+
+describe('handleConfigCallback — runtime switching', () => {
+  test('idle Claude SDK → Codex preflights, saves, audits, and strictly replaces', async () => {
+    const saved = [];
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '12345': {
+            pm: 'sdk',
+            model: 'sonnet',
+            effort: 'high',
+            codexModel: 'gpt-5.6-sol',
+            codexEffort: 'high',
+            cwd: '/workspace',
+          },
+        },
+      },
+      saveConfig: () => saved.push(true),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:codex', existingRows: 4 });
+
+    await fn(ctx);
+
+    assert.equal(m.deps.config.chats['12345'].pm, 'codex');
+    assert.equal(saved.length, 1);
+    assert.deepEqual(
+      m.pmCalls.map((call) => call[0]),
+      ['get', 'prepareRuntimeSelection', 'buildSpawnContext', 'replaceRuntime'],
+    );
+    assert.deepEqual(
+      m.pmCalls[2][3],
+      { mutateSessionOnDrift: false },
+    );
+    assert.equal(m.pmCalls[3][2].runtime, 'codex');
+    const audit = m.dbCalls.find((call) => call[0] === 'logConfigChange');
+    assert.deepEqual({
+      field: audit[1].field,
+      oldValue: audit[1].old_value,
+      newValue: audit[1].new_value,
+      source: audit[1].source,
+    }, {
+      field: 'pm',
+      oldValue: 'sdk',
+      newValue: 'codex',
+      source: 'inline-button',
+    });
+    assert.match(ctx._acks[0].text, /Runtime → Codex/);
+  });
+
+  test('Codex → Claude CLI skips Codex candidate preflight', async () => {
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '12345': {
+            pm: 'codex',
+            model: 'sonnet',
+            effort: 'high',
+            codexModel: 'gpt-5.6-sol',
+            codexEffort: 'high',
+            cwd: '/workspace',
+          },
+        },
+      },
+      resolveRuntimeView: async () => CODEX_VIEW,
+    });
+    const fn = createHandleConfigCallback(m.deps);
+
+    await fn(makeCtx({ data: 'cfg:runtime:cli', existingRows: 4 }));
+
+    assert.equal(m.deps.config.chats['12345'].pm, 'cli');
+    assert.equal(
+      m.pmCalls.some((call) => call[0] === 'prepareRuntimeSelection'),
+      false,
+    );
+    assert.equal(
+      m.pmCalls.filter(
+        (call) => call[0] === 'discardRuntimeSelection',
+      ).length,
+      1,
+    );
+    const replacement = m.pmCalls.find(
+      (call) => call[0] === 'replaceRuntime',
+    );
+    assert.equal(replacement[2].backend, 'cli');
+  });
+
+  test('every busy or pinned signal rejects before preflight or writes', async (t) => {
+    const blockedStates = [
+      'RecoveryConflict',
+      'ContainmentFailed',
+      'FailedAmbiguous',
+      'DurabilityBlocked',
+      'StartingTurn',
+      'Active',
+      'Settling',
+      'BackgroundWorking',
+      'BackgroundSettling',
+      'Quiescing',
+    ];
+    const cases = [
+      ['in-flight turn', { inFlight: true }],
+      ['background work pin', { hasActiveBackgroundWork: () => true }],
+      ['open question pin', { hasOpenQuestions: () => true }],
+      ['pending delivery pin', { hasPendingDeliveryWork: () => true }],
+      ['failed lifecycle probe', {
+        hasActiveBackgroundWork: () => {
+          throw new Error('process probe failed');
+        },
+      }],
+      ...blockedStates.map((state) => [`${state} state`, { state }]),
+    ];
+
+    for (const [name, signal] of cases) {
+      await t.test(name, async () => {
+        let saves = 0;
+        const m = makeDeps({
+          config: {
+            bot: { allowConfigCommands: true },
+            chats: {
+              '12345': { pm: 'sdk', model: 'sonnet', effort: 'high' },
+            },
+          },
+          currentProcess: {
+            runtime: 'claude',
+            backend: 'sdk',
+            ...signal,
+          },
+          saveConfig: () => { saves += 1; },
+        });
+        const fn = createHandleConfigCallback(m.deps);
+        const ctx = makeCtx({
+          data: 'cfg:runtime:codex',
+          existingRows: 4,
+        });
+
+        await fn(ctx);
+
+        assert.equal(m.deps.config.chats['12345'].pm, 'sdk');
+        assert.equal(saves, 0);
+        assert.equal(m.dbCalls.length, 0);
+        assert.deepEqual(
+          m.pmCalls.map((call) => call[0]),
+          ['get'],
+          'busy checks must precede Codex preflight and replacement',
+        );
+        assert.match(ctx._acks[0].text, /finish/i);
+        assert.equal(ctx._acks[0].show_alert, true);
+      });
+    }
+  });
+
+  test('failed Codex candidate preflight leaves config and process untouched', async () => {
+    let saves = 0;
+    const error = new Error('ChatGPT login expired');
+    error.code = 'CODEX_RUNTIME_UNAVAILABLE';
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: { '12345': { pm: 'sdk', model: 'sonnet', effort: 'high' } },
+      },
+      prepareRuntimeSelectionError: error,
+      saveConfig: () => { saves += 1; },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:codex', existingRows: 4 });
+
+    await fn(ctx);
+
+    assert.equal(m.deps.config.chats['12345'].pm, 'sdk');
+    assert.equal(saves, 0);
+    assert.equal(m.dbCalls.length, 0);
+    assert.equal(
+      m.pmCalls.some((call) => call[0] === 'replaceRuntime'),
+      false,
+    );
+    assert.match(ctx._acks[0].text, /Codex.*unavailable/i);
+  });
+
+  test('save failure restores an absent runtime override exactly', async () => {
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true, pm: 'sdk' },
+        chats: {
+          '12345': {
+            model: 'sonnet',
+            effort: 'high',
+            codexModel: 'gpt-5.6-sol',
+            codexEffort: 'high',
+          },
+        },
+      },
+      saveConfig: () => {
+        throw new Error('read only filesystem');
+      },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:codex', existingRows: 4 });
+
+    await fn(ctx);
+
+    assert.equal(
+      Object.hasOwn(m.deps.config.chats['12345'], 'pm'),
+      false,
+      'rollback must restore absence rather than persist inherited sdk',
+    );
+    assert.equal(m.dbCalls.length, 0);
+    assert.deepEqual(
+      m.pmCalls.map((call) => call[0]),
+      ['get', 'prepareRuntimeSelection', 'discardRuntimeSelection'],
+    );
+    assert.equal(ctx._edits.length, 0);
+    assert.match(ctx._acks[0].text, /nothing changed/i);
+    assert.equal(ctx._acks[0].show_alert, true);
+  });
+
+  test('failed isolated-topic switch restores an absent topics map exactly', async () => {
+    const config = {
+      bot: { allowConfigCommands: true, pm: 'sdk' },
+      chats: {
+        '-100': {
+          isolateTopics: true,
+          model: 'sonnet',
+          effort: 'high',
+          codexModel: 'gpt-5.6-sol',
+          codexEffort: 'high',
+          cwd: '/workspace',
+        },
+      },
+    };
+    const before = structuredClone(config);
+    const m = makeDeps({
+      config,
+      getSessionKey: (chatId, threadId) => `${chatId}:${threadId}`,
+      saveConfig: () => {
+        throw new Error('read only filesystem');
+      },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({
+      data: 'cfg:runtime:codex',
+      chatId: '-100',
+      existingRows: 4,
+    });
+    ctx.callbackQuery.message.message_thread_id = 3;
+
+    await fn(ctx);
+
+    assert.deepEqual(config, before);
+    assert.match(ctx._acks[0].text, /nothing changed/i);
+  });
+
+  test('audit failure rolls persistence back and never replaces the runtime', async () => {
+    let saves = 0;
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true, pm: 'sdk' },
+        chats: {
+          '12345': {
+            model: 'sonnet',
+            effort: 'high',
+            codexModel: 'gpt-5.6-sol',
+            codexEffort: 'high',
+          },
+        },
+      },
+      logConfigChangeError: new Error('audit unavailable'),
+      saveConfig: () => { saves += 1; },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:codex', existingRows: 4 });
+
+    await fn(ctx);
+
+    assert.equal(
+      Object.hasOwn(m.deps.config.chats['12345'], 'pm'),
+      false,
+    );
+    assert.equal(saves, 2, 'selection save plus exact rollback save');
+    assert.equal(m.dbCalls.length, 0);
+    assert.deepEqual(
+      m.pmCalls.map((call) => call[0]),
+      ['get', 'prepareRuntimeSelection', 'discardRuntimeSelection'],
+    );
+    assert.equal(ctx._edits.length, 0);
+    assert.match(ctx._acks[0].text, /audit.*nothing changed/i);
+    assert.equal(ctx._acks[0].show_alert, true);
+  });
+
+  test('audit rollback-save failure reports persisted config uncertainty', async () => {
+    let saves = 0;
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true, pm: 'sdk' },
+        chats: {
+          '12345': {
+            model: 'sonnet',
+            effort: 'high',
+            codexModel: 'gpt-5.6-sol',
+            codexEffort: 'high',
+          },
+        },
+      },
+      logConfigChangeError: new Error('audit unavailable'),
+      saveConfig: () => {
+        saves += 1;
+        if (saves === 2) throw new Error('rollback save failed');
+      },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:codex', existingRows: 4 });
+
+    await fn(ctx);
+
+    assert.equal(saves, 2);
+    assert.equal(m.dbCalls.length, 0);
+    assert.deepEqual(
+      m.pmCalls.map((call) => call[0]),
+      ['get', 'prepareRuntimeSelection', 'discardRuntimeSelection'],
+    );
+    assert.equal(ctx._edits.length, 0);
+    assert.match(ctx._acks[0].text, /persisted config needs attention/i);
+    assert.equal(ctx._acks[0].show_alert, true);
+  });
+
+  test('replacement failure restores the exact persisted runtime selection', async () => {
+    let saves = 0;
+    const error = new Error('retirement failed');
+    error.code = 'RUNTIME_SWITCH_EVICTION_FAILED';
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true, pm: 'sdk' },
+        chats: {
+          '12345': {
+            model: 'sonnet',
+            effort: 'high',
+            codexModel: 'gpt-5.6-sol',
+            codexEffort: 'high',
+            cwd: '/workspace',
+          },
+        },
+      },
+      replaceRuntimeError: error,
+      saveConfig: () => { saves += 1; },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:codex', existingRows: 4 });
+
+    await fn(ctx);
+
+    assert.equal(
+      Object.hasOwn(m.deps.config.chats['12345'], 'pm'),
+      false,
+    );
+    assert.equal(saves, 2);
+    assert.deepEqual(
+      m.dbCalls
+        .filter((call) => call[0] === 'logConfigChange')
+        .map((call) => [call[1].old_value, call[1].new_value]),
+      [['sdk', 'codex'], ['codex', 'sdk']],
+    );
+    assert.equal(ctx._edits.length, 0);
+    assert.match(
+      ctx._acks[0].text,
+      /previous runtime selection restored/i,
+    );
+    assert.doesNotMatch(ctx._acks[0].text, /nothing changed/i);
+    assert.equal(ctx._acks[0].show_alert, true);
+    assert.equal(
+      m.pmCalls.filter((call) => call[0] === 'discardRuntimeSelection').length,
+      1,
+    );
+  });
+
+  test('failed compensating audit reports durable audit uncertainty', async () => {
+    let auditWrites = 0;
+    const error = new Error('target startup failed');
+    error.code = 'RUNTIME_START_FAILED';
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true, pm: 'sdk' },
+        chats: {
+          '12345': {
+            model: 'sonnet',
+            effort: 'high',
+            codexModel: 'gpt-5.6-sol',
+            codexEffort: 'high',
+            cwd: '/workspace',
+          },
+        },
+      },
+      logConfigChange: (row, calls) => {
+        auditWrites += 1;
+        if (auditWrites === 2) throw new Error('audit disk unavailable');
+        calls.push(['logConfigChange', row]);
+      },
+      replaceRuntimeError: error,
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:codex', existingRows: 4 });
+
+    await fn(ctx);
+
+    assert.equal(auditWrites, 2);
+    assert.match(ctx._acks[0].text, /audit history needs attention/i);
+    assert.equal(ctx._acks[0].show_alert, true);
+  });
+
+  test('releases the session intent lock before rendering or Telegram calls', async () => {
+    let held = false;
+    let replacementObserved = false;
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '12345': {
+            pm: 'sdk',
+            model: 'sonnet',
+            effort: 'high',
+            codexModel: 'gpt-5.6-sol',
+            codexEffort: 'high',
+          },
+        },
+      },
+      intentLock: {
+        async acquire(key) {
+          assert.equal(key, '12345');
+          held = true;
+          return () => { held = false; };
+        },
+      },
+      pm: {
+        get: () => null,
+        replaceRuntime: async () => {
+          assert.equal(held, true, 'replacement is protected by intent lock');
+          replacementObserved = true;
+        },
+      },
+      formatConfigInfoText: () => {
+        assert.equal(held, false);
+        return 'updated';
+      },
+      buildConfigKeyboard: () => {
+        assert.equal(held, false);
+        return { inline_keyboard: [] };
+      },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:codex', existingRows: 4 });
+    const answerCallbackQuery = ctx.answerCallbackQuery;
+    const editMessageText = ctx.editMessageText;
+    ctx.answerCallbackQuery = async (args) => {
+      assert.equal(held, false);
+      await answerCallbackQuery(args);
+    };
+    ctx.editMessageText = async (text, opts) => {
+      assert.equal(held, false);
+      await editMessageText(text, opts);
+    };
+
+    await fn(ctx);
+
+    assert.equal(replacementObserved, true);
+    assert.equal(held, false);
+    assert.equal(ctx._edits.length, 1);
+    assert.match(ctx._acks[0].text, /Runtime → Codex/);
+  });
+
+  test('isolated-topic runtime switch writes only that topic and audits its ID', async () => {
+    const config = {
+      bot: { allowConfigCommands: true, pm: 'sdk' },
+      chats: {
+        '-100': {
+          model: 'sonnet',
+          effort: 'high',
+          isolateTopics: true,
+          topics: {
+            '3': {
+              name: 'Music',
+              codexModel: 'gpt-5.6-sol',
+              codexEffort: 'high',
+              cwd: '/music',
+            },
+          },
+        },
+      },
+    };
+    const m = makeDeps({
+      config,
+      getSessionKey: (chatId, threadId) => `${chatId}:${threadId}`,
+      buildSpawnContext: async (key) => ({
+        runtime: 'codex',
+        backend: 'codex',
+        key,
+      }),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({
+      data: 'cfg:runtime:codex',
+      chatId: '-100',
+      existingRows: 4,
+    });
+    ctx.callbackQuery.message.message_thread_id = 3;
+
+    await fn(ctx);
+
+    assert.equal(config.chats['-100'].topics['3'].pm, 'codex');
+    assert.equal(config.chats['-100'].pm, undefined);
+    const audit = m.dbCalls.find((call) => call[0] === 'logConfigChange');
+    assert.equal(audit[1].thread_id, '3');
+  });
+
+  test('same canonical runtime and invalid targets are no-ops', async () => {
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: { '12345': { pm: 'channels', model: 'sonnet', effort: 'high' } },
+      },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+
+    const same = makeCtx({ data: 'cfg:runtime:cli', existingRows: 4 });
+    await fn(same);
+    assert.match(same._acks[0].text, /Already Claude CLI/);
+
+    const invalid = makeCtx({ data: 'cfg:runtime:other', existingRows: 4 });
+    await fn(invalid);
+    assert.match(invalid._acks[0].text, /Invalid runtime/);
+    assert.equal(m.dbCalls.length, 0);
+    assert.equal(
+      m.pmCalls.some((call) => call[0] === 'replaceRuntime'),
+      false,
     );
   });
 });

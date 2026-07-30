@@ -47,6 +47,9 @@ function createDeployment(t, lease = null) {
       'approval_policy = "never"',
       'web_search = "disabled"',
       '',
+      '[features]',
+      'goals = false',
+      '',
       '[permissions."polygram-session".filesystem]',
       `${JSON.stringify(codexTmp)} = "deny"`,
       '',
@@ -209,6 +212,38 @@ test('doctor rejects a protocol map that drifts from the selected target', async
   );
 });
 
+test('doctor rejects a managed Codex profile that exposes native goals', async (t) => {
+  const deployment = createDeployment(t);
+  writeFileSync(
+    path.join(deployment.codexHome, 'config.toml'),
+    [
+      'default_permissions = "polygram-session"',
+      'approval_policy = "never"',
+      'web_search = "disabled"',
+      '',
+      '[permissions."polygram-session".filesystem]',
+      `${JSON.stringify(deployment.codexTmp)} = "deny"`,
+      '',
+      '[permissions."polygram-session".network]',
+      'enabled = false',
+      '',
+    ].join('\n'),
+    { mode: 0o600 },
+  );
+
+  const checks = await collectCodexDoctorChecks({
+    config: deployment.config,
+    db: deployment.db,
+    dependencies: deployment.dependencies,
+    processEnv: deployment.processEnv,
+  });
+
+  assert.equal(
+    checks.find(({ name }) => name === 'codex-profile').status,
+    'fail',
+  );
+});
+
 test('unsafe Codex temp roots fail closed without exposing their path', async (t) => {
   const deployment = createDeployment(t);
   chmodSync(deployment.codexTmp, 0o755);
@@ -328,6 +363,9 @@ test('Codex temp inspection honors the configured permission profile', async (t)
       'default_permissions = "custom-session"',
       'approval_policy = "never"',
       'web_search = "disabled"',
+      '',
+      '[features]',
+      'goals = false',
       '',
       '[permissions."custom-session".filesystem]',
       `${JSON.stringify(deployment.codexTmp)} = "deny"`,

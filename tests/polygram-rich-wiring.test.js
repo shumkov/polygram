@@ -64,6 +64,62 @@ describe('polygram rich-message wiring', () => {
     assert.doesNotMatch(wiring, /runtimeView\.model\s*===\s*proc\.model/);
   });
 
+  test('runtime views expose the exact configured backend and selection scope', () => {
+    const wiring = sectionBetween(
+      'async function resolveSessionRuntimeView',
+      'async function buildSpawnContext',
+    );
+    assert.match(wiring, /resolveRuntimeDescriptor\(\{/);
+    assert.match(wiring, /backend:\s*runtimeSelection\.backend/);
+    assert.match(wiring, /configuredPm:\s*runtimeSelection\.configuredPm/);
+    assert.match(wiring, /selectionSource:\s*runtimeSelection\.source/);
+  });
+
+  test('an unavailable configured Codex runtime still produces a switchable config view', () => {
+    assert.match(source, /function buildUnavailableCodexRuntimeView\(/);
+    const fallback = sectionBetween(
+      'function buildUnavailableCodexRuntimeView',
+      'async function resolveSessionRuntimeView',
+    );
+    assert.match(fallback, /resolveCodexRuntimeCandidate\(\{/);
+    assert.match(fallback, /runtime:\s*'codex'/);
+    assert.match(fallback, /models:[^\n]*Object\.freeze\(\[\]\)/);
+    assert.match(fallback, /processStatus:\s*'unavailable'/);
+
+    const runtimeView = sectionBetween(
+      'async function resolveSessionRuntimeView',
+      'async function buildSpawnContext',
+    );
+    assert.match(runtimeView, /buildUnavailableCodexRuntimeView\(\{/);
+
+    // The UI fallback must not become a send-path fallback: actual Codex
+    // spawning remains fail-closed when the controller is unavailable.
+    const spawn = sectionBetween(
+      'async function buildSpawnContext',
+      'async function getOrSpawnForChat',
+    );
+    assert.match(spawn, /if \(!codexRuntimeController\) \{/);
+    assert.match(spawn, /throw error;/);
+    assert.doesNotMatch(spawn, /buildUnavailableCodexRuntimeView/);
+  });
+
+  test('runtime switch callback gets candidate preflight and exact spawn-context wiring', () => {
+    const wiring = sectionBetween(
+      'handleConfigCallback = createHandleConfigCallback({',
+      'handleCodexReconciliationCallback =',
+    );
+    assert.match(wiring, /prepareRuntimeSelection:/);
+    assert.match(
+      wiring,
+      /codexRuntimeController\.resolveCandidateRuntimeView\(\{/,
+    );
+    assert.match(
+      wiring,
+      /codexRuntimeController\?\.discardCandidateRuntime\(/,
+    );
+    assert.match(wiring, /\bbuildSpawnContext,/);
+  });
+
   test('the CLI-backend display hint is resolved per chat, not a fixed constant', () => {
     // Regression guard: cli-backed chats (pm:'cli') get their system-prompt
     // display hint from createProcessFactory's displayHint option, which

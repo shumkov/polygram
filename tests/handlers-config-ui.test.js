@@ -34,19 +34,24 @@ const CODEX_VIEW = Object.freeze({
 describe('buildConfigKeyboard', () => {
   test('show=all renders model + effort + rich-text rows with current values marked', () => {
     const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high' }, 'all');
-    assert.equal(kb.inline_keyboard.length, 3);
-    const modelRow = kb.inline_keyboard[0];
+    assert.equal(kb.inline_keyboard.length, 4);
+    assert.deepEqual(kb.inline_keyboard[0], [
+      { text: '✓ Claude SDK', callback_data: 'cfg:runtime:sdk' },
+      { text: 'Claude CLI', callback_data: 'cfg:runtime:cli' },
+      { text: 'Codex', callback_data: 'cfg:runtime:codex' },
+    ]);
+    const modelRow = kb.inline_keyboard[1];
     assert.equal(modelRow.length, MODEL_OPTIONS.length);
     const sonnet = modelRow.find((b) => b.callback_data === 'cfg:model:sonnet');
     assert.match(sonnet.text, /^✓ sonnet$/);
     const opus = modelRow.find((b) => b.callback_data === 'cfg:model:opus');
     assert.equal(opus.text, 'opus');
 
-    const effortRow = kb.inline_keyboard[1];
+    const effortRow = kb.inline_keyboard[2];
     const high = effortRow.find((b) => b.callback_data === 'cfg:effort:high');
     assert.match(high.text, /^✓ high$/);
 
-    const richTextRow = kb.inline_keyboard[2];
+    const richTextRow = kb.inline_keyboard[3];
     assert.equal(richTextRow.length, 1);
     assert.equal(richTextRow[0].callback_data, 'cfg:richtext:on');
     assert.match(richTextRow[0].text, /off$/);
@@ -54,7 +59,7 @@ describe('buildConfigKeyboard', () => {
 
   test('rich-text row toggles: on when set, callback flips to off', () => {
     const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high', richText: true }, 'all');
-    const richTextRow = kb.inline_keyboard[2];
+    const richTextRow = kb.inline_keyboard[3];
     assert.equal(richTextRow[0].callback_data, 'cfg:richtext:off');
     assert.match(richTextRow[0].text, /^✓ Rich text: on$/);
   });
@@ -66,25 +71,103 @@ describe('buildConfigKeyboard', () => {
     assert.equal(kbEffort.inline_keyboard.length, 1);
   });
 
+  test('runtime row is shown only on the full card and marks the canonical backend', () => {
+    const cli = buildConfigKeyboard(
+      { model: 'sonnet', effort: 'high' },
+      'all',
+      null,
+      false,
+      { runtime: 'claude', backend: 'cli' },
+    );
+    assert.deepEqual(cli.inline_keyboard[0], [
+      { text: 'Claude SDK', callback_data: 'cfg:runtime:sdk' },
+      { text: '✓ Claude CLI', callback_data: 'cfg:runtime:cli' },
+      { text: 'Codex', callback_data: 'cfg:runtime:codex' },
+    ]);
+
+    const codex = buildConfigKeyboard(
+      { codexModel: 'gpt-5.6-sol', codexEffort: 'high' },
+      'all',
+      null,
+      false,
+      CODEX_VIEW,
+    );
+    assert.match(codex.inline_keyboard[0][2].text, /^✓ Codex$/);
+
+    const modelOnly = buildConfigKeyboard(
+      { model: 'sonnet', effort: 'high' },
+      'model',
+      null,
+      false,
+      { runtime: 'claude', backend: 'cli' },
+    );
+    const effortOnly = buildConfigKeyboard(
+      { model: 'sonnet', effort: 'high' },
+      'effort',
+      null,
+      false,
+      { runtime: 'claude', backend: 'cli' },
+    );
+    assert.equal(
+      modelOnly.inline_keyboard.flat()
+        .some((button) => button.callback_data.startsWith('cfg:runtime:')),
+      false,
+    );
+    assert.equal(
+      effortOnly.inline_keyboard.flat()
+        .some((button) => button.callback_data.startsWith('cfg:runtime:')),
+      false,
+    );
+  });
+
+  test('unavailable Codex keeps runtime escape controls without empty Telegram rows', () => {
+    const unavailable = {
+      runtime: 'codex',
+      backend: 'codex',
+      model: null,
+      effort: null,
+      models: [],
+      efforts: [],
+      processStatus: 'unavailable',
+      unavailableReason: 'CODEX_RUNTIME_UNAVAILABLE',
+    };
+    const kb = buildConfigKeyboard(
+      {},
+      'all',
+      null,
+      false,
+      unavailable,
+    );
+
+    assert.deepEqual(
+      kb.inline_keyboard.map((row) => row.map((button) => button.callback_data)),
+      [
+        ['cfg:runtime:sdk', 'cfg:runtime:cli', 'cfg:runtime:codex'],
+        ['cfg:richtext:on'],
+      ],
+    );
+    assert.equal(kb.inline_keyboard.some((row) => row.length === 0), false);
+  });
+
   test('a topic-level richText override takes precedence over chat-level for the ✓ marker', () => {
     const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high', richText: false }, 'all', { richText: true });
-    assert.match(kb.inline_keyboard[2][0].text, /^✓ Rich text: on$/);
+    assert.match(kb.inline_keyboard[3][0].text, /^✓ Rich text: on$/);
   });
 
   test('an inherited effective rich-text value shows ✓ on the card', () => {
     const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high' }, 'all', null, true);
-    assert.match(kb.inline_keyboard[2][0].text, /^✓ Rich text: on$/);
+    assert.match(kb.inline_keyboard[3][0].text, /^✓ Rich text: on$/);
   });
 
   test('an explicit effective false overrides local values in the card', () => {
     const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high', richText: true }, 'all', null, false);
-    assert.match(kb.inline_keyboard[2][0].text, /off$/);
-    assert.equal(kb.inline_keyboard[2][0].callback_data, 'cfg:richtext:on');
+    assert.match(kb.inline_keyboard[3][0].text, /off$/);
+    assert.equal(kb.inline_keyboard[3][0].callback_data, 'cfg:richtext:on');
   });
 
   test('no effective value passed falls back to chat/topic only, defaults to off', () => {
     const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high' }, 'all');
-    assert.match(kb.inline_keyboard[2][0].text, /off$/);
+    assert.match(kb.inline_keyboard[3][0].text, /off$/);
   });
 
   test('show=model only renders the model row', () => {
@@ -102,7 +185,7 @@ describe('buildConfigKeyboard', () => {
 
   test('default show is all', () => {
     const kb = buildConfigKeyboard({ model: 'haiku', effort: 'medium' });
-    assert.equal(kb.inline_keyboard.length, 3);
+    assert.equal(kb.inline_keyboard.length, 4);
   });
 
   test('every model option produces a button with cfg:model:* callback_data', () => {
@@ -129,15 +212,15 @@ describe('buildConfigKeyboard', () => {
       codexEffort: 'xhigh',
     }, 'all', null, false, CODEX_VIEW);
     assert.deepEqual(
-      kb.inline_keyboard[0].map((button) => button.callback_data),
+      kb.inline_keyboard[1].map((button) => button.callback_data),
       ['cfg:model:gpt-5.6-sol', 'cfg:model:gpt-5.5'],
     );
-    assert.match(kb.inline_keyboard[0][0].text, /^✓ GPT-5\.6 SOL$/);
+    assert.match(kb.inline_keyboard[1][0].text, /^✓ GPT-5\.6 SOL$/);
     assert.deepEqual(
-      kb.inline_keyboard[1].map((button) => button.callback_data),
+      kb.inline_keyboard[2].map((button) => button.callback_data),
       ['cfg:effort:high', 'cfg:effort:xhigh'],
     );
-    assert.match(kb.inline_keyboard[1][1].text, /^✓ xhigh$/);
+    assert.match(kb.inline_keyboard[2][1].text, /^✓ xhigh$/);
   });
 });
 
@@ -287,6 +370,10 @@ describe('createFormatConfigInfoText', () => {
     assert.match(out, /network and web search are disabled/);
     assert.match(out, /Product MCP tools and interactive approvals are unavailable/);
     assert.match(out, /Detached\/background servers are unsupported/);
+    assert.match(
+      out,
+      /Native goals are disabled for Polygram-managed Codex sessions until native goal support is implemented/,
+    );
     assert.match(out, /\*\*gpt-5\.6-sol\*\* — GPT-5\.6 SOL/);
     assert.doesNotMatch(out, /Agent: claude-agent/);
     assert.doesNotMatch(out, /deep analysis, code refactor/);
@@ -378,6 +465,57 @@ describe('createFormatConfigInfoText', () => {
       legacy(chat, 'all', '42'),
     );
   });
+
+  test('Claude card names its canonical backend and runtime selection source', () => {
+    const fmt = buildFormat();
+    const chat = { model: 'sonnet', effort: 'high', agent: 'shumabit' };
+
+    const sdk = fmt(chat, 'all', '42', null, false, {
+      runtime: 'claude',
+      backend: 'sdk',
+      selectionSource: 'chat',
+    });
+    assert.match(sdk, /^Runtime: Claude SDK \(source: chat\)$/m);
+    assert.match(sdk, /^Agent: shumabit$/m);
+
+    const cli = fmt(chat, 'all', '42', null, false, {
+      runtime: 'claude',
+      backend: 'cli',
+      selectionSource: 'topic',
+    });
+    assert.match(cli, /^Runtime: Claude CLI \(source: topic\)$/m);
+  });
+
+  test('Codex card includes runtime selection source when provided', () => {
+    const fmt = buildFormat();
+    const out = fmt({
+      codexModel: 'gpt-5.6-sol',
+      codexEffort: 'high',
+    }, 'all', '42', null, false, {
+      ...CODEX_VIEW,
+      selectionSource: 'bot',
+    });
+    assert.match(out, /^Runtime: Codex app-server \(source: bot\)$/m);
+  });
+
+  test('unavailable incomplete Codex card remains readable and switchable', () => {
+    const fmt = buildFormat();
+    const out = fmt({}, 'all', '42', null, false, {
+      runtime: 'codex',
+      backend: 'codex',
+      model: null,
+      effort: null,
+      models: [],
+      efforts: [],
+      processStatus: 'unavailable',
+      unavailableReason: 'CODEX_RUNTIME_UNAVAILABLE',
+    });
+
+    assert.match(out, /Selected: incomplete Codex selection/);
+    assert.match(out, /Models are unavailable until Codex preflight succeeds/);
+    assert.match(out, /Effort options are unavailable until Codex preflight succeeds/);
+    assert.doesNotMatch(out, /\bnull\/null\b/);
+  });
 });
 
 describe('MODEL_VERSIONS_DESC', () => {
@@ -434,7 +572,7 @@ describe('config card — per-topic override resolution (Music topic /model bug,
     const out = fmt(chatConfig, 'all', 'sk', topicConfig);
     assert.match(out, /^Model: opus/m);
     assert.match(out, /^Effort: max/m);
-    const modelRow = buildConfigKeyboard(chatConfig, 'all', topicConfig).inline_keyboard[0];
+    const modelRow = buildConfigKeyboard(chatConfig, 'all', topicConfig).inline_keyboard[1];
     assert.match(modelRow.find((b) => b.callback_data === 'cfg:model:opus').text, /^✓ opus$/);
     assert.equal(modelRow.find((b) => b.callback_data === 'cfg:model:sonnet').text, 'sonnet');
   });
@@ -444,7 +582,7 @@ describe('config card — per-topic override resolution (Music topic /model bug,
     const chatConfig = { model: 'sonnet', effort: 'high', agent: 'shumabit' };
     assert.match(fmt(chatConfig, 'all', 'sk', null), /^Agent: shumabit/m);
     assert.match(fmt(chatConfig, 'all', 'sk', {}), /^Agent: shumabit/m);
-    assert.match(buildConfigKeyboard(chatConfig, 'all').inline_keyboard[0]
+    assert.match(buildConfigKeyboard(chatConfig, 'all').inline_keyboard[1]
       .find((b) => b.callback_data === 'cfg:model:sonnet').text, /^✓ sonnet$/);
     // partial override: topic sets only agent → model/effort stay chat-level
     const out = fmt(chatConfig, 'all', 'sk', { agent: 'curator' });
