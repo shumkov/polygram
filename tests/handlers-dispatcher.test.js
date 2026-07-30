@@ -76,10 +76,10 @@ function fixture(overrides = {}) {
     botName: 'testbot',
     logEvent: (kind, detail) => calls.events.push({ kind, detail }),
     handleMessage,
-    sendToProcess: async (sk, prompt, ctx) => {
+    sendToProcess: overrides.sendToProcess || (async (sk, prompt, ctx) => {
       calls.sendToProcess.push({ sessionKey: sk, prompt, ctx });
       return overrides.sendToProcessResult || { text: 'auto-resume reply text' };
-    },
+    }),
     classifyError: overrides.classifyError || ((err) => ({
       kind: overrides.classifyKind || 'unknown',
       userMessage: overrides.userMessage === undefined ? `error: ${err.message}` : overrides.userMessage,
@@ -146,6 +146,85 @@ describe('createDispatcher — in-flight counter', () => {
     for (const r of resolvers) r();
     await nextTick(); await nextTick();
     assert.equal(dispatcher.inFlightHandlers.has('sk'), false);
+  });
+});
+
+describe('createDispatcher — settlement ownership', () => {
+  test('awaitSettlement waits for an ordinary handler to finish', async () => {
+    const fx = fixture();
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+
+    let settled = false;
+    const waiting = fx.dispatcher.awaitSettlement({ timeoutMs: 1000 })
+      .then(() => { settled = true; });
+    await nextTick();
+    assert.equal(settled, false);
+
+    fx.getResolver().resolve();
+    await waiting;
+    assert.equal(settled, true);
+  });
+
+  test('awaitSettlement fails loud when owned work does not settle', async () => {
+    const fx = fixture();
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+
+    await assert.rejects(
+      () => fx.dispatcher.awaitSettlement({ timeoutMs: 5 }),
+      (error) => error?.code === 'HANDLER_SETTLEMENT_TIMEOUT',
+    );
+    fx.getResolver().resolve();
+  });
+
+  test('awaitSettlement includes the detached auto-resume continuation', async () => {
+    let finishResume;
+    const sendToProcess = () => new Promise((resolve) => {
+      finishResume = resolve;
+    });
+    const fx = fixture({ isAutoResumable: true, sendToProcess });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(new Error('300s no activity'));
+    await nextTick();
+
+    let settled = false;
+    const waiting = fx.dispatcher.awaitSettlement({ timeoutMs: 1000 })
+      .then(() => { settled = true; });
+    await nextTick();
+    assert.equal(settled, false, 'auto-resume still owns work after handleMessage rejects');
+
+    finishResume({ text: 'resumed answer' });
+    await waiting;
+    assert.equal(settled, true);
+  });
+
+  test('awaitSettlement includes a scheduled startup retry and its handler', async () => {
+    let retryResolve;
+    let attempts = 0;
+    const startupError = Object.assign(new Error('startup disappeared'), {
+      code: 'TMUX_SESSION_GONE',
+    });
+    const handleMessage = () => {
+      attempts += 1;
+      if (attempts === 1) return Promise.reject(startupError);
+      return new Promise((resolve) => { retryResolve = resolve; });
+    };
+    const fx = fixture({ handleMessage, startupRetryDelayMs: 0 });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    let settled = false;
+    const waiting = fx.dispatcher.awaitSettlement({ timeoutMs: 1000 })
+      .then(() => { settled = true; });
+    await nextTick();
+    assert.equal(attempts, 2);
+    assert.equal(settled, false);
+
+    retryResolve();
+    await waiting;
+    assert.equal(settled, true);
   });
 });
 

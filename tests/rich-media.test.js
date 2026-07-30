@@ -946,6 +946,61 @@ describe('bounded media file_id cache integration', () => {
 });
 
 describe('typed media rescue delivery context', () => {
+  test('attributes placeholder cleanup, rescue, and warnings to the exact source turn', async () => {
+    const tmp = makeTempDir('rich-media-delivery-meta-');
+    const source = path.join(tmp, 'photo.png');
+    fs.writeFileSync(source, Buffer.alloc(8, 1));
+    const [resolved] = createRichMediaResolver({ allowedRoots: [tmp] })([
+      { src: source, caption: '' },
+    ]);
+    const calls = [];
+    const context = createMediaDeliveryContext({
+      allowedRoots: [tmp],
+      tg: async (_bot, method, _params, meta) => {
+        calls.push({ method, meta });
+        return { message_id: calls.length };
+      },
+      bot: {},
+      botName: 'shumorobot',
+      chatId: 'chat',
+      sessionKey: 'chat:topic',
+      sourceMsgId: 91,
+    });
+
+    await context.deletePlaceholder(1);
+    await context.rescueEntries([
+      { kind: 'photo', media: resolved.media, caption: '' },
+    ]);
+    context.recordTextFailures(1);
+    await context.flushPartialDeliveryWarning();
+
+    assert.deepEqual(calls.map(({ method, meta }) => ({
+      method,
+      sessionKey: meta.sessionKey,
+      sourceMsgId: meta.sourceMsgId,
+      botName: meta.botName,
+    })), [
+      {
+        method: 'deleteMessage',
+        sessionKey: 'chat:topic',
+        sourceMsgId: 91,
+        botName: 'shumorobot',
+      },
+      {
+        method: 'sendPhoto',
+        sessionKey: 'chat:topic',
+        sourceMsgId: 91,
+        botName: 'shumorobot',
+      },
+      {
+        method: 'sendMessage',
+        sessionKey: 'chat:topic',
+        sourceMsgId: 91,
+        botName: 'shumorobot',
+      },
+    ]);
+  });
+
   test('collects nested photos in display order and sends valid rescues sequentially', async () => {
     const tmp = makeTempDir('rich-media-rescue-');
     const first = path.join(tmp, 'first.png');

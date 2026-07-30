@@ -71,6 +71,105 @@ describe('shutdown signal-time sampling', () => {
   });
 });
 
+describe('reply delivery barrier wiring', () => {
+  test('creates the barrier before the Telegram sender and passes it to the choke point', () => {
+    assert.match(src, /const \{ createDeliveryBarrier \} = require\('\.\/lib\/telegram\/delivery-barrier'\)/);
+    const createBarrier = src.indexOf('deliveryBarrier = createDeliveryBarrier()');
+    const createTelegram = src.indexOf('tg = createSender(db, console, config, deliveryBarrier)');
+    assert.notEqual(createBarrier, -1, 'delivery barrier is not created');
+    assert.notEqual(createTelegram, -1, 'Telegram sender does not receive the barrier');
+    assert.ok(createBarrier < createTelegram, 'delivery barrier must exist before the sender');
+  });
+
+  test('stream edits retain the exact session key when no thread id is present', () => {
+    assert.match(src, /const outMetaBase = \{[\s\S]{0,200}?sessionKey,/);
+    assert.match(src, /\{ \.\.\.outMetaBase, source: 'bot-reply-stream-edit' \}/);
+    assert.match(src, /sourceMsgId: msg\.message_id/);
+    assert.match(src, /createMediaDeliveryContext\(\{[\s\S]{0,300}?sessionKey,/);
+  });
+
+  test('inline agent reactions are fenced as reply-bearing output', () => {
+    const reactionCalls = [...src.matchAll(
+      /setMessageReaction[\s\S]{0,420}deliveryClass: 'reply-bearing'/g,
+    )];
+    assert.ok(
+      reactionCalls.length >= 2,
+      'both inline and solo agent reaction paths must cross the reply-bearing barrier',
+    );
+  });
+});
+
+describe('clean restart lifecycle ordering', () => {
+  test('retires processes and settles handlers before clean persistence', () => {
+    const body = shutdownBody();
+    const retire = body.indexOf('await prepareCleanRetirement({');
+    const persist = body.indexOf('persistShutdownDisposition({');
+    assert.notEqual(retire, -1, 'clean retirement is missing');
+    assert.notEqual(persist, -1, 'shutdown persistence is missing');
+    assert.ok(retire < persist, 'clean retirement must finish before persistence');
+    assert.match(
+      body,
+      /prepareCleanRetirement\(\{[\s\S]{0,250}?awaitHandlerSettlement,/,
+    );
+    assert.match(
+      body,
+      /if \(pm && !pmRetired\) await pm\.shutdown\(\)/,
+      'a retired ProcessManager must not be shut down a second time',
+    );
+  });
+
+  test('a failed clean transaction invalidates any usable clean-recovery state', () => {
+    const body = shutdownBody();
+    const persist = body.indexOf('persistShutdownDisposition({');
+    const failed = body.indexOf('[shutdown] persistence failed:', persist);
+    assert.notEqual(persist, -1, 'shutdown persistence is missing');
+    assert.notEqual(failed, -1, 'shutdown persistence failure handler is missing');
+    const failureBranch = body.slice(persist, failed + 300);
+    assert.match(
+      failureBranch,
+      /db\.recordCrashShutdown\(\{ botName: BOT_NAME \}\)/,
+      'persistence failure must clear clean marker/intents through crash disposition',
+    );
+  });
+
+  test('boot claims clean recovery before replay, compact recovery, or polling', () => {
+    const claim = src.indexOf('startCleanRestartRecovery({');
+    const replay = src.indexOf('const candidates = db.getReplayCandidates({', claim);
+    const compact = src.indexOf('db.findOrphanedCompactCommands({', claim);
+    const polling = src.indexOf('const pollPromise = pollBot(bot)', claim);
+    assert.notEqual(claim, -1, 'clean recovery claim is missing');
+    for (const [label, at] of Object.entries({ replay, compact, polling })) {
+      assert.notEqual(at, -1, `${label} marker is missing`);
+      assert.ok(claim < at, `clean recovery must be claimed before ${label}`);
+    }
+  });
+
+  test('same-session compact replay waits for the tracked continuation without delaying polling', () => {
+    assert.match(
+      src,
+      /cleanRecoveryTasksBySession\.get\(o\.session_key\)[\s\S]{0,500}trackHandlerTask\([\s\S]{0,500}\.then\(\(\) => recoverCompact\(o\)\)/,
+    );
+    const deferredCompact = src.indexOf('cleanRecoveryTasksBySession.get(o.session_key)');
+    const polling = src.indexOf('const pollPromise = pollBot(bot)', deferredCompact);
+    assert.notEqual(polling, -1);
+  });
+
+  test('strict recovery spawn requires the expected existing session and attestation', () => {
+    assert.match(src, /resumePolicy: 'require-existing-session'/);
+    assert.match(src, /expectedSessionId: strictResume\.expectedSessionId/);
+    assert.match(src, /noWaitForCapacity: true/);
+    assert.match(src, /entry\?\.getResumeAttestation/);
+    assert.match(src, /pm\.retireExpectedProcess\(sessionKey, rejectedProcess, reason\)/);
+    assert.match(src, /sendToProcess\(sessionKey, text, createCleanResumeTurnContext\(\{/);
+    assert.match(src, /\{ expectedProcess, onDispatched \}/);
+    assert.match(
+      src,
+      /if \(strictResume && promptBackend === 'codex'\)[\s\S]{0,250}?CLEAN_RESUME_CONFIG_DRIFT/,
+      'a backend switch must fail before spawning a different provider',
+    );
+  });
+});
+
 describe('ipc handler wiring', () => {
   test('polygram serves the shared production handler set', () => {
     // Guards against the handlers drifting back inline, where the IPC tests

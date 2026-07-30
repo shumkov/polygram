@@ -119,6 +119,7 @@ const { formatContextReply, maybeContextFullHint } = require('./lib/context-form
 const { createAbortGrace } = require('./lib/abort-grace');
 const agentLoader = require('./lib/agents/loader');
 const { createSender } = require('./lib/telegram/api');
+const { createDeliveryBarrier } = require('./lib/telegram/delivery-barrier');
 const { createAsyncLock } = require('@shumkov/orchestra');
 const { sweepInbox } = require('./lib/db/inbox');
 const { parseBotArg, parseDbArg, filterConfigToBot, activeBotConfig } = require('./lib/config-scope');
@@ -177,6 +178,16 @@ const { createAuthDisabledGate } = require('./lib/ops/auth-disabled-gate');
 const { createHeartbeat } = require('./lib/ops/heartbeat');
 const { createCgroupOomObserver } = require('./lib/ops/cgroup-oom-observer');
 const { persistShutdownDisposition } = require('./lib/ops/shutdown-disposition');
+const {
+  prepareCleanRetirement,
+  buildResumeIntents,
+} = require('./lib/ops/clean-shutdown');
+const {
+  CLEAN_RESUME_POLICY_VERSION,
+  createCleanResumeTurnContext,
+  executeCleanResumeClaim,
+  startCleanRestartRecovery,
+} = require('./lib/ops/clean-resume');
 const { resolveReplayWindowMs } = require('./lib/db/replay-window');
 const { pruneEvents, resolveRetentionPolicy, validatePolicy } = require('./lib/db/events-retention');
 const { sweepSecrets, resolveSecretSweepConfig } = require('./lib/db/secret-sweep');
@@ -226,6 +237,7 @@ let emojiToSticker = {}; // emoji → file_id
 let config;
 let db;
 let tg; // unified sender, created after db opens
+let deliveryBarrier = null;
 let pairings; // pairings store, created after db opens
 let approvals; // approvals store, created after db opens
 // approvalWaiters Map moved to lib/handlers/approvals.js (commit 29).
@@ -753,7 +765,10 @@ async function resolveSessionRuntimeView({
 
 async function buildSpawnContext(
   sessionKey,
-  { mutateSessionOnDrift = true } = {},
+  {
+    mutateSessionOnDrift = true,
+    strictResume = null,
+  } = {},
 ) {
   const chatId = getChatIdFromKey(sessionKey);
   const chatConfig = config.chats[chatId];
@@ -765,6 +780,11 @@ async function buildSpawnContext(
     threadId: threadId || null,
   });
 
+  if (strictResume && promptBackend === 'codex') {
+    const error = new Error('strict Claude resume cannot cross a backend change');
+    error.code = 'CLEAN_RESUME_CONFIG_DRIFT';
+    throw error;
+  }
   if (promptBackend === 'codex') {
     if (!codexRuntimeController) {
       const error = new Error('Codex runtime controller is not initialized');
@@ -809,7 +829,38 @@ async function buildSpawnContext(
     promptBackend,
   );
   let existingSessionId;
-  if (isColdSpawn) {
+  if (strictResume) {
+    if (!isColdSpawn) {
+      const error = new Error('strict clean resume requires an unspawned session');
+      error.code = 'CLEAN_RESUME_SESSION_ALREADY_SPAWNED';
+      throw error;
+    }
+    const topicConfig = getTopicConfig(chatConfig, threadId || null);
+    const resolved = {
+      agent: topicConfig.agent || chatConfig.agent || null,
+      cwd: topicConfig.cwd || chatConfig.cwd || null,
+      backend: pickBackend({ config, chatId, threadId: threadId || null, pmDefault: 'sdk' }),
+    };
+    const runtime = db.getProviderSession(sessionKey, 'claude:channels');
+    const driftFields = ['agent', 'cwd'].filter(
+      (field) => (runtime?.[field] || null) !== resolved[field],
+    );
+    if (
+      !runtime
+      || runtime.generation_id !== strictResume.expectedGenerationId
+      || runtime.provider_session_id !== strictResume.expectedSessionId
+      || !['cli', 'channels'].includes(runtime.pm_backend)
+      || !['cli', 'channels'].includes(resolved.backend)
+      || driftFields.length > 0
+    ) {
+      const error = new Error('strict clean resume session identity or config changed');
+      error.code = driftFields.length > 0
+        ? 'CLEAN_RESUME_CONFIG_DRIFT'
+        : 'CLEAN_RESUME_SESSION_CHANGED';
+      throw error;
+    }
+    existingSessionId = strictResume.expectedSessionId;
+  } else if (isColdSpawn) {
     const topicConfig = getTopicConfig(chatConfig, threadId || null);
     const resolved = {
       agent: topicConfig.agent || chatConfig.agent || null,
@@ -843,6 +894,11 @@ async function buildSpawnContext(
     threadId: threadId || null,
     label: getSessionLabel(chatConfig, threadId),
     existingSessionId,
+    ...(strictResume ? {
+      resumePolicy: 'require-existing-session',
+      expectedSessionId: strictResume.expectedSessionId,
+      noWaitForCapacity: true,
+    } : {}),
     // File-send outbound cap inputs: localApi (backend ceiling) + the resolved
     // per-file override (topic → chat → bot → default) from the SAME resolver
     // the inbound filter and the send() choke point use, so CliProcess's
@@ -866,8 +922,13 @@ async function getOrSpawnForChat(sessionKey) {
   return pm.getOrSpawn(sessionKey, ctx);
 }
 
-async function sendToProcess(sessionKey, prompt, context = {}, { onDispatched } = {}) {
-  const entry = await getOrSpawnForChat(sessionKey);
+async function sendToProcess(
+  sessionKey,
+  prompt,
+  context = {},
+  { onDispatched, expectedProcess = null } = {},
+) {
+  const entry = expectedProcess || await getOrSpawnForChat(sessionKey);
   if (!entry) throw new Error('No process for chat');
   const chatId = getChatIdFromKey(sessionKey);
   const chatConfig = config.chats[chatId];
@@ -900,6 +961,7 @@ async function sendToProcess(sessionKey, prompt, context = {}, { onDispatched } 
       maxTurnMs,
       maxTurnHardMs,
       context,
+      ...(expectedProcess ? { expectedProcess } : {}),
     });
     if (typeof onDispatched === 'function') onDispatched();
     return await turnP;
@@ -934,7 +996,13 @@ async function sendToProcess(sessionKey, prompt, context = {}, { onDispatched } 
   // starts, which is the correct UX (and what the user already expects).
   const release = await stdinLock.acquire(sessionKey);
   try {
-    const turnP = pm.send(sessionKey, prompt, { timeoutMs, maxTurnMs, maxTurnHardMs, context });
+    const turnP = pm.send(sessionKey, prompt, {
+      timeoutMs,
+      maxTurnMs,
+      maxTurnHardMs,
+      context,
+      ...(expectedProcess ? { expectedProcess } : {}),
+    });
     // Phase 3 §4: pm.send synchronously kicks off the turn — the
     // process is now inFlight. Signal the committed-intent latch so
     // it can release; a concurrent handler will then correctly see
@@ -975,6 +1043,8 @@ let attemptAutoResume = null;
 let errorReplyText = null;
 let queueWarnThreshold = null;
 let inFlightHandlers = null;
+let awaitHandlerSettlement = null;
+let trackHandlerTask = null;
 let recoverCodexRequest = null;
 
 // AUTH_DISABLED (docs/AUTH_DISABLED_HANDLING_SPEC.md): dedupe/re-arm gate for
@@ -1373,7 +1443,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       await tg(bot, 'sendMessage', {
         chat_id: chatId, text: `Attachment(s) skipped: ${summary.slice(0, 300)}`,
         ...replyOpts(threadId),
-      }, { source: 'attachment-skipped', botName: BOT_NAME });
+      }, {
+        source: 'attachment-skipped',
+        botName: BOT_NAME,
+        sessionKey,
+        sourceMsgId: msg.message_id,
+      });
     } catch (err) {
       // Surface the failure: claude is about to reply as if the photo
       // was processed (because filterAttachments dropped it before
@@ -1416,6 +1491,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   const outMetaBase = {
     source: 'bot-reply-stream',
     botName: BOT_NAME,
+    sessionKey,
+    sourceMsgId: msg.message_id,
     model: chatConfig.model,
     effort: chatConfig.effort,
     ...(linkPreview === false ? { linkPreview: false } : {}),
@@ -1503,6 +1580,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     threadId,
     replyToMessageId: msg.message_id,
     botName: BOT_NAME,
+    sessionKey,
+    sourceMsgId: msg.message_id,
     logEvent: (kind, detail) => logEvent(kind, {
       chat_id: chatId, thread_id: threadId, bot: BOT_NAME, ...detail,
     }),
@@ -1609,6 +1688,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           phase: payload.phase,
           mediaContext,
           hadReplyAnchor: payload.hadReplyAnchor,
+          meta: outMetaBase,
         });
       }
       const text = payload;
@@ -1623,7 +1703,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           chat_id: chatId,
           message_id: messageId,
           text: sanitizeLiveText(text),
-        }, { source: 'bot-reply-stream-edit', botName: BOT_NAME });
+        }, { ...outMetaBase, source: 'bot-reply-stream-edit' });
       } catch (err) {
         // Stream-edit failures would otherwise be invisible — edits
         // don't insert a messages row by default (tg() does, but we
@@ -1648,7 +1728,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       try {
         await tg(bot, 'deleteMessage', {
           chat_id: chatId, message_id: messageId,
-        }, { source: 'bot-reply-stream-discard', botName: BOT_NAME });
+        }, { ...outMetaBase, source: 'bot-reply-stream-discard' });
       } catch (err) {
         console.error(`[${label}] discard preview failed: ${err.message}`);
         throw err;
@@ -2578,7 +2658,12 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           chat_id: chatId,
           message_id: msg.message_id,
           reaction: [{ type: 'emoji', emoji }],
-        }, { ...outMeta, source: 'inline-reaction', reaction: emoji });
+        }, {
+          ...outMeta,
+          deliveryClass: 'reply-bearing',
+          source: 'inline-reaction',
+          reaction: emoji,
+        });
       } catch (err) {
         console.error(`[${label}] inline setMessageReaction(${emoji}) failed: ${err.message}`);
       }
@@ -2705,7 +2790,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         chat_id: chatId,
         message_id: msg.message_id,
         reaction: [{ type: 'emoji', emoji: parsed.reaction }],
-      }, outMeta).catch((err) => {
+      }, { ...outMeta, deliveryClass: 'reply-bearing' }).catch((err) => {
         telegramDeliveryComplete = false;
         console.error(`[${label}] setMessageReaction failed: ${err.message}`);
       });
@@ -3447,7 +3532,8 @@ async function main() {
         );
       }
     }
-    tg = createSender(db, console, config);
+    deliveryBarrier = createDeliveryBarrier();
+    tg = createSender(db, console, config, deliveryBarrier);
     richMediaFileIdCache = createMediaFileIdCache();
     // ONE latch decision for both rich paths. They set the same flag, so a
     // counter owned by either would let that path latch on its first bare
@@ -3712,6 +3798,7 @@ async function main() {
 
   const sdkCallbacks = createSdkCallbacks({
     db, dbWrite, config, bot, botName: BOT_NAME, tg, logEvent, sessionFeedback,
+    deliveryBarrier,
     classifyToolName, announce, shouldAnnounce, contextHintShown,
     extractAssistantText, getChatIdFromKey, getThreadIdFromKey,
     // F#23: enable parse/sanitize/sticker/react on the autonomous-wakeup path.
@@ -4131,6 +4218,8 @@ async function main() {
     errorReplyText,
     queueWarnThreshold,
     inFlightHandlers,
+    awaitSettlement: awaitHandlerSettlement,
+    trackTask: trackHandlerTask,
   } = createDispatcher({
     config, db, dbWrite, tg, botName: BOT_NAME, logEvent,
     handleMessage, sendToProcess,
@@ -4342,18 +4431,91 @@ async function main() {
     const drainElapsed = Date.now() - drainStart;
     const remaining = countInFlight(inFlightHandlers);
 
-    // 3. A handled signal is normally deliberate, but a Linux supervisor can
-    //    also stop the service after an OOM-killed child. Persist crash-like
-    //    state when the process cgroup recorded an OOM kill; otherwise retain
-    //    the clean-restart marker. Both paths mark in-flight work replayable in
-    //    the same transaction as the marker update.
+    // 3. A clean stop closes both output boundaries before persisting any
+    //    recovery intent. The ProcessManager receipt is the only authority for
+    //    which CLI turn was still active; replay rows alone cannot establish
+    //    that fact.
+    let pmRetired = false;
+    let forceCrashReason = null;
+    let resumeIntents = [];
+    if (shutdownObservation?.detected !== true) {
+      try {
+        const retirement = await prepareCleanRetirement({
+          pm,
+          deliveryBarrier,
+          awaitHandlerSettlement,
+          settlementTimeoutMs: SHUTDOWN_DRAIN_MS,
+        });
+        pmRetired = true;
+        const projected = buildResumeIntents({
+          snapshots: retirement.snapshots,
+          policyVersion: CLEAN_RESUME_POLICY_VERSION,
+          resolveSourceMessageId: ({ sessionKey, sourceMsgId }) => {
+            const chatId = getChatIdFromKey(sessionKey);
+            const messageId = db.getInboundMessageId({
+              chat_id: chatId,
+              msg_id: sourceMsgId,
+            });
+            if (!messageId) return null;
+            const row = db.getInboundMessageById(messageId);
+            const chatConfig = config.chats[row?.chat_id];
+            const rowSessionKey = row && chatConfig
+              ? getSessionKey(
+                row.chat_id,
+                row.thread_id == null ? null : String(row.thread_id),
+                chatConfig,
+              )
+              : null;
+            return row?.bot_name === BOT_NAME && rowSessionKey === sessionKey
+              ? messageId
+              : null;
+          },
+        });
+        if (config.bot?.resumeInterruptedCliTurns === true) {
+          resumeIntents = projected.resumeIntents;
+        }
+        for (const snapshot of projected.snapshots) {
+          logEvent('clean-retirement-snapshot', {
+            bot: BOT_NAME,
+            session_key: snapshot.sessionKey,
+            source_msg_id: snapshot.sourceMsgId ?? null,
+            source_message_id: snapshot.sourceMessageId ?? null,
+            policy_version: CLEAN_RESUME_POLICY_VERSION,
+            eligible: snapshot.eligible === true,
+            reason: snapshot.reason ?? null,
+          });
+        }
+      } catch (err) {
+        forceCrashReason = 'clean-retirement-failed';
+        console.error(`[shutdown] clean retirement failed: ${err.message}`);
+        if (pm) await pm.shutdown().catch(() => {});
+        pmRetired = true;
+      }
+    }
+
+    // 4. Persist only after the old delivery/process boundary is closed and
+    //    every dispatcher-owned continuation has settled. Any uncertainty is
+    //    recorded crash-like, which clears stale intents and keeps ordinary
+    //    original-message replay available.
     if (db) {
       try {
         const res = persistShutdownDisposition({
           db,
           botName: BOT_NAME,
           observation: shutdownObservation,
+          resumeIntents,
+          forceCrashReason,
         });
+        if (res.clean) {
+          for (const intent of resumeIntents) {
+            logEvent('clean-resume-intent-recorded', {
+              bot: BOT_NAME,
+              session_key: intent.sessionKey,
+              source_message_id: intent.sourceMessageId,
+              policy_version: intent.policyVersion,
+            });
+          }
+        }
         logEvent('shutdown-drain', {
           bot: BOT_NAME,
           in_flight: remaining,
@@ -4367,10 +4529,22 @@ async function main() {
         console.log(`[shutdown] ${res.clean ? 'clean' : 'crash-like'} shutdown recorded (${res.shutdownReason}); ${inFlightAtSignal} in-flight at signal, drained ${drainElapsed}ms, ${remaining} still in-flight, ${res.replayMarked} marked replay-pending`);
       } catch (err) {
         console.error(`[shutdown] persistence failed: ${err.message}`);
+        try {
+          const fallback = db.recordCrashShutdown({ botName: BOT_NAME });
+          logEvent('shutdown-persistence-fallback', {
+            bot: BOT_NAME,
+            replay_marked: fallback.replayMarked,
+            error: err.message?.slice(0, 200),
+          });
+        } catch (fallbackErr) {
+          console.error(
+            `[shutdown] could not invalidate clean recovery state: ${fallbackErr.message}`,
+          );
+        }
       }
     }
 
-    // 4. Remaining shutdown: approvals sweeper, IPC, resolve hook waiters,
+    // 5. Remaining shutdown: approvals sweeper, IPC, resolve hook waiters,
     //    kill pm subprocesses, close DB.
     if (approvalSweepTimer) clearInterval(approvalSweepTimer);
     authDisabledHeartbeat?.stop();  // null if we shut down before main() armed it
@@ -4382,7 +4556,7 @@ async function main() {
     // old `approvalWaiters` reference here would ReferenceError
     // mid-shutdown and prevent pm/DB cleanup.
     if (cancelAllWaiters) cancelAllWaiters('cancelled', 'polygram shutting down');
-    if (pm) await pm.shutdown().catch(() => {});
+    if (pm && !pmRetired) await pm.shutdown().catch(() => {});
     if (db) {
       try { db.logEvent('polygram-stop'); db.raw.close(); } catch {}
     }
@@ -4446,24 +4620,194 @@ async function main() {
   // window discarded it; the agent's 7-hour Xero task was abandoned.
   // Auto-derive: 1.2 × max(chatConfig.maxTurn) across all chats,
   // floored at 3 min (legacy default), capped at 2 hours (sanity).
+  const cleanRecoveryTasksBySession = new Map();
   try {
     const chatIds = Object.keys(config.chats);
     if (chatIds.length > 0) {
       const replayWindowMs = resolveReplayWindowMs(config);
 
       // 0.14: classify by RESTART INTENT. Read-and-clear the clean-shutdown
-      // marker FIRST, in its own try/catch — ANY error => treat as crash
-      // (recover), never skip-all (fail toward recovery). A deliberate restart
-      // skips re-answering stale messages and posts one visibility notice; a
-      // crash recovers everything (unchanged rc.57 behavior).
-      let cleanShutdown = false;
+      // marker and claim continuation intents FIRST. If that transaction
+      // cannot commit, boot must stop: proceeding could run ordinary crash
+      // replay behind an unclaimed continuation intent.
+      const sourceSessionKey = (row) => {
+        const chatConfig = config.chats[row?.chat_id];
+        if (!row || !chatConfig) return null;
+        return getSessionKey(
+          row.chat_id,
+          row.thread_id == null ? null : String(row.thread_id),
+          chatConfig,
+        );
+      };
+      let cleanRecovery;
       try {
-        const maxAgeMs = 2 * (replayWindowMs || 3 * 60 * 1000);
-        cleanShutdown = db.consumeCleanShutdownMarker({ botName: BOT_NAME, maxAgeMs }).clean;
+        cleanRecovery = await startCleanRestartRecovery({
+          db,
+          botName: BOT_NAME,
+          maxAgeMs: 2 * (replayWindowMs || 3 * 60 * 1000),
+          olderThanMs: replayWindowMs || 30 * 60 * 1000,
+          supportedPolicyVersions: [CLEAN_RESUME_POLICY_VERSION],
+          sessionKeyForSource: sourceSessionKey,
+          trackTask: trackHandlerTask,
+          onClaim: (kind, claim) => {
+            logEvent(
+              kind === 'stranded'
+                ? 'clean-resume-intent-stranded'
+                : 'clean-resume-intent-claimed',
+              {
+                bot: claim.bot_name,
+                session_key: claim.session_key,
+                source_message_id: claim.source_message_id,
+                policy_version: claim.policy_version,
+                reason: claim.reason || undefined,
+              },
+            );
+          },
+          executeClaim: (claim, { onReady }) => executeCleanResumeClaim(claim, {
+            enabled: config.bot?.resumeInterruptedCliTurns === true,
+            loadSource: (messageId) => db.getInboundMessageById(messageId),
+            sessionKeyForSource: sourceSessionKey,
+            loadRuntimeSession: (sessionKey) => (
+              db.getProviderSession(sessionKey, 'claude:channels')
+            ),
+            resolveStrictSpawnContext: async ({ claim: activeClaim, runtime }) => {
+              try {
+                return {
+                  ok: true,
+                  context: await buildSpawnContext(activeClaim.session_key, {
+                    strictResume: {
+                      expectedGenerationId: activeClaim.session_generation_id,
+                      expectedSessionId: runtime.provider_session_id,
+                    },
+                  }),
+                };
+              } catch (error) {
+                return { ok: false, reason: error.code || 'session-config-drift' };
+              }
+            },
+            strictSpawn: async ({ sessionKey, context }) => {
+              const entry = await pm.getOrSpawn(sessionKey, context);
+              return {
+                process: entry,
+                attestation: typeof entry?.getResumeAttestation === 'function'
+                  ? entry.getResumeAttestation()
+                  : entry?.resumeAttestation,
+              };
+            },
+            discardSpawn: ({ sessionKey, process: rejectedProcess, reason }) => (
+              pm.retireExpectedProcess(sessionKey, rejectedProcess, reason)
+            ),
+            sendContinue: ({
+              sessionKey,
+              text,
+              sourceMsgId,
+              expectedProcess,
+              onDispatched,
+            }) => (
+              sendToProcess(sessionKey, text, createCleanResumeTurnContext({
+                sourceMsgId,
+                threadId: getThreadIdFromKey(sessionKey),
+              }), { expectedProcess, onDispatched })
+            ),
+            deliverResult: async ({ claim: activeClaim, source, text }) => {
+              const delivered = await processAndDeliverAgentText({
+                text,
+                bot,
+                tg,
+                chatId: source.chat_id,
+                threadId: source.thread_id,
+                replyToMessageId: source.msg_id,
+                source: 'clean-resume-reply',
+                meta: {
+                  botName: BOT_NAME,
+                  sessionKey: activeClaim.session_key,
+                  sourceMsgId: source.msg_id,
+                },
+                parseResponse,
+                sanitizeAssistantReply,
+                chunkMarkdownText,
+                deliverReplies,
+                chunkBudget: TG_CHUNK_BUDGET,
+                logEvent,
+                sessionKey: activeClaim.session_key,
+                logger: console,
+                redactInbound,
+              });
+              const failures = (delivered.deliverResult?.failed?.length || 0)
+                + delivered.auxiliaryFailures;
+              const visible = (delivered.deliverResult?.sent?.length || 0)
+                + delivered.stickersSent
+                + delivered.reactionsApplied;
+              return {
+                ok: failures === 0 && visible > 0 && !delivered.emptiedByStrategy,
+                ambiguous: failures > 0 || delivered.deliveryAmbiguous,
+              };
+            },
+            sendNotice: async ({ source, text, ambiguous }) => {
+              if (!source) throw new Error('clean resume source message is missing');
+              await tg(bot, 'sendMessage', {
+                chat_id: Number(source.chat_id),
+                text,
+                ...(source.thread_id
+                  ? { message_thread_id: Number(source.thread_id) }
+                  : {}),
+              }, {
+                source: ambiguous
+                  ? 'clean-resume-uncertain-notice'
+                  : 'clean-resume-notice',
+                botName: BOT_NAME,
+                sessionKey: sourceSessionKey(source),
+                sourceMsgId: source.msg_id,
+                plainText: true,
+              });
+            },
+            complete: ({ sourceMessageId, status }) => {
+              const completion = db.completeCleanRestartRecovery({
+                sourceMessageId,
+                status,
+              });
+              if (completion.changes !== 1) {
+                const error = new Error(
+                  `clean recovery source ${sourceMessageId} lost terminal ownership`,
+                );
+                error.code = 'CLEAN_RECOVERY_TERMINAL_CONFLICT';
+                throw error;
+              }
+              return completion;
+            },
+            logEvent,
+            onReady,
+          }),
+          onTaskError: (error, claim) => {
+            logEvent('clean-resume-task-failed', {
+              bot: claim.bot_name,
+              session_key: claim.session_key,
+              source_message_id: claim.source_message_id,
+              policy_version: claim.policy_version,
+              reason: error.code || 'unexpected-recovery-error',
+            });
+            console.error(
+              `[clean-resume] ${claim.session_key || 'unknown'}: ${error.message}`,
+            );
+          },
+        });
+        for (let index = 0; index < cleanRecovery.claims.length; index += 1) {
+          const sessionKey = cleanRecovery.claims[index].session_key;
+          const task = cleanRecovery.tasks[index];
+          const previous = cleanRecoveryTasksBySession.get(sessionKey);
+          cleanRecoveryTasksBySession.set(
+            sessionKey,
+            previous ? Promise.all([previous, task]) : task,
+          );
+        }
       } catch (err) {
-        console.error(`[replay] clean-shutdown marker read failed (-> crash recover): ${err.message}`);
-        cleanShutdown = false;
+        const fatal = new Error(
+          `clean restart recovery claim failed; automated recovery is fenced: ${err.message}`,
+        );
+        fatal.code = 'CLEAN_RECOVERY_CLAIM_FAILED';
+        throw fatal;
       }
+      const cleanShutdown = cleanRecovery.clean;
 
       const candidates = db.getReplayCandidates({ chatIds, ...(replayWindowMs && { olderThanMs: replayWindowMs }) });
 
@@ -4514,16 +4858,8 @@ async function main() {
         return msg;
       };
 
-      const replaySessionKey = (row) => {
-        const chatConfig = config.chats[row.chat_id];
-        if (!chatConfig) return null;
-        const threadId = row.thread_id == null
-          ? null
-          : String(row.thread_id);
-        return getSessionKey(row.chat_id, threadId, chatConfig);
-      };
       const getProviderRecovery = (row) => {
-        const sessionKey = replaySessionKey(row);
+        const sessionKey = sourceSessionKey(row);
         if (!sessionKey) {
           return {
             provider: 'unknown',
@@ -4625,6 +4961,7 @@ async function main() {
       }
     }
   } catch (err) {
+    if (err.code === 'CLEAN_RECOVERY_CLAIM_FAILED') throw err;
     console.error(`[replay] boot replay failed: ${err.message}`);
   }
 
@@ -4660,9 +4997,10 @@ async function main() {
     }
     let replayed = 0;
     let surfacedFallback = 0;
-    for (const o of orphansLatest.values()) {
+    let deferred = 0;
+    const recoverCompact = async (o) => {
       const chatCfg = config.chats[o.chat_id];
-      if (!chatCfg) continue;
+      if (!chatCfg) return;
       const threadId = o.thread_id ? Number(o.thread_id) : null;
       const savedSessionId = getClaudeSessionId(db, o.session_key);
 
@@ -4691,7 +5029,7 @@ async function main() {
             user_id: o.user_id,
           });
           replayed += 1;
-          continue;
+          return;
         } catch (err) {
           console.error(`[compact-replay] ${o.session_key}: ${err.message} — falling back to surface`);
           // fall through to surface fallback below
@@ -4720,9 +5058,24 @@ async function main() {
       } catch (err) {
         console.error(`[compact-orphan-surface] ${o.session_key}: ${err.message}`);
       }
+    };
+    for (const o of orphansLatest.values()) {
+      const recoveryTask = cleanRecoveryTasksBySession.get(o.session_key);
+      if (recoveryTask) {
+        deferred += 1;
+        trackHandlerTask(
+          Promise.resolve(recoveryTask)
+            .then(() => recoverCompact(o))
+            .catch((err) => {
+              console.error(`[compact-replay] ${o.session_key}: deferred recovery failed: ${err.message}`);
+            }),
+        );
+        continue;
+      }
+      await recoverCompact(o);
     }
-    if (replayed + surfacedFallback > 0) {
-      console.log(`[compact-orphan] silent-replayed=${replayed}, surfaced-fallback=${surfacedFallback}`);
+    if (replayed + surfacedFallback + deferred > 0) {
+      console.log(`[compact-orphan] silent-replayed=${replayed}, surfaced-fallback=${surfacedFallback}, deferred=${deferred}`);
     }
   } catch (err) {
     console.error(`[compact-orphan-handler] failed: ${err.message}`);

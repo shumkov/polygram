@@ -285,6 +285,11 @@ Per-bot flags:
 - `replayWindowMs` (default 180000 = 3 min) — boot replay only
   resurrects interrupted turns younger than this. Longer outages drop
   the queue rather than re-dispatching ancient work.
+- `resumeInterruptedCliTurns` (default false) — on a deliberate clean
+  restart, strictly resume an interrupted CLI session and send one tracked
+  `continue`. Keep this off until the pinned-CLI recovery gate passes for the
+  deployed Orchestra version. Crash recovery still re-dispatches the original
+  message.
 
 See `config.example.json` for the full schema.
 

@@ -23,12 +23,37 @@ test('handled shutdown signals retain the existing clean-shutdown persistence', 
     botName: 'shumabit',
     now: 1_800_000_000_000,
     since: 1_799_999_000_000,
+    resumeIntents: [],
   }]);
   assert.deepEqual(result, {
     clean: true,
     shutdownReason: 'oom-observer-unavailable',
     replayMarked: 2,
+    intentsRecorded: 0,
   });
+});
+
+test('clean shutdown passes only retired resume intents into the atomic transaction', () => {
+  const calls = [];
+  const resumeIntents = [{
+    sessionKey: '100:3',
+    sourceMessageId: 55,
+    policyVersion: 1,
+  }];
+  const result = persistShutdownDisposition({
+    db: {
+      recordCleanShutdown(args) {
+        calls.push(args);
+        return { replayMarked: 2, intentsRecorded: 1 };
+      },
+    },
+    botName: 'shumabit',
+    now: 1_800_000_000_000,
+    resumeIntents,
+  });
+
+  assert.deepEqual(calls[0].resumeIntents, resumeIntents);
+  assert.equal(result.intentsRecorded, 1);
 });
 
 test('detected cgroup OOM persists crash state with a JSON-safe counter delta', () => {
@@ -64,6 +89,35 @@ test('detected cgroup OOM persists crash state with a JSON-safe counter delta', 
     oomKillDelta: '9007199254740993',
   });
   assert.doesNotThrow(() => JSON.stringify(result));
+});
+
+test('retirement uncertainty records crash state and never writes clean intents', () => {
+  let crashArgs;
+  const result = persistShutdownDisposition({
+    db: {
+      recordCleanShutdown() {
+        throw new Error('must not record clean');
+      },
+      recordCrashShutdown(args) {
+        crashArgs = args;
+        return { replayMarked: 3 };
+      },
+    },
+    botName: 'shumabit',
+    resumeIntents: [{
+      sessionKey: '100',
+      sourceMessageId: 55,
+      policyVersion: 1,
+    }],
+    forceCrashReason: 'clean-retirement-failed',
+  });
+
+  assert.equal(crashArgs.botName, 'shumabit');
+  assert.deepEqual(result, {
+    clean: false,
+    shutdownReason: 'clean-retirement-failed',
+    replayMarked: 3,
+  });
 });
 
 test('non-OOM observer states retain clean persistence with truthful reasons', () => {

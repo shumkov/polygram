@@ -83,9 +83,22 @@ These remain standalone and are not part of the pinned-version
 compatibility matrix:
 
 ```sh
+CLAUDE_GATE_BIN=/absolute/path/to/the/pinned/claude \
+CLAUDE_GATE_EXPECTED_VERSION=x.y.z \
+CLAUDE_GATE_ARTIFACT_BASE=/absolute/private/artifact-directory \
+node scripts/spikes/clean-restart-resume.mjs
 node scripts/spikes/auth-expired.mjs  # DESTRUCTIVE: revokes OAuth
 node scripts/spikes/boot-replay.mjs   # DAEMON ONLY: kill mid-turn + restart
 ```
+
+`clean-restart-resume.mjs` is the opt-in, authenticated gate for the
+clean-restart resume-plus-`continue` rollout. It verifies the exact installed
+Orchestra contract, retires a live eight-step CLI turn after step five, strictly
+resumes the same Claude session, and checks that only steps six through eight
+run. It also rejects reply-bearing output, pending/ambiguous delivery, and a
+missing JSONL. Config drift is deterministic Polygram policy covered by the
+clean-resume coordinator and source-wiring tests. The gate consumes model usage
+and leaves private evidence beneath the supplied mode-0700 artifact directory.
 
 Conventions:
 
