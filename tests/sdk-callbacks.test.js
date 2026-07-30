@@ -289,6 +289,23 @@ describe('onClose — logs process-close event', () => {
     assert.equal(h.events[0].detail.chat_id, '12345');
     assert.equal(h.events[0].detail.session_key, '12345');
   });
+
+  test('releases reply evidence after the owning process closes', () => {
+    const retired = [];
+    const h = baseDeps({
+      deliveryBarrier: {
+        retireSession: (sessionKey) => retired.push(sessionKey),
+      },
+    });
+
+    createSdkCallbacks(h.deps).onClose(
+      '12345:3',
+      0,
+      { chatId: '12345', label: 'topic' },
+    );
+
+    assert.deepEqual(retired, ['12345:3']);
+  });
 });
 
 describe('onQuestionResumed — re-lights the turn reactor after a question is answered', () => {

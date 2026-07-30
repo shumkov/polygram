@@ -22,7 +22,7 @@ describe('schema + migrations', () => {
 
   test('user_version is at current schema after migration', () => {
     const v = db.raw.pragma('user_version', { simple: true });
-    assert.equal(v, 17);
+    assert.equal(v, 18);
   });
 
   test('WAL mode is enabled', () => {
@@ -34,6 +34,7 @@ describe('schema + migrations', () => {
     for (const t of [
       'sessions',
       'agent_runtime_sessions',
+      'clean_restart_resume_intents',
       'codex_runtime_identity',
       'codex_reboot_releases',
       'codex_generations',
@@ -102,8 +103,15 @@ describe('schema + migrations', () => {
       const upgraded = open(fixturePath);
       const after = upgraded.raw.prepare('SELECT * FROM sessions').get();
       assert.deepEqual(after, before);
+      const providerSession = upgraded.getProviderSession(
+        '-1003807211164:3',
+        'claude:inline',
+      );
+      assert.match(providerSession.generation_id, /^[a-f0-9]{32}$/);
+      const { generation_id: _generationId, ...providerSessionWithoutGeneration } =
+        providerSession;
       assert.deepEqual(
-        upgraded.getProviderSession('-1003807211164:3', 'claude:inline'),
+        providerSessionWithoutGeneration,
         {
           session_key: '-1003807211164:3',
           namespace: 'claude:inline',

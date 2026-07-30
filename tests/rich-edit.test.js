@@ -63,6 +63,18 @@ describe('richEditMessageText — success path', () => {
     assert.equal(m.tgCalls[0].params.richSourceText, undefined, 'must not leak into the API params');
   });
 
+  test('threads exact turn delivery metadata through every rich edit', async () => {
+    const m = makeDeps();
+    const editor = createRichEditor(m.deps);
+    await editor({
+      ...baseArgs,
+      meta: { sessionKey: 'chat:3', sourceMsgId: 77 },
+    });
+
+    assert.equal(m.tgCalls[0].meta.sessionKey, 'chat:3');
+    assert.equal(m.tgCalls[0].meta.sourceMsgId, 77);
+  });
+
   test('logs rich-message-sent with block/char counts, does not trip the latch', async () => {
     const m = makeDeps();
     const editor = createRichEditor(m.deps);

@@ -29,9 +29,9 @@ function harness(overrides = {}) {
 
   const base = {
     bot: {},
-    tg: async (_b, method, params) => {
+    tg: async (_b, method, params, meta) => {
       order.push(`tg:${method}`);
-      tgCalls.push({ method, params });
+      tgCalls.push({ method, params, meta });
       return { message_id: 1 };
     },
     chatId: '12345',
@@ -189,6 +189,69 @@ test('reactions still fire after a strategy-handled delivery', async () => {
   assert.ok(react, 'reaction must still be applied');
   assert.equal(react.params.message_id, 42);
   assert.deepEqual(deliverCalls, [], 'the strategy handled delivery');
+});
+
+test('agent-authored reactions are reply-bearing output for the exact source', async () => {
+  const { opts, tgCalls } = harness({
+    parseResponse: (text) => ({
+      text, sticker: null, stickerLabel: null, stickers: [],
+      reaction: '🔥', reactions: [], redactions: [],
+    }),
+  });
+
+  await processAndDeliverAgentText({
+    ...opts,
+    text: 'done',
+    replyToMessageId: 77,
+    sessionKey: 'chat:3',
+    meta: { sessionKey: 'chat:3' },
+    deliverText: async () => ({ handled: true, sent: [], failed: [] }),
+  });
+
+  const reaction = tgCalls.find((call) => call.method === 'setMessageReaction');
+  assert.equal(reaction.meta.deliveryClass, 'reply-bearing');
+  assert.equal(reaction.meta.sourceMsgId, 77);
+});
+
+test('sticker and reaction delivery failures remain ambiguous to recovery callers', async () => {
+  for (const parsed of [
+    {
+      text: '',
+      sticker: 'file-pumped',
+      stickerLabel: 'pumped',
+      stickers: [],
+      reaction: null,
+      reactions: [],
+      redactions: [],
+    },
+    {
+      text: '',
+      sticker: null,
+      stickerLabel: null,
+      stickers: [],
+      reaction: '🔥',
+      reactions: [],
+      redactions: [],
+    },
+  ]) {
+    const { opts } = harness({
+      parseResponse: () => ({ ...parsed }),
+      tg: async () => {
+        throw new Error('delivery outcome unknown');
+      },
+    });
+
+    const result = await processAndDeliverAgentText({
+      ...opts,
+      text: 'agent output',
+      replyToMessageId: 77,
+      sessionKey: 'chat:3',
+      meta: { sessionKey: 'chat:3', sourceMsgId: 77 },
+    });
+
+    assert.equal(result.auxiliaryFailures, 1);
+    assert.equal(result.deliveryAmbiguous, true);
+  }
 });
 
 // ─── Fall-through and isolation ────────────────────────────────────────────

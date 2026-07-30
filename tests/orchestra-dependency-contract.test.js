@@ -8,7 +8,7 @@ const lockfile = require('../package-lock.json');
 const orchestra = require('@shumkov/orchestra');
 const orchestraPackage = require('@shumkov/orchestra/package.json');
 
-const REQUIRED_ORCHESTRA_VERSION = '0.10.5';
+const REQUIRED_ORCHESTRA_VERSION = '0.10.6';
 
 test('installed Orchestra exactly matches the reviewed Codex contract', () => {
   assert.equal(
@@ -60,4 +60,6 @@ test('installed Orchestra exactly matches the reviewed Codex contract', () => {
   assert.equal(typeof orchestra.ProcessManager.prototype.replaceRuntime, 'function');
   assert.equal(typeof orchestra.ProcessManager.prototype.steerTurn, 'function');
   assert.equal(typeof orchestra.ProcessManager.prototype.interrupt, 'function');
+  assert.equal(typeof orchestra.ProcessManager.prototype.retireForCleanRestart, 'function');
+  assert.equal(typeof orchestra.ProcessManager.prototype.retireExpectedProcess, 'function');
 });
