@@ -2,38 +2,35 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { createFormatConfigInfoText, MODEL_VERSIONS_DESC } = require('../lib/handlers/config-ui');
+const { createFormatConfigInfoText } = require('../lib/handlers/config-ui');
 
+// The card used to compare the live proc's spawn-time model/effort against the
+// configured ones and print "sonnet (running) → opus (pending — applies on your
+// next message)". The body carries no settings at all now, so the comparison
+// and every phrasing of it must be gone — including for a live proc that really
+// has drifted, which is the case that used to produce the line.
 function fmt({ procModel, procEffort, alive = true } = {}) {
   const proc = { model: procModel, effort: procEffort, closed: false };
   const pm = { has: () => alive, get: () => (alive ? proc : null) };
   return createFormatConfigInfoText({ pm, db: {}, getClaudeSessionId: () => 'abcdef1234567890' });
 }
 
-describe('config card — running vs configured model/effort (cli reload-pending)', () => {
-  test('model drift → "sonnet (running) → opus (pending)"', () => {
-    const f = fmt({ procModel: 'sonnet' });
-    const body = f({ model: 'opus', effort: 'high' }, 'all', 'sk');
-    assert.match(body, /Model: sonnet \(running\) → opus \(pending — applies on your next message\)/);
-  });
-
-  test('matched model → plain "Model: opus (ver)", no running line', () => {
-    const f = fmt({ procModel: 'opus' });
-    const body = f({ model: 'opus', effort: 'high' }, 'all', 'sk');
-    assert.match(body, new RegExp(`Model: opus \\(${MODEL_VERSIONS_DESC.opus}\\)`));
-    assert.doesNotMatch(body, /running/);
-  });
-
-  test('no live proc (cold) → plain configured model, no running line', () => {
-    const f = fmt({ procModel: 'sonnet', alive: false });
-    const body = f({ model: 'opus', effort: 'high' }, 'all', 'sk');
-    assert.match(body, new RegExp(`Model: opus \\(${MODEL_VERSIONS_DESC.opus}\\)`));
-    assert.doesNotMatch(body, /running/);
-  });
-
-  test('effort drift → "high (running) → max (pending)"', () => {
-    const f = fmt({ procModel: 'opus', procEffort: 'high' });
-    const body = f({ model: 'opus', effort: 'max' }, 'all', 'sk');
-    assert.match(body, /Effort: high \(running\) → max \(pending — applies on your next message\)/);
-  });
+describe('config card — the running-vs-configured lines are gone', () => {
+  for (const [name, deps, chatConfig] of [
+    ['model drift', { procModel: 'sonnet' }, { model: 'opus', effort: 'high' }],
+    ['effort drift', { procModel: 'opus', procEffort: 'high' }, { model: 'opus', effort: 'max' }],
+    ['no drift', { procModel: 'opus', procEffort: 'high' }, { model: 'opus', effort: 'high' }],
+    ['cold process', { procModel: 'sonnet', alive: false }, { model: 'opus', effort: 'high' }],
+  ]) {
+    test(`${name} → a bare header, no settings, no drift copy`, () => {
+      const body = fmt(deps)(chatConfig, 'all', 'sk');
+      assert.match(body, /^⚙️ Settings/);
+      assert.doesNotMatch(body, /running/);
+      assert.doesNotMatch(body, /pending/);
+      assert.doesNotMatch(body, /^Model: /m);
+      assert.doesNotMatch(body, /^Effort: [a-z]/m);
+      assert.doesNotMatch(body, /^Session: /m);
+      assert.doesNotMatch(body, /^Process: /m);
+    });
+  }
 });

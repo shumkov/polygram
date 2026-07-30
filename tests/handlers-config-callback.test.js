@@ -1127,6 +1127,37 @@ describe('handleConfigCallback — runtime switching', () => {
     assert.equal(audit[1].thread_id, '3');
   });
 
+  test('a chat on the button-less SDK backend can still switch away', async () => {
+    // Dropping the SDK button removes a way IN, not a way OUT: sdk chats exist
+    // in config files, and their card must still work.
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: { '12345': { pm: 'sdk', model: 'sonnet', effort: 'high' } },
+      },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:cli', existingRows: 4 });
+    await fn(ctx);
+    assert.match(ctx._acks[0].text, /Claude/);
+    assert.equal(m.deps.config.chats['12345'].pm, 'cli');
+  });
+
+  test('a stale card tapping the removed SDK button changes nothing', async () => {
+    // Cards already sent keep their old buttons. sdk is no longer an offered
+    // target, so the tap is refused like any other unknown runtime.
+    const m = makeDeps();
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:sdk', existingRows: 4 });
+    await fn(ctx);
+    assert.match(ctx._acks[0].text, /Invalid runtime/);
+    assert.equal(m.dbCalls.length, 0);
+    assert.equal(
+      m.pmCalls.some((call) => call[0] === 'replaceRuntime'),
+      false,
+    );
+  });
+
   test('same canonical runtime and invalid targets are no-ops', async () => {
     const m = makeDeps({
       config: {
@@ -1138,7 +1169,7 @@ describe('handleConfigCallback — runtime switching', () => {
 
     const same = makeCtx({ data: 'cfg:runtime:cli', existingRows: 4 });
     await fn(same);
-    assert.match(same._acks[0].text, /Already Claude CLI/);
+    assert.match(same._acks[0].text, /Already Claude$/);
 
     const invalid = makeCtx({ data: 'cfg:runtime:other', existingRows: 4 });
     await fn(invalid);
@@ -1267,12 +1298,15 @@ describe('handleConfigCallback — richtext toggle', () => {
     assert.equal(m.pmCalls.length, 0);
   });
 
-  test('ack text distinguishes live delivery from the next-spawn authoring lag', async () => {
+  test('ack text carries no session-lag caveat — the toggle applies on the next message', async () => {
+    // The hint used to be stuck until something respawned the session, so the
+    // ack warned about it. Display-hint drift now respawns on the next message,
+    // which makes the caveat both wrong and noise.
     const m = makeDeps();
     const fn = createHandleConfigCallback(m.deps);
     const ctx = makeCtx({ data: 'cfg:richtext:on', existingRows: 3 });
     await fn(ctx);
-    assert.match(ctx._acks[0].text, /next session/i);
+    assert.equal(ctx._acks[0].text, 'Rich text → on');
   });
 
   test('ack text for turning off is plain, no session-lag caveat', async () => {

@@ -4198,7 +4198,6 @@ async function main() {
   // call time and captures the value (closure-by-value). v4 reviewer
   // caught this as the same class as the v3 BLOCKER.
   formatConfigInfoText = createFormatConfigInfoText({
-    pm, db, getClaudeSessionId,
     resolveRuntimeView: resolveSessionRuntimeView,
   });
   handleConfigCallback = createHandleConfigCallback({
