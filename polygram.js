@@ -1123,9 +1123,9 @@ let handleSendOverIpc = null;
 // formatToolInputForCard).
 
 // Config card UI moved to lib/handlers/config-ui.js. polygram.js
-// keeps a thin formatConfigInfoText wrapper since it needs the
-// runtime pm + db + getClaudeSessionId; buildConfigKeyboard is
-// pure and re-exported.
+// keeps a thin formatConfigInfoText wrapper since it supplies the
+// async runtime-view resolver; buildConfigKeyboard is pure and
+// re-exported.
 const {
   buildConfigKeyboard,
   createFormatConfigInfoText,
@@ -5046,7 +5046,10 @@ async function main() {
       // (rc.65+) AND a session_id to resume into.
       if (o.text && savedSessionId) {
         try {
-          const entry = await pm.getOrSpawn(o.session_key, buildSpawnContext(o.session_key));
+          const entry = await pm.getOrSpawn(
+            o.session_key,
+            await buildSpawnContext(o.session_key),
+          );
           // 0.10.0 P0.4: route through Process.fireUserMessage so both
           // SDK and tmux backends work. Pre-0.10.0-P0.4 reached into
           // entry.inputController.push directly — broken on tmux.

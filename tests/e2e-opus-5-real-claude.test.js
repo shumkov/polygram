@@ -12,8 +12,8 @@
  *   1. the explicit `claude-opus-5` id — pinned, means Opus 5 on any CLI,
  *   2. the bare `opus` alias — resolved by the CLI, and version-dependent:
  *      2.1.173 resolved it to claude-opus-4-8, the pinned 2.1.220 resolves it
- *      to claude-opus-5. MODEL_VERSIONS_DESC claims the latter on the config
- *      card, and this is what keeps that claim honest.
+ *      to claude-opus-5. MODEL_VERSIONS_DESC claims the latter in the /model
+ *      reply, and this is what keeps that claim honest.
  *
  * Evidence is the session JSONL's per-message `model` field (what actually
  * served the turn), not the flag we passed (what we asked for).
@@ -151,7 +151,7 @@ test('e2e: real claude runs a turn on the explicit claude-opus-5 id', {
   assert.ok(MODEL_COSTS['claude-opus-5'], 'claude-opus-5 must have a MODEL_COSTS entry');
 });
 
-test('e2e: the bare `opus` alias resolves to what the config card claims', {
+test('e2e: the bare `opus` alias resolves to what the /model reply claims', {
   skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
   timeout: 240_000,
 }, async () => {
@@ -160,8 +160,8 @@ test('e2e: the bare `opus` alias resolves to what the config card claims', {
   assert.match(replyText, /PONGTEST/i, 'the `opus` alias must complete a turn');
   assert.ok(
     models.includes(MODEL_VERSIONS_DESC.opus),
-    `the config card tells users \`opus\` runs ${MODEL_VERSIONS_DESC.opus}; the pinned `
+    `the /model reply tells users \`opus\` runs ${MODEL_VERSIONS_DESC.opus}; the pinned `
     + `CLI ${CLAUDE_CLI_PINNED_VERSION} actually served ${JSON.stringify(models)}. `
-    + 'Either the pin moved or MODEL_VERSIONS_DESC is stale — the card is lying to users.',
+    + 'Either the pin moved or MODEL_VERSIONS_DESC is stale — the reply is lying to users.',
   );
 });

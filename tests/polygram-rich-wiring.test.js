@@ -276,10 +276,14 @@ describe('the spawn-context hint and the factory-resolver hint are the same stri
     assert.fail(`${label}: unbalanced buildPolygramDisplayHint call`);
   }
 
-  const contextCall = hintCall(
-    sectionBetween('async function buildSpawnContext', 'async function getOrSpawnForChat'),
-    'buildSpawnContext',
+  const spawnSection = sectionBetween(
+    'async function buildSpawnContext',
+    'async function getOrSpawnForChat',
   );
+  const contextCall = hintCall(spawnSection, 'buildSpawnContext');
+  // The context the factory receives — its threadId is what the resolver would
+  // be called with on a spawn that has no hint to use.
+  const returnBlock = spawnSection.slice(spawnSection.lastIndexOf('\n  return {'));
   const factoryCall = hintCall(
     sectionBetween('const orchestraProcessFactory = createProcessFactory({', ');'),
     'createProcessFactory',
@@ -316,6 +320,29 @@ describe('the spawn-context hint and the factory-resolver hint are the same stri
       run(contextCall, config, '42', '7'),
       run(contextCall, config, '42', null),
     );
+  });
+
+  test('the context carries the same normalized thread the hint was built with', () => {
+    // Both sides above are handed the same threadId by the test, which would
+    // hide a normalization dropped on one of them. In production the hint is
+    // built from `threadId` inside buildSpawnContext while the factory sees the
+    // context's `threadId` field — an empty-string thread normalized on one
+    // side and not the other resolves two different chats' settings.
+    const contextThread = /threadId:\s*([^,\n]+),/.exec(returnBlock)?.[1];
+    assert.ok(contextThread, 'the returned context must carry a threadId');
+    const hintThread = /resolveRichTextEnabled\(config, chatId,\s*([^)]+)\)/
+      .exec(contextCall)?.[1];
+    assert.ok(hintThread, 'the context hint must resolve richText for a thread');
+
+    const evalThread = (expr, threadId) => new Function('threadId', `return ${expr};`)(threadId);
+    for (const raw of ['7', '', null, undefined]) {
+      assert.equal(
+        evalThread(contextThread, raw),
+        evalThread(hintThread, raw),
+        `threadId ${JSON.stringify(raw)} must normalize the same on both sides`,
+      );
+    }
+    assert.equal(evalThread(contextThread, ''), null, 'an empty thread is a chat-level spawn');
   });
 
   test('the equality is not free — the builder options it pins do change the hint', () => {

@@ -14,6 +14,16 @@ const {
   MODEL_OPTIONS,
   EFFORT_OPTIONS,
 } = require('../lib/handlers/config-callback');
+const { resolveRichTextEnabled } = require('../lib/telegram/rich');
+
+// What buildSpawnContext (polygram.js) derives the session's thread from: the
+// session key, which collapses every topic of a non-isolated chat onto the chat.
+// The authoring hint is resolved with THAT thread, so a toggle only reaches the
+// agent if it changes the value at this scope.
+function sessionThreadId(sessionKey) {
+  const key = String(sessionKey);
+  return key.includes(':') ? key.split(':')[1] : null;
+}
 
 const silentLogger = { log: () => {}, error: () => {} };
 const CODEX_VIEW = Object.freeze({
@@ -1357,7 +1367,75 @@ describe('handleConfigCallback — richtext toggle', () => {
     assert.equal(m.deps.config.chats['-100'].richText, undefined, 'chat root must not change');
   });
 
-  test('a non-isolated topic toggle updates the topic value that delivery resolves', async () => {
+  test('an isolated topic toggle drifts that topic session\'s own hint', async () => {
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': { model: 'sonnet', isolateTopics: true, topics: { '3': { name: 'Music' } } },
+        },
+      },
+      getSessionKey: (chatId, threadId) => (threadId ? `${chatId}:${threadId}` : String(chatId)),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:on', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    const config = m.deps.config;
+    const key = m.deps.getSessionKey('-100', '3');
+    assert.equal(
+      resolveRichTextEnabled(config, '-100', sessionThreadId(key)), true,
+      'the topic has its own session, so its hint resolves the topic value and drifts',
+    );
+    assert.equal(resolveRichTextEnabled(config, '-100', '3'), true, 'delivery agrees');
+  });
+
+  test('a non-isolated topic toggle writes at CHAT level, where the session resolves it', async () => {
+    // The trap this pins: a topic-level write flips delivery (resolved per
+    // message with the real thread) while the session's authoring hint —
+    // resolved with the collapsed session thread, i.e. null — never changes.
+    // No drift, no respawn, and an ack that promises a change that never comes.
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: { '3': { name: 'General' } },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:on', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    const config = m.deps.config;
+    assert.equal(config.chats['-100'].richText, true, 'the write lands at chat level');
+    assert.equal(
+      config.chats['-100'].topics['3'].richText, undefined,
+      'no topic override may shadow it',
+    );
+    const key = m.deps.getSessionKey('-100', '3');
+    assert.equal(
+      resolveRichTextEnabled(config, '-100', sessionThreadId(key)), true,
+      'the shared session\'s hint now resolves the new value — this is the drift',
+    );
+    assert.equal(resolveRichTextEnabled(config, '-100', '3'), true,
+      'and delivery in the topic agrees with it');
+    const log = m.dbCalls.find((c) => c[0] === 'logConfigChange');
+    assert.equal(log[1].thread_id, null, 'the audit records the scope actually written');
+    assert.equal(ctx._acks[0].text, 'Rich text → on');
+  });
+
+  test('a stale topic override from the old behavior stops shadowing the chat value', async () => {
+    // Every non-isolated topic toggle before this fix wrote here, so live
+    // configs carry these. Left in place, the override keeps winning for
+    // delivery and the chat-level write does nothing the user can see.
     const m = makeDeps({
       config: {
         bot: { allowConfigCommands: true },
@@ -1376,10 +1454,45 @@ describe('handleConfigCallback — richtext toggle', () => {
     ctx.callbackQuery.message.message_thread_id = 3;
     await fn(ctx);
 
-    assert.equal(m.deps.config.chats['-100'].topics['3'].richText, false);
-    assert.equal(m.deps.config.chats['-100'].richText, undefined, 'the topic toggle must not alter every topic');
-    const log = m.dbCalls.find((c) => c[0] === 'logConfigChange');
-    assert.equal(log[1].thread_id, '3');
+    const config = m.deps.config;
+    assert.equal(config.chats['-100'].richText, false);
+    assert.equal(config.chats['-100'].topics['3'].richText, undefined,
+      'the stale override is cleared, not left to win');
+    assert.equal(config.chats['-100'].topics['3'].name, 'General',
+      'and nothing else about the topic is touched');
+    // Both resolutions must land on the chat-level value: delivery (real
+    // thread, resolved topic-first) and the session's authoring hint (the
+    // collapsed session thread).
+    assert.equal(resolveRichTextEnabled(config, '-100', '3'), false, 'delivery');
+    const key = m.deps.getSessionKey('-100', '3');
+    assert.equal(resolveRichTextEnabled(config, '-100', sessionThreadId(key)), false, 'hint');
     assert.equal(ctx._acks[0].text, 'Rich text → off');
+  });
+
+  test('a failed save restores both the chat write and the cleared topic override', async () => {
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '-100': {
+            model: 'sonnet',
+            isolateTopics: false,
+            topics: { '3': { name: 'General', richText: true } },
+          },
+        },
+      },
+      getSessionKey: (chatId) => String(chatId),
+      saveConfig: async () => { throw new Error('disk full'); },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:richtext:off', chatId: '-100', existingRows: 3 });
+    ctx.callbackQuery.message.message_thread_id = 3;
+    await fn(ctx);
+
+    const config = m.deps.config;
+    assert.equal(config.chats['-100'].richText, undefined, 'the chat write is rolled back');
+    assert.equal(config.chats['-100'].topics['3'].richText, true,
+      'and the override is put back — a failed save must change nothing');
+    assert.match(ctx._acks[0].text, /Couldn't save/);
   });
 });

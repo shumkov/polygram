@@ -273,16 +273,10 @@ function assertNoTechnicalLines(body) {
 }
 
 describe('createFormatConfigInfoText', () => {
-  function buildFormat({ alive = true, savedSessionId = 'sess-12345678-rest' } = {}) {
-    const pm = {
-      has: () => alive,
-      get: () => ({ closed: !alive }),
-    };
-    return createFormatConfigInfoText({
-      pm,
-      db: { _placeholder: true },
-      getClaudeSessionId: () => savedSessionId,
-    });
+  // The formatter takes no process, db or session-id context — the card stopped
+  // reporting any of it, so there is nothing to inject.
+  function buildFormat() {
+    return createFormatConfigInfoText();
   }
 
   test('the card body is a bare header — every technical line is gone', () => {
@@ -304,12 +298,14 @@ describe('createFormatConfigInfoText', () => {
 
   test('process and session state cannot reach the card at all', () => {
     // The card used to read pm/db for warm-vs-cold and the session id. Those
-    // lines are gone, so a formatter built without any of that context must
-    // still render — pinning that nothing quietly went on reading them.
-    const fmt = createFormatConfigInfoText({});
-    const out = fmt({ model: 'opus', effort: 'low', agent: 'x' }, 'all', 'sk');
-    assert.match(out, /^⚙️ Settings/);
-    assertNoTechnicalLines(out);
+    // lines are gone and so are the deps: a formatter built with no arguments
+    // at all must still render every card.
+    const fmt = createFormatConfigInfoText();
+    for (const show of ['all', 'model', 'effort']) {
+      const out = fmt({ model: 'opus', effort: 'low', agent: 'x' }, show, 'sk');
+      assert.match(out, /^⚙️ Settings/);
+      assertNoTechnicalLines(out);
+    }
   });
 
   test('rich-text state no longer appears in the body, whatever it resolves to', () => {
@@ -347,20 +343,6 @@ describe('createFormatConfigInfoText', () => {
   test('async runtime resolver still decides which help blocks the card gets', async () => {
     const calls = [];
     const fmt = createFormatConfigInfoText({
-      pm: {
-        has: () => true,
-        get: () => ({
-          closed: false,
-          // These legacy fields are intentionally misleading. Codex UI must
-          // use the explicit settings projections instead.
-          model: 'must-not-render',
-          effort: 'must-not-render',
-        }),
-      },
-      db: {},
-      getClaudeSessionId: () => {
-        throw new Error('Codex card must not read the dormant Claude row');
-      },
       resolveRuntimeView: async (context) => {
         calls.push(context);
         return {
@@ -412,7 +394,6 @@ describe('createFormatConfigInfoText', () => {
     );
     assert.match(out, /\*\*gpt-5\.6-sol\*\* — GPT-5\.6 SOL/);
     assert.doesNotMatch(out, /deep analysis, code refactor/);
-    assert.doesNotMatch(out, /must-not-render/);
     assertNoTechnicalLines(out);
   });
 
@@ -420,13 +401,7 @@ describe('createFormatConfigInfoText', () => {
     test(`Codex ${processStatus} renders the minimal card without process copy`, () => {
       // Process/selection state is what the card stopped saying. Each status
       // used to get its own sentence; now it changes nothing about the body.
-      const fmt = createFormatConfigInfoText({
-        pm: { has: () => false, get: () => null },
-        db: {},
-        getClaudeSessionId: () => {
-          throw new Error('Codex card must not read Claude state');
-        },
-      });
+      const fmt = createFormatConfigInfoText();
       const out = fmt({
         codexModel: 'gpt-5.6-sol',
         codexEffort: 'high',
@@ -451,14 +426,8 @@ describe('createFormatConfigInfoText', () => {
   }
 
   test('an async Claude runtime view produces the exact legacy card', async () => {
-    const deps = {
-      pm: { has: () => false, get: () => null },
-      db: {},
-      getClaudeSessionId: () => 'sess-12345678-rest',
-    };
-    const legacy = createFormatConfigInfoText(deps);
+    const legacy = createFormatConfigInfoText();
     const resolved = createFormatConfigInfoText({
-      ...deps,
       resolveRuntimeView: async () => ({ runtime: 'claude' }),
     });
     const chat = { model: 'sonnet', effort: 'high', agent: 'shumabit' };
@@ -537,11 +506,7 @@ describe('config card — per-topic override resolution (Music topic /model bug,
   // class of leak is now pinned as absence — and the ✓ markers, which are what
   // the user reads instead, carry the topic > chat precedence.
   function buildFormat() {
-    return createFormatConfigInfoText({
-      pm: { has: () => true, get: () => ({ closed: false }) },
-      db: {},
-      getClaudeSessionId: () => 'sess-abcd1234',
-    });
+    return createFormatConfigInfoText();
   }
 
   test('neither topic nor chat values can leak into the card body', () => {
