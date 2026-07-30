@@ -7,6 +7,15 @@ const path = require('node:path');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'polygram.js'), 'utf8');
 
+const { createRichSender } = require('../lib/telegram/rich-send');
+const { createRichCapabilityLatch } = require('../lib/telegram/rich-capability-latch');
+const {
+  isRichCapabilityError,
+  isRichCapabilityErrorExplicit,
+  isRichMessageFieldRejection,
+  isRichContentError,
+} = require('../lib/telegram/rich');
+
 function sectionBetween(startMarker, endMarker) {
   const start = source.indexOf(startMarker);
   assert.notEqual(start, -1, `missing start marker: ${startMarker}`);
@@ -183,6 +192,33 @@ describe('polygram rich-message wiring', () => {
     );
   });
 
+  test('the streamer opens its bubble through the shared rich sender, not a hand-rolled call', () => {
+    // sendRichMessage is the only verb that can open a bubble rich; going
+    // direct to tg() would bypass the latch, the transcript row and the
+    // media preflight the primitive owns.
+    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload) => {');
+    assert.match(wiring, /sendRich: richSendMessage,/);
+    assert.doesNotMatch(wiring, /'sendRichMessage'/,
+      'the primitive owns the verb — this wiring must not call it directly');
+    // A refusal never throws; it downgrades to the plain bubble the streamer
+    // pre-computed against the smaller plain cap.
+    assert.match(wiring, /if \(out\?\.wentRich\)/);
+    assert.match(wiring, /sanitizeLiveText\(openRich \? payload\.plainText : payload\)/);
+    assert.match(wiring, /wentRich: false/,
+      'the streamer needs to know a downgraded open left a PLAIN bubble');
+  });
+
+  test('the reply anchor is spent once per open, whichever verb carries it', () => {
+    // A rich attempt that downgrades sends exactly one bubble. Attaching
+    // reply_parameters to both would quote the user twice; attaching it to
+    // neither would lose the anchor for the whole turn.
+    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload) => {');
+    assert.equal((wiring.match(/allow_sending_without_reply: true/g) || []).length, 1);
+    assert.match(wiring, /const replyParams = hadReplyAnchor/);
+    assert.match(wiring, /replyParams,/, 'the rich open reuses it');
+    assert.match(wiring, /if \(replyParams\) params\.reply_parameters = replyParams;/);
+  });
+
   test('exactly one capability latch is shared by both rich paths', () => {
     // Two counters would let either path latch on its first bare 404 while
     // the other believed two were still required, which is the restart-blip
@@ -195,6 +231,113 @@ describe('polygram rich-message wiring', () => {
       (source.match(/capabilityLatch: richCapabilityLatch/g) || []).length, 2,
       'and handed to both the editor and the sender',
     );
+  });
+});
+
+// ─── the streamed open's own verdict ───────────────────────────────
+//
+// Two layers, because neither alone is enough. polygram.js runs main() on
+// load and the send closure is built inside handleMessage, so there is no
+// seam to drive it: layer 1 executes the real sender and the real shared
+// latch to establish WHY the open needs a verdict of its own, and layer 2 is
+// a source tripwire that the closure actually keeps one.
+
+describe('the streamed rich open stops probing a server that cannot serve it', () => {
+  // A server that does rich EDITS but answers sendRichMessage with a bare 404
+  // — the exact shape the two-strike rule was built to survive at a restart,
+  // and the one where it never fires.
+  function bare404Fleet({ explicit = false } = {}) {
+    const unsupported = { send: false, edit: false };
+    const wire = [];
+    const latch = createRichCapabilityLatch({
+      isExplicit: isRichCapabilityErrorExplicit,
+      isFieldRejection: isRichMessageFieldRejection,
+      setUnsupported: (verb) => { unsupported[verb] = true; },
+    });
+    const sendRich = createRichSender({
+      tg: async (_bot, method) => {
+        wire.push(method);
+        const err = new Error(explicit
+          ? 'Not Found: method "sendRichMessage" not found'
+          : 'Not Found');
+        err.error_code = 404;
+        throw err;
+      },
+      botName: 'testbot',
+      isRichCapabilityError,
+      isRichCapabilityErrorExplicit,
+      isRichContentError,
+      getRichKnownUnsupported: () => unsupported.send,
+      setRichKnownUnsupported: () => { unsupported.send = true; },
+      capabilityLatch: latch,
+      logger: { error: () => {}, warn: () => {} },
+    });
+    // One bubble: the open is attempted, then the rich EDIT one flush later
+    // succeeds — which is exactly what resets the strike counter.
+    const bubble = async () => {
+      const out = await sendRich({ chatId: '1', blocks: [{ type: 'divider' }], sourceText: 'x' });
+      latch.recordHealthyOutcome();
+      return out;
+    };
+    return { bubble, wire, unsupported };
+  }
+
+  test('the shared latch never trips on this server, so an unguarded open probes forever', async () => {
+    // The premise. Without a verdict of its own, every preview for the
+    // process lifetime pays a doomed round-trip and files a capability
+    // strike the soak reads as a server going bad.
+    const fleet = bare404Fleet();
+    for (let i = 0; i < 20; i++) await fleet.bubble();
+    assert.equal(fleet.wire.length, 20, '20 bubbles, 20 failed sends');
+    assert.equal(fleet.unsupported.send, false, 'and the send verdict is still green');
+  });
+
+  test('one capability refusal is enough for the OPEN: two bubbles, one attempt', async () => {
+    const fleet = bare404Fleet();
+    // The rule the send closure applies, verbatim: skip the open once a
+    // capability refusal has been seen.
+    let openUnsupported = false;
+    for (let i = 0; i < 2; i++) {
+      if (openUnsupported) continue;
+      const out = await fleet.bubble();
+      if (out.fallback === 'capability') openUnsupported = true;
+    }
+    assert.equal(fleet.wire.length, 1, 'exactly one failed sendRichMessage process-wide');
+    assert.equal(fleet.unsupported.send, false,
+      'and the shared send verdict is untouched — the reply tool keeps its two strikes');
+  });
+
+  test('an explicit method-naming 404 still latches the shared verdict on bubble 1', async () => {
+    const fleet = bare404Fleet({ explicit: true });
+    const out = await fleet.bubble();
+    assert.equal(out.fallback, 'capability');
+    assert.equal(fleet.unsupported.send, true, 'conclusive evidence latches as it always did');
+    assert.equal(fleet.unsupported.edit, false, 'a missing METHOD condemns only its own verb');
+  });
+});
+
+describe('polygram wiring for the open verdict', () => {
+  test('the open holds its own verdict and never writes to the shared latches', () => {
+    assert.match(source, /let richStreamOpenUnsupported = false;/);
+    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload) => {');
+    assert.match(wiring, /if \(openRich && !richStreamOpenUnsupported\)/,
+      'a refused open must stop the next one from being attempted at all');
+    assert.match(wiring, /if \(out\?\.fallback === 'capability'\) \{[\s\S]*?richStreamOpenUnsupported = true;/,
+      'and only a capability refusal trips it — a content error says nothing about the verb');
+    assert.doesNotMatch(wiring, /richSendKnownUnsupported\s*=|richKnownUnsupported\s*=/,
+      'the open must not write either shared latch: its evidence bar is lower');
+  });
+
+  test('the open runs the same flatten-and-retry the reply path runs', () => {
+    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload) => {');
+    assert.match(wiring, /await sendRichWithStylingRetry\(\{/);
+    assert.match(wiring, /onStylingRejected: \(\) => richStylingLatch\?\.recordStylingRejection\(\)/);
+    assert.match(wiring, /onStylingAccepted: \(\) => richStylingLatch\?\.recordHealthyOutcome\(\)/);
+  });
+
+  test('a streamed open is distinguishable from a reply-tool send in the soak', () => {
+    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload) => {');
+    assert.match(wiring, /source: 'bot-reply-stream-open-rich'/);
   });
 });
 
@@ -227,14 +370,16 @@ describe('polygram inline-styling wiring', () => {
     assert.match(source, /onStylingAccepted: \(\) => richStylingLatch\?\.recordHealthyOutcome\(\)/);
   });
 
-  test('BOTH paths can feed the verdict, not just the reply tool', () => {
+  test('ALL THREE paths can feed the verdict, not just the reply tool', () => {
     // The streamer styles every payload it renders. If only the dispatcher
     // could record a rejection, a streamer-only chat against a styling-unaware
     // server would refuse, degrade, and never learn — every bubble plain,
-    // forever, with the latch still showing green.
-    assert.equal((source.match(/onStylingRejected:/g) || []).length, 2,
-      'the editor and the sender both report');
-    assert.equal((source.match(/onStylingAccepted:/g) || []).length, 2);
+    // forever, with the latch still showing green. The streamed OPEN is the
+    // third: without it, a styling-refusing server costs every preview its
+    // first frame and teaches the process nothing.
+    assert.equal((source.match(/onStylingRejected:/g) || []).length, 3,
+      'the editor, the reply-tool sender and the streamed open all report');
+    assert.equal((source.match(/onStylingAccepted:/g) || []).length, 3);
   });
 
   test('the limit predicate reaches both senders', () => {

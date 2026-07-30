@@ -585,3 +585,107 @@ test('nothing downstream inspects media nested inside rich_message', async () =>
   assert.equal(params.rich_message.blocks[0].photo.media, envelope,
     'the nested value is untouched — materialization is the only thing that converts it');
 });
+
+// ─── the OPEN's styling ladder ─────────────────────────────────────
+//
+// The streamed rich open runs the same flatten-and-retry the reply-tool
+// dispatcher runs around this verb, so a server that refuses typed nodes
+// costs a bubble its STYLING, not its structure — and the process learns
+// from the refusal instead of paying for it on every preview.
+
+const { sendRichWithStylingRetry } = require('../lib/telegram/rich-send');
+
+const STYLED = [{ type: 'heading', level: 1, text: [{ type: 'bold', text: 'Title' }] }];
+const FLAT = [{ type: 'heading', level: 1, text: 'Title' }];
+
+function stylingHarness({ answers }) {
+  const attempts = [];
+  const verdicts = [];
+  const sendRich = async (request) => {
+    attempts.push(request.blocks);
+    return answers[attempts.length - 1] ?? { wentRich: true, result: { message_id: 1 } };
+  };
+  const run = (blocks) => sendRichWithStylingRetry({
+    sendRich,
+    request: { chatId: '1', blocks, sourceText: '# Title' },
+    onStylingRejected: () => verdicts.push('rejected'),
+    onStylingAccepted: () => verdicts.push('accepted'),
+    logger: { error: () => {} },
+  });
+  return { run, attempts, verdicts };
+}
+
+test('a refused styled open is retried flat, and the acceptance condemns styling', async () => {
+  const h = stylingHarness({
+    answers: [{ wentRich: false, fallback: 'content-error' }, { wentRich: true, result: { message_id: 5 } }],
+  });
+  const out = await h.run(STYLED);
+  assert.equal(out.wentRich, true, 'the structure survives — only the styling was dropped');
+  assert.equal(h.attempts.length, 2);
+  assert.deepEqual(h.attempts[1], FLAT, 'the retry flattens the REFUSED tree, it does not re-render');
+  assert.deepEqual(h.verdicts, ['rejected']);
+});
+
+test('a refusal naming a LIMIT is retried but is not evidence about styling', async () => {
+  // Flattening removes styling AND shrinks the payload, so the acceptance is
+  // explained by the shrink. Counting it would let two oversized replies
+  // disable styling for the whole process.
+  const h = stylingHarness({
+    answers: [{ wentRich: false, fallback: 'content-limit' }, { wentRich: true, result: { message_id: 5 } }],
+  });
+  const out = await h.run(STYLED);
+  assert.equal(out.wentRich, true);
+  assert.equal(h.attempts.length, 2);
+  assert.deepEqual(h.verdicts, []);
+});
+
+test('an accepted styled open ends any run of suspicion', async () => {
+  const h = stylingHarness({ answers: [{ wentRich: true, result: { message_id: 5 } }] });
+  await h.run(STYLED);
+  assert.equal(h.attempts.length, 1);
+  assert.deepEqual(h.verdicts, ['accepted']);
+});
+
+test('an unstyled open never touches the styling verdict, whatever happens', async () => {
+  const accepted = stylingHarness({ answers: [{ wentRich: true, result: { message_id: 5 } }] });
+  await accepted.run(FLAT);
+  assert.deepEqual(accepted.verdicts, []);
+
+  const refused = stylingHarness({ answers: [{ wentRich: false, fallback: 'content-error' }] });
+  const out = await refused.run(FLAT);
+  assert.equal(out.wentRich, false);
+  assert.equal(refused.attempts.length, 1, 'there is nothing to flatten — no second round-trip');
+  assert.deepEqual(refused.verdicts, []);
+});
+
+test('a capability refusal is not retried — the verb is missing, not the styling', async () => {
+  const h = stylingHarness({ answers: [{ wentRich: false, fallback: 'capability' }] });
+  const out = await h.run(STYLED);
+  assert.equal(out.fallback, 'capability', 'the class reaches the caller so it can stop probing');
+  assert.equal(h.attempts.length, 1);
+  assert.deepEqual(h.verdicts, []);
+});
+
+test('a flat retry that also fails reports the retry, and says nothing about styling', async () => {
+  const h = stylingHarness({
+    answers: [
+      { wentRich: false, fallback: 'content-error' },
+      { wentRich: false, fallback: 'content-error' },
+    ],
+  });
+  const out = await h.run(STYLED);
+  assert.equal(out.wentRich, false);
+  assert.deepEqual(h.verdicts, [], 'both shapes refused — the blocks were the problem');
+});
+
+test('a throwing verdict callback never costs a delivered bubble', async () => {
+  const attempts = [];
+  const out = await sendRichWithStylingRetry({
+    sendRich: async (request) => { attempts.push(request.blocks); return { wentRich: true, result: { message_id: 9 } }; },
+    request: { chatId: '1', blocks: STYLED, sourceText: '# Title' },
+    onStylingAccepted: () => { throw new Error('latch exploded'); },
+    logger: { error: () => {} },
+  });
+  assert.equal(out.wentRich, true);
+  assert.equal(attempts.length, 1);
+});
