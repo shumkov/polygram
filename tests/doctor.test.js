@@ -447,7 +447,7 @@ test('unsafe IPC runtime roots fail without exposing paths or raw errors', async
   assert.doesNotMatch(JSON.stringify(ipc), /private\/tmp|polygram-secret/);
 });
 
-test('quarantine is explicit, content-free, and requires a same-host reboot', async (t) => {
+test('unverified cleanup is explicit, content-free, and reboot-independent', async (t) => {
   const deployment = createDeployment(t, {
     generation_id: 'generation-secret-value',
     stable_host_id: `host:${'c'.repeat(64)}`,
@@ -463,14 +463,15 @@ test('quarantine is explicit, content-free, and requires a same-host reboot', as
   const lease = checks.find(({ name }) => name === 'codex-lease');
 
   assert.equal(lease.status, 'fail');
-  assert.match(lease.detail, /quarantine/i);
-  assert.match(lease.detail, /same-host reboot required/i);
+  assert.match(lease.detail, /cleanup is unverified/i);
+  assert.doesNotMatch(lease.detail, /reboot/i);
   assert.deepEqual(lease.extra, {
     runtime: 'codex',
     scope: 'daemon',
     status: 'quarantined',
     ownerPresent: true,
-    rebootRequired: true,
+    rebootRequired: false,
+    serviceRestartRequired: true,
     reasonCode: null,
   });
   assert.doesNotMatch(

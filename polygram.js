@@ -68,6 +68,7 @@ const { createBuildSdkOptions } = require('./lib/sdk/build-options');
 const { createSdkCallbacks } = require('./lib/sdk/callbacks');
 const {
   createCodexRuntimeController,
+  resolveCodexStartupRecovery,
 } = require('./lib/codex/runtime-controller');
 const {
   buildCodexSpawnContext,
@@ -3510,6 +3511,12 @@ async function main() {
     db = dbClient.open(DB_PATH);
     console.log(`[db] opened ${DB_PATH}`);
     try {
+      const startupRecovery = await resolveCodexStartupRecovery(pidClaim, {
+        claimThrowsOnSurvivingPredecessor:
+          processGuard.CLAIM_PID_FILE_THROWS_ON_SURVIVING_PREDECESSOR === true,
+        persistedLeaseStatus: db.getCodexLease()?.status ?? null,
+        supervisorGraceMs: processGuard.CODEX_SUPERVISOR_GRACE_MS,
+      });
       codexRuntimeController = createCodexRuntimeController({
         config,
         db,
@@ -3520,6 +3527,7 @@ async function main() {
           path.join(process.env.HOME || DATA_DIR, '.claude'),
         ],
         logger: console,
+        startupRecovery,
       });
     } catch (error) {
       codexRuntimeController = null;
@@ -3531,9 +3539,9 @@ async function main() {
       try {
         const codexBoot = codexRuntimeController.initialize();
         codexManagerOptions = codexBoot.managerOptions;
-        if (codexBoot.recovery.status === 'quarantined') {
+        if (codexBoot.recovery.status !== 'clear') {
           console.warn(
-            `[codex] runtime quarantined at boot (${codexBoot.recovery.reason || 'unknown'})`,
+            `[codex] runtime recovery blocked at boot (${codexBoot.recovery.reason || 'unknown'})`,
           );
         }
       } catch (error) {

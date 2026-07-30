@@ -194,6 +194,13 @@ describe('classify — Codex typed errors stay provider-specific and retry-safe'
     assert.match(classified.userMessage, /do not resend|don't resend/i);
   });
 
+  test('CODEX_RECOVERY_BLOCKED maps to the existing Codex durability shape', () => {
+    assert.deepEqual(
+      classify({ code: 'CODEX_RECOVERY_BLOCKED' }),
+      classify({ code: 'CODEX_DURABILITY_FAILED' }),
+    );
+  });
+
   test('an unrecognized Codex code never falls through to legacy provider heuristics', () => {
     const classified = classify(Object.assign(
       new Error('Claude tmux auth failed with 429 capacity'),

@@ -40,7 +40,6 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const child_process = require('child_process');
 const { EventEmitter } = require('events');
 
 const {
@@ -75,29 +74,38 @@ describe('claimPidFile', () => {
     assert.equal(fs.readFileSync(pidPath, 'utf8').trim(), String(process.pid));
   });
 
-  test('SIGKILLs prior live PID before claiming', () => {
-    // Spawn a sleeping child we can detect + verify-killed.
-    const child = child_process.spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
-    child.unref();
-    fs.writeFileSync(pidPath, String(child.pid) + '\n');
+  test('SIGKILLs prior live PID before claiming', (t) => {
+    const predecessorPid = 424_242;
+    const originalKill = process.kill;
+    const signals = [];
+    let alive = true;
+    process.kill = (pid, signal) => {
+      if (pid !== predecessorPid) return originalKill(pid, signal);
+      if (signal === 0) {
+        if (alive) return true;
+        const error = new Error('no such process');
+        error.code = 'ESRCH';
+        throw error;
+      }
+      signals.push(signal);
+      if (signal === 'SIGKILL') alive = false;
+      return true;
+    };
+    t.after(() => {
+      process.kill = originalKill;
+    });
+    fs.writeFileSync(pidPath, `${predecessorPid}\n`);
 
     const logged = [];
     const result = claimPidFile(pidPath, {
       logger: { log: (m) => logged.push(m) },
-      sigtermWaitMs: 100, // shorter for tests
+      sigtermWaitMs: 1,
+      sigkillWaitMs: 1,
     });
-    assert.equal(result.priorPid, child.pid);
-    assert.ok(['sigterm-killed', 'sigkill-killed'].includes(result.priorAction),
-      'should have killed prior — got ' + result.priorAction);
+    assert.equal(result.priorPid, predecessorPid);
+    assert.equal(result.priorAction, 'sigkill-killed');
+    assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
     assert.equal(fs.readFileSync(pidPath, 'utf8').trim(), String(process.pid));
-    // Note: we deliberately don't `kill -0` the dead child here.
-    // Detached children whose parent (this test process) hasn't
-    // reaped them stay as zombies for a tick, and `kill -0 <zombie>`
-    // succeeds even though the process is dead. The contract this
-    // function asserts is "we sent the kill signals" — verifying the
-    // kernel actually finished tearing down the entry is testing the
-    // kernel, not us. Reap so we don't leak.
-    try { child.kill('SIGKILL'); } catch {}
   });
 
   test('does NOT kill self if pidPath already contains current PID', () => {

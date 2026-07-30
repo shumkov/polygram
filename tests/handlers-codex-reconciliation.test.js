@@ -151,7 +151,7 @@ describe('Codex reconciliation Telegram UI', () => {
     const buttons = view.reply_markup.inline_keyboard.flat();
 
     assert.match(view.text, /message #42/);
-    assert.match(view.text, /does not release containment quarantine/i);
+    assert.match(view.text, /does not control runtime availability/i);
     assert.doesNotMatch(view.text, /do not render this prompt/);
     assert.deepEqual(
       buttons.map((button) => button.text),

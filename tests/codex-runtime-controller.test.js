@@ -119,6 +119,14 @@ function fixture({
         disposition: 'already-disposed',
       };
     },
+    settleCodexFailedGeneration(input) {
+      calls.push(['settle-failed-generation', input]);
+      return {
+        committed: true,
+        disposition: 'failed-settled',
+        generationId: input.generation_id,
+      };
+    },
     claimCodexDispatchReservation(input) {
       calls.push(['claim-dispatch', input]);
       return {
@@ -1914,6 +1922,123 @@ test('first prepared checkpoint atomically establishes durable generation owners
   );
 });
 
+test('thread-accepted-before-startup-failure settles before the first durable checkpoint', async () => {
+  const { calls, controller, receipt } = fixture();
+  controller.initialize();
+  await controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+    threadId: null,
+  });
+  const proc = Object.assign(new EventEmitter(), {
+    runtime: 'codex',
+    sessionKey: '100',
+    generationId: 'generation-before-first-checkpoint',
+    providerSessionId: 'thread-rejected-before-startup',
+    appServerSessionId: 'app-server-rejected-before-startup',
+    containmentReason: 'thread-accepted-before-startup-failure',
+    state: 'ContainmentFailed',
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    spawnProfileId: receipt.spawnProfileId,
+    startupReleaseSafe: false,
+    closed: false,
+  });
+  controller.registerProcess(proc);
+
+  assert.deepEqual(
+    await controller.checkpointSink({
+      kind: 'containment-cleanup-completed',
+      generationId: proc.generationId,
+      hostIdentity: 'host:current',
+      bootSessionIdentity: 'boot:current',
+      threadId: proc.providerSessionId,
+      appServerSessionId: proc.appServerSessionId,
+      reason: proc.containmentReason,
+      ts: 1200,
+    }),
+    {
+      committed: true,
+      disposition: 'failed-settled',
+      generationId: proc.generationId,
+    },
+  );
+  assert.deepEqual(
+    calls.find((entry) => entry[0] === 'settle-failed-generation'),
+    [
+      'settle-failed-generation',
+      {
+        generation_id: proc.generationId,
+        session_key: proc.sessionKey,
+        stable_host_id: 'host:current',
+        incident_boot_session_id: 'boot:current',
+        current_boot_session_id: 'boot:current',
+        provider_session_id: proc.providerSessionId,
+        app_server_session_id: proc.appServerSessionId,
+        reason: proc.containmentReason,
+        source: 'managed-group-empty',
+        allow_missing_generation: true,
+        ts: 1200,
+      },
+    ],
+  );
+  assert.equal(
+    controller.discardCandidateRuntime(proc.sessionKey),
+    false,
+    'the settled process and its matching preflight receipt are already gone',
+  );
+  proc.closed = true;
+  proc.emit('close', 1, {
+    backend: 'codex',
+    generationId: proc.generationId,
+    reason: 'containment-cleanup',
+    containmentReason: proc.containmentReason,
+    containmentCleanupCommitted: true,
+  });
+  assert.equal(calls.some((entry) => entry[0] === 'retire'), false);
+});
+
+test('containment cleanup requires the process to retain exact host and boot ownership', async () => {
+  const { calls, controller, receipt } = fixture();
+  controller.initialize();
+  await controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+    threadId: null,
+  });
+  const proc = Object.assign(new EventEmitter(), {
+    runtime: 'codex',
+    sessionKey: '100',
+    generationId: 'generation-missing-process-owner',
+    providerSessionId: 'thread-missing-process-owner',
+    appServerSessionId: 'app-server-missing-process-owner',
+    containmentReason: 'startup-failed',
+    state: 'ContainmentFailed',
+    spawnProfileId: receipt.spawnProfileId,
+    startupReleaseSafe: false,
+    closed: false,
+  });
+  controller.registerProcess(proc);
+
+  await assert.rejects(
+    controller.checkpointSink({
+      kind: 'containment-cleanup-completed',
+      generationId: proc.generationId,
+      hostIdentity: 'host:current',
+      bootSessionIdentity: 'boot:current',
+      threadId: proc.providerSessionId,
+      appServerSessionId: proc.appServerSessionId,
+      reason: proc.containmentReason,
+      ts: 1200,
+    }),
+    (error) => error.code === 'CODEX_CHECKPOINT_STALE_GENERATION',
+  );
+  assert.equal(
+    calls.some((entry) => entry[0] === 'settle-failed-generation'),
+    false,
+  );
+});
+
 test('retirement waits for healthy stop, transport close, and the manager handshake', async () => {
   const { calls, controller, receipt } = fixture();
   controller.initialize();
@@ -2165,8 +2290,8 @@ test('persisted containment blocks preflight and carries incident ownership to m
   const initialized = controller.initialize();
   assert.deepEqual(initialized.managerOptions.codexRecoveryState, {
     status: 'quarantined',
-    hostIdentity: 'host:incident',
-    bootSessionIdentity: 'boot:incident',
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
     generationId: 'incident-generation',
   });
   await assert.rejects(
@@ -2177,7 +2302,7 @@ test('persisted containment blocks preflight and carries incident ownership to m
     }),
     (error) => (
       error instanceof CodexRuntimeControllerError
-      && error.code === 'CODEX_CONTAINMENT_QUARANTINED'
+      && error.code === 'CODEX_RECOVERY_BLOCKED'
     ),
   );
 });
