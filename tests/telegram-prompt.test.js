@@ -116,12 +116,17 @@ describe('rich media display hint', () => {
     assert.match(richHint, /at least a sentence/i);
   });
 
-  test('warns that media never survives a streamed message (own reply instead)', () => {
+  test('a media-bearing answer skips streaming — media renders inline in one reply', () => {
     const richHint = buildPolygramDisplayHint(true, { inlineMedia: true });
     assert.match(richHint, /media.{0,120}(stream|live preview)|(stream|live preview).{0,120}media/is,
       'ties media to the streaming limitation');
-    assert.match(richHint, /own\s+(separate\s+)?reply|separate\s+(reply|message)/i,
-      'tells the agent to deliver media as its own reply');
+    assert.match(richHint, /skip.{0,40}stream/i,
+      'the whole point of rich media is pictures inside the document, so a '
+      + 'media answer forgoes the live preview instead of splitting');
+    assert.match(richHint, /inline in the rich|pictures in place/i,
+      'says the media lands inside the rich document');
+    assert.match(richHint, /(do not|not).{0,40}(split|separate)/is,
+      'forbids splitting media into a separate message');
     assert.match(richHint, /caption/i,
       'names the degradation so the consequence is concrete');
   });
