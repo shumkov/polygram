@@ -24,7 +24,7 @@ const source = fs.readFileSync(path.join(__dirname, '..', 'polygram.js'), 'utf8'
 
 describe('polygram append-only guard wiring', () => {
   test('the streamer is given the refusal callback', () => {
-    assert.match(source, /onNonCumulativeSnapshot: \(\{ prevLen, newLen, violations \}\) => \{/,
+    assert.match(source, /onNonCumulativeSnapshot: \(\{ prevLen, newLen \}\) => \{/,
       'createStreamer must receive the callback, or refusals are silent');
   });
 
@@ -43,7 +43,6 @@ describe('polygram append-only guard wiring', () => {
     // the property that makes this a contract violation and not a truncation.
     assert.match(wiring, /prev_len: prevLen/);
     assert.match(wiring, /new_len: newLen/);
-    assert.match(wiring, /violations/);
   });
 
   test('the turn id is in scope before the streamer is built', () => {

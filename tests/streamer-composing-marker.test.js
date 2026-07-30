@@ -118,6 +118,28 @@ describe('composing marker — while the bubble is growing', () => {
     assert.equal(h.sent[0].payload, 'Начало ответа.');
     assert.ok(!carriesMarker(h.sent[0].payload));
   });
+
+  test('one snapshot then silence still gets the marker — that IS the stall', async () => {
+    // The marker exists for "is it still writing or did it die?", and a turn
+    // that emits one snapshot and then goes quiet is the sharpest form of the
+    // question. Flush only ever ran off a LATER chunk, so this case — the one
+    // that needs the marker most — would never see it.
+    const h = makeHarness();
+    await h.streamer.onChunk('Начало ответа.');
+    assert.equal(h.edits.length, 0, 'nothing yet: the open carries no marker');
+
+    await h.advance(500);   // one throttle window, no new snapshot
+
+    assert.equal(h.edits.length, 1);
+    assert.equal(h.lastEdit().payload, `Начало ответа.${COMPOSING_MARKER_SUFFIX}`);
+  });
+
+  test('the stall edit does not fire for a caller with no marker configured', async () => {
+    const h = makeHarness({ toComposingMarker: null });
+    await h.streamer.onChunk('Начало ответа.');
+    await h.advance(500);
+    assert.equal(h.edits.length, 0, 'no marker, no reason to touch the bubble');
+  });
 });
 
 describe('composing marker — the bubble must stop claiming it', () => {
@@ -216,6 +238,13 @@ describe('composing marker — the bubble must stop claiming it', () => {
     assert.ok(seal, 'the detached rich bubble must be sealed too');
     assert.ok(!carriesMarker(seal.payload));
     assert.equal(seal.payload.phase, 'seal');
+
+    // The seal renders partial:false, so the block partial mode was holding
+    // back joins the tree. A preserved bubble ending mid-thought was the old
+    // behaviour for every bubble without media; sealing completes it.
+    const texts = seal.payload.blocks.map((b) => b.text);
+    assert.ok(texts.includes('Ещё абзац.'),
+      'the held-back trailing block belongs on a bubble that is finished');
   });
 
   test('a detached bubble that never showed the marker is not re-edited', async () => {

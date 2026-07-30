@@ -124,7 +124,6 @@ describe('streamer — append-only snapshot guard', () => {
     assert.equal(events.length, 1, 'the violation must be counted');
     assert.equal(events[0].prevLen, SNAPSHOT_A.length);
     assert.equal(events[0].newLen, SNAPSHOT_B.length);
-    assert.equal(events[0].violations, 1);
   });
 
   test('after a violation the anchor is the last ACCEPTED snapshot, not the rejected one', async () => {
@@ -218,7 +217,7 @@ describe('streamer — append-only snapshot guard', () => {
     void h;
   });
 
-  test('repeated violations keep counting so a looping model is distinguishable', async () => {
+  test('one row per refusal, so a looping model is a GROUP BY away', async () => {
     const events = [];
     const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
 
@@ -228,7 +227,75 @@ describe('streamer — append-only snapshot guard', () => {
     await h.streamer.onChunk(`${SNAPSHOT_B}\n\nещё`);
     await h.advance(500);
 
-    assert.deepEqual(events.map((e) => e.violations), [1, 2]);
+    assert.equal(events.length, 2);
+  });
+});
+
+describe('streamer — ticking a checkbox is not losing text', () => {
+  // The display hint teaches this verbatim (lib/telegram/display-hint.js):
+  // "use them when ... you will send an updated list with items checked off
+  // as you complete them". That is a mid-document mutation of text the reader
+  // has already seen, and a verbatim-prefix guard would refuse it — freezing
+  // the preview for the rest of the turn on the exact feature polygram asks
+  // the agent to use.
+  const PENDING = 'Работаю над задачей.\n\n- [ ] шаг один\n- [ ] шаг два\n\nПочти готово.';
+
+  test('a snapshot that only ticks an item off is accepted', async () => {
+    const events = [];
+    const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
+
+    await h.streamer.onChunk(PENDING);
+    await h.advance(500);
+    const ticked = 'Работаю над задачей.\n\n- [x] шаг один\n- [ ] шаг два\n\nПочти готово, остался второй шаг.';
+    await h.streamer.onChunk(ticked);
+    await h.advance(500);
+
+    assert.equal(events.length, 0, 'ticking a box loses nothing — the item is still there, in place');
+    assert.equal(h.streamer.latestText, ticked);
+    assert.equal(h.edits[h.edits.length - 1].payload, ticked);
+  });
+
+  test('ticking every box at once is still accepted', async () => {
+    const events = [];
+    const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
+
+    await h.streamer.onChunk(PENDING);
+    await h.advance(500);
+    await h.streamer.onChunk('Работаю над задачей.\n\n- [x] шаг один\n- [x] шаг два\n\nГотово.');
+    await h.advance(500);
+
+    assert.equal(events.length, 0);
+  });
+
+  test('a snapshot that ticks a box AND drops a completed section is still refused', async () => {
+    // The relaxation must not become an escape hatch: checkbox state is
+    // exempt, the text around it is not.
+    const events = [];
+    const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
+
+    await h.streamer.onChunk(PENDING);
+    await h.advance(500);
+    const editsBefore = h.edits.length;
+    await h.streamer.onChunk('- [x] шаг один\n- [x] шаг два\n\nГотово, но вступление пропало.');
+    await h.advance(500);
+
+    assert.equal(events.length, 1);
+    assert.equal(h.edits.length, editsBefore, 'the lost opening paragraph must still stop the render');
+    assert.equal(h.streamer.latestText, PENDING);
+  });
+
+  test('a literal [x] in prose is not treated as a checkbox', async () => {
+    // Only a task-list marker at the head of a list item is state; `[x]`
+    // inside a sentence is content, and rewriting it IS losing text.
+    const events = [];
+    const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
+
+    await h.streamer.onChunk('Регексп [x] совпадает.\n\nВторой абзац.\n\nТретий начат');
+    await h.advance(500);
+    await h.streamer.onChunk('Регексп [ ] совпадает.\n\nВторой абзац.\n\nТретий абзац целиком.');
+    await h.advance(500);
+
+    assert.equal(events.length, 1, 'prose is prose — a changed character above the boundary is a rewrite');
   });
 });
 

@@ -1618,11 +1618,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // refused it and kept the bubble on the last good one; this is the only
     // place that misuse becomes visible, since the tool ack stays ok either
     // way (an error there buys a retry loop, not a better snapshot).
-    onNonCumulativeSnapshot: ({ prevLen, newLen, violations }) => {
+    onNonCumulativeSnapshot: ({ prevLen, newLen }) => {
       logEvent('stream-noncumulative', {
         chat_id: chatId, thread_id: threadId, bot: BOT_NAME,
         turn_id: dispatchedTurnId,
-        prev_len: prevLen, new_len: newLen, violations,
+        prev_len: prevLen, new_len: newLen,
       });
     },
     send: async (payload) => {
