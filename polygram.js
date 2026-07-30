@@ -73,6 +73,11 @@ const {
   buildCodexSpawnContext,
 } = require('./lib/codex/spawn-context');
 const {
+  processMatchesRuntime,
+  resolveCodexRuntimeCandidate,
+  resolveRuntimeDescriptor,
+} = require('./lib/runtime-config');
+const {
   scheduleCodexRetention,
 } = require('./lib/codex/retention-scheduler');
 const {
@@ -599,58 +604,157 @@ async function clearAutosteeredReactions(sessionKey) {
 let buildSdkOptions = null;
 let codexRuntimeController = null;
 
+function buildUnavailableCodexRuntimeView({
+  runtimeSelection,
+  chatId,
+  threadId,
+  error,
+  runtimeView = null,
+}) {
+  let candidate = null;
+  try {
+    candidate = resolveCodexRuntimeCandidate({
+      config,
+      chatId,
+      threadId,
+    });
+  } catch {
+    // The runtime button must remain available even when the saved Codex
+    // model, effort, or cwd is incomplete.
+  }
+  const model = runtimeView?.model ?? candidate?.model ?? null;
+  const effort = runtimeView?.effort ?? candidate?.effort ?? null;
+  const desiredSettings = (
+    typeof model === 'string'
+    && typeof effort === 'string'
+  ) ? Object.freeze({ model, effort }) : null;
+  return Object.freeze({
+    ...runtimeView,
+    runtime: 'codex',
+    backend: runtimeSelection.backend,
+    configuredPm: runtimeSelection.configuredPm,
+    selectionSource: runtimeSelection.source,
+    model,
+    effort,
+    models: runtimeView?.models ?? Object.freeze([]),
+    efforts: runtimeView?.efforts ?? Object.freeze([]),
+    desiredSettings: runtimeView?.desiredSettings ?? desiredSettings,
+    nextTurnSettings: runtimeView?.nextTurnSettings ?? null,
+    observedThreadSettings: runtimeView?.observedThreadSettings ?? null,
+    activeTurnSettings: runtimeView?.activeTurnSettings ?? null,
+    processStatus: 'unavailable',
+    unavailableReason:
+      error?.code || error?.name || 'CODEX_RUNTIME_UNAVAILABLE',
+  });
+}
+
 async function resolveSessionRuntimeView({
   sessionKey,
   chatId,
   threadId = null,
 } = {}) {
-  if (codexRuntimeController) {
-    const runtimeView = await codexRuntimeController.resolveRuntimeView({
+  const runtimeSelection = resolveRuntimeDescriptor({
+    config,
+    chatId,
+    threadId,
+    defaultPm: 'sdk',
+    logger: console,
+  });
+  const runtimeMetadata = {
+    runtime: runtimeSelection.runtime,
+    backend: runtimeSelection.backend,
+    configuredPm: runtimeSelection.configuredPm,
+    selectionSource: runtimeSelection.source,
+  };
+  if (runtimeSelection.runtime !== 'codex') {
+    return Object.freeze(runtimeMetadata);
+  }
+  if (!codexRuntimeController) {
+    return buildUnavailableCodexRuntimeView({
+      runtimeSelection,
+      chatId,
+      threadId,
+      error: { code: 'CODEX_RUNTIME_UNAVAILABLE' },
+    });
+  }
+
+  let runtimeView;
+  try {
+    runtimeView = await codexRuntimeController.resolveRuntimeView({
       sessionKey,
       chatId,
       threadId,
     });
-    if (!isCodexRuntimeView(runtimeView)) return runtimeView;
-    if (typeof pm?.getModelSettingsStatus !== 'function') {
-      const error = new Error('Codex model-settings status is unavailable');
-      error.code = 'CODEX_RUNTIME_UNAVAILABLE';
-      throw error;
-    }
-    const settingsStatus = await pm.getModelSettingsStatus(sessionKey);
-    const processStatus = settingsStatus.outcome;
-    const unavailableReason = settingsStatus.reason ?? null;
-    const copySettings = (settings) => (
-      settings
-      && typeof settings.model === 'string'
-      && typeof settings.effort === 'string'
-        ? Object.freeze({
-          model: settings.model,
-          effort: settings.effort,
-        })
-        : null
-    );
-    return Object.freeze({
-      ...runtimeView,
-      desiredSettings: Object.freeze({
-        model: runtimeView.model,
-        effort: runtimeView.effort,
-      }),
-      nextTurnSettings: copySettings(settingsStatus.nextTurn),
-      observedThreadSettings: copySettings(settingsStatus.observedThread),
-      activeTurnSettings: copySettings(settingsStatus.currentTurn),
-      processStatus,
-      unavailableReason,
+  } catch (error) {
+    return buildUnavailableCodexRuntimeView({
+      runtimeSelection,
+      chatId,
+      threadId,
+      error,
     });
   }
-  if (resolvePromptBackend({ config, chatId, threadId }) === 'codex') {
-    const error = new Error('Codex runtime controller is not initialized');
-    error.code = 'CODEX_RUNTIME_UNAVAILABLE';
-    throw error;
+  if (!isCodexRuntimeView(runtimeView)) {
+    return buildUnavailableCodexRuntimeView({
+      runtimeSelection,
+      chatId,
+      threadId,
+      error: { code: 'CODEX_RUNTIME_VIEW_MISMATCH' },
+      runtimeView,
+    });
   }
-  return Object.freeze({ runtime: 'claude' });
+  runtimeView = Object.freeze({
+    ...runtimeView,
+    ...runtimeMetadata,
+  });
+  if (typeof pm?.getModelSettingsStatus !== 'function') {
+    return buildUnavailableCodexRuntimeView({
+      runtimeSelection,
+      chatId,
+      threadId,
+      error: { code: 'CODEX_RUNTIME_UNAVAILABLE' },
+      runtimeView,
+    });
+  }
+  let settingsStatus;
+  try {
+    settingsStatus = await pm.getModelSettingsStatus(sessionKey);
+  } catch (error) {
+    return buildUnavailableCodexRuntimeView({
+      runtimeSelection,
+      chatId,
+      threadId,
+      error,
+      runtimeView,
+    });
+  }
+  const copySettings = (settings) => (
+    settings
+    && typeof settings.model === 'string'
+    && typeof settings.effort === 'string'
+      ? Object.freeze({
+        model: settings.model,
+        effort: settings.effort,
+      })
+      : null
+  );
+  return Object.freeze({
+    ...runtimeView,
+    desiredSettings: Object.freeze({
+      model: runtimeView.model,
+      effort: runtimeView.effort,
+    }),
+    nextTurnSettings: copySettings(settingsStatus.nextTurn),
+    observedThreadSettings: copySettings(settingsStatus.observedThread),
+    activeTurnSettings: copySettings(settingsStatus.currentTurn),
+    processStatus: settingsStatus.outcome,
+    unavailableReason: settingsStatus.reason ?? null,
+  });
 }
 
-async function buildSpawnContext(sessionKey) {
+async function buildSpawnContext(
+  sessionKey,
+  { mutateSessionOnDrift = true } = {},
+) {
   const chatId = getChatIdFromKey(sessionKey);
   const chatConfig = config.chats[chatId];
   if (!chatConfig) return null;
@@ -677,6 +781,7 @@ async function buildSpawnContext(sessionKey) {
       runtimeController: codexRuntimeController,
       getSessionLabel,
       logEvent,
+      mutateSessionOnDrift,
     });
   }
 
@@ -684,24 +789,25 @@ async function buildSpawnContext(sessionKey) {
   // under. agent / cwd are spawn-identity — baked into the process at
   // spawn time, never mutable on a live session. Resolve them the
   // same way the backends do (topic override merged over chat-level)
-  // and compare to the stored `sessions` row. On drift,
-  // resolveSessionForSpawn drops the stale row and returns
-  // existingSessionId:null → the spawn starts fresh under the correct
-  // config instead of `--resume`-ing a stale one. This self-heals the
-  // pre-per-topic-config rows (e.g. shumorobot's Music topic :3,
-  // stored agent=shumabit / cwd=$HOME vs the current
-  // music-curation:music-curator / .../Music/rekordbox).
+  // and compare to the stored `sessions` row. On a normal cold spawn,
+  // resolveSessionForSpawn drops a stale row and returns
+  // existingSessionId:null. Runtime-switch preparation can defer that
+  // deletion so a rejected replacement cannot erase the dormant session.
   // model/effort are NOT compared — they apply live via setModel /
-  // applyFlagSettings with no respawn. pm_backend is also NOT
-  // compared (rc.32): both backends spawn the same pinned claude
-  // binary against the same on-disk JSONL, so a backend flip
-  // preserves context. See lib/db/sessions.js for full reasoning.
+  // applyFlagSettings with no respawn. Compatible inline-wrapper backend
+  // changes preserve context; the CLI Channels boundary remains
+  // invalidating. See lib/db/sessions.js for the compatibility rules.
   //
   // The drift check runs only at COLD spawn (no warm process). A warm
   // process already runs under its spawn-time config; getOrSpawn
   // returns it without using this context, so dropping its row here
   // would be premature — defer to the next cold spawn.
-  const isColdSpawn = !pm || !pm.has(sessionKey) || pm.get(sessionKey)?.closed;
+  const liveProcess = pm?.get(sessionKey) ?? null;
+  const isColdSpawn = !processMatchesRuntime(
+    liveProcess,
+    'claude',
+    promptBackend,
+  );
   let existingSessionId;
   if (isColdSpawn) {
     const topicConfig = getTopicConfig(chatConfig, threadId || null);
@@ -710,7 +816,12 @@ async function buildSpawnContext(sessionKey) {
       cwd: topicConfig.cwd || chatConfig.cwd || null,
       backend: pickBackend({ config, chatId, threadId: threadId || null, pmDefault: 'sdk' }),
     };
-    const r = resolveSessionForSpawn(db, sessionKey, resolved);
+    const r = resolveSessionForSpawn(
+      db,
+      sessionKey,
+      resolved,
+      { mutateOnDrift: mutateSessionOnDrift },
+    );
     existingSessionId = r.existingSessionId;
     if (r.drift) {
       logEvent('session-config-drift', {
@@ -3971,6 +4082,27 @@ async function main() {
     config, db, dbWrite, pm, intentLock, getSessionKey,
     formatConfigInfoText, buildConfigKeyboard, saveConfig,
     resolveRuntimeView: resolveSessionRuntimeView,
+    prepareRuntimeSelection: ({
+      sessionKey,
+      chatId,
+      threadId,
+      runtime,
+    }) => {
+      if (runtime !== 'codex' || !codexRuntimeController) {
+        const error = new Error('Codex runtime preflight is unavailable');
+        error.code = 'CODEX_RUNTIME_UNAVAILABLE';
+        throw error;
+      }
+      return codexRuntimeController.resolveCandidateRuntimeView({
+        sessionKey,
+        chatId,
+        threadId,
+      });
+    },
+    discardRuntimeSelection: (sessionKey) => (
+      codexRuntimeController?.discardCandidateRuntime(sessionKey) ?? false
+    ),
+    buildSpawnContext,
     botName: BOT_NAME, logger: console,
   });
   handleCodexReconciliationCallback = createHandleCodexReconciliationCallback({

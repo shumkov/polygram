@@ -11,7 +11,9 @@ const assert = require('node:assert/strict');
 const {
   createCodexRuntimeAvailability,
   RuntimeConfigError,
+  resolveCodexRuntimeCandidate,
   resolveCodexRuntimeRequest,
+  processMatchesRuntime,
   resolveRuntimeConfig,
   resolveRuntimeDescriptor,
 } = require('../lib/runtime-config');
@@ -81,6 +83,24 @@ function resolve(config, overrides = {}) {
 }
 
 describe('resolveRuntimeConfig — precedence and attribution', () => {
+  test('live-process matching is target-relative across all runtimes', () => {
+    const sdk = { runtime: 'claude', backend: 'sdk', closed: false };
+    const cli = { runtime: 'claude', backend: 'cli', closed: false };
+    const codex = { runtime: 'codex', backend: 'codex', closed: false };
+
+    assert.equal(processMatchesRuntime(sdk, 'claude', 'sdk'), true);
+    assert.equal(processMatchesRuntime(sdk, 'claude', 'cli'), false);
+    assert.equal(processMatchesRuntime(sdk, 'codex', 'codex'), false);
+    assert.equal(processMatchesRuntime(cli, 'claude', 'cli'), true);
+    assert.equal(processMatchesRuntime(cli, 'claude', 'sdk'), false);
+    assert.equal(processMatchesRuntime(codex, 'codex', 'codex'), true);
+    assert.equal(processMatchesRuntime(codex, 'claude', 'sdk'), false);
+    assert.equal(
+      processMatchesRuntime({ ...codex, closed: true }, 'codex', 'codex'),
+      false,
+    );
+  });
+
   test('lightweight descriptor shares canonical precedence without Codex preflight', () => {
     const descriptor = resolveRuntimeDescriptor({
       config: {
@@ -136,6 +156,46 @@ describe('resolveRuntimeConfig — precedence and attribution', () => {
     assert.equal(
       resolveCodexRuntimeRequest({
         config: { chats: { '100': { pm: 'sdk' } } },
+        chatId: '100',
+        threadId: '7',
+      }),
+      null,
+    );
+  });
+
+  test('resolves a prospective Codex candidate while the current runtime remains Claude', () => {
+    const config = {
+      defaults: { cwd: '/default', codexEffort: 'high' },
+      bot: { codexModel: 'gpt-5.6-sol' },
+      chats: {
+        '100': {
+          pm: 'sdk',
+          topics: { '7': { codexEffort: 'xhigh' } },
+        },
+      },
+    };
+
+    const candidate = resolveCodexRuntimeCandidate({
+      config,
+      chatId: '100',
+      threadId: '7',
+    });
+
+    assert.deepEqual(candidate, {
+      runtime: 'codex',
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      cwd: '/default',
+      sources: {
+        model: 'bot',
+        effort: 'topic',
+        cwd: 'default',
+      },
+    });
+    assert.ok(Object.isFrozen(candidate));
+    assert.equal(
+      resolveCodexRuntimeRequest({
+        config,
         chatId: '100',
         threadId: '7',
       }),

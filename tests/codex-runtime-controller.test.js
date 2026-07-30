@@ -1641,6 +1641,181 @@ test('restores durable ownership before preparing an exact Codex session', async
   );
 });
 
+test('prospective Codex preflight is cached without changing the configured Claude runtime', async () => {
+  const config = {
+    codex: {
+      home: '/srv/codex-home',
+      daemonSecretRoots: ['/srv/polygram'],
+    },
+    chats: {
+      '100': {
+        pm: 'sdk',
+        cwd: '/srv/workspace',
+        codexModel: 'gpt-5.6-sol',
+        codexEffort: 'xhigh',
+      },
+    },
+  };
+  const { calls, controller } = fixture({ configOverride: config });
+
+  assert.deepEqual(
+    await controller.resolveCandidateRuntimeView({
+      sessionKey: '100',
+      chatId: '100',
+    }),
+    {
+      runtime: 'codex',
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      models: [{
+        model: 'gpt-5.6-sol',
+        displayName: 'GPT-5.6 Sol',
+        defaultReasoningEffort: 'high',
+        supportedReasoningEfforts: ['high', 'xhigh'],
+      }],
+      efforts: ['high', 'xhigh'],
+    },
+  );
+  assert.equal(config.chats['100'].pm, 'sdk');
+  assert.equal(
+    await controller.prepareSession({
+      sessionKey: '100',
+      chatId: '100',
+    }),
+    null,
+  );
+
+  config.chats['100'].pm = 'codex';
+  await controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+  });
+
+  assert.equal(
+    calls.filter((entry) => entry[0] === 'prepare-profile').length,
+    1,
+  );
+  assert.equal(
+    calls.filter((entry) => entry[0] === 'model-preflight').length,
+    1,
+  );
+});
+
+test('unused prospective Codex preflight can be discarded without touching config', async () => {
+  const config = {
+    codex: {
+      home: '/srv/codex-home',
+      daemonSecretRoots: ['/srv/polygram'],
+    },
+    chats: {
+      '100': {
+        pm: 'sdk',
+        cwd: '/srv/workspace',
+        codexModel: 'gpt-5.6-sol',
+        codexEffort: 'xhigh',
+      },
+    },
+  };
+  const { calls, controller, receipt } = fixture({ configOverride: config });
+  await controller.resolveCandidateRuntimeView({
+    sessionKey: '100',
+    chatId: '100',
+  });
+
+  assert.equal(controller.discardCandidateRuntime('100'), true);
+  assert.equal(config.chats['100'].pm, 'sdk');
+  assert.throws(
+    () => controller.resolveReceipt('100', {
+      runtime: 'codex',
+      spawnProfileId: receipt.spawnProfileId,
+    }),
+    { code: 'CODEX_PREFLIGHT_RECEIPT_MISSING' },
+  );
+  assert.equal(
+    calls.filter((entry) => entry[0] === 'model-invalidate').length,
+    0,
+    'discarding one unused session receipt must retain the shared catalog',
+  );
+});
+
+test('candidate discard refuses a receipt bound to a registered Codex process', async () => {
+  const { controller, receipt } = fixture();
+  await controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+  });
+  const proc = Object.assign(new EventEmitter(), {
+    runtime: 'codex',
+    sessionKey: '100',
+    generationId: 'generation-candidate-bound',
+    spawnProfileId: receipt.spawnProfileId,
+    startupReleaseSafe: false,
+    closed: false,
+  });
+  controller.registerProcess(proc);
+
+  assert.equal(controller.discardCandidateRuntime('100'), false);
+  assert.equal(
+    controller.resolveReceipt('100', {
+      runtime: 'codex',
+      spawnProfileId: receipt.spawnProfileId,
+    }),
+    receipt,
+  );
+});
+
+test('normal prepare revalidates configured Codex selection after candidate preflight', async () => {
+  const config = {
+    codex: {
+      home: '/srv/codex-home',
+      daemonSecretRoots: ['/srv/polygram'],
+    },
+    chats: {
+      '100': {
+        pm: 'sdk',
+        cwd: '/srv/workspace',
+        codexModel: 'gpt-5.6-sol',
+        codexEffort: 'xhigh',
+      },
+    },
+  };
+  const { controller } = fixture({
+    configOverride: config,
+    controllerOptions: {
+      resolveRuntime: ({ config: currentConfig, codexAvailability }) => {
+        const selected = currentConfig.chats['100'];
+        if (selected.pm !== 'codex') {
+          return Object.freeze({ runtime: 'claude', backend: 'sdk' });
+        }
+        return Object.freeze({
+          runtime: 'codex',
+          backend: 'codex',
+          spawnProfileId: codexAvailability.receipt.spawnProfileId,
+          model: selected.codexModel,
+          effort: selected.codexEffort,
+          cwd: selected.cwd,
+        });
+      },
+    },
+  });
+  await controller.resolveCandidateRuntimeView({
+    sessionKey: '100',
+    chatId: '100',
+  });
+
+  config.chats['100'].pm = 'codex';
+  const preparing = controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+  });
+  config.chats['100'].pm = 'sdk';
+
+  await assert.rejects(
+    preparing,
+    { code: 'CODEX_PREFLIGHT_PROFILE_MISMATCH' },
+  );
+});
+
 test('constructs the app-server client only from the preflighted static profile', async () => {
   const { clientOptions, controller, receipt } = fixture();
   controller.initialize();

@@ -403,6 +403,35 @@ describe('provider session namespaces', () => {
       undefined,
     );
   });
+
+  test('runtime-switch preparation reports Codex drift without deleting the dormant thread', () => {
+    db.upsertProviderSession({
+      session_key: 'chat',
+      namespace: CODEX_APP_SERVER_NAMESPACE,
+      provider: 'codex',
+      provider_session_id: 'old-thread',
+      cwd: '/workspace-a',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+      pm_backend: 'codex',
+    });
+
+    const resolved = resolveProviderSessionForSpawn(db, 'chat', {
+      runtime: 'codex',
+      backend: 'codex',
+      cwd: '/workspace-b',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+    }, { mutateOnDrift: false });
+
+    assert.equal(resolved.existingSessionId, null);
+    assert.deepEqual(resolved.drift.fields, ['cwd']);
+    assert.equal(
+      db.getProviderSession('chat', CODEX_APP_SERVER_NAMESPACE)
+        .provider_session_id,
+      'old-thread',
+    );
+  });
 });
 
 // ─── S2: session-config drift detection ──────────────────────────────
@@ -527,6 +556,30 @@ describe('resolveSessionForSpawn (S2 drift)', () => {
     assert.equal(r.drift.before.pm_backend, 'sdk');
     assert.equal(r.drift.after.pm_backend, 'cli');
     assert.equal(db.getSession('chat:3'), undefined, 'row deleted');
+  });
+
+  test('runtime-switch preparation reports a channels boundary without deleting first', () => {
+    db.upsertSession({
+      session_key: 'chat:3', chat_id: 'chat', thread_id: '3',
+      claude_session_id: 'sess-prepared-only',
+      agent: 'music-curation:music-curator',
+      cwd: '/Users/ivanshumkov/Music/rekordbox',
+      pm_backend: 'sdk',
+    });
+
+    const r = resolveSessionForSpawn(
+      db,
+      'chat:3',
+      { ...resolved, backend: 'cli' },
+      { mutateOnDrift: false },
+    );
+
+    assert.equal(r.existingSessionId, null);
+    assert.ok(r.drift.fields.includes('pm_backend'));
+    assert.equal(
+      db.getSession('chat:3').claude_session_id,
+      'sess-prepared-only',
+    );
   });
 
   test('rc.6: tmux → channels flip DROPS the session', () => {

@@ -90,6 +90,9 @@ function ownedConfig({
     approvals_reviewer: 'user',
     web_search: 'disabled',
     allow_login_shell: false,
+    features: {
+      goals: false,
+    },
     shell_environment_policy: {
       inherit: 'none',
       ignore_default_excludes: false,
@@ -817,6 +820,54 @@ function integrationConfig(fixture) {
     },
   };
 }
+
+test('warm Claude source resolves the dormant Codex thread for a runtime switch', {
+  timeout: 30_000,
+}, async (t) => {
+  const fixture = makeFixture(t);
+  const db = dbClient.open(fixture.dbPath);
+  t.after(() => {
+    try { db.raw.close(); } catch {}
+  });
+  const config = integrationConfig(fixture);
+  const integrationOrchestra = createIntegrationOrchestra();
+  const runtime = createRuntime({
+    db,
+    config,
+    fixture,
+    integrationOrchestra,
+  });
+  db.upsertProviderSession({
+    session_key: '1',
+    namespace: 'codex:app-server',
+    provider: 'codex',
+    provider_session_id: 'dormant-codex-thread',
+    cwd: fixture.workspace,
+    model: 'gpt-5.6-sol',
+    effort: 'medium',
+    pm_backend: 'codex',
+  });
+  const liveClaude = {
+    runtime: 'claude',
+    backend: 'sdk',
+    providerSessionId: 'claude-session-must-not-cross-resume',
+    closed: false,
+  };
+
+  const spawnContext = await buildCodexSpawnContext({
+    sessionKey: '1',
+    chatId: '1',
+    threadId: null,
+    chatConfig: config.chats['1'],
+    db,
+    pm: { get: () => liveClaude },
+    runtimeController: runtime.controller,
+    getSessionLabel: () => 'Codex integration',
+    logEvent() {},
+  });
+
+  assert.equal(spawnContext.existingSessionId, 'dormant-codex-thread');
+});
 
 async function createHarness(t, scenario) {
   const fixture = makeFixture(t, scenario);

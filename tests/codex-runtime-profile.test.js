@@ -114,6 +114,9 @@ function ownedConfig(f) {
     approvals_reviewer: 'user',
     web_search: 'disabled',
     allow_login_shell: false,
+    features: {
+      goals: false,
+    },
     shell_environment_policy: {
       inherit: 'none',
       ignore_default_excludes: false,
@@ -343,6 +346,7 @@ describe('owned Codex native-beta runtime profile', () => {
     assert.match(raw, /default_permissions = "polygram-session"/);
     assert.match(raw, /approval_policy = "never"/);
     assert.match(raw, /allow_login_shell = false/);
+    assert.match(raw, /^\[features\]\ngoals = false$/m);
     assert.match(raw, /network = \\{ enabled = false \\}|enabled = false/);
     assert.match(raw, new RegExp(
       `${f.ipcRuntimeRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*deny`,

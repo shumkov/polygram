@@ -58,6 +58,10 @@ See `docs/0.12.0-stable-release-plan.md`. Open items there:
 
 ## Post-stable features (designs filed, need operator decisions)
 
+- **Native provider goals and autonomous turns (deferred)** — replace the
+  temporary Polygram-managed Codex goal gate with safe, provider-native Codex
+  and Claude goals; do not build a Polygram goal evaluator.
+  [Deferred specification](docs/NATIVE_PROVIDER_GOALS_SPEC.md).
 - **SessionStart cwd auto-pairing** — `/use <cwd>` to pair without editing
   config.json. `docs/0.12.0-session-start-pair-spec.md` (open questions need a
   decision). ~4h.
