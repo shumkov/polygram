@@ -24,8 +24,8 @@
     "config.example.json"
   ],
   "scripts": {
-    "test": "node --test --test-force-exit tests/*.test.js",
-    "coverage": "node --test --test-force-exit --experimental-test-coverage tests/*.test.js",
+    "test": "node --test --test-concurrency=4 tests/*.test.js",
+    "coverage": "node --test --test-concurrency=4 --experimental-test-coverage tests/*.test.js",
     "coverage:lcov": "mkdir -p coverage && node --test --experimental-test-coverage --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/lcov.info tests/*.test.js",
     "start": "node polygram.js",
     "split-db": "node scripts/split-db.js",
