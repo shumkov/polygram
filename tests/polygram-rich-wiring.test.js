@@ -127,6 +127,33 @@ describe('polygram rich-message wiring', () => {
     );
   });
 
+  test('the streamer opens its bubble through the shared rich sender, not a hand-rolled call', () => {
+    // sendRichMessage is the only verb that can open a bubble rich; going
+    // direct to tg() would bypass the latch, the transcript row and the
+    // media preflight the primitive owns.
+    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload) => {');
+    assert.match(wiring, /await richSendMessage\(\{/);
+    assert.doesNotMatch(wiring, /'sendRichMessage'/,
+      'the primitive owns the verb — this wiring must not call it directly');
+    // A refusal never throws; it downgrades to the plain bubble the streamer
+    // pre-computed against the smaller plain cap.
+    assert.match(wiring, /if \(out\?\.wentRich\)/);
+    assert.match(wiring, /sanitizeLiveText\(openRich \? payload\.plainText : payload\)/);
+    assert.match(wiring, /wentRich: false/,
+      'the streamer needs to know a downgraded open left a PLAIN bubble');
+  });
+
+  test('the reply anchor is spent once per open, whichever verb carries it', () => {
+    // A rich attempt that downgrades sends exactly one bubble. Attaching
+    // reply_parameters to both would quote the user twice; attaching it to
+    // neither would lose the anchor for the whole turn.
+    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload) => {');
+    assert.equal((wiring.match(/allow_sending_without_reply: true/g) || []).length, 1);
+    assert.match(wiring, /const replyParams = hadReplyAnchor/);
+    assert.match(wiring, /replyParams,/, 'the rich open reuses it');
+    assert.match(wiring, /if \(replyParams\) params\.reply_parameters = replyParams;/);
+  });
+
   test('exactly one capability latch is shared by both rich paths', () => {
     // Two counters would let either path latch on its first bare 404 while
     // the other believed two were still required, which is the restart-blip

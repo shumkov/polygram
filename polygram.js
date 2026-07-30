@@ -1411,23 +1411,47 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // becomes rich during streaming.
       logEvent('rich-streaming-upgrade', { chat_id: chatId, thread_id: threadId, bot: BOT_NAME });
     },
-    send: async (text) => {
+    send: async (payload) => {
+      const openRich = payload && typeof payload === 'object' && payload.rich;
       const hadReplyAnchor = !firstBubbleSent;
+      // allow_sending_without_reply: long-running turns give the user
+      // plenty of time to delete their original message. Without this
+      // flag, Telegram rejects the reply with MESSAGE_NOT_FOUND and the
+      // whole streamed answer is lost.
+      const replyParams = hadReplyAnchor
+        ? { message_id: msg.message_id, allow_sending_without_reply: true }
+        : null;
+      // One bubble per call whichever verb carries it, so the anchor is
+      // spent here rather than once per transport — a rich open that has
+      // to downgrade still quotes the user exactly once.
+      firstBubbleSent = true;
+      if (openRich) {
+        // sendRichMessage is the only verb that opens a bubble rich; a
+        // plain send followed by a rich edit would flicker. It never
+        // throws and reports whether rich actually landed, so a refusal
+        // just opens plain here and the next flush retries via the edit
+        // path (which is where the plain→rich upgrade metric belongs).
+        const out = await richSendMessage({
+          bot, chatId, threadId,
+          blocks: payload.blocks,
+          sourceText: payload.sourceText,
+          replyParams,
+          mediaContext,
+          meta: outMetaBase,
+        });
+        if (out?.wentRich) {
+          return { ...out.result, _hadReplyAnchor: hadReplyAnchor, wentRich: true };
+        }
+      }
       const params = {
-        chat_id: chatId, text: sanitizeLiveText(text),
+        chat_id: chatId,
+        text: sanitizeLiveText(openRich ? payload.plainText : payload),
         ...(threadId && { message_thread_id: threadId }),
       };
-      if (!firstBubbleSent) {
-        // allow_sending_without_reply: long-running turns give the user
-        // plenty of time to delete their original message. Without this
-        // flag, Telegram rejects the reply with MESSAGE_NOT_FOUND and the
-        // whole streamed answer is lost.
-        params.reply_parameters = { message_id: msg.message_id, allow_sending_without_reply: true };
-        firstBubbleSent = true;
-      }
+      if (replyParams) params.reply_parameters = replyParams;
       const res = await tg(bot, 'sendMessage', params, outMetaBase);
       return res && typeof res === 'object'
-        ? { ...res, _hadReplyAnchor: hadReplyAnchor }
+        ? { ...res, _hadReplyAnchor: hadReplyAnchor, wentRich: false }
         : res;
     },
     edit: async (messageId, payload) => {

@@ -17,6 +17,7 @@ const { describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { createStreamer } = require('../lib/telegram/streamer');
+const { toTelegramRichBlocks } = require('../lib/telegram/rich');
 const {
   createStreamerRegistry,
   createDeliverTextFactory,
@@ -25,6 +26,10 @@ const {
   resolveStreamPreviewEnabled,
 } = require('../lib/telegram/live-preview');
 
+// A bubble is described either by a plain string or by a rich payload
+// carrying its source Markdown. What the user reads is the same either way.
+const bubbleText = (payload) => (typeof payload === 'string' ? payload : payload.sourceText);
+
 /** A fake Telegram that records what the user would actually see. */
 function fakeTelegram({ failEdit = false } = {}) {
   const tg = {
@@ -32,15 +37,15 @@ function fakeTelegram({ failEdit = false } = {}) {
     sent: [],        // bubbles created
     edits: [],       // {msgId, text}
     deleted: [],     // msgIds removed
-    send: async (text) => {
+    send: async (payload) => {
       const message_id = tg.nextId++;
-      tg.sent.push({ message_id, text });
+      tg.sent.push({ message_id, text: bubbleText(payload), payload });
       return { message_id };
     },
     edit: async (msgId, payload) => {
       if (msgId == null) throw new Error('editMessageText: message_id is required');
       if (failEdit) throw new Error('Bad Request: can\'t parse entities');
-      tg.edits.push({ msgId, text: payload });
+      tg.edits.push({ msgId, text: bubbleText(payload), payload });
     },
     deleteMessage: async (msgId) => { tg.deleted.push(msgId); },
   };
@@ -57,7 +62,9 @@ function visibleBubbles(tg) {
     });
 }
 
-function harness({ failEdit = false, maxLen = 4096, interim = false, turnId = null } = {}) {
+function harness({
+  failEdit = false, maxLen = 4096, interim = false, turnId = null, toRichPayload = null,
+} = {}) {
   const tg = fakeTelegram({ failEdit });
   const events = [];
   const rows = [];
@@ -69,6 +76,7 @@ function harness({ failEdit = false, maxLen = 4096, interim = false, turnId = nu
     throttleMs: 0,
     maxLen,
     logger: { error: () => {}, warn: () => {} },
+    ...(toRichPayload && { toRichPayload }),
   });
   const registry = createStreamerRegistry();
   const deliveredTexts = [];
@@ -103,6 +111,25 @@ describe('turn shapes', () => {
     assert.equal(h.tg.sent.length, 1);
     assert.deepEqual(visibleBubbles(h.tg), [
       { message_id: 100, text: 'The answer begins, continues, and ends.' },
+    ]);
+    assert.equal(h.events.find((e) => e.kind === 'stream-preview-consumed').detail.msg_id, 100);
+  });
+
+  test('stream… that OPENED rich → reply that fits: still ONE bubble, finalized in place', async () => {
+    // A preview whose first chunk already had structure is created by
+    // sendRichMessage, not sendMessage. The consume rule must settle it the
+    // same way — the id it hands back is the id it opened.
+    const h = harness({ toRichPayload: toTelegramRichBlocks });
+    await h.streamer.onChunk('# Answer\n\n- [ ] one\n\nand prose.');
+
+    const out = await h.deliver()({ text: '# Answer\n\n- [ ] one\n- [x] two' });
+
+    assert.equal(h.tg.sent.length, 1, 'the rich open IS the bubble; the reply must not add another');
+    assert.equal(h.tg.sent[0].payload.rich, true, 'the bubble opened rich, not plain');
+    assert.equal(out.handled, true);
+    assert.deepEqual(out.sent, [100]);
+    assert.deepEqual(visibleBubbles(h.tg), [
+      { message_id: 100, text: '# Answer\n\n- [ ] one\n- [x] two' },
     ]);
     assert.equal(h.events.find((e) => e.kind === 'stream-preview-consumed').detail.msg_id, 100);
   });
