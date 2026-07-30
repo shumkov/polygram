@@ -11,8 +11,11 @@ const assert = require('node:assert/strict');
 const {
   createCodexRuntimeAvailability,
   RuntimeConfigError,
+  requireCodexEnabled,
+  requireCodexDispatchEnabled,
   resolveCodexRuntimeCandidate,
   resolveCodexRuntimeRequest,
+  resolveCodexEnabled,
   processMatchesRuntime,
   resolveRuntimeConfig,
   resolveRuntimeDescriptor,
@@ -83,6 +86,102 @@ function resolve(config, overrides = {}) {
 }
 
 describe('resolveRuntimeConfig — precedence and attribution', () => {
+  test('Codex enablement uses topic, chat, bot, then default boolean precedence', () => {
+    const config = {
+      defaults: { codexEnabled: false },
+      bot: { codexEnabled: true },
+      chats: {
+        '100': {
+          codexEnabled: false,
+          topics: {
+            '7': { codexEnabled: true },
+            '8': { codexEnabled: 'yes' },
+          },
+        },
+        '200': { codexEnabled: 'yes' },
+      },
+    };
+
+    assert.equal(resolveCodexEnabled(config, '100', '7'), true);
+    assert.equal(resolveCodexEnabled(config, '100', '8'), false);
+    assert.equal(resolveCodexEnabled(config, '100', '9'), false);
+    assert.equal(resolveCodexEnabled(config, '200', null), true);
+    assert.equal(resolveCodexEnabled({ defaults: { codexEnabled: true } }, '300'), true);
+    assert.equal(resolveCodexEnabled({}, '300'), false);
+  });
+
+  test('Codex authorization throws a stable scope error only when disabled', () => {
+    assert.equal(
+      requireCodexEnabled(
+        { chats: { '100': { codexEnabled: true } } },
+        '100',
+      ),
+      true,
+    );
+    assert.throws(
+      () => requireCodexEnabled(
+        { chats: { '100': {} } },
+        '100',
+      ),
+      (error) => {
+        assert.ok(error instanceof RuntimeConfigError);
+        assert.equal(error.code, 'CODEX_SCOPE_DISABLED');
+        assert.equal(error.runtime, 'codex');
+        assert.match(error.message, /not enabled/i);
+        return true;
+      },
+    );
+  });
+
+  test('disabled Claude-selected sibling topic cannot dispatch to a live shared Codex generation', () => {
+    const config = {
+      chats: {
+        '100': {
+          codexEnabled: true,
+          topics: {
+            '7': { codexEnabled: false },
+            '8': { codexEnabled: true },
+          },
+        },
+      },
+    };
+
+    assert.throws(
+      () => requireCodexDispatchEnabled({
+        config,
+        chatId: '100',
+        threadId: '7',
+        selectedProvider: 'claude',
+        liveCodexGeneration: true,
+      }),
+      (error) => {
+        assert.ok(error instanceof RuntimeConfigError);
+        assert.equal(error.code, 'CODEX_SCOPE_DISABLED');
+        return true;
+      },
+    );
+    assert.equal(
+      requireCodexDispatchEnabled({
+        config,
+        chatId: '100',
+        threadId: '8',
+        selectedProvider: 'claude',
+        liveCodexGeneration: true,
+      }),
+      true,
+    );
+    assert.equal(
+      requireCodexDispatchEnabled({
+        config,
+        chatId: '100',
+        threadId: '7',
+        selectedProvider: 'claude',
+        liveCodexGeneration: false,
+      }),
+      false,
+    );
+  });
+
   test('live-process matching is target-relative across all runtimes', () => {
     const sdk = { runtime: 'claude', backend: 'sdk', closed: false };
     const cli = { runtime: 'claude', backend: 'cli', closed: false };
@@ -121,10 +220,58 @@ describe('resolveRuntimeConfig — precedence and attribution', () => {
     assert.equal(descriptor.runtime, 'codex');
     assert.equal(descriptor.backend, 'codex');
     assert.equal(descriptor.promptMode, 'codex');
+    assert.equal(descriptor.codexEnabled, false);
     assert.ok(Object.isFrozen(descriptor));
   });
 
-  test('resolves the exact Codex request before preflight without enabling it', () => {
+  test('disabled saved Codex remains observable but cannot cross runtime boundaries', () => {
+    const config = {
+      defaults: {
+        codexModel: 'gpt-5.6-sol',
+        codexEffort: 'xhigh',
+        cwd: '/work',
+      },
+      chats: { '100': { pm: 'codex' } },
+    };
+
+    const descriptor = resolveRuntimeDescriptor({
+      config,
+      chatId: '100',
+      threadId: '7',
+    });
+    assert.equal(descriptor.runtime, 'codex');
+    assert.equal(descriptor.backend, 'codex');
+    assert.equal(descriptor.codexEnabled, false);
+
+    for (const resolveDisabled of [
+      () => resolveCodexRuntimeCandidate({
+        config,
+        chatId: '100',
+        threadId: '7',
+      }),
+      () => resolveCodexRuntimeRequest({
+        config,
+        chatId: '100',
+        threadId: '7',
+      }),
+      () => resolveRuntimeConfig({
+        config,
+        chatId: '100',
+        threadId: '7',
+        codexAvailability: {
+          state: 'unavailable',
+          reason: 'must not win over scope policy',
+        },
+      }),
+    ]) {
+      assert.throws(
+        resolveDisabled,
+        (error) => error.code === 'CODEX_SCOPE_DISABLED',
+      );
+    }
+  });
+
+  test('resolves the exact enabled Codex request before preflight', () => {
     const request = resolveCodexRuntimeRequest({
       config: {
         defaults: { cwd: '/default', codexEffort: 'high' },
@@ -132,6 +279,7 @@ describe('resolveRuntimeConfig — precedence and attribution', () => {
         chats: {
           '100': {
             pm: 'codex',
+            codexEnabled: true,
             topics: { '7': { codexEffort: 'xhigh' } },
           },
         },
@@ -170,6 +318,7 @@ describe('resolveRuntimeConfig — precedence and attribution', () => {
       chats: {
         '100': {
           pm: 'sdk',
+          codexEnabled: true,
           topics: { '7': { codexEffort: 'xhigh' } },
         },
       },
@@ -224,6 +373,7 @@ describe('resolveRuntimeConfig — precedence and attribution', () => {
           topics: {
             '7': {
               pm: 'codex',
+              codexEnabled: true,
               codexModel: 'codex-topic',
               codexEffort: 'xhigh',
             },
@@ -270,6 +420,7 @@ describe('resolveRuntimeConfig — precedence and attribution', () => {
       chats: {
         '100': {
           pm: 'codex',
+          codexEnabled: true,
           topics: { '7': { codexEffort: 'xhigh' } },
         },
       },
@@ -447,7 +598,7 @@ describe('resolveRuntimeConfig — backend/session compatibility', () => {
     const got = resolve(
       {
         defaults: { codexModel: 'gpt-test', codexEffort: 'high', cwd: '/work' },
-        chats: { '100': { pm: 'codex' } },
+        chats: { '100': { pm: 'codex', codexEnabled: true } },
       },
       {
         codexAvailability: codexAvailability({
@@ -479,7 +630,9 @@ describe('resolveRuntimeConfig — backend/session compatibility', () => {
     const first = resolve(
       {
         defaults: { codexEffort: 'high', cwd: '/work' },
-        chats: { '100': { pm: 'codex', codexModel: 'gpt-a' } },
+        chats: {
+          '100': { pm: 'codex', codexEnabled: true, codexModel: 'gpt-a' },
+        },
       },
       {
         codexAvailability: codexAvailability({
@@ -492,7 +645,9 @@ describe('resolveRuntimeConfig — backend/session compatibility', () => {
     const changedModel = resolve(
       {
         defaults: { codexEffort: 'high', cwd: '/work' },
-        chats: { '100': { pm: 'codex', codexModel: 'gpt-b' } },
+        chats: {
+          '100': { pm: 'codex', codexEnabled: true, codexModel: 'gpt-b' },
+        },
       },
       {
         codexAvailability: codexAvailability({
@@ -505,7 +660,9 @@ describe('resolveRuntimeConfig — backend/session compatibility', () => {
     const changedProfile = resolve(
       {
         defaults: { codexEffort: 'high', cwd: '/work' },
-        chats: { '100': { pm: 'codex', codexModel: 'gpt-a' } },
+        chats: {
+          '100': { pm: 'codex', codexEnabled: true, codexModel: 'gpt-a' },
+        },
       },
       {
         codexAvailability: codexAvailability({
@@ -584,7 +741,14 @@ describe('resolveRuntimeConfig — backend/session compatibility', () => {
           codexModel: 'gpt-test',
           codexEffort: 'high',
         },
-        chats: { '100': { pm: 'codex', cwd: '/codex', agent: 'claude-agent-a' } },
+        chats: {
+          '100': {
+            pm: 'codex',
+            codexEnabled: true,
+            cwd: '/codex',
+            agent: 'claude-agent-a',
+          },
+        },
       },
       { codexAvailability: availability },
     );
@@ -596,7 +760,14 @@ describe('resolveRuntimeConfig — backend/session compatibility', () => {
           codexModel: 'gpt-test',
           codexEffort: 'high',
         },
-        chats: { '100': { pm: 'codex', cwd: '/codex', agent: 'claude-agent-b' } },
+        chats: {
+          '100': {
+            pm: 'codex',
+            codexEnabled: true,
+            cwd: '/codex',
+            agent: 'claude-agent-b',
+          },
+        },
       },
       { codexAvailability: availability },
     );
@@ -651,6 +822,7 @@ describe('resolveRuntimeConfig — provider model isolation', () => {
           '100': {
             ...config.chats['100'],
             pm: 'codex',
+            codexEnabled: true,
           },
         },
       },
@@ -676,7 +848,12 @@ describe('resolveRuntimeConfig — provider model isolation', () => {
         {
           defaults: { cwd: '/work' },
           chats: {
-            '100': { pm: 'codex', model: 'claude-opus', effort: 'high' },
+            '100': {
+              pm: 'codex',
+              codexEnabled: true,
+              model: 'claude-opus',
+              effort: 'high',
+            },
           },
         },
         {
@@ -716,7 +893,7 @@ describe('resolveRuntimeConfig — fail-closed explicit Codex selection', () => 
     test(`${state} Codex preflight rejects with an actionable typed error`, () => {
       assert.throws(
         () => resolve(
-          { chats: { '100': { pm: 'codex' } } },
+          { chats: { '100': { pm: 'codex', codexEnabled: true } } },
           {
             codexAvailability: {
               state,
@@ -741,7 +918,9 @@ describe('resolveRuntimeConfig — fail-closed explicit Codex selection', () => 
 
   test('missing availability is unavailable, so unwired callers cannot enable Codex', () => {
     assert.throws(
-      () => resolve({ chats: { '100': { pm: 'codex' } } }),
+      () => resolve({
+        chats: { '100': { pm: 'codex', codexEnabled: true } },
+      }),
       (err) => {
         assert.ok(err instanceof RuntimeConfigError);
         assert.equal(err.code, 'CODEX_RUNTIME_UNAVAILABLE');
@@ -770,7 +949,7 @@ describe('resolveRuntimeConfig — fail-closed explicit Codex selection', () => 
               codexEffort: 'high',
               cwd: '/work',
             },
-            chats: { '100': { pm: 'codex' } },
+            chats: { '100': { pm: 'codex', codexEnabled: true } },
           },
           { codexAvailability: candidate },
         ),
@@ -808,7 +987,7 @@ describe('resolveRuntimeConfig — fail-closed explicit Codex selection', () => 
           codexEffort: 'low',
           cwd: '/work',
         },
-        chats: { '100': { pm: 'codex' } },
+        chats: { '100': { pm: 'codex', codexEnabled: true } },
       },
       { codexAvailability: trusted },
     );
@@ -822,7 +1001,10 @@ describe('resolveRuntimeConfig — fail-closed explicit Codex selection', () => 
     ]) {
       assert.throws(
         () => resolve(
-          { defaults, chats: { '100': { pm: 'codex' } } },
+          {
+            defaults,
+            chats: { '100': { pm: 'codex', codexEnabled: true } },
+          },
           { codexAvailability: trusted },
         ),
         (error) => error.code === 'CODEX_PREFLIGHT_PROFILE_MISMATCH',
@@ -856,7 +1038,7 @@ describe('resolveRuntimeConfig — fail-closed explicit Codex selection', () => 
   test('unknown availability state is invalid config, never treated as available', () => {
     assert.throws(
       () => resolve(
-        { chats: { '100': { pm: 'codex' } } },
+        { chats: { '100': { pm: 'codex', codexEnabled: true } } },
         { codexAvailability: { state: 'maybe' } },
       ),
       (err) => {
@@ -887,7 +1069,7 @@ describe('resolveRuntimeConfig — fail-closed explicit Codex selection', () => 
             codexEffort: 'high',
             cwd: '/work',
           },
-          chats: { '100': { pm: 'codex' } },
+          chats: { '100': { pm: 'codex', codexEnabled: true } },
         },
         {
           codexAvailability: codexAvailability({

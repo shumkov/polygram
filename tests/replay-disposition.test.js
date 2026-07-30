@@ -263,6 +263,66 @@ describe('executeReplayPlan — crash branch', () => {
     assert.equal(res.noticed, 0);
   });
 
+  test('a scope-disabled legacy recovery row is deferred without blocking the next row', async () => {
+    const disabled = C('-100', 1);
+    const recoverable = C('-200', 2);
+    const calls = [];
+    const events = [];
+    const res = await executeReplayPlan({
+      plan: {
+        recover: [disabled, recoverable],
+        skip: [],
+        notices: [],
+      },
+      deps: {
+        recover: async (candidate) => {
+          calls.push(candidate.msg_id);
+          if (candidate === disabled) {
+            const error = new Error('Codex is not enabled for this chat');
+            error.code = 'CODEX_SCOPE_DISABLED';
+            throw error;
+          }
+          return { ok: true };
+        },
+        sendNotice: async () => ({ ok: true }),
+        markSkipped: () => {},
+        logEvent: (kind, detail) => events.push({ kind, detail }),
+      },
+    });
+
+    assert.deepEqual(calls, [1, 2]);
+    assert.equal(res.recovered, 1);
+    assert.equal(res.deferred, 1);
+    assert.deepEqual(
+      events.find((event) => event.kind === 'codex-replay-deferred')?.detail,
+      {
+        chat_id: '-100',
+        thread_id: null,
+        msg_id: 1,
+        reason: 'scope-disabled',
+      },
+    );
+  });
+
+  test('an unrelated legacy recovery error still rejects the replay batch', async () => {
+    const failure = new Error('recovery transport failed');
+    await assert.rejects(
+      executeReplayPlan({
+        plan: {
+          recover: [C('-100', 1)],
+          skip: [],
+          notices: [],
+        },
+        deps: {
+          recover: async () => { throw failure; },
+          sendNotice: async () => ({ ok: true }),
+          markSkipped: () => {},
+        },
+      }),
+      (error) => error === failure,
+    );
+  });
+
   test('Codex recovery never falls through to the legacy/Claude recoverer', async () => {
     const candidate = C('-100', 1);
     const plan = classifyReplay({
@@ -316,6 +376,55 @@ describe('executeReplayPlan — crash branch', () => {
     assert.deepEqual(calls, [candidate]);
     assert.equal(res.recovered, 1);
     assert.equal(res.deferred, undefined);
+  });
+
+  test('a scope-disabled Codex row is deferred without blocking the next row', async () => {
+    const disabled = C('-100', 1);
+    const recoverable = C('-200', 2);
+    const plan = classifyReplay({
+      candidates: [disabled, recoverable],
+      cleanShutdown: false,
+      getProviderRecovery: () => ({
+        provider: 'codex',
+        delivery_state: 'prepared',
+        recovery_state: 'prepared',
+      }),
+    });
+    const calls = [];
+    const events = [];
+    const res = await executeReplayPlan({
+      plan,
+      deps: {
+        recover: async () => {
+          throw new Error('must not fail over to Claude');
+        },
+        recoverCodex: async (candidate) => {
+          calls.push(candidate.msg_id);
+          if (candidate === disabled) {
+            const error = new Error('Codex is not enabled for this chat');
+            error.code = 'CODEX_SCOPE_DISABLED';
+            throw error;
+          }
+          return { ok: true };
+        },
+        sendNotice: async () => ({ ok: true }),
+        markSkipped: () => {},
+        logEvent: (kind, detail) => events.push({ kind, detail }),
+      },
+    });
+
+    assert.deepEqual(calls, [1, 2]);
+    assert.equal(res.recovered, 1);
+    assert.equal(res.deferred, 1);
+    assert.deepEqual(
+      events.find((event) => event.kind === 'codex-replay-deferred')?.detail,
+      {
+        chat_id: '-100',
+        thread_id: null,
+        msg_id: 1,
+        reason: 'scope-disabled',
+      },
+    );
   });
 });
 

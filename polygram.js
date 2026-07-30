@@ -79,6 +79,7 @@ const {
 } = require('./lib/codex/spawn-context');
 const {
   processMatchesRuntime,
+  requireCodexDispatchEnabled,
   resolveCodexRuntimeCandidate,
   resolveRuntimeDescriptor,
 } = require('./lib/runtime-config');
@@ -631,15 +632,17 @@ function buildUnavailableCodexRuntimeView({
   runtimeView = null,
 }) {
   let candidate = null;
-  try {
-    candidate = resolveCodexRuntimeCandidate({
-      config,
-      chatId,
-      threadId,
-    });
-  } catch {
-    // The runtime button must remain available even when the saved Codex
-    // model, effort, or cwd is incomplete.
+  if (runtimeSelection.codexEnabled) {
+    try {
+      candidate = resolveCodexRuntimeCandidate({
+        config,
+        chatId,
+        threadId,
+      });
+    } catch {
+      // The runtime button must remain available even when the saved Codex
+      // model, effort, or cwd is incomplete.
+    }
   }
   const model = runtimeView?.model ?? candidate?.model ?? null;
   const effort = runtimeView?.effort ?? candidate?.effort ?? null;
@@ -653,6 +656,7 @@ function buildUnavailableCodexRuntimeView({
     backend: runtimeSelection.backend,
     configuredPm: runtimeSelection.configuredPm,
     selectionSource: runtimeSelection.source,
+    codexEnabled: runtimeSelection.codexEnabled,
     model,
     effort,
     models: runtimeView?.models ?? Object.freeze([]),
@@ -684,9 +688,18 @@ async function resolveSessionRuntimeView({
     backend: runtimeSelection.backend,
     configuredPm: runtimeSelection.configuredPm,
     selectionSource: runtimeSelection.source,
+    codexEnabled: runtimeSelection.codexEnabled,
   };
   if (runtimeSelection.runtime !== 'codex') {
     return Object.freeze(runtimeMetadata);
+  }
+  if (!runtimeSelection.codexEnabled) {
+    return buildUnavailableCodexRuntimeView({
+      runtimeSelection,
+      chatId,
+      threadId,
+      error: { code: 'CODEX_SCOPE_DISABLED' },
+    });
   }
   if (!codexRuntimeController) {
     return buildUnavailableCodexRuntimeView({
@@ -1191,11 +1204,32 @@ function parsePairCodeArgs(text) {
 async function handleMessage(sessionKey, chatId, msg, bot) {
   const chatConfig = config.chats[chatId];
   if (!chatConfig) return;
-  const selectedInboundProvider = resolvePromptBackend({
-    config,
-    chatId,
-    threadId: msg.message_thread_id?.toString() || null,
-  }) === 'codex'
+  const text = msg.text || msg.caption || '';
+  const threadId = msg.message_thread_id;
+  const threadIdStr = threadId?.toString() || null;
+  const botAllowsCommands = !!config.bot?.allowConfigCommands;
+  const runtimeInspectionCommand = (
+    botAllowsCommands
+    && (
+      text === '/config'
+      || text === '/model'
+      || text === '/effort'
+    )
+  );
+  const selectedBackend = runtimeInspectionCommand
+    ? resolveRuntimeDescriptor({
+      config,
+      chatId,
+      threadId: threadIdStr,
+      defaultPm: 'sdk',
+      logger: console,
+    }).backend
+    : resolvePromptBackend({
+      config,
+      chatId,
+      threadId: threadIdStr,
+    });
+  const selectedInboundProvider = selectedBackend === 'codex'
     ? 'codex'
     : 'claude';
   if (
@@ -1231,9 +1265,6 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     });
   }
 
-  const text = msg.text || msg.caption || '';
-  const threadId = msg.message_thread_id;
-  const threadIdStr = threadId?.toString() || null;
   const label = getSessionLabel(chatConfig, threadIdStr);
 
   const replyOpts = (tid) => ({
@@ -1245,7 +1276,6 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // comment there for the bump procedure.
   const MODEL_VERSIONS = MODEL_VERSIONS_DESC;
 
-  const botAllowsCommands = !!config.bot?.allowConfigCommands;
   const cmdUser = msg.from?.first_name || msg.from?.username || null;
   const cmdUserId = msg.from?.id || null;
 
@@ -1291,7 +1321,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     }, { source: 'command-reply', botName: BOT_NAME, model: chatConfig.model, effort: chatConfig.effort, ...metaTags });
   };
 
-  if (botAllowsCommands && (text === '/model' || text === '/config' || text === '/effort')) {
+  if (runtimeInspectionCommand) {
     const show = text === '/effort' ? 'effort' : text === '/model' ? 'model' : 'all';
     // Resolve per-topic overrides so a topic's card shows its REAL
     // agent/model/effort, not the chat-level default — Music topic (thread 3)
@@ -2010,6 +2040,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         || current.backend === 'codex'
       ),
     );
+    requireCodexDispatchEnabled({
+      config,
+      chatId,
+      threadId: threadIdStr || null,
+      selectedProvider: selectedInboundProvider,
+      liveCodexGeneration,
+    });
     if (liveCodexGeneration) {
       if (!codexRuntimeController) {
         codexDispatchDecision = 'unavailable';

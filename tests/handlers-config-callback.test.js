@@ -15,6 +15,9 @@ const {
   EFFORT_OPTIONS,
 } = require('../lib/handlers/config-callback');
 const { resolveRichTextEnabled } = require('../lib/telegram/rich');
+const {
+  buildConfigKeyboard: buildRealConfigKeyboard,
+} = require('../lib/handlers/config-ui');
 
 // What buildSpawnContext (polygram.js) derives the session's thread from: the
 // session key, which collapses every topic of a non-isolated chat onto the chat.
@@ -38,8 +41,14 @@ const CODEX_VIEW = Object.freeze({
       supportedReasoningEfforts: ['high', 'xhigh'],
     },
     {
-      model: 'gpt-5.5',
-      displayName: 'GPT-5.5',
+      model: 'gpt-5.6-terra',
+      displayName: 'GPT-5.6 TERRA',
+      defaultReasoningEffort: 'high',
+      supportedReasoningEfforts: ['medium', 'high'],
+    },
+    {
+      model: 'gpt-6-experimental',
+      displayName: 'GPT-6 Experimental',
       defaultReasoningEffort: 'high',
       supportedReasoningEfforts: ['medium', 'high'],
     },
@@ -302,6 +311,7 @@ describe('handleConfigCallback — Codex model and effort', () => {
           '12345': {
             model: 'sonnet',
             effort: 'max',
+            codexEnabled: true,
             codexModel: 'gpt-5.6-sol',
             codexEffort: 'high',
           },
@@ -330,17 +340,17 @@ describe('handleConfigCallback — Codex model and effort', () => {
       },
     });
     const fn = createHandleConfigCallback(m.deps);
-    const ctx = makeCtx({ data: 'cfg:model:gpt-5.5' });
+    const ctx = makeCtx({ data: 'cfg:model:gpt-5.6-terra' });
     await fn(ctx);
 
     const chat = m.deps.config.chats['12345'];
-    assert.equal(chat.codexModel, 'gpt-5.5');
+    assert.equal(chat.codexModel, 'gpt-5.6-terra');
     assert.equal(chat.codexEffort, 'high');
     assert.equal(chat.model, 'sonnet');
     assert.deepEqual(m.pmCalls, [[
       'selectModelSettings',
       '12345',
-      { model: 'gpt-5.5', effort: 'high' },
+      { model: 'gpt-5.6-terra', effort: 'high' },
     ]]);
     assert.deepEqual(m.runtimeCalls, [{
       sessionKey: '12345',
@@ -354,7 +364,7 @@ describe('handleConfigCallback — Codex model and effort', () => {
     assert.equal(views[0][0], 'info');
     assert.equal(views[0][1], '12345');
     assert.deepEqual(views[0][2].desiredSettings, {
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-terra',
       effort: 'high',
     });
     assert.equal(views[0][2].processStatus, 'not-loaded');
@@ -377,7 +387,7 @@ describe('handleConfigCallback — Codex model and effort', () => {
     });
     m.deps.config.chats['12345'].codexEffort = 'xhigh';
     const fn = createHandleConfigCallback(m.deps);
-    const ctx = makeCtx({ data: 'cfg:model:gpt-5.5' });
+    const ctx = makeCtx({ data: 'cfg:model:gpt-5.6-terra' });
     await fn(ctx);
 
     const chat = m.deps.config.chats['12345'];
@@ -385,7 +395,7 @@ describe('handleConfigCallback — Codex model and effort', () => {
       model: chat.codexModel,
       effort: chat.codexEffort,
     }, {
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-terra',
       effort: 'high',
     });
     assert.equal(saved.length, 1);
@@ -396,18 +406,18 @@ describe('handleConfigCallback — Codex model and effort', () => {
         value: call[1].new_value,
       })),
       [
-        { field: 'model', old: 'gpt-5.6-sol', value: 'gpt-5.5' },
+        { field: 'model', old: 'gpt-5.6-sol', value: 'gpt-5.6-terra' },
         { field: 'effort', old: 'xhigh', value: 'high' },
       ],
     );
     assert.deepEqual(rendered, [{
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-terra',
       effort: 'high',
     }]);
     assert.deepEqual(m.pmCalls, [[
       'selectModelSettings',
       '12345',
-      { model: 'gpt-5.5', effort: 'high' },
+      { model: 'gpt-5.6-terra', effort: 'high' },
     ]]);
     assert.match(ctx._acks[0].text, /effort → high/);
     assert.match(ctx._acks[0].text, /next session/i);
@@ -441,6 +451,22 @@ describe('handleConfigCallback — Codex model and effort', () => {
     const ctx = makeCtx({ data: 'cfg:model:opus' });
     await fn(ctx);
     assert.match(ctx._acks[0].text, /Invalid model/);
+    assert.equal(m.dbCalls.length, 0);
+    assert.equal(m.pmCalls.length, 0);
+    assert.equal(
+      m.deps.config.chats['12345'].codexModel,
+      'gpt-5.6-sol',
+    );
+  });
+
+  test('authenticated models outside the compact interactive list are rejected', async () => {
+    const m = codexDeps();
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:model:gpt-6-experimental' });
+
+    await fn(ctx);
+
+    assert.equal(ctx._acks[0].text, 'Invalid model');
     assert.equal(m.dbCalls.length, 0);
     assert.equal(m.pmCalls.length, 0);
     assert.equal(
@@ -488,7 +514,7 @@ describe('handleConfigCallback — Codex model and effort', () => {
     const chat = m.deps.config.chats['12345'];
     chat.codexEffort = 'xhigh';
     const fn = createHandleConfigCallback(m.deps);
-    const ctx = makeCtx({ data: 'cfg:model:gpt-5.5' });
+    const ctx = makeCtx({ data: 'cfg:model:gpt-5.6-terra' });
 
     await fn(ctx);
 
@@ -515,7 +541,7 @@ describe('handleConfigCallback — Codex model and effort', () => {
     const chat = m.deps.config.chats['12345'];
     chat.codexEffort = 'xhigh';
     const fn = createHandleConfigCallback(m.deps);
-    const ctx = makeCtx({ data: 'cfg:model:gpt-5.5' });
+    const ctx = makeCtx({ data: 'cfg:model:gpt-5.6-terra' });
 
     await fn(ctx);
 
@@ -545,7 +571,7 @@ describe('handleConfigCallback — Codex model and effort', () => {
     });
     m.deps.config.chats['12345'].codexEffort = 'xhigh';
     const fn = createHandleConfigCallback(m.deps);
-    const ctx = makeCtx({ data: 'cfg:model:gpt-5.5' });
+    const ctx = makeCtx({ data: 'cfg:model:gpt-5.6-terra' });
 
     await fn(ctx);
 
@@ -566,16 +592,16 @@ describe('handleConfigCallback — Codex model and effort', () => {
         threadId: 'thread-1',
         generationId: 'generation-1',
         currentTurn: { model: 'gpt-5.6-sol', effort: 'high' },
-        nextTurn: { model: 'gpt-5.5', effort: 'high' },
+        nextTurn: { model: 'gpt-5.6-terra', effort: 'high' },
       },
     });
     const fn = createHandleConfigCallback(m.deps);
-    const ctx = makeCtx({ data: 'cfg:model:gpt-5.5' });
+    const ctx = makeCtx({ data: 'cfg:model:gpt-5.6-terra' });
 
     await fn(ctx);
 
     assert.match(ctx._acks[0].text, /current turn gpt-5\.6-sol\/high unchanged/i);
-    assert.match(ctx._acks[0].text, /next turn gpt-5\.5\/high/i);
+    assert.match(ctx._acks[0].text, /next turn gpt-5\.6-terra\/high/i);
   });
 
   test('unexpected PM failure reports durable selection with unknown live status', async () => {
@@ -607,7 +633,7 @@ describe('handleConfigCallback — Codex model and effort', () => {
         assert.equal(held, true);
         return {
           outcome: 'not-loaded',
-          nextTurn: { model: 'gpt-5.5', effort: 'high' },
+          nextTurn: { model: 'gpt-5.6-terra', effort: 'high' },
         };
       },
       formatConfigInfoText: () => {
@@ -618,7 +644,7 @@ describe('handleConfigCallback — Codex model and effort', () => {
     });
     const fn = createHandleConfigCallback(m.deps);
 
-    await fn(makeCtx({ data: 'cfg:model:gpt-5.5' }));
+    await fn(makeCtx({ data: 'cfg:model:gpt-5.6-terra' }));
     assert.equal(rendered, true);
     assert.equal(
       m.pmCalls.some((call) => call[0] === 'selectModelSettings'),
@@ -628,8 +654,8 @@ describe('handleConfigCallback — Codex model and effort', () => {
 });
 
 describe('handleConfigCallback — runtime switching', () => {
-  test('idle Claude SDK → Codex preflights, saves, audits, and strictly replaces', async () => {
-    const saved = [];
+  test('stale Codex callback is rejected before preflight, writes, or process access', async () => {
+    let saves = 0;
     const m = makeDeps({
       config: {
         bot: { allowConfigCommands: true },
@@ -644,7 +670,84 @@ describe('handleConfigCallback — runtime switching', () => {
           },
         },
       },
+      saveConfig: () => { saves += 1; },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:codex', existingRows: 4 });
+
+    await fn(ctx);
+
+    assert.deepEqual(ctx._acks, [{
+      text: 'Codex is not enabled for this chat',
+      show_alert: true,
+    }]);
+    assert.equal(m.deps.config.chats['12345'].pm, 'sdk');
+    assert.equal(saves, 0);
+    assert.equal(m.dbCalls.length, 0);
+    assert.equal(m.pmCalls.length, 0);
+  });
+
+  test('topic opt-out rejects Codex using the callback exact chat and thread', async () => {
+    let saves = 0;
+    const config = {
+      bot: { allowConfigCommands: true },
+      chats: {
+        '-100': {
+          codexEnabled: true,
+          isolateTopics: true,
+          model: 'sonnet',
+          effort: 'high',
+          topics: {
+            '3': {
+              name: 'Music',
+              codexEnabled: false,
+            },
+          },
+        },
+      },
+    };
+    const m = makeDeps({
+      config,
+      getSessionKey: (chatId, threadId) => `${chatId}:${threadId}`,
+      saveConfig: () => { saves += 1; },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({
+      data: 'cfg:runtime:codex',
+      chatId: '-100',
+      existingRows: 4,
+    });
+    ctx.callbackQuery.message.message_thread_id = 3;
+
+    await fn(ctx);
+
+    assert.equal(ctx._acks[0].text, 'Codex is not enabled for this chat');
+    assert.equal(ctx._acks[0].show_alert, true);
+    assert.equal(config.chats['-100'].topics['3'].pm, undefined);
+    assert.equal(saves, 0);
+    assert.equal(m.dbCalls.length, 0);
+    assert.equal(m.pmCalls.length, 0);
+  });
+
+  test('enabled idle Claude SDK → Codex preflights, saves, audits, and strictly replaces', async () => {
+    const saved = [];
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '12345': {
+            pm: 'sdk',
+            model: 'sonnet',
+            effort: 'high',
+            codexEnabled: true,
+            codexModel: 'gpt-5.6-sol',
+            codexEffort: 'high',
+            cwd: '/workspace',
+          },
+        },
+      },
       saveConfig: () => saved.push(true),
+      buildConfigKeyboard: buildRealConfigKeyboard,
     });
     const fn = createHandleConfigCallback(m.deps);
     const ctx = makeCtx({ data: 'cfg:runtime:codex', existingRows: 4 });
@@ -675,9 +778,14 @@ describe('handleConfigCallback — runtime switching', () => {
       source: 'inline-button',
     });
     assert.match(ctx._acks[0].text, /Runtime → Codex/);
+    assert.deepEqual(
+      ctx._edits[0].opts.reply_markup.inline_keyboard[0].map((button) => button.text),
+      ['Claude', '✓ Codex'],
+      'the post-switch card must keep enabled runtimes visible',
+    );
   });
 
-  test('Codex → Claude CLI skips Codex candidate preflight', async () => {
+  test('disabled saved Codex → Claude CLI remains a repair path without Codex preflight', async () => {
     const m = makeDeps({
       config: {
         bot: { allowConfigCommands: true },
@@ -748,7 +856,12 @@ describe('handleConfigCallback — runtime switching', () => {
           config: {
             bot: { allowConfigCommands: true },
             chats: {
-              '12345': { pm: 'sdk', model: 'sonnet', effort: 'high' },
+              '12345': {
+                pm: 'sdk',
+                model: 'sonnet',
+                effort: 'high',
+                codexEnabled: true,
+              },
             },
           },
           currentProcess: {
@@ -787,7 +900,14 @@ describe('handleConfigCallback — runtime switching', () => {
     const m = makeDeps({
       config: {
         bot: { allowConfigCommands: true },
-        chats: { '12345': { pm: 'sdk', model: 'sonnet', effort: 'high' } },
+        chats: {
+          '12345': {
+            pm: 'sdk',
+            model: 'sonnet',
+            effort: 'high',
+            codexEnabled: true,
+          },
+        },
       },
       prepareRuntimeSelectionError: error,
       saveConfig: () => { saves += 1; },
@@ -807,6 +927,43 @@ describe('handleConfigCallback — runtime switching', () => {
     assert.match(ctx._acks[0].text, /Codex.*unavailable/i);
   });
 
+  test('enabled incomplete Codex configuration has a dedicated alert and no side effects', async () => {
+    let saves = 0;
+    const error = new Error('Codex model is required');
+    error.code = 'CODEX_RUNTIME_SELECTION_INCOMPLETE';
+    const m = makeDeps({
+      config: {
+        bot: { allowConfigCommands: true },
+        chats: {
+          '12345': {
+            pm: 'sdk',
+            model: 'sonnet',
+            effort: 'high',
+            codexEnabled: true,
+          },
+        },
+      },
+      prepareRuntimeSelectionError: error,
+      saveConfig: () => { saves += 1; },
+    });
+    const fn = createHandleConfigCallback(m.deps);
+    const ctx = makeCtx({ data: 'cfg:runtime:codex', existingRows: 4 });
+
+    await fn(ctx);
+
+    assert.deepEqual(ctx._acks, [{
+      text: 'Codex is enabled, but its model, effort, or workspace is not configured for this chat',
+      show_alert: true,
+    }]);
+    assert.equal(m.deps.config.chats['12345'].pm, 'sdk');
+    assert.equal(saves, 0);
+    assert.equal(m.dbCalls.length, 0);
+    assert.deepEqual(
+      m.pmCalls.map((call) => call[0]),
+      ['get', 'prepareRuntimeSelection'],
+    );
+  });
+
   test('save failure restores an absent runtime override exactly', async () => {
     const m = makeDeps({
       config: {
@@ -815,6 +972,7 @@ describe('handleConfigCallback — runtime switching', () => {
           '12345': {
             model: 'sonnet',
             effort: 'high',
+            codexEnabled: true,
             codexModel: 'gpt-5.6-sol',
             codexEffort: 'high',
           },
@@ -852,6 +1010,7 @@ describe('handleConfigCallback — runtime switching', () => {
           isolateTopics: true,
           model: 'sonnet',
           effort: 'high',
+          codexEnabled: true,
           codexModel: 'gpt-5.6-sol',
           codexEffort: 'high',
           cwd: '/workspace',
@@ -889,6 +1048,7 @@ describe('handleConfigCallback — runtime switching', () => {
           '12345': {
             model: 'sonnet',
             effort: 'high',
+            codexEnabled: true,
             codexModel: 'gpt-5.6-sol',
             codexEffort: 'high',
           },
@@ -926,6 +1086,7 @@ describe('handleConfigCallback — runtime switching', () => {
           '12345': {
             model: 'sonnet',
             effort: 'high',
+            codexEnabled: true,
             codexModel: 'gpt-5.6-sol',
             codexEffort: 'high',
           },
@@ -964,6 +1125,7 @@ describe('handleConfigCallback — runtime switching', () => {
           '12345': {
             model: 'sonnet',
             effort: 'high',
+            codexEnabled: true,
             codexModel: 'gpt-5.6-sol',
             codexEffort: 'high',
             cwd: '/workspace',
@@ -1013,6 +1175,7 @@ describe('handleConfigCallback — runtime switching', () => {
           '12345': {
             model: 'sonnet',
             effort: 'high',
+            codexEnabled: true,
             codexModel: 'gpt-5.6-sol',
             codexEffort: 'high',
             cwd: '/workspace',
@@ -1047,6 +1210,7 @@ describe('handleConfigCallback — runtime switching', () => {
             pm: 'sdk',
             model: 'sonnet',
             effort: 'high',
+            codexEnabled: true,
             codexModel: 'gpt-5.6-sol',
             codexEffort: 'high',
           },
@@ -1103,6 +1267,7 @@ describe('handleConfigCallback — runtime switching', () => {
         '-100': {
           model: 'sonnet',
           effort: 'high',
+          codexEnabled: true,
           isolateTopics: true,
           topics: {
             '3': {

@@ -810,6 +810,7 @@ function integrationConfig(fixture) {
       1: {
         name: 'Codex integration',
         pm: 'codex',
+        codexEnabled: true,
         codexModel: 'gpt-5.6-sol',
         codexEffort: 'medium',
         cwd: fixture.workspace,
@@ -1007,6 +1008,7 @@ test('fake app-server runs Polygram text start, stream, final, persistence, and 
       1: {
         name: 'Codex integration',
         pm: 'codex',
+        codexEnabled: true,
         codexModel: 'gpt-5.6-sol',
         codexEffort: 'medium',
         cwd: fixture.workspace,

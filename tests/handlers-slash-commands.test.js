@@ -310,6 +310,18 @@ describe('slash-commands — Codex model and effort', () => {
         supportedReasoningEfforts: ['high', 'xhigh'],
       },
       {
+        model: 'gpt-5.6-terra',
+        displayName: 'GPT-5.6 TERRA',
+        defaultReasoningEffort: 'high',
+        supportedReasoningEfforts: ['high', 'xhigh'],
+      },
+      {
+        model: 'gpt-5.6-luna',
+        displayName: 'GPT-5.6 LUNA',
+        defaultReasoningEffort: 'high',
+        supportedReasoningEfforts: ['medium', 'high'],
+      },
+      {
         model: 'gpt-5.5',
         displayName: 'GPT-5.5',
         defaultReasoningEffort: 'high',
@@ -327,12 +339,12 @@ describe('slash-commands — Codex model and effort', () => {
         return codexView;
       },
     });
-    const ctx = fx.makeCtx({ text: '/model gpt-5.5' });
+    const ctx = fx.makeCtx({ text: '/model gpt-5.6-terra' });
     ctx.chatConfig.codexModel = 'gpt-5.6-sol';
     ctx.chatConfig.codexEffort = 'high';
     await fx.dispatch(ctx);
 
-    assert.equal(ctx.chatConfig.codexModel, 'gpt-5.5');
+    assert.equal(ctx.chatConfig.codexModel, 'gpt-5.6-terra');
     assert.equal(ctx.chatConfig.codexEffort, 'high');
     assert.equal(ctx.chatConfig.model, 'sonnet');
     assert.deepEqual(
@@ -340,7 +352,7 @@ describe('slash-commands — Codex model and effort', () => {
       [{
         kind: 'selectModelSettings',
         sk: 'sk:999',
-        settings: { model: 'gpt-5.5', effort: 'high' },
+        settings: { model: 'gpt-5.6-terra', effort: 'high' },
       }],
     );
     assert.deepEqual(runtimeCalls, [{
@@ -350,7 +362,10 @@ describe('slash-commands — Codex model and effort', () => {
     }]);
     assert.equal(fx.calls.db.configChanges[0].field, 'model');
     assert.equal(fx.calls.db.configChanges.length, 1);
-    assert.match(fx.calls.sendReply[0], /Model → gpt-5\.5 \(GPT-5\.5\)/);
+    assert.match(
+      fx.calls.sendReply[0],
+      /Model → gpt-5\.6-terra \(GPT-5\.6 TERRA\)/,
+    );
     assert.match(fx.calls.sendReply[0], /selected for this chat's next session/i);
   });
 
@@ -360,7 +375,7 @@ describe('slash-commands — Codex model and effort', () => {
       resolveRuntimeView: async () => codexView,
       saveConfig: () => saved.push(true),
     });
-    const ctx = fx.makeCtx({ text: '/model gpt-5.5' });
+    const ctx = fx.makeCtx({ text: '/model gpt-5.6-luna' });
     ctx.chatConfig.codexModel = 'gpt-5.6-sol';
     ctx.chatConfig.codexEffort = 'xhigh';
     await fx.dispatch(ctx);
@@ -369,7 +384,7 @@ describe('slash-commands — Codex model and effort', () => {
       model: ctx.chatConfig.codexModel,
       effort: ctx.chatConfig.codexEffort,
     }, {
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-luna',
       effort: 'high',
     });
     assert.equal(saved.length, 1);
@@ -380,7 +395,7 @@ describe('slash-commands — Codex model and effort', () => {
         value: new_value,
       })),
       [
-        { field: 'model', old: 'gpt-5.6-sol', value: 'gpt-5.5' },
+        { field: 'model', old: 'gpt-5.6-sol', value: 'gpt-5.6-luna' },
         { field: 'effort', old: 'xhigh', value: 'high' },
       ],
     );
@@ -389,7 +404,7 @@ describe('slash-commands — Codex model and effort', () => {
       [{
         kind: 'selectModelSettings',
         sk: 'sk:999',
-        settings: { model: 'gpt-5.5', effort: 'high' },
+        settings: { model: 'gpt-5.6-luna', effort: 'high' },
       }],
     );
     assert.match(fx.calls.sendReply[0], /Effort → high/);
@@ -429,7 +444,7 @@ describe('slash-commands — Codex model and effort', () => {
         throw new Error('disk full');
       },
     });
-    const ctx = fx.makeCtx({ text: '/model gpt-5.5' });
+    const ctx = fx.makeCtx({ text: '/model gpt-5.6-luna' });
     ctx.chatConfig.codexModel = 'gpt-5.6-sol';
     assert.equal(Object.hasOwn(ctx.chatConfig, 'codexEffort'), false);
 
@@ -452,7 +467,7 @@ describe('slash-commands — Codex model and effort', () => {
       auditError: new Error('second audit row rejected'),
       saveConfig: () => { saves += 1; },
     });
-    const ctx = fx.makeCtx({ text: '/model gpt-5.5' });
+    const ctx = fx.makeCtx({ text: '/model gpt-5.6-luna' });
     ctx.chatConfig.codexModel = 'gpt-5.6-sol';
     ctx.chatConfig.codexEffort = 'xhigh';
 
@@ -484,7 +499,7 @@ describe('slash-commands — Codex model and effort', () => {
         if (saves === 2) throw new Error('rollback save failed');
       },
     });
-    const ctx = fx.makeCtx({ text: '/model gpt-5.5' });
+    const ctx = fx.makeCtx({ text: '/model gpt-5.6-luna' });
     ctx.chatConfig.codexModel = 'gpt-5.6-sol';
     ctx.chatConfig.codexEffort = 'xhigh';
 
@@ -509,17 +524,17 @@ describe('slash-commands — Codex model and effort', () => {
         threadId: 'thread-1',
         generationId: 'generation-1',
         currentTurn: { model: 'gpt-5.6-sol', effort: 'high' },
-        nextTurn: { model: 'gpt-5.5', effort: 'high' },
+        nextTurn: { model: 'gpt-5.6-terra', effort: 'high' },
       },
     });
-    const ctx = fx.makeCtx({ text: '/model gpt-5.5' });
+    const ctx = fx.makeCtx({ text: '/model gpt-5.6-terra' });
     ctx.chatConfig.codexModel = 'gpt-5.6-sol';
     ctx.chatConfig.codexEffort = 'high';
 
     await fx.dispatch(ctx);
 
     assert.match(fx.calls.sendReply[0], /current turn gpt-5\.6-sol\/high unchanged/i);
-    assert.match(fx.calls.sendReply[0], /next turn gpt-5\.5\/high/i);
+    assert.match(fx.calls.sendReply[0], /next turn gpt-5\.6-terra\/high/i);
   });
 
   for (const [outcome, expected] of [
@@ -532,16 +547,16 @@ describe('slash-commands — Codex model and effort', () => {
         selectModelSettingsResult: {
           outcome,
           ...(outcome === 'unavailable' && { reason: 'quiescing' }),
-          nextTurn: { model: 'gpt-5.5', effort: 'high' },
+          nextTurn: { model: 'gpt-5.6-terra', effort: 'high' },
         },
       });
-      const ctx = fx.makeCtx({ text: '/model gpt-5.5' });
+      const ctx = fx.makeCtx({ text: '/model gpt-5.6-terra' });
       ctx.chatConfig.codexModel = 'gpt-5.6-sol';
       ctx.chatConfig.codexEffort = 'high';
 
       await fx.dispatch(ctx);
 
-      assert.equal(ctx.chatConfig.codexModel, 'gpt-5.5');
+      assert.equal(ctx.chatConfig.codexModel, 'gpt-5.6-terra');
       assert.match(fx.calls.sendReply[0], expected);
     });
   }
@@ -580,11 +595,11 @@ describe('slash-commands — Codex model and effort', () => {
         assert.equal(held, true);
         return {
           outcome: 'not-loaded',
-          nextTurn: { model: 'gpt-5.5', effort: 'high' },
+          nextTurn: { model: 'gpt-5.6-terra', effort: 'high' },
         };
       },
     });
-    const ctx = fx.makeCtx({ text: '/model gpt-5.5' });
+    const ctx = fx.makeCtx({ text: '/model gpt-5.6-terra' });
     ctx.chatConfig.codexModel = 'gpt-5.6-sol';
     ctx.chatConfig.codexEffort = 'high';
     ctx.sendReply = async (text) => {
@@ -612,11 +627,34 @@ describe('slash-commands — Codex model and effort', () => {
     assert.equal(ctx.chatConfig.codexModel, 'gpt-5.6-sol');
   });
 
+  test('/model rejects an authenticated model outside the compact product set without side effects', async () => {
+    let saves = 0;
+    const fx = fixture({
+      resolveRuntimeView: async () => codexView,
+      saveConfig: () => { saves += 1; },
+    });
+    const ctx = fx.makeCtx({ text: '/model gpt-5.5' });
+    ctx.chatConfig.codexModel = 'gpt-5.6-sol';
+    ctx.chatConfig.codexEffort = 'high';
+
+    await fx.dispatch(ctx);
+
+    assert.match(fx.calls.sendReply[0], /Unknown model/);
+    assert.equal(ctx.chatConfig.codexModel, 'gpt-5.6-sol');
+    assert.equal(ctx.chatConfig.codexEffort, 'high');
+    assert.equal(saves, 0);
+    assert.equal(fx.calls.db.configChanges.length, 0);
+    assert.equal(
+      fx.calls.pmCalls.some((call) => call.kind === 'selectModelSettings'),
+      false,
+    );
+  });
+
   test('Codex topic change writes only the topic codexModel override', async () => {
     const fx = fixture({
       resolveRuntimeView: async () => codexView,
     });
-    const ctx = fx.makeCtx({ text: '/model gpt-5.5' });
+    const ctx = fx.makeCtx({ text: '/model gpt-5.6-luna' });
     ctx.threadIdStr = '3';
     ctx.chatConfig = {
       model: 'sonnet',
@@ -632,7 +670,7 @@ describe('slash-commands — Codex model and effort', () => {
       },
     };
     await fx.dispatch(ctx);
-    assert.equal(ctx.chatConfig.topics['3'].codexModel, 'gpt-5.5');
+    assert.equal(ctx.chatConfig.topics['3'].codexModel, 'gpt-5.6-luna');
     assert.equal(ctx.chatConfig.topics['3'].codexEffort, 'high');
     assert.equal(ctx.chatConfig.topics['3'].model, 'opus');
     assert.equal(ctx.chatConfig.codexModel, 'gpt-5.6-sol');

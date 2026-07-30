@@ -35,7 +35,7 @@ describe('polygram rich-message wiring', () => {
 
   test('the command card receives the same effective value as delivery', () => {
     const wiring = sectionBetween(
-      "if (botAllowsCommands && (text === '/model'",
+      'if (runtimeInspectionCommand)',
       '// Slash command dispatch',
     );
     assert.match(wiring, /effectiveRichText = resolveRichTextEnabled\(config, chatId,/);

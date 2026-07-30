@@ -262,6 +262,38 @@ describe('D5 gateInbound — question-consume + shouldHandle + dispatch', () => 
     assert.notEqual(r3.stage, 'rewind', 'edited /rewind is nonsensical — stage skipped');
     assert.equal(rewindCalls.length, 1);
   });
+
+  test('disabled saved-Codex /rewind dispatches its scope denial instead of failing silently', async () => {
+    const scopeError = Object.assign(
+      new Error('Codex is not enabled for this chat'),
+      { code: 'CODEX_SCOPE_DISABLED' },
+    );
+    const { gate, calls } = makeGate({
+      rewindHandler: {
+        tryConsume: async () => {
+          throw new Error('rewind must not inspect a disabled Codex runtime');
+        },
+      },
+      deps: {
+        resolveRuntime: () => {
+          throw scopeError;
+        },
+      },
+    });
+    const msg = dmMsg({ text: '/rewind' });
+
+    const result = await gate(msg, { tier: 'fresh' });
+
+    assert.deepEqual(result, {
+      action: 'dispatched',
+      stage: 'rewind',
+    });
+    assert.deepEqual(
+      calls.dispatched,
+      [{ sk: '100', cid: '100', msg }],
+      'the dispatcher owns the visible error reply and terminal handler status',
+    );
+  });
 });
 
 describe('D4 redeliverAsFreshTurn — the ONE redelivery tail', () => {

@@ -186,6 +186,7 @@ function fixture({
         home: '/srv/codex-home',
         daemonSecretRoots: ['/srv/polygram'],
       },
+      defaults: { codexEnabled: true },
       chats: {
         '100': {
           pm: 'codex',
@@ -322,6 +323,7 @@ test('different chats serialize native preflight admission daemon-wide', async (
         home: '/srv/codex-home',
         daemonSecretRoots: ['/srv/polygram'],
       },
+      defaults: { codexEnabled: true },
       chats: {
         '100': {
           pm: 'codex',
@@ -395,6 +397,7 @@ test('preflight admission wait is bounded without starting a competing app-serve
         home: '/srv/codex-home',
         daemonSecretRoots: ['/srv/polygram'],
       },
+      defaults: { codexEnabled: true },
       chats: {
         '100': {
           pm: 'codex',
@@ -836,6 +839,7 @@ test('model changes reuse the authenticated static receipt and preflight', async
       home: '/srv/codex-home',
       daemonSecretRoots: ['/srv/polygram'],
     },
+    defaults: { codexEnabled: true },
     chats: {
       '100': {
         pm: 'codex',
@@ -919,6 +923,7 @@ test('expired catalogs block a turn when the durable model disappeared', async (
       home: '/srv/codex-home',
       daemonSecretRoots: ['/srv/polygram'],
     },
+    defaults: { codexEnabled: true },
     chats: {
       '100': {
         pm: 'codex',
@@ -1655,6 +1660,7 @@ test('prospective Codex preflight is cached without changing the configured Clau
       home: '/srv/codex-home',
       daemonSecretRoots: ['/srv/polygram'],
     },
+    defaults: { codexEnabled: true },
     chats: {
       '100': {
         pm: 'sdk',
@@ -1715,6 +1721,7 @@ test('unused prospective Codex preflight can be discarded without touching confi
       home: '/srv/codex-home',
       daemonSecretRoots: ['/srv/polygram'],
     },
+    defaults: { codexEnabled: true },
     chats: {
       '100': {
         pm: 'sdk',
@@ -1778,6 +1785,7 @@ test('normal prepare revalidates configured Codex selection after candidate pref
       home: '/srv/codex-home',
       daemonSecretRoots: ['/srv/polygram'],
     },
+    defaults: { codexEnabled: true },
     chats: {
       '100': {
         pm: 'sdk',
