@@ -101,4 +101,9 @@ test('latestText exposes the newest draft, not just what is on screen', async ()
 
   assert.equal(streamer.currentText, 'First part', 'the bubble still shows the first chunk');
   assert.equal(streamer.latestText, 'First part, second part');
+
+  // The pending edit this test deliberately leaves queued is a live timer for
+  // the full throttle window. Left armed it holds the event loop open until it
+  // fires — draining it is this test's cleanup, not part of what it asserts.
+  await streamer.flushDraft();
 });
