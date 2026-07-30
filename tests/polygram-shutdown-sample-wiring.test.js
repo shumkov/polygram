@@ -58,8 +58,9 @@ describe('shutdown signal-time sampling', () => {
     const body = shutdownBody();
     // Both must reach the event: the pair is what shows how much work a restart
     // actually cost versus how much the drain managed to finish.
-    assert.match(body, /logEvent\('shutdown-drain', \{[\s\S]*?in_flight: remaining,/);
-    assert.match(body, /logEvent\('shutdown-drain', \{[\s\S]*?in_flight_at_signal: inFlightAtSignal,/);
+    assert.match(body, /logEvent\('shutdown-drain', lifecycleDetail\(\{[\s\S]*?in_flight: remaining,/);
+    assert.match(body, /logEvent\('shutdown-drain', lifecycleDetail\(\{[\s\S]*?in_flight_at_signal: inFlightAtSignal,/);
+    assert.match(body, /\}, invocationId\)\)/);
   });
 
   test('the post-drain count is measured after the drain, not reused', () => {
