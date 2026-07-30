@@ -72,6 +72,7 @@ const { createBuildSdkOptions } = require('./lib/sdk/build-options');
 const { createSdkCallbacks } = require('./lib/sdk/callbacks');
 const {
   createCodexRuntimeController,
+  resolveCodexStartupRecovery,
 } = require('./lib/codex/runtime-controller');
 const {
   buildCodexSpawnContext,
@@ -138,7 +139,7 @@ const { chunkMarkdownText } = require('./lib/telegram/chunk');
 const {
   toTelegramRichBlocks, resolveRichTextEnabled, isRichCapabilityError, isRichContentError,
   isRichCapabilityErrorExplicit, isRichMessageFieldRejection, stripMediaMarkdown,
-  isRichLimitError,
+  isRichLimitError, blocksAreStyled,
 } = require('./lib/telegram/rich');
 const {
   makeRichMediaResolver,
@@ -160,6 +161,7 @@ const { createRichSender, sendRichWithStylingRetry } = require('./lib/telegram/r
 const { createRichDeliveryFactory } = require('./lib/telegram/rich-dispatch');
 const { createRichEditStrategy } = require('./lib/telegram/rich-edit-dispatch');
 const { composeDeliverTextFactories } = require('./lib/telegram/deliver-strategy');
+const { composingMarker } = require('./lib/telegram/composing-marker');
 const { buildPolygramDisplayHint } = require('./lib/telegram/display-hint');
 const { redactBotToken, stripUrlCredentials } = require('./lib/error/net');
 // F#23: shared agent-reply helper. parseResponse + sanitizer + chunked
@@ -1495,6 +1497,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // vertically. After the first send, the flag flips and subsequent
   // initial-sends omit reply_parameters.
   let firstBubbleSent = false;
+  // The turn id the engine assigned at dispatch, published by its onTurnId
+  // callback below. Declared at turn scope rather than beside the dispatch
+  // because the streamer's own instrumentation — created before the dispatch —
+  // needs to name the turn a snapshot belonged to.
+  let dispatchedTurnId = null;
   // Streaming is unconditional as of 0.4.0 — matches OpenClaw's model and
   // eliminates the "stuck at 15min typing" complaint from the non-streaming
   // code path. For short responses the streamer stays idle and we fall
@@ -1602,10 +1609,29 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
     // captures them. See stripInlineTagsForStreamer above.
     transformText: stripInlineTagsForStreamer,
     toRichPayload,
+    // "Still writing" on the growing bubble. The marker matches the styling
+    // of what it decorates rather than what the transport can carry: rich-edit
+    // records a styling verdict for any payload blocksAreStyled() calls
+    // styled, and a typed node on flat content would make those verdicts —
+    // strike runs reset, flatten retries paid — be about polygram's own
+    // decoration. Reading the latch instead is not enough: it says what is
+    // POSSIBLE, and the content is what is actually there.
+    toComposingMarker: ({ blocks }) => composingMarker({ styled: blocksAreStyled(blocks || []) }),
     onRichUpgrade: () => {
       // Record the visible transition when an existing plain bubble
       // becomes rich during streaming.
       logEvent('rich-streaming-upgrade', { chat_id: chatId, thread_id: threadId, bot: BOT_NAME });
+    },
+    // A snapshot that lost text the reader had already seen. The streamer
+    // refused it and kept the bubble on the last good one; this is the only
+    // place that misuse becomes visible, since the tool ack stays ok either
+    // way (an error there buys a retry loop, not a better snapshot).
+    onNonCumulativeSnapshot: ({ prevLen, newLen }) => {
+      logEvent('stream-noncumulative', {
+        chat_id: chatId, thread_id: threadId, bot: BOT_NAME,
+        session_key: sessionKey, turn_id: dispatchedTurnId,
+        prev_len: prevLen, new_len: newLen,
+      });
     },
     send: async (payload) => {
       const openRich = payload && typeof payload === 'object' && payload.rich;
@@ -2154,7 +2180,6 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // dispatchedTurnId is filled by the engine's onTurnId callback below,
       // before any tool call for this turn can reach us; it lets a reply be
       // checked against the turn it actually names.
-      let dispatchedTurnId = null;
       if (streamPreviewEnabled) {
         releaseStreamerRegistration = streamerRegistry.register(sessionKey, {
           streamer, chatId, deliveredTexts,
@@ -3491,6 +3516,12 @@ async function main() {
     db = dbClient.open(DB_PATH);
     console.log(`[db] opened ${DB_PATH}`);
     try {
+      const startupRecovery = await resolveCodexStartupRecovery(pidClaim, {
+        claimThrowsOnSurvivingPredecessor:
+          processGuard.CLAIM_PID_FILE_THROWS_ON_SURVIVING_PREDECESSOR === true,
+        persistedLeaseStatus: db.getCodexLease()?.status ?? null,
+        supervisorGraceMs: processGuard.CODEX_SUPERVISOR_GRACE_MS,
+      });
       codexRuntimeController = createCodexRuntimeController({
         config,
         db,
@@ -3501,6 +3532,7 @@ async function main() {
           path.join(process.env.HOME || DATA_DIR, '.claude'),
         ],
         logger: console,
+        startupRecovery,
       });
     } catch (error) {
       codexRuntimeController = null;
@@ -3512,9 +3544,9 @@ async function main() {
       try {
         const codexBoot = codexRuntimeController.initialize();
         codexManagerOptions = codexBoot.managerOptions;
-        if (codexBoot.recovery.status === 'quarantined') {
+        if (codexBoot.recovery.status !== 'clear') {
           console.warn(
-            `[codex] runtime quarantined at boot (${codexBoot.recovery.reason || 'unknown'})`,
+            `[codex] runtime recovery blocked at boot (${codexBoot.recovery.reason || 'unknown'})`,
           );
         }
       } catch (error) {
