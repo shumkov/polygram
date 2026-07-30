@@ -238,7 +238,7 @@ describe('Codex operational retention', () => {
     assert.equal(db.getCodexAttempt('reserved-retry'), undefined);
   });
 
-  test('containment incidents remain until a later boot durably releases them', () => {
+  test('failed generations retain until cleanup without a reboot predicate', () => {
     seedAttempt({
       generationId: 'contained-generation',
       attemptId: 'contained-attempt',
@@ -249,18 +249,20 @@ describe('Codex operational retention', () => {
     });
 
     const held = db.pruneCodexOperationalData({ now: NOW });
-    assert.deepEqual(held, { deletedAttempts: 0, deletedGenerations: 0 });
-    assert.ok(db.getCodexAttempt('contained-attempt'));
+    assert.deepEqual(held, { deletedAttempts: 1, deletedGenerations: 0 });
+    assert.equal(db.getCodexAttempt('contained-attempt'), undefined);
 
     db.raw.prepare(`
-      INSERT INTO codex_reboot_releases (
-        stable_host_id, incident_boot_session_id,
-        released_boot_session_id, released_ts
-      ) VALUES ('host-a', 'boot-a', 'boot-b', @releasedTs)
-    `).run({ releasedTs: NOW - DAY_MS });
+      INSERT INTO codex_attempt_checkpoints (
+        generation_id, kind, detail_json, ts
+      ) VALUES (
+        'contained-generation', 'containment-cleanup-completed',
+        '{"source":"exclusive-takeover-grace"}', @settledTs
+      )
+    `).run({ settledTs: NOW - DAY_MS });
 
     const released = db.pruneCodexOperationalData({ now: NOW });
-    assert.deepEqual(released, { deletedAttempts: 1, deletedGenerations: 1 });
+    assert.deepEqual(released, { deletedAttempts: 0, deletedGenerations: 1 });
     assert.equal(db.getCodexAttempt('contained-attempt'), undefined);
   });
 });

@@ -768,8 +768,8 @@ describe('Codex synchronous durability ledger', () => {
     });
 
     const restored = db.reconstructCodexRecovery({ ...identity, now: 1400 });
-    assert.equal(restored.status, 'quarantined');
-    assert.equal(restored.reason, 'persisted-active-generation');
+    assert.equal(restored.status, 'recovery-blocked');
+    assert.equal(restored.reason, 'exclusive-startup-recovery-unproven');
     assert.deepEqual(restored.unresolvedAttemptIds, ['attempt-a']);
     assert.deepEqual(restored.replayableAttemptIds, []);
   });

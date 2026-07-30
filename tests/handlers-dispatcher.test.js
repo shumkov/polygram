@@ -61,6 +61,8 @@ function fixture(overrides = {}) {
     },
     db: {
       setInboundHandlerStatus: (row) => calls.setInboundStatus.push(row),
+      setInboundHandlerStatusUnlessCodexTerminal:
+        overrides.setInboundHandlerStatusUnlessCodexTerminal,
       getReplayProviderRecovery: overrides.getReplayProviderRecovery,
       clearSessionId: overrides.clearSessionId || ((sk) => {
         calls.clearSessionId.push(sk);
@@ -285,6 +287,23 @@ describe('createDispatcher — error → terminal status mapping', () => {
     assert.equal(calls.setInboundStatus[0]?.status, 'replay-pending');
     assert.equal(calls.tg.length, 0);
     assert.equal(calls.autoResumeAttempts.length, 0);
+  });
+
+  test('shutdown tail uses the Codex-terminal-preserving status update', async () => {
+    const preserved = [];
+    const { calls } = await runAndFail(new Error('contained process closed'), {
+      shuttingDown: true,
+      setInboundHandlerStatusUnlessCodexTerminal: (row) => {
+        preserved.push(row);
+        return { changes: 0 };
+      },
+    });
+    assert.deepEqual(preserved, [{
+      chat_id: 100,
+      msg_id: baseMsg.message_id,
+      status: 'replay-pending',
+    }]);
+    assert.deepEqual(calls.setInboundStatus, []);
   });
 
   test('shutting down + replay: status=replay-attempted', async () => {
