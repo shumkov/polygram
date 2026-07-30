@@ -151,6 +151,23 @@ describe('polygram rich-message wiring', () => {
       'the CLI hint should teach the media syntax this backend delivers');
   });
 
+  test('the spawn context carries the CURRENT hint, so a toggle respawns the session', () => {
+    // The hint is baked into the system prompt at spawn time. orchestra's
+    // wouldReloadFor compares the spawn context's hint against the warm proc's
+    // and reloads on drift — but only if we actually put one in the context.
+    // Without it, flipping richText leaves the live session rendering the old
+    // way until something else forces a respawn.
+    const spawn = sectionBetween(
+      'async function buildSpawnContext',
+      'async function getOrSpawnForChat',
+    );
+    assert.match(
+      spawn,
+      /displayHint:\s*buildPolygramDisplayHint\(\s*resolveRichTextEnabled\(config, chatId,/,
+      'the context hint must be resolved fresh per build, not cached at boot',
+    );
+  });
+
   test('neither rich path accepts URL media, whatever the server', () => {
     // The streamer's resolver used to allow URLs whenever there was no
     // self-hosted apiRoot. That is the wrong way round: a self-hosted server
@@ -230,6 +247,86 @@ describe('polygram rich-message wiring', () => {
     assert.equal(
       (source.match(/capabilityLatch: richCapabilityLatch/g) || []).length, 2,
       'and handed to both the editor and the sender',
+    );
+  });
+});
+
+// ─── the two hint call sites must agree, byte for byte ─────────────
+//
+// The spawn context's hint is compared against the hint the FACTORY resolver
+// produced at spawn time. They are built from the same builder but at two
+// call sites, so any difference in arguments — a missing `inlineMedia: true`,
+// a different richText resolution — is not a cosmetic mismatch: it reads as
+// permanent drift, and every single message respawns the session.
+
+describe('the spawn-context hint and the factory-resolver hint are the same string', () => {
+  const { buildPolygramDisplayHint } = require('../lib/telegram/display-hint');
+  const { resolveRichTextEnabled } = require('../lib/telegram/rich');
+
+  // Pull the literal builder call out of each site and run it, rather than
+  // matching two regexes that could both drift in the same direction.
+  function hintCall(section, label) {
+    const start = section.indexOf('buildPolygramDisplayHint(');
+    assert.notEqual(start, -1, `${label}: no buildPolygramDisplayHint call found`);
+    let depth = 0;
+    for (let i = section.indexOf('(', start); i < section.length; i++) {
+      if (section[i] === '(') depth++;
+      else if (section[i] === ')' && --depth === 0) return section.slice(start, i + 1);
+    }
+    assert.fail(`${label}: unbalanced buildPolygramDisplayHint call`);
+  }
+
+  const contextCall = hintCall(
+    sectionBetween('async function buildSpawnContext', 'async function getOrSpawnForChat'),
+    'buildSpawnContext',
+  );
+  const factoryCall = hintCall(
+    sectionBetween('const orchestraProcessFactory = createProcessFactory({', ');'),
+    'createProcessFactory',
+  );
+
+  const run = (expr, config, chatId, threadId) => new Function(
+    'buildPolygramDisplayHint', 'resolveRichTextEnabled', 'config', 'chatId', 'threadId',
+    `return ${expr};`,
+  )(buildPolygramDisplayHint, resolveRichTextEnabled, config, chatId, threadId);
+
+  for (const richText of [true, false]) {
+    test(`identical with richText ${richText ? 'on' : 'off'}`, () => {
+      const config = { chats: { 42: { richText } }, defaults: {}, bot: {} };
+      assert.equal(
+        run(contextCall, config, '42', null),
+        run(factoryCall, config, '42', null),
+      );
+    });
+  }
+
+  test('identical under a topic override', () => {
+    const config = {
+      chats: { 42: { richText: false, topics: { 7: { richText: true } } } },
+      defaults: {},
+      bot: {},
+    };
+    assert.equal(
+      run(contextCall, config, '42', '7'),
+      run(factoryCall, config, '42', '7'),
+    );
+    // …and the override is actually reaching the builder, or the equality above
+    // would hold for the wrong reason.
+    assert.notEqual(
+      run(contextCall, config, '42', '7'),
+      run(contextCall, config, '42', null),
+    );
+  });
+
+  test('the equality is not free — the builder options it pins do change the hint', () => {
+    assert.notEqual(
+      buildPolygramDisplayHint(true, { inlineMedia: true }),
+      buildPolygramDisplayHint(true),
+      'dropping inlineMedia at one call site would be exactly this kind of mismatch',
+    );
+    assert.notEqual(
+      buildPolygramDisplayHint(true, { inlineMedia: true }),
+      buildPolygramDisplayHint(false, { inlineMedia: true }),
     );
   });
 });

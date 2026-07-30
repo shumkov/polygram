@@ -896,6 +896,16 @@ async function buildSpawnContext(
     // the inbound filter and the send() choke point use, so CliProcess's
     // pre-check + system-prompt line can't drift from actual enforcement.
     localApi: !!config.bot?.apiRoot,
+    // The display hint this chat should be running under, resolved fresh on
+    // every context build. It is spawn-time state (woven into the appended
+    // system prompt), so a warm session only picks up a rich-text toggle if the
+    // context carries the new hint for getOrSpawn to notice the drift against.
+    // MUST be built exactly like the factory-side resolver below — a difference
+    // in either argument is permanent drift, i.e. a respawn per message.
+    displayHint: buildPolygramDisplayHint(
+      resolveRichTextEnabled(config, chatId, threadId || null),
+      { inlineMedia: true },
+    ),
     // Pre-resolve through the SAME backend-aware resolver origin's CliProcess used, so
     // orchestra (which now uses opts.outboundCapOverride verbatim, without its own
     // resolveFileCaps clamp) gets the backend default (2GB local / 50MB cloud) AND the
