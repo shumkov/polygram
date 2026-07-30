@@ -187,6 +187,7 @@ const {
   createCleanResumeTurnContext,
   executeCleanResumeClaim,
   startCleanRestartRecovery,
+  validateStrictResumeSpawn,
 } = require('./lib/ops/clean-resume');
 const { resolveReplayWindowMs } = require('./lib/db/replay-window');
 const { pruneEvents, resolveRetentionPolicy, validatePolicy } = require('./lib/db/events-retention');
@@ -781,9 +782,10 @@ async function buildSpawnContext(
   });
 
   if (strictResume && promptBackend === 'codex') {
-    const error = new Error('strict Claude resume cannot cross a backend change');
-    error.code = 'CLEAN_RESUME_CONFIG_DRIFT';
-    throw error;
+    validateStrictResumeSpawn({
+      strictResume,
+      promptBackend,
+    });
   }
   if (promptBackend === 'codex') {
     if (!codexRuntimeController) {
@@ -830,11 +832,6 @@ async function buildSpawnContext(
   );
   let existingSessionId;
   if (strictResume) {
-    if (!isColdSpawn) {
-      const error = new Error('strict clean resume requires an unspawned session');
-      error.code = 'CLEAN_RESUME_SESSION_ALREADY_SPAWNED';
-      throw error;
-    }
     const topicConfig = getTopicConfig(chatConfig, threadId || null);
     const resolved = {
       agent: topicConfig.agent || chatConfig.agent || null,
@@ -842,24 +839,13 @@ async function buildSpawnContext(
       backend: pickBackend({ config, chatId, threadId: threadId || null, pmDefault: 'sdk' }),
     };
     const runtime = db.getProviderSession(sessionKey, 'claude:channels');
-    const driftFields = ['agent', 'cwd'].filter(
-      (field) => (runtime?.[field] || null) !== resolved[field],
-    );
-    if (
-      !runtime
-      || runtime.generation_id !== strictResume.expectedGenerationId
-      || runtime.provider_session_id !== strictResume.expectedSessionId
-      || !['cli', 'channels'].includes(runtime.pm_backend)
-      || !['cli', 'channels'].includes(resolved.backend)
-      || driftFields.length > 0
-    ) {
-      const error = new Error('strict clean resume session identity or config changed');
-      error.code = driftFields.length > 0
-        ? 'CLEAN_RESUME_CONFIG_DRIFT'
-        : 'CLEAN_RESUME_SESSION_CHANGED';
-      throw error;
-    }
-    existingSessionId = strictResume.expectedSessionId;
+    existingSessionId = validateStrictResumeSpawn({
+      strictResume,
+      promptBackend,
+      liveProcess,
+      runtime,
+      resolved,
+    });
   } else if (isColdSpawn) {
     const topicConfig = getTopicConfig(chatConfig, threadId || null);
     const resolved = {

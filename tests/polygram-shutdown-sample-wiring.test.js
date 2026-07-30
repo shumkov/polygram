@@ -164,8 +164,8 @@ describe('clean restart lifecycle ordering', () => {
     assert.match(src, /\{ expectedProcess, onDispatched \}/);
     assert.match(
       src,
-      /if \(strictResume && promptBackend === 'codex'\)[\s\S]{0,250}?CLEAN_RESUME_CONFIG_DRIFT/,
-      'a backend switch must fail before spawning a different provider',
+      /if \(strictResume && promptBackend === 'codex'\)[\s\S]{0,250}?validateStrictResumeSpawn\(\{/,
+      'a backend switch must pass through the tested strict-resume validator',
     );
   });
 });

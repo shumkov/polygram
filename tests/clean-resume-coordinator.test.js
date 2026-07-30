@@ -6,6 +6,7 @@ const {
   executeCleanResumeClaim,
   recoveryNoticeText,
   startCleanRestartRecovery,
+  validateStrictResumeSpawn,
 } = require('../lib/ops/clean-resume');
 
 const claim = {
@@ -27,6 +28,111 @@ const source = {
   handler_status: 'resume-attempted',
 };
 const resumedProcess = { id: 'resumed-process' };
+
+function strictSpawnFixture(overrides = {}) {
+  return {
+    strictResume: {
+      expectedGenerationId: 'generation-a',
+      expectedSessionId: 'session-a',
+    },
+    promptBackend: 'channels',
+    liveProcess: null,
+    runtime: {
+      generation_id: 'generation-a',
+      provider_session_id: 'session-a',
+      pm_backend: 'cli',
+      agent: 'reviewer',
+      cwd: '/srv/polygram',
+    },
+    resolved: {
+      agent: 'reviewer',
+      cwd: '/srv/polygram',
+      backend: 'channels',
+    },
+    ...overrides,
+  };
+}
+
+describe('strict clean-resume spawn validation', () => {
+  test('accepts only the exact dormant Claude CLI session generation', () => {
+    assert.equal(
+      validateStrictResumeSpawn(strictSpawnFixture()),
+      'session-a',
+    );
+  });
+
+  test('rejects a configured switch to Codex before a different provider can spawn', () => {
+    assert.throws(
+      () => validateStrictResumeSpawn(strictSpawnFixture({
+        promptBackend: 'codex',
+      })),
+      { code: 'CLEAN_RESUME_CONFIG_DRIFT' },
+    );
+  });
+
+  test('rejects an already-live process instead of attaching continue to it', () => {
+    assert.throws(
+      () => validateStrictResumeSpawn(strictSpawnFixture({
+        liveProcess: {
+          runtime: 'claude',
+          backend: 'channels',
+          closed: false,
+        },
+      })),
+      { code: 'CLEAN_RESUME_SESSION_ALREADY_SPAWNED' },
+    );
+  });
+
+  test('rejects a live mismatched runtime instead of replacing it', () => {
+    assert.throws(
+      () => validateStrictResumeSpawn(strictSpawnFixture({
+        liveProcess: {
+          runtime: 'codex',
+          backend: 'codex',
+          closed: false,
+        },
+      })),
+      { code: 'CLEAN_RESUME_SESSION_ALREADY_SPAWNED' },
+    );
+  });
+
+  for (const field of ['agent', 'cwd']) {
+    test(`rejects ${field} drift without mutating the dormant runtime row`, () => {
+      const runtime = strictSpawnFixture().runtime;
+      const before = structuredClone(runtime);
+      const resolved = {
+        ...strictSpawnFixture().resolved,
+        [field]: `${runtime[field]}-changed`,
+      };
+
+      assert.throws(
+        () => validateStrictResumeSpawn(strictSpawnFixture({
+          runtime,
+          resolved,
+        })),
+        { code: 'CLEAN_RESUME_CONFIG_DRIFT' },
+      );
+      assert.deepEqual(runtime, before);
+    });
+  }
+
+  for (const [label, override] of [
+    ['generation', { generation_id: 'generation-b' }],
+    ['provider session', { provider_session_id: 'session-b' }],
+  ]) {
+    test(`rejects a replaced ${label}`, () => {
+      assert.throws(
+        () => validateStrictResumeSpawn(strictSpawnFixture({
+          runtime: {
+            ...strictSpawnFixture().runtime,
+            ...override,
+          },
+        })),
+        { code: 'CLEAN_RESUME_SESSION_CHANGED' },
+      );
+    });
+  }
+});
 
 function fixture(overrides = {}) {
   const calls = {
