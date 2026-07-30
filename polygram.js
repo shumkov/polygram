@@ -1491,6 +1491,11 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // vertically. After the first send, the flag flips and subsequent
   // initial-sends omit reply_parameters.
   let firstBubbleSent = false;
+  // The turn id the engine assigned at dispatch, published by its onTurnId
+  // callback below. Declared at turn scope rather than beside the dispatch
+  // because the streamer's own instrumentation — created before the dispatch —
+  // needs to name the turn a snapshot belonged to.
+  let dispatchedTurnId = null;
   // Streaming is unconditional as of 0.4.0 — matches OpenClaw's model and
   // eliminates the "stuck at 15min typing" complaint from the non-streaming
   // code path. For short responses the streamer stays idle and we fall
@@ -1602,6 +1607,17 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // Record the visible transition when an existing plain bubble
       // becomes rich during streaming.
       logEvent('rich-streaming-upgrade', { chat_id: chatId, thread_id: threadId, bot: BOT_NAME });
+    },
+    // A snapshot that lost text the reader had already seen. The streamer
+    // refused it and kept the bubble on the last good one; this is the only
+    // place that misuse becomes visible, since the tool ack stays ok either
+    // way (an error there buys a retry loop, not a better snapshot).
+    onNonCumulativeSnapshot: ({ prevLen, newLen, violations }) => {
+      logEvent('stream-noncumulative', {
+        chat_id: chatId, thread_id: threadId, bot: BOT_NAME,
+        turn_id: dispatchedTurnId,
+        prev_len: prevLen, new_len: newLen, violations,
+      });
     },
     send: async (payload) => {
       const openRich = payload && typeof payload === 'object' && payload.rich;
@@ -2150,7 +2166,6 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // dispatchedTurnId is filled by the engine's onTurnId callback below,
       // before any tool call for this turn can reach us; it lets a reply be
       // checked against the turn it actually names.
-      let dispatchedTurnId = null;
       if (streamPreviewEnabled) {
         releaseStreamerRegistration = streamerRegistry.register(sessionKey, {
           streamer, chatId, deliveredTexts,

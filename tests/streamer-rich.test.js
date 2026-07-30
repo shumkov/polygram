@@ -188,11 +188,17 @@ describe('streamer — progressive rich streaming (integration with real toTeleg
 
   test('once rich, growing content keeps producing rich edits (no downgrade)', async () => {
     const h = makeHarness({ toRichPayload: toTelegramRichBlocks });
-    // Trailing paragraph on both ticks so the list is inside the rendered
-    // tree rather than the held-back tail, and the growth is visible.
-    await h.streamer.onChunk('# Report\n\n- [ ] a\n\ntail.');
+    // A snapshot only ever appends, so the list grows BEFORE the trailing
+    // paragraph that takes it out of the held-back tail. The last two ticks
+    // are what make the growth visible: the completed list appears once
+    // something follows it, and keeps its items as prose accumulates.
+    await h.streamer.onChunk('# Report\n\n- [ ] a');
+    await h.advance(500);
+    await h.streamer.onChunk('# Report\n\n- [ ] a\n- [ ] b\n- [ ] c');
     await h.advance(500);
     await h.streamer.onChunk('# Report\n\n- [ ] a\n- [ ] b\n- [ ] c\n\ntail.');
+    await h.advance(500);
+    await h.streamer.onChunk('# Report\n\n- [ ] a\n- [ ] b\n- [ ] c\n\ntail.\n\nmore prose.');
     await h.advance(500);
     assert.ok(h.edits.length >= 1, 'the growth must produce an edit for this to mean anything');
     for (const e of h.edits) {
@@ -257,7 +263,7 @@ describe('streamer — the bubble OPENS rich', () => {
     });
     await h.streamer.onChunk(OPEN_BODY);
     await h.advance(500);
-    await h.streamer.onChunk('# Report\n\n- [ ] one\n- [x] two\n\nand prose after.');
+    await h.streamer.onChunk(`${OPEN_BODY}\n\nAnd more prose.`);
     await h.advance(500);
     await h.streamer.finalize('# Report\n\n- [ ] one\n- [x] two');
     assert.equal(upgrades, 0,
@@ -286,7 +292,7 @@ describe('streamer — the bubble OPENS rich', () => {
     });
     await h.streamer.onChunk(OPEN_BODY);
     await h.advance(500);
-    await h.streamer.onChunk('# Report\n\n- [ ] one\n- [x] two\n\nand prose after.');
+    await h.streamer.onChunk(`${OPEN_BODY}\n\nAnd more prose.`);
     await h.advance(500);
     assert.equal(upgrades, 1, 'this bubble really did change shape');
     assert.equal(typeof h.edits[h.edits.length - 1].payload, 'object');
