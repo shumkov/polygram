@@ -32,6 +32,10 @@ const { buildPrompt, resolvePromptBackend } = require('./lib/prompt');
 const { countInFlight } = require('./lib/queue-utils');
 const { createIpcHandlers } = require('./lib/ipc/handlers');
 const { classifyOrphanSweep } = require('./lib/ops/tmux-preflight');
+const {
+  parseSystemdInvocationId,
+  lifecycleDetail,
+} = require('./lib/ops/systemd-invocation');
 const { filterAttachments, resolveFileCaps, resolveMaxFileOverride, MAX_TOTAL_BYTES } = require('./lib/attachments');
 // 0.9.0: SDK ProcessManager is the only pm. CLI pm
 // (lib/process-manager.js) deleted in commit 6.
@@ -3391,6 +3395,7 @@ let startPollWatchdog = null;
 
 async function main() {
   const cgroupOomObserver = createCgroupOomObserver();
+  const invocationId = parseSystemdInvocationId();
   let codexManagerOptions = Object.freeze({
     codexHostIdentity: null,
     codexBootSessionIdentity: null,
@@ -3628,7 +3633,10 @@ async function main() {
       console.log(`[inbox] swept ${swept.swept} files (${(swept.bytes / 1_048_576).toFixed(1)} MiB) older than ${inboxRetentionMs / 86_400_000}d`);
       db.logEvent('inbox-swept', { files: swept.swept, bytes: swept.bytes, retention_days: inboxRetentionMs / 86_400_000 });
     }
-    db.logEvent('polygram-start', { migration: migration.reason, imported: migration.imported });
+    db.logEvent('polygram-start', lifecycleDetail({
+      migration: migration.reason,
+      imported: migration.imported,
+    }, invocationId));
     if (cgroupOomObserver.startup.status === 'unavailable') {
       console.warn(`[oom-observer] unavailable (${cgroupOomObserver.startup.reason}); handled shutdown signals will retain clean-restart behavior`);
       db.logEvent('oom-observer-unavailable', { reason: cgroupOomObserver.startup.reason });
@@ -4534,7 +4542,7 @@ async function main() {
             });
           }
         }
-        logEvent('shutdown-drain', {
+        logEvent('shutdown-drain', lifecycleDetail({
           bot: BOT_NAME,
           in_flight: remaining,
           in_flight_at_signal: inFlightAtSignal,
@@ -4543,7 +4551,7 @@ async function main() {
           clean: res.clean,
           shutdown_reason: res.shutdownReason,
           ...(res.oomKillDelta != null ? { oom_kill_delta: res.oomKillDelta } : {}),
-        });
+        }, invocationId));
         console.log(`[shutdown] ${res.clean ? 'clean' : 'crash-like'} shutdown recorded (${res.shutdownReason}); ${inFlightAtSignal} in-flight at signal, drained ${drainElapsed}ms, ${remaining} still in-flight, ${res.replayMarked} marked replay-pending`);
       } catch (err) {
         console.error(`[shutdown] persistence failed: ${err.message}`);
@@ -4576,7 +4584,10 @@ async function main() {
     if (cancelAllWaiters) cancelAllWaiters('cancelled', 'polygram shutting down');
     if (pm && !pmRetired) await pm.shutdown().catch(() => {});
     if (db) {
-      try { db.logEvent('polygram-stop'); db.raw.close(); } catch {}
+      try {
+        db.logEvent('polygram-stop', lifecycleDetail({}, invocationId));
+        db.raw.close();
+      } catch {}
     }
     // rc.50: release our PID file claim so the next boot doesn't try
     // to kill us. releasePidFile is idempotent and only deletes the

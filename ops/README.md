@@ -109,6 +109,19 @@ canonical absolute directory. Temporary paths and unsafe aliases are rejected;
 there is no `/tmp` fallback. If the data-directory path is too long for a
 portable Unix socket, set `POLYGRAM_IPC_DIR` to a shorter owner-only path.
 
+Deployment automation can query the aggregate in-flight handler count without
+printing session identifiers or the socket path:
+
+```sh
+POLYGRAM_IPC_DIR=/absolute/data-dir/.ipc polygram-ipc admin-bot busy
+# {"bot":"admin-bot","in_flight":0}
+```
+
+This is an advisory quiet-window check. The daemon's shutdown admission,
+delivery, and handler-settlement barriers remain the correctness boundary.
+Invoking `polygram-ipc admin-bot` without a subcommand retains the existing
+path-and-ping health output.
+
 Allowed methods: `sendMessage`, `sendPhoto`, `sendDocument`, `sendSticker`,
 `sendChatAction`, `editMessageText`, `setMessageReaction`. Other methods
 are rejected server-side.

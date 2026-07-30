@@ -58,8 +58,9 @@ describe('shutdown signal-time sampling', () => {
     const body = shutdownBody();
     // Both must reach the event: the pair is what shows how much work a restart
     // actually cost versus how much the drain managed to finish.
-    assert.match(body, /logEvent\('shutdown-drain', \{[\s\S]*?in_flight: remaining,/);
-    assert.match(body, /logEvent\('shutdown-drain', \{[\s\S]*?in_flight_at_signal: inFlightAtSignal,/);
+    assert.match(body, /logEvent\('shutdown-drain', lifecycleDetail\(\{[\s\S]*?in_flight: remaining,/);
+    assert.match(body, /logEvent\('shutdown-drain', lifecycleDetail\(\{[\s\S]*?in_flight_at_signal: inFlightAtSignal,/);
+    assert.match(body, /\}, invocationId\)\)/);
   });
 
   test('the post-drain count is measured after the drain, not reused', () => {
@@ -100,6 +101,25 @@ describe('reply delivery barrier wiring', () => {
 });
 
 describe('clean restart lifecycle ordering', () => {
+  test('fences inbound admission before delivery/process retirement and clean persistence', () => {
+    const body = shutdownBody();
+    const stopInbound = body.indexOf('bot._stop()');
+    const retire = body.indexOf('await prepareCleanRetirement({');
+    const persist = body.indexOf('persistShutdownDisposition({');
+    assert.notEqual(stopInbound, -1, 'Telegram intake fence is missing');
+    assert.notEqual(retire, -1, 'delivery/process retirement barrier is missing');
+    assert.notEqual(persist, -1, 'clean persistence is missing');
+    assert.ok(
+      stopInbound < retire && retire < persist,
+      'shutdown must fence admission, settle delivery/process/handlers, then persist',
+    );
+    assert.match(
+      body,
+      /prepareCleanRetirement\(\{[\s\S]{0,250}?deliveryBarrier,[\s\S]{0,250}?awaitHandlerSettlement,/,
+      'the retirement barrier must include reply delivery and handler settlement',
+    );
+  });
+
   test('retires processes and settles handlers before clean persistence', () => {
     const body = shutdownBody();
     const retire = body.indexOf('await prepareCleanRetirement({');
