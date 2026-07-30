@@ -2,16 +2,15 @@
  * The streamer accepts a snapshot only if it EXTENDS the last accepted one.
  *
  * The `stream` tool's contract says snapshots are cumulative, but that is a
- * model-compliance contract. Production (topic 5639, turn 802281d2) saw
- * 724 chars/5 blocks -> 1,997/13 blocks -> 2,297/7 blocks: the third snapshot
- * was LONGER than the second and had dropped the first three sections. The
- * streamer rendered it faithfully and the user watched the top of the report
- * vanish mid-stream.
+ * model-compliance contract: a model can send a LONGER snapshot that has
+ * dropped its earlier sections, and rendering it wipes the top of a report
+ * out from under someone reading it.
  *
- * Extension tolerates revision of the incomplete TAIL — in partial mode the
- * model is legitimately still rewriting the block it is part-way through.
- * What it does not tolerate is losing text the reader has already seen as
- * complete.
+ * What may change freely is whatever the reader has not seen settle — the
+ * block a rich bubble is still holding back, the line a plain bubble is still
+ * typing. What may not change is anything already on screen. So the pin comes
+ * from the renderer's own account of what it drew, never from a guess about
+ * where blocks begin.
  *
  * Fake clock/schedule harness (same pattern as streamer-rich.test.js) so
  * throttle timing is deterministic.
@@ -22,9 +21,10 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { createStreamer, committedPrefix } = require('../lib/telegram/streamer');
+const { createStreamer, completeLines } = require('../lib/telegram/streamer');
+const { toTelegramRichBlocks, partialVisibleExtent } = require('../lib/telegram/rich');
 
-function makeHarness({ onNonCumulativeSnapshot, toRichPayload } = {}) {
+function makeHarness({ onNonCumulativeSnapshot, toRichPayload, minChars = 1 } = {}) {
   const sent = [];
   const edits = [];
   let nextId = 1000;
@@ -38,7 +38,7 @@ function makeHarness({ onNonCumulativeSnapshot, toRichPayload } = {}) {
       return { message_id: id };
     },
     edit: async (msgId, payload) => { edits.push({ msgId, payload }); },
-    minChars: 1,
+    minChars,
     throttleMs: 500,
     clock: () => now,
     schedule: (fn, delay) => {
@@ -181,40 +181,86 @@ describe('streamer — append-only snapshot guard', () => {
     assert.equal(h.streamer.latestText, text);
   });
 
-  test('text with no completed block yet — the guard abstains', async () => {
+  test('a plain bubble pins every complete line it displayed', async () => {
     const events = [];
     const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
 
-    // No blank line anywhere: the whole snapshot is one in-progress block,
-    // which is exactly the case rich rendering emits as-is rather than
-    // holding back. Nothing has been seen as COMPLETE, so nothing is pinned.
+    // A plain render shows the WHOLE text — there is no held-back block — so
+    // a line that reached the screen is a line that may not vanish.
     await h.streamer.onChunk('Первая строка\nВторая строка');
     await h.advance(500);
-    await h.streamer.onChunk('Совсем другой текст без пустых строк');
+    await h.streamer.onChunk('Совсем другой текст без первой строки');
+    await h.advance(500);
+
+    assert.equal(events.length, 1);
+    assert.equal(h.streamer.latestText, 'Первая строка\nВторая строка');
+  });
+
+  test('a plain bubble still lets the line being typed be rewritten', async () => {
+    const events = [];
+    const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
+
+    await h.streamer.onChunk('Первая строка\nВторая стро');
+    await h.advance(500);
+    await h.streamer.onChunk('Первая строка\nВторая строка, переписанная целиком.');
+    await h.advance(500);
+
+    assert.equal(events.length, 0, 'the line in progress has not settled');
+  });
+
+  test('a single unfinished line pins nothing at all', async () => {
+    const events = [];
+    const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
+
+    await h.streamer.onChunk('Начал писать');
+    await h.advance(500);
+    await h.streamer.onChunk('Начал заново, совсем иначе.');
     await h.advance(500);
 
     assert.equal(events.length, 0);
-    assert.equal(h.streamer.latestText, 'Совсем другой текст без пустых строк');
+  });
+});
+
+describe('streamer — nothing is pinned before anything is drawn', () => {
+  // Traced repro: a first snapshot shorter than streamMinChars pins a prefix
+  // although NOTHING was rendered. The model revises its opening, every later
+  // snapshot is refused against that stale pin, and the preview never opens
+  // at all — zero sends, state stuck idle, for the whole turn.
+  test('a snapshot below minChars pins nothing, so the preview can still open', async () => {
+    const events = [];
+    const h = makeHarness({ minChars: 30, onNonCumulativeSnapshot: (d) => events.push(d) });
+
+    await h.streamer.onChunk('Привет!\n\nСейчас');          // 15 chars, nothing sent
+    await h.advance(500);
+    assert.equal(h.sent.length, 0, 'precondition: below minChars, nothing was drawn');
+
+    await h.streamer.onChunk('Здравствуйте!\n\nОдну минуту'); // revised opening, still short
+    await h.advance(500);
+    await h.streamer.onChunk('Здравствуйте!\n\nОдну минуту, сейчас всё посмотрю и отвечу.');
+    await h.advance(500);
+
+    assert.equal(events.length, 0, 'nothing was on screen, so nothing could be lost');
+    assert.equal(h.sent.length, 1, 'the preview must still open once the text is long enough');
+    assert.equal(h.streamer.state, 'live');
   });
 
-  test('a violation before the bubble exists still protects the finalize body', async () => {
-    const h = makeHarness();
-    // minChars is 1 in the harness, so drive the idle case by failing the
-    // send: the streamer reverts to idle while keeping latestText.
+  test('a failed initial send leaves nothing pinned', async () => {
+    const events = [];
     const streamer = createStreamer({
       send: async () => { throw new Error('send failed'); },
       edit: async () => {},
       minChars: 1,
       logger: { log: () => {}, error: () => {}, warn: () => {} },
+      onNonCumulativeSnapshot: (d) => events.push(d),
     });
 
     await streamer.onChunk(SNAPSHOT_A);
     assert.equal(streamer.state, 'idle', 'the failed send must have reverted to idle');
     await streamer.onChunk(SNAPSHOT_B);
 
-    assert.equal(streamer.latestText, SNAPSHOT_A,
-      'finalize falls back to latestText — it must not become the truncated snapshot');
-    void h;
+    assert.equal(events.length, 0, 'the bubble never existed — there is nothing to protect');
+    assert.equal(streamer.latestText, SNAPSHOT_B,
+      'and the draft must track the model, or finalize delivers text it has moved past');
   });
 
   test('one row per refusal, so a looping model is a GROUP BY away', async () => {
@@ -299,37 +345,60 @@ describe('streamer — ticking a checkbox is not losing text', () => {
   });
 });
 
-describe('streamer — nothing unseen may be pinned', () => {
-  // An unterminated ``` fence is ONE top-level block, and partial mode holds
-  // the whole thing back (toTelegramRichBlocks returns zero blocks for a
-  // snapshot that is nothing but an open fence). A blank line inside it is
-  // not a boundary the reader ever saw, so pinning there freezes the preview
-  // the moment the model edits a line of its own snippet — the same freeze
-  // the checkbox exemption fixed, through a different door.
-  test('a blank line inside an unterminated code fence is not a boundary', async () => {
+describe('streamer — a fence is pinned exactly when the reader can see it', () => {
+  // The same source is a different promise depending on which renderer drew
+  // it, which is why the pin has to come from the renderer rather than from
+  // the shape of the text.
+  const OPEN_FENCE_PLAIN = 'Вот решение.\n\n```js\nfunction f() {\n  const x = 1;\n\n  return x;';
+  const OPEN_FENCE_RICH = '# Решение\n\n```js\nfunction f() {\n  const x = 1;\n\n  return x;';
+
+  test('a plain-rendered fence is fully visible, so its body is pinned', async () => {
     const events = [];
-    const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
+    const h = makeHarness({ toRichPayload: toTelegramRichBlocks, onNonCumulativeSnapshot: (d) => events.push(d) });
 
-    await h.streamer.onChunk('Вот решение.\n\n```js\nfunction f() {\n  const x = 1;\n\n  return x;');
+    // No rich trigger here: this renders as plain text and the reader is
+    // looking at every line of the snippet.
+    assert.equal(toTelegramRichBlocks(OPEN_FENCE_PLAIN, { partial: true }).usedRich, false,
+      'precondition: this shape renders plain');
+
+    await h.streamer.onChunk(OPEN_FENCE_PLAIN);
     await h.advance(500);
-    // Revising a line ABOVE the blank line inside the fence — text the reader
-    // has never been shown, because the whole fence is still held back.
-    await h.streamer.onChunk('Вот решение.\n\n```js\nfunction f() {\n  const x = 42;\n\n  return x;\n}\n```\n\nГотово.');
+    // Dropping the fence lines the reader is looking at: the production wipe
+    // shape, wearing a code block.
+    await h.streamer.onChunk('Вот решение.\n\n```js\n  return x;\n}\n```\n\nГотово, всё работает как надо.');
     await h.advance(500);
 
-    assert.equal(events.length, 0, 'the reader has seen none of the fence — none of it may be pinned');
+    assert.equal(events.length, 1, 'lines on screen may not be dropped, fence or not');
+    assert.equal(h.streamer.latestText, OPEN_FENCE_PLAIN);
   });
 
-  test('the paragraph before the fence is still pinned', async () => {
+  test('a rich-rendered fence is held back, so its body is not pinned', async () => {
     const events = [];
-    const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
+    const h = makeHarness({ toRichPayload: toTelegramRichBlocks, onNonCumulativeSnapshot: (d) => events.push(d) });
 
-    await h.streamer.onChunk('Вот решение.\n\n```js\nfunction f() {\n  const x = 1;\n\n  return x;');
+    const partial = toTelegramRichBlocks(OPEN_FENCE_RICH, { partial: true });
+    assert.equal(partial.usedRich, true);
+    assert.equal(partial.blocks.length, 1, 'precondition: only the heading is on screen');
+
+    await h.streamer.onChunk(OPEN_FENCE_RICH);
+    await h.advance(500);
+    // Revising the snippet the renderer is still holding back.
+    await h.streamer.onChunk('# Решение\n\n```js\nfunction f() {\n  const x = 42;\n\n  return x;\n}\n```\n\nГотово.');
+    await h.advance(500);
+
+    assert.equal(events.length, 0, 'nothing of the fence reached the screen, so nothing of it is pinned');
+  });
+
+  test('the heading above a held-back fence is still pinned', async () => {
+    const events = [];
+    const h = makeHarness({ toRichPayload: toTelegramRichBlocks, onNonCumulativeSnapshot: (d) => events.push(d) });
+
+    await h.streamer.onChunk(OPEN_FENCE_RICH);
     await h.advance(500);
     await h.streamer.onChunk('```js\nfunction f() {\n  const x = 1;\n\n  return x;\n}\n```\n\nГотово.');
     await h.advance(500);
 
-    assert.equal(events.length, 1, 'losing the intro paragraph is still losing seen text');
+    assert.equal(events.length, 1, 'losing the displayed heading is still losing seen text');
   });
 
   test('CRLF text is guarded, not silently exempt', async () => {
@@ -346,23 +415,121 @@ describe('streamer — nothing unseen may be pinned', () => {
   });
 });
 
-describe('committedPrefix', () => {
-  test('is empty when nothing has been completed', () => {
-    assert.equal(committedPrefix(''), '');
-    assert.equal(committedPrefix('one line'), '');
-    assert.equal(committedPrefix('line\nline'), '');
+describe('completeLines — the plain bubble\'s settled extent', () => {
+  test('nothing is settled until a line ends', () => {
+    assert.equal(completeLines(''), '');
+    assert.equal(completeLines('one unfinished line'), '');
   });
 
-  test('ends at the last blank line, keeping the separator', () => {
-    assert.equal(committedPrefix('a\n\nb'), 'a\n\n');
-    assert.equal(committedPrefix('a\n\nb\n\nc'), 'a\n\nb\n\n');
+  test('everything up to the last newline has settled', () => {
+    assert.equal(completeLines('a\nb'), 'a\n');
+    assert.equal(completeLines('a\nb\n'), 'a\nb\n');
+  });
+});
+
+describe('the pin agrees with what the renderer drew', () => {
+  // Every case here asserts the RENDERER's own account of what was visible,
+  // then proves that mutating something visible is refused and mutating
+  // something held back is accepted. A boundary guessed from the text —
+  // blank lines, fences, anything — disagrees with the renderer in both
+  // directions, and both directions are bugs: one freezes the preview, the
+  // other lets it be wiped.
+  const visibleSource = (src) => src.slice(0, partialVisibleExtent(src));
+
+  const RICH_CASES = [
+    {
+      name: 'blocks separated by single newlines',
+      src: '# One\n## Two\n## Three',
+      mutateVisible: '# One\n## Changed\n## Three',
+      extendHeldBack: '# One\n## Two\n## Three complete\n\nmore',
+    },
+    {
+      name: 'table followed by prose',
+      src: '| a | b |\n| - | - |\n| 1 | 2 |\n\nafter the table\n\nstill writing',
+      mutateVisible: '| a | b |\n| - | - |\n| 9 | 9 |\n\nafter the table\n\nstill writing more',
+      extendHeldBack: '| a | b |\n| - | - |\n| 1 | 2 |\n\nafter the table\n\nstill writing more',
+    },
+    {
+      name: 'loose multi-paragraph list',
+      src: '# Title\n\n- item one\n\n- item two\n\ntail para',
+      mutateVisible: '# Title\n\n- item ONE\n\n- item two\n\ntail para extended',
+      extendHeldBack: '# Title\n\n- item one\n\n- item two\n\ntail para extended',
+    },
+    {
+      name: 'closed fence with an internal blank line',
+      src: '# Title\n\n```js\nconst a = 1;\n\nconst b = 2;\n```\n\ntail',
+      mutateVisible: '# Title\n\n```js\nconst a = 99;\n\nconst b = 2;\n```\n\ntail extended',
+      extendHeldBack: '# Title\n\n```js\nconst a = 1;\n\nconst b = 2;\n```\n\ntail extended',
+    },
+    {
+      name: 'tilde fence',
+      src: '# Title\n\n~~~js\nconst a = 1;\n\nconst b = 2;\n~~~\n\ntail',
+      mutateVisible: '# Title\n\n~~~js\nconst a = 99;\n\nconst b = 2;\n~~~\n\ntail extended',
+      extendHeldBack: '# Title\n\n~~~js\nconst a = 1;\n\nconst b = 2;\n~~~\n\ntail extended',
+    },
+    {
+      name: 'a literal triple backtick in prose',
+      src: '# Title\n\nUse ``` to open a fence.\n\nstill writing',
+      mutateVisible: '# Title\n\nUse ~~~ to open a fence.\n\nstill writing more',
+      extendHeldBack: '# Title\n\nUse ``` to open a fence.\n\nstill writing more',
+    },
+  ];
+
+  for (const c of RICH_CASES) {
+    test(`${c.name}: a visible mutation is refused`, async () => {
+      const events = [];
+      const h = makeHarness({ toRichPayload: toTelegramRichBlocks, onNonCumulativeSnapshot: (d) => events.push(d) });
+      const seen = visibleSource(c.src);
+      assert.ok(seen.length > 0, 'precondition: something was on screen');
+      assert.ok(c.mutateVisible.slice(0, seen.length) !== seen,
+        'precondition: this mutation really does change displayed source');
+
+      await h.streamer.onChunk(c.src);
+      await h.advance(500);
+      await h.streamer.onChunk(c.mutateVisible);
+      await h.advance(500);
+
+      assert.equal(events.length, 1);
+    });
+
+    test(`${c.name}: revising what is held back is accepted`, async () => {
+      const events = [];
+      const h = makeHarness({ toRichPayload: toTelegramRichBlocks, onNonCumulativeSnapshot: (d) => events.push(d) });
+
+      await h.streamer.onChunk(c.src);
+      await h.advance(500);
+      await h.streamer.onChunk(c.extendHeldBack);
+      await h.advance(500);
+
+      assert.equal(events.length, 0);
+    });
+  }
+
+  test('a trailing blank-line run may shrink', async () => {
+    const events = [];
+    const h = makeHarness({ toRichPayload: toTelegramRichBlocks, onNonCumulativeSnapshot: (d) => events.push(d) });
+
+    await h.streamer.onChunk('# Title\n\nfirst para\n\nsecond para\n\n\n');
+    await h.advance(500);
+    await h.streamer.onChunk('# Title\n\nfirst para\n\nsecond para\n\nthird');
+    await h.advance(500);
+
+    assert.equal(events.length, 0, 'losing a blank line loses nothing anyone was reading');
   });
 
-  test('a trailing blank line commits everything before it', () => {
-    assert.equal(committedPrefix('a\n\n'), 'a\n\n');
-  });
+  test('a ticked checkbox carrying an annotation is refused, deliberately', async () => {
+    // normalizeTaskMarkers forgives the BOX. Text appended beside it is new
+    // prose on a settled line, which is indistinguishable from a rewrite —
+    // pinned as intended rather than tolerated by accident.
+    const events = [];
+    const h = makeHarness({ onNonCumulativeSnapshot: (d) => events.push(d) });
 
-  test('runs of blank lines resolve to the last one', () => {
-    assert.equal(committedPrefix('a\n\n\nb'), 'a\n\n\n');
+    await h.streamer.onChunk('Прогресс:\n- [ ] задеплоить\n- [ ] проверить\nещё пишу');
+    await h.advance(500);
+    await h.streamer.onChunk('Прогресс:\n- [x] задеплоить — готово в 14:03\n- [ ] проверить\nещё пишу дальше');
+    await h.advance(500);
+
+    assert.equal(events.length, 1,
+      'the box is forgiven; an annotation appearing on a settled line is not');
   });
 });

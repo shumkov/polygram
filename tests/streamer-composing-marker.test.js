@@ -323,6 +323,45 @@ describe('composing marker — the bubble must stop claiming it', () => {
     const plainSeal = h.edits.find((e) => e.msgId === detachedId && typeof e.payload === 'string');
     assert.equal(plainSeal, undefined,
       'a rich document must not be overwritten by a truncated plain render');
+
+    // Losing the marker must not mean losing the document: the blocks already
+    // on screen are re-sent, which differ from the display only by the marker.
+    const seal = h.edits.filter((e) => e.msgId === detachedId).pop();
+    assert.equal(seal.payload.phase, 'seal');
+    assert.ok(!carriesMarker(seal.payload));
+    assert.deepEqual(seal.payload.blocks, [{ type: 'paragraph', text: `${long}!` }],
+      'the sealed bubble keeps every character it was displaying');
+  });
+
+  test('a seal whose edit fails transiently is retried once', async () => {
+    // A seal is the LAST edit a detached bubble ever gets: appendSealJob logs
+    // the failure and moves on, and no turn-end pass revisits it. Without a
+    // retry, one flaky call strands the marker permanently.
+    let attempts = 0;
+    const h = makeHarness({
+      editReturns: (msgId, payload) => {
+        // Exactly the seal payload: the content with no marker beside it. The
+        // live frames carry the marker, and counting those would make the
+        // retry look present when it is not.
+        if (payload === 'Первое сообщение.') {
+          attempts += 1;
+          if (attempts === 1) throw new Error('429 slow down');
+        }
+        return undefined;
+      },
+    });
+
+    await h.streamer.onChunk('Первое сообщение.');
+    await h.advance(500);
+    const detachedId = h.streamer.msgId;
+
+    h.streamer.forceNewMessage();
+    await h.streamer.onChunk('Второе сообщение.');
+    await h.streamer.drainSeals();
+
+    assert.equal(attempts, 2, 'the transient failure must be retried');
+    const seal = h.edits.filter((e) => e.msgId === detachedId).pop();
+    assert.ok(!carriesMarker(seal.payload), 'and the marker is gone after the retry');
   });
 
   test('a detached bubble that never showed the marker is not re-edited', async () => {
