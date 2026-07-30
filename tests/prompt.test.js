@@ -441,7 +441,7 @@ describe('buildPrompt — full integration', () => {
         chats: {
           '42': {
             pm: 'cli',
-            topics: { 7: { pm: 'codex' } },
+            topics: { 7: { pm: 'codex', codexEnabled: true } },
           },
         },
       },
@@ -475,6 +475,20 @@ describe('buildPrompt — full integration', () => {
       chatId: 42,
       threadId: 7,
     }), 'sdk');
+  });
+
+  test('disabled saved Codex cannot select the prompt dispatch backend', () => {
+    assert.throws(
+      () => resolvePromptBackend({
+        config: {
+          chats: {
+            '42': { pm: 'codex' },
+          },
+        },
+        chatId: 42,
+      }),
+      (error) => error.code === 'CODEX_SCOPE_DISABLED',
+    );
   });
 
   test('no sticker set → prompt never mentions stickers', () => {

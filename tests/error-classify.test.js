@@ -138,6 +138,30 @@ describe('classify — typed-code short-circuit', () => {
 });
 
 describe('classify — Codex typed errors stay provider-specific and retry-safe', () => {
+  test('CODEX_SCOPE_DISABLED reports scope policy without auth or recovery guidance', () => {
+    assert.deepEqual(classify({
+      code: 'CODEX_SCOPE_DISABLED',
+      message: 'Codex auth and runtime are healthy',
+    }), {
+      kind: 'codexScopeDisabled',
+      userMessage: 'Codex is not enabled for this chat',
+      isTransient: false,
+      autoRecover: null,
+    });
+  });
+
+  test('CODEX_RUNTIME_SELECTION_INCOMPLETE reports missing chat configuration', () => {
+    assert.deepEqual(classify({
+      code: 'CODEX_RUNTIME_SELECTION_INCOMPLETE',
+      message: 'Codex authentication is unavailable',
+    }), {
+      kind: 'codexRuntimeSelectionIncomplete',
+      userMessage: 'Codex is enabled, but its model, effort, or workspace is not configured for this chat',
+      isTransient: false,
+      autoRecover: null,
+    });
+  });
+
   const cases = [
     ['CODEX_AUTH_UNAVAILABLE', 'codexAuthUnavailable'],
     ['CODEX_MODEL_UNAVAILABLE', 'codexModelUnavailable'],

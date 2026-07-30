@@ -19,6 +19,10 @@ function section(startMarker, endMarker) {
 }
 
 describe('Codex main-loop steering wiring', () => {
+  const runtimeViewResolver = section(
+    'async function resolveSessionRuntimeView(',
+    'async function buildSpawnContext(',
+  );
   const handleStart = section(
     'async function handleMessage(',
     '// Single source of truth at module scope',
@@ -54,7 +58,7 @@ describe('Codex main-loop steering wiring', () => {
     );
     assert.match(
       handleStart,
-      /selectedInboundProvider = resolvePromptBackend\(\{[\s\S]*?\}\) === 'codex'[\s\S]*?: 'claude'/,
+      /selectedInboundProvider = selectedBackend === 'codex'[\s\S]*?: 'claude'/,
     );
     assert.doesNotMatch(
       handleStart,
@@ -63,8 +67,25 @@ describe('Codex main-loop steering wiring', () => {
     );
     assert.ok(
       handleStart.indexOf('db.recordInboundRuntimeSelection(')
-        < handleStart.indexOf("const text = msg.text || msg.caption || '';"),
-      'selection must precede all command/provider dispatch',
+        < handleStart.indexOf('const label = getSessionLabel('),
+      'selection must be durable before command/provider handler setup continues',
+    );
+  });
+
+  test('only exact enabled inspection commands can observe a disabled saved runtime', () => {
+    assert.match(
+      handleStart,
+      /const runtimeInspectionCommand = \([\s\S]*?botAllowsCommands[\s\S]*?text === '\/config'[\s\S]*?text === '\/model'[\s\S]*?text === '\/effort'[\s\S]*?\);/,
+    );
+    assert.match(
+      handleStart,
+      /const selectedBackend = runtimeInspectionCommand[\s\S]*?\? resolveRuntimeDescriptor\(\{[\s\S]*?\}\)\.backend[\s\S]*?: resolvePromptBackend\(\{/,
+      'inspection must be observational while every other path stays fail closed',
+    );
+    assert.doesNotMatch(
+      handleStart,
+      /startsWith\(['"]\/(?:config|model|effort)/,
+      'argument-bearing commands must not inherit the inspection exception',
     );
   });
 
@@ -102,6 +123,65 @@ describe('Codex main-loop steering wiring', () => {
       steering.slice(reaction),
       /markReplied\(\);/,
       'accepted steering must inherit the target turn settlement',
+    );
+  });
+
+  test('revocation is rechecked for the actual target before Codex dispatch', () => {
+    const intent = steering.indexOf(
+      'const releaseIntent = await intentLock.acquire(sessionKey);',
+    );
+    const authorization = steering.indexOf(
+      'requireCodexDispatchEnabled({',
+    );
+    const processRead = steering.indexOf('const current = pm.get(sessionKey);');
+    const liveTarget = steering.indexOf('const liveCodexGeneration = Boolean(');
+    const reservation = steering.indexOf(
+      'codexRuntimeController.claimDispatchReservation(',
+    );
+    const send = steering.indexOf('sendToProcess(sessionKey, prompt,');
+
+    assert.ok(intent >= 0, 'the dispatch commitment must hold the intent lock');
+    assert.ok(
+      authorization > intent,
+      'Codex authorization must be refreshed after acquiring the intent lock',
+    );
+    assert.ok(
+      processRead < liveTarget
+        && liveTarget < authorization
+        && authorization < reservation
+        && authorization < send,
+      'the actual target must be known and denied before reservations, steering, or send',
+    );
+    assert.match(
+      steering.slice(authorization, reservation),
+      /selectedProvider: selectedInboundProvider,[\s\S]*?liveCodexGeneration,/,
+      'the policy must cover selected Codex and an already-live shared Codex target',
+    );
+  });
+
+  test('disabled saved Codex is observable without touching its runtime controller', () => {
+    assert.match(
+      runtimeViewResolver,
+      /codexEnabled: runtimeSelection\.codexEnabled/,
+      'every runtime view must expose effective Codex enablement',
+    );
+    const disabled = runtimeViewResolver.indexOf(
+      'if (!runtimeSelection.codexEnabled)',
+    );
+    const controllerPresence = runtimeViewResolver.indexOf(
+      'if (!codexRuntimeController)',
+    );
+    const controllerRead = runtimeViewResolver.indexOf(
+      'codexRuntimeController.resolveRuntimeView(',
+    );
+    assert.ok(disabled >= 0, 'saved disabled Codex needs a repair view');
+    assert.ok(
+      disabled < controllerPresence && disabled < controllerRead,
+      'scope denial must precede controller/preflight access',
+    );
+    assert.match(
+      runtimeViewResolver.slice(disabled, controllerPresence),
+      /CODEX_SCOPE_DISABLED/,
     );
   });
 

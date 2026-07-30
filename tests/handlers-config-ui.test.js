@@ -12,6 +12,7 @@ const {
 
 const CODEX_VIEW = Object.freeze({
   runtime: 'codex',
+  codexEnabled: true,
   model: 'gpt-5.6-sol',
   effort: 'high',
   models: [
@@ -20,6 +21,18 @@ const CODEX_VIEW = Object.freeze({
       displayName: 'GPT-5.6 SOL',
       defaultReasoningEffort: 'high',
       supportedReasoningEfforts: ['high', 'xhigh'],
+    },
+    {
+      model: 'gpt-5.6-terra',
+      displayName: 'GPT-5.6 TERRA',
+      defaultReasoningEffort: 'high',
+      supportedReasoningEfforts: ['high', 'xhigh'],
+    },
+    {
+      model: 'gpt-5.6-luna',
+      displayName: 'GPT-5.6 LUNA',
+      defaultReasoningEffort: 'medium',
+      supportedReasoningEfforts: ['medium', 'high'],
     },
     {
       model: 'gpt-5.5',
@@ -32,12 +45,11 @@ const CODEX_VIEW = Object.freeze({
 });
 
 describe('buildConfigKeyboard', () => {
-  test('show=all renders model + effort + rich-text rows with current values marked', () => {
+  test('Codex is default-off on the full card while other rows keep their current values', () => {
     const kb = buildConfigKeyboard({ model: 'sonnet', effort: 'high' }, 'all');
     assert.equal(kb.inline_keyboard.length, 4);
     assert.deepEqual(kb.inline_keyboard[0], [
       { text: 'Claude', callback_data: 'cfg:runtime:cli' },
-      { text: 'Codex', callback_data: 'cfg:runtime:codex' },
     ]);
     const modelRow = kb.inline_keyboard[1];
     assert.equal(modelRow.length, MODEL_OPTIONS.length);
@@ -69,7 +81,7 @@ describe('buildConfigKeyboard', () => {
     );
     assert.deepEqual(
       kb.inline_keyboard[0].map((button) => button.callback_data),
-      ['cfg:runtime:cli', 'cfg:runtime:codex'],
+      ['cfg:runtime:cli'],
     );
     assert.equal(
       kb.inline_keyboard.flat().some((button) => button.text.startsWith('✓ Claude')),
@@ -102,7 +114,17 @@ describe('buildConfigKeyboard', () => {
       false,
       { runtime: 'claude', backend: 'cli' },
     );
+    const cliWithCodex = buildConfigKeyboard(
+      { model: 'sonnet', effort: 'high' },
+      'all',
+      null,
+      false,
+      { runtime: 'claude', backend: 'cli', codexEnabled: true },
+    );
     assert.deepEqual(cli.inline_keyboard[0], [
+      { text: '✓ Claude', callback_data: 'cfg:runtime:cli' },
+    ]);
+    assert.deepEqual(cliWithCodex.inline_keyboard[0], [
       { text: '✓ Claude', callback_data: 'cfg:runtime:cli' },
       { text: 'Codex', callback_data: 'cfg:runtime:codex' },
     ]);
@@ -142,10 +164,11 @@ describe('buildConfigKeyboard', () => {
     );
   });
 
-  test('unavailable Codex keeps runtime escape controls without empty Telegram rows', () => {
+  test('a saved disabled Codex selection exposes only Claude as the repair action', () => {
     const unavailable = {
       runtime: 'codex',
       backend: 'codex',
+      codexEnabled: false,
       model: null,
       effort: null,
       models: [],
@@ -164,7 +187,7 @@ describe('buildConfigKeyboard', () => {
     assert.deepEqual(
       kb.inline_keyboard.map((row) => row.map((button) => button.callback_data)),
       [
-        ['cfg:runtime:cli', 'cfg:runtime:codex'],
+        ['cfg:runtime:cli'],
         ['cfg:richtext:on'],
       ],
     );
@@ -226,7 +249,7 @@ describe('buildConfigKeyboard', () => {
     }
   });
 
-  test('Codex card uses only authenticated model and per-model effort options', () => {
+  test('Codex card intersects the authenticated catalog with the compact product model set', () => {
     const kb = buildConfigKeyboard({
       model: 'sonnet',
       effort: 'max',
@@ -235,7 +258,11 @@ describe('buildConfigKeyboard', () => {
     }, 'all', null, false, CODEX_VIEW);
     assert.deepEqual(
       kb.inline_keyboard[1].map((button) => button.callback_data),
-      ['cfg:model:gpt-5.6-sol', 'cfg:model:gpt-5.5'],
+      [
+        'cfg:model:gpt-5.6-sol',
+        'cfg:model:gpt-5.6-terra',
+        'cfg:model:gpt-5.6-luna',
+      ],
     );
     assert.match(kb.inline_keyboard[1][0].text, /^✓ GPT-5\.6 SOL$/);
     assert.deepEqual(
@@ -243,6 +270,37 @@ describe('buildConfigKeyboard', () => {
       ['cfg:effort:high', 'cfg:effort:xhigh'],
     );
     assert.match(kb.inline_keyboard[2][1].text, /^✓ xhigh$/);
+  });
+
+  test('/model and /effort remain provider-relative when Codex is disabled', () => {
+    const disabledCodex = { ...CODEX_VIEW, codexEnabled: false };
+    const model = buildConfigKeyboard(
+      { codexModel: 'gpt-5.6-sol', codexEffort: 'xhigh' },
+      'model',
+      null,
+      false,
+      disabledCodex,
+    );
+    const effort = buildConfigKeyboard(
+      { codexModel: 'gpt-5.6-sol', codexEffort: 'xhigh' },
+      'effort',
+      null,
+      false,
+      disabledCodex,
+    );
+
+    assert.deepEqual(
+      model.inline_keyboard[0].map((button) => button.callback_data),
+      [
+        'cfg:model:gpt-5.6-sol',
+        'cfg:model:gpt-5.6-terra',
+        'cfg:model:gpt-5.6-luna',
+      ],
+    );
+    assert.deepEqual(
+      effort.inline_keyboard[0].map((button) => button.callback_data),
+      ['cfg:effort:high', 'cfg:effort:xhigh'],
+    );
   });
 });
 
@@ -393,6 +451,7 @@ describe('createFormatConfigInfoText', () => {
       /Native goals are disabled for Polygram-managed Codex sessions until native goal support is implemented/,
     );
     assert.match(out, /\*\*gpt-5\.6-sol\*\* — GPT-5\.6 SOL/);
+    assert.doesNotMatch(out, /GPT-5\.5/);
     assert.doesNotMatch(out, /deep analysis, code refactor/);
     assertNoTechnicalLines(out);
   });
