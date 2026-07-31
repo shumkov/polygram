@@ -1,8 +1,11 @@
 # Resume an interrupted turn after a clean restart
 
-Status: IMPLEMENTED AND REVIEWED — Claude CLI and native Codex parity are
-implemented with independent correctness, containment, and deploy-reliability
-review. Release and controlled production activation remain pending.
+Status: RELEASED AND ACTIVE — Claude CLI and native Codex parity shipped in
+Polygram 0.37.0 with `@shumkov/orchestra` 0.10.13 after independent
+correctness, containment, and deploy-reliability review. Shumabit has both
+provider flags enabled; UMI Assistant remains disabled for both. A natural
+eligible production continuation for each enabled backend remains a rollout
+observation before broader activation.
 
 This is a bounded clean-restart feature. It does not preserve a live process,
 replay the original user message, adopt a tmux session, or recover work after a
