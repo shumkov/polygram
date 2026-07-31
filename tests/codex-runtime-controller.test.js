@@ -27,6 +27,7 @@ function fixture({
     defaultReasoningEffort: 'high',
     supportedReasoningEfforts: ['high', 'xhigh'],
   }],
+  staticProfileExtras = null,
   controllerOptions = null,
 } = {}) {
   const calls = [];
@@ -44,6 +45,7 @@ function fixture({
       ownedConfigSha256: 'b'.repeat(64),
       model: 'gpt-5.6-sol',
       effort: 'xhigh',
+      ...(staticProfileExtras || {}),
     }),
   });
   const fakeDb = {
@@ -1859,6 +1861,37 @@ test('constructs the app-server client only from the preflighted static profile'
     onNotification,
     onFault,
   }]);
+});
+
+test('constructs a contained app-server client with the attested launcher receipt', async () => {
+  const launcher = '/usr/local/libexec/claude-session-scope';
+  const launcherSha256 = 'd'.repeat(64);
+  const { clientOptions, controller, receipt } = fixture({
+    staticProfileExtras: {
+      sessionLauncher: launcher,
+      sessionLauncherSha256: launcherSha256,
+    },
+    controllerOptions: { sessionLauncher: launcher },
+  });
+  controller.initialize();
+  await controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+    threadId: null,
+  });
+
+  controller.clientFactory({
+    sessionKey: '100',
+    expectedStaticProfile: receipt.expectedStaticProfile,
+    onNotification() {},
+    onFault() {},
+  });
+
+  assert.equal(clientOptions[0].sessionLauncher, launcher);
+  assert.equal(
+    clientOptions[0].expectedSessionLauncherSha256,
+    launcherSha256,
+  );
 });
 
 test('first prepared checkpoint atomically establishes durable generation ownership', async () => {

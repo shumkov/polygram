@@ -147,6 +147,38 @@ describe('clean shutdown retirement boundary', () => {
 });
 
 describe('retirement snapshot persistence projection', () => {
+  test('projects exact Codex turn and spawn-profile bindings into policy v2', () => {
+    const result = buildResumeIntents({
+      snapshots: [{
+        runtime: 'codex',
+        namespace: 'codex:app-server',
+        sessionKey: '100:3',
+        sourceMsgId: 9,
+        providerSessionId: 'thread-retired',
+        providerTurnId: 'turn-interrupted',
+        cwd: '/workspace',
+        model: 'gpt-5.6-sol',
+        effort: 'xhigh',
+        spawnProfileId: 'profile-retired',
+        eligible: true,
+      }],
+      resolveSourceMessageId: () => 55,
+      policyVersion: 2,
+    });
+
+    assert.deepEqual(result.resumeIntents, [{
+      sessionKey: '100:3',
+      sourceMessageId: 55,
+      policyVersion: 2,
+      interruptedProviderTurnId: 'turn-interrupted',
+      interruptedSpawnProfileId: 'profile-retired',
+      expectedProviderSessionId: 'thread-retired',
+      expectedCwd: '/workspace',
+      expectedModel: 'gpt-5.6-sol',
+      expectedEffort: 'xhigh',
+    }]);
+  });
+
   test('persists only eligible snapshots whose exact inbound source resolves', () => {
     const result = buildResumeIntents({
       snapshots: [

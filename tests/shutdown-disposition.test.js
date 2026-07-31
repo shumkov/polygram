@@ -24,6 +24,7 @@ test('handled shutdown signals retain the existing clean-shutdown persistence', 
     now: 1_800_000_000_000,
     since: 1_799_999_000_000,
     resumeIntents: [],
+    continuationAuthorized: false,
   }]);
   assert.deepEqual(result, {
     clean: true,
@@ -50,9 +51,11 @@ test('clean shutdown passes only retired resume intents into the atomic transact
     botName: 'shumabit',
     now: 1_800_000_000_000,
     resumeIntents,
+    continuationAuthorized: true,
   });
 
   assert.deepEqual(calls[0].resumeIntents, resumeIntents);
+  assert.equal(calls[0].continuationAuthorized, true);
   assert.equal(result.intentsRecorded, 1);
 });
 

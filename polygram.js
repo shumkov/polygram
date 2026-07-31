@@ -191,6 +191,7 @@ const {
 } = require('./lib/ops/clean-shutdown');
 const {
   CLEAN_RESUME_POLICY_VERSION,
+  SUPPORTED_CLEAN_RESUME_POLICY_VERSIONS,
   createCleanResumeTurnContext,
   executeCleanResumeClaim,
   startCleanRestartRecovery,
@@ -800,12 +801,6 @@ async function buildSpawnContext(
     threadId: threadId || null,
   });
 
-  if (strictResume && promptBackend === 'codex') {
-    validateStrictResumeSpawn({
-      strictResume,
-      promptBackend,
-    });
-  }
   if (promptBackend === 'codex') {
     if (!codexRuntimeController) {
       const error = new Error('Codex runtime controller is not initialized');
@@ -823,6 +818,7 @@ async function buildSpawnContext(
       getSessionLabel,
       logEvent,
       mutateSessionOnDrift,
+      strictResume,
     });
   }
 
@@ -3443,6 +3439,7 @@ let startPollWatchdog = null;
 async function main() {
   const cgroupOomObserver = createCgroupOomObserver();
   const invocationId = parseSystemdInvocationId();
+  let abnormalProviderTermination = null;
   let codexManagerOptions = Object.freeze({
     codexHostIdentity: null,
     codexBootSessionIdentity: null,
@@ -3572,6 +3569,7 @@ async function main() {
       codexRuntimeController = createCodexRuntimeController({
         config,
         db,
+        sessionLauncher,
         defaultDaemonSecretRoots: [
           DATA_DIR,
           ipcRuntimeDir,
@@ -3887,6 +3885,18 @@ async function main() {
     renderQuestion: (payload) => questionHandlers?.renderAsk(payload),
     logger: console,
   });
+  sdkCallbacks.onAbnormalTermination = (_sessionKey, evidence) => {
+    if (abnormalProviderTermination !== null) return;
+    abnormalProviderTermination = Object.freeze({
+      backend: evidence?.backend ?? null,
+      event: evidence?.event ?? null,
+      exitCode: evidence?.exitCode ?? null,
+    });
+    logEvent('abnormal-provider-termination', {
+      bot: BOT_NAME,
+      ...abnormalProviderTermination,
+    });
+  };
   // 0.10.0: sdkCallbacks (the polygram-side lifecycle handlers — status
   // reactor, stream chunk → bubble edit, etc.) move from the underlying
   // SDK pm to the generic ProcessManager. The SDK pm gets legacyCallbacks
@@ -4409,7 +4419,7 @@ async function main() {
   // replay picks it up. Prevents "Sorry, I couldn't process that message"
   // from showing on every restart.
   const SHUTDOWN_DRAIN_MS = 30_000;
-  const shutdown = async () => {
+  const shutdown = async ({ continuationAuthorized = false, trigger = 'signal' } = {}) => {
     if (isShuttingDown) return;
     const shutdownObservation = cgroupOomObserver.sample();
     // Sample in-flight work at SIGNAL time, alongside the OOM observation and
@@ -4419,7 +4429,7 @@ async function main() {
     // idle, and cannot answer "how much work did this restart cost?".
     const inFlightAtSignal = countInFlight(inFlightHandlers);
     isShuttingDown = true;
-    console.log('\nShutting down...');
+    console.log(`\nShutting down (${trigger})...`);
     // 1. Stop accepting new inbound first so nothing new queues behind the drain.
     if (bot && bot._stop) bot._stop();
 
@@ -4508,7 +4518,9 @@ async function main() {
     //    which CLI turn was still active; replay rows alone cannot establish
     //    that fact.
     let pmRetired = false;
-    let forceCrashReason = null;
+    let forceCrashReason = abnormalProviderTermination
+      ? 'provider-process-terminated'
+      : null;
     let resumeIntents = [];
     if (shutdownObservation?.detected !== true) {
       try {
@@ -4519,7 +4531,7 @@ async function main() {
           settlementTimeoutMs: SHUTDOWN_DRAIN_MS,
         });
         pmRetired = true;
-        const projected = buildResumeIntents({
+        const projected = continuationAuthorized ? buildResumeIntents({
           snapshots: retirement.snapshots,
           policyVersion: CLEAN_RESUME_POLICY_VERSION,
           resolveSourceMessageId: ({ sessionKey, sourceMsgId }) => {
@@ -4542,10 +4554,12 @@ async function main() {
               ? messageId
               : null;
           },
-        });
-        if (config.bot?.resumeInterruptedCliTurns === true) {
-          resumeIntents = projected.resumeIntents;
-        }
+        }) : { resumeIntents: [], snapshots: retirement.snapshots };
+        resumeIntents = projected.resumeIntents.filter((intent) => (
+          intent.interruptedProviderTurnId == null
+            ? config.bot?.resumeInterruptedCliTurns === true
+            : config.bot?.resumeInterruptedCodexTurns === true
+        ));
         for (const snapshot of projected.snapshots) {
           logEvent('clean-retirement-snapshot', {
             bot: BOT_NAME,
@@ -4576,6 +4590,7 @@ async function main() {
           botName: BOT_NAME,
           observation: shutdownObservation,
           resumeIntents,
+          continuationAuthorized,
           forceCrashReason,
         });
         if (res.clean) {
@@ -4642,8 +4657,8 @@ async function main() {
     if (PID_PATH) processGuard.releasePidFile(PID_PATH);
     setTimeout(() => process.exit(0), 100);
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', () => shutdown());
+  process.on('SIGTERM', () => shutdown());
   // rc.28: also catch SIGHUP. The shumabit deploy path runs polygram
   // inside `tmux new-session`; on `launchctl kickstart -k` the
   // shumabit-start launcher does `tmux kill-session -t polygram`
@@ -4655,7 +4670,7 @@ async function main() {
   // been mid-tool-use longer than the replayWindowMs gets silently
   // dropped. Surface symptom: bot stops responding after deploy on
   // long agent runs (the §7.4 incident).
-  process.on('SIGHUP', shutdown);
+  process.on('SIGHUP', () => shutdown());
 
   try {
     // Fresh per-boot secret, persisted 0600 for same-UID readers (cron
@@ -4669,6 +4684,21 @@ async function main() {
         botName: BOT_NAME,
         getInFlightHandlers: () => inFlightHandlers,
         handleSendOverIpc: (req) => handleSendOverIpc(req),
+        requestDeployRestart: () => {
+          if (isShuttingDown) {
+            const error = new Error('shutdown already in progress');
+            error.code = 'SHUTDOWN_IN_PROGRESS';
+            throw error;
+          }
+          const oldPid = process.pid;
+          shutdown({
+            continuationAuthorized: true,
+            trigger: 'deploy-ipc',
+          }).catch((error) => {
+            console.error(`[shutdown] deploy restart failed: ${error.message}`);
+          });
+          return { accepted: true, old_pid: oldPid };
+        },
       }),
       logger: console,
     });
@@ -4721,7 +4751,7 @@ async function main() {
           botName: BOT_NAME,
           maxAgeMs: 2 * (replayWindowMs || 3 * 60 * 1000),
           olderThanMs: replayWindowMs || 30 * 60 * 1000,
-          supportedPolicyVersions: [CLEAN_RESUME_POLICY_VERSION],
+          supportedPolicyVersions: SUPPORTED_CLEAN_RESUME_POLICY_VERSIONS,
           sessionKeyForSource: sourceSessionKey,
           trackTask: trackHandlerTask,
           onClaim: (kind, claim) => {
@@ -4739,11 +4769,18 @@ async function main() {
             );
           },
           executeClaim: (claim, { onReady }) => executeCleanResumeClaim(claim, {
-            enabled: config.bot?.resumeInterruptedCliTurns === true,
+            enabled: claim.interrupted_provider_turn_id == null
+              ? config.bot?.resumeInterruptedCliTurns === true
+              : config.bot?.resumeInterruptedCodexTurns === true,
             loadSource: (messageId) => db.getInboundMessageById(messageId),
             sessionKeyForSource: sourceSessionKey,
-            loadRuntimeSession: (sessionKey) => (
-              db.getProviderSession(sessionKey, 'claude:channels')
+            loadRuntimeSession: (sessionKey, activeClaim) => (
+              db.getProviderSession(
+                sessionKey,
+                activeClaim.interrupted_provider_turn_id == null
+                  ? 'claude:channels'
+                  : 'codex:app-server',
+              )
             ),
             resolveStrictSpawnContext: async ({ claim: activeClaim, runtime }) => {
               try {
@@ -4753,6 +4790,14 @@ async function main() {
                     strictResume: {
                       expectedGenerationId: activeClaim.session_generation_id,
                       expectedSessionId: runtime.provider_session_id,
+                      ...(activeClaim.interrupted_provider_turn_id == null
+                        ? {}
+                        : {
+                            expectedInterruptedTurnId:
+                              activeClaim.interrupted_provider_turn_id,
+                            expectedSpawnProfileId:
+                              activeClaim.interrupted_spawn_profile_id,
+                          }),
                     },
                   }),
                 };
@@ -4818,6 +4863,15 @@ async function main() {
                 ambiguous: failures > 0 || delivered.deliveryAmbiguous,
               };
             },
+            settleProviderDelivery: ({
+              claim: activeClaim,
+              result,
+              disposition,
+            }) => codexRuntimeController.settleTelegramDelivery(
+              activeClaim.session_key,
+              result,
+              { disposition },
+            ),
             sendNotice: async ({ source, text, ambiguous }) => {
               if (!source) throw new Error('clean resume source message is missing');
               await tg(bot, 'sendMessage', {
@@ -5159,6 +5213,9 @@ async function main() {
     console.error(`[compact-orphan-handler] failed: ${err.message}`);
   }
 
+  logEvent('polygram-admission-open', lifecycleDetail({
+    bot: BOT_NAME,
+  }, invocationId));
   console.log(`[${BOT_NAME}] Starting...`);
   const pollPromise = pollBot(bot).catch(err => {
     console.error(`[${BOT_NAME}] Fatal:`, err.message);

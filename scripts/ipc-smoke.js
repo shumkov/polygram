@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Quick IPC round-trip probe.
- * Usage: node scripts/ipc-smoke.js <bot-name> [busy]
+ * Usage: node scripts/ipc-smoke.js <bot-name> [busy|restart]
  */
 
 const { call, readSecret, socketPathFor } = require('../lib/ipc/client');
@@ -28,6 +28,29 @@ const { call, readSecret, socketPathFor } = require('../lib/ipc/client');
     console.log(JSON.stringify({
       bot: result.bot,
       in_flight: result.in_flight,
+    }));
+    return;
+  }
+
+  if (command === 'restart') {
+    const result = await call({
+      path,
+      op: 'deploy_restart',
+      secret: readSecret(bot),
+      callTimeoutMs: 60_000,
+    });
+    if (
+      result.ok !== true
+      || result.accepted !== true
+      || !Number.isSafeInteger(result.old_pid)
+      || result.old_pid <= 1
+    ) {
+      throw new Error(result.error || 'invalid deploy restart response');
+    }
+    console.log(JSON.stringify({
+      bot,
+      accepted: true,
+      old_pid: result.old_pid,
     }));
     return;
   }

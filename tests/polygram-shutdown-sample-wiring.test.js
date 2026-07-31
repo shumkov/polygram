@@ -19,9 +19,9 @@ const src = fs.readFileSync(path.join(__dirname, '..', 'polygram.js'), 'utf8');
 
 // Body of the SIGTERM/SIGINT/SIGHUP handler.
 function shutdownBody() {
-  const start = src.indexOf('const shutdown = async () => {');
+  const start = src.indexOf('const shutdown = async ({');
   assert.notEqual(start, -1, 'shutdown handler not found — this test needs updating');
-  const end = src.indexOf("process.on('SIGINT', shutdown)", start);
+  const end = src.indexOf("process.on('SIGINT', () => shutdown())", start);
   assert.notEqual(end, -1, 'end of shutdown handler not found — this test needs updating');
   return src.slice(start, end);
 }
@@ -101,6 +101,41 @@ describe('reply delivery barrier wiring', () => {
 });
 
 describe('clean restart lifecycle ordering', () => {
+  test('a spontaneous provider termination forces crash-like shutdown persistence', () => {
+    assert.match(
+      src,
+      /sdkCallbacks\.onAbnormalTermination\s*=\s*\(/,
+      'ProcessManager abnormal termination evidence must be latched by the daemon',
+    );
+    const body = shutdownBody();
+    assert.match(
+      body,
+      /forceCrashReason\s*=\s*abnormalProviderTermination\s*\?\s*'provider-process-terminated'/,
+      'a prior provider death must prevent a later handled stop from looking clean',
+    );
+  });
+
+  test('only the deploy IPC path authorizes continuation intents', () => {
+    const body = shutdownBody();
+    assert.match(
+      body,
+      /const projected = continuationAuthorized \? buildResumeIntents\(/,
+      'ordinary handled signals must not reach continuation-intent projection',
+    );
+    assert.match(
+      src,
+      /requestDeployRestart: \(\) => \{[\s\S]{0,500}?shutdown\(\{[\s\S]{0,180}?continuationAuthorized: true,[\s\S]{0,180}?trigger: 'deploy-ipc'/,
+      'the authenticated IPC handler must directly begin the authorized shutdown',
+    );
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+      assert.match(
+        src,
+        new RegExp(`process\\.on\\('${signal}', \\(\\) => shutdown\\(\\)\\)`),
+        `${signal} must use the ordinary non-authorizing shutdown path`,
+      );
+    }
+  });
+
   test('fences inbound admission before delivery/process retirement and clean persistence', () => {
     const body = shutdownBody();
     const stopInbound = body.indexOf('bot._stop()');
@@ -184,8 +219,17 @@ describe('clean restart lifecycle ordering', () => {
     assert.match(src, /\{ expectedProcess, onDispatched \}/);
     assert.match(
       src,
-      /if \(strictResume && promptBackend === 'codex'\)[\s\S]{0,250}?validateStrictResumeSpawn\(\{/,
-      'a backend switch must pass through the tested strict-resume validator',
+      /buildCodexSpawnContext\(\{[\s\S]{0,500}?strictResume,/,
+      'Codex strict-resume identity must reach its spawn-context validator',
+    );
+    const codexSpawnContext = fs.readFileSync(
+      path.join(__dirname, '..', 'lib', 'codex', 'spawn-context.js'),
+      'utf8',
+    );
+    assert.match(
+      codexSpawnContext,
+      /if \(strictResume\) \{[\s\S]{0,500}?validateStrictResumeSpawn\(\{/,
+      'a Codex backend switch must pass through the tested strict-resume validator',
     );
   });
 });

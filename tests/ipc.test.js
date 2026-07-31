@@ -115,6 +115,29 @@ describe('ipc round-trip', () => {
     assert.equal(res.bot, 'shumabit');
   });
 
+  test('deploy restart op directly invokes the daemon restart request', async () => {
+    const calls = [];
+    await startServer(createIpcHandlers({
+      botName: 'shumabit',
+      getInFlightHandlers: () => new Map(),
+      handleSendOverIpc: async () => ({}),
+      requestDeployRestart: (req) => {
+        calls.push(req.op);
+        return { accepted: true, old_pid: 4242 };
+      },
+    }));
+
+    const res = await ipcClient.call({ path: sockPath, op: 'deploy_restart' });
+
+    assert.deepEqual(calls, ['deploy_restart']);
+    assert.deepEqual(res, {
+      id: null,
+      ok: true,
+      accepted: true,
+      old_pid: 4242,
+    });
+  });
+
   test('id is echoed back in reply', async () => {
     await startServer({ noop: async () => ({}) });
     const res = await ipcClient.call({

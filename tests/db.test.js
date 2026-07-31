@@ -22,7 +22,7 @@ describe('schema + migrations', () => {
 
   test('user_version is at current schema after migration', () => {
     const v = db.raw.pragma('user_version', { simple: true });
-    assert.equal(v, 18);
+    assert.equal(v, 19);
   });
 
   test('WAL mode is enabled', () => {
@@ -125,6 +125,7 @@ describe('schema + migrations', () => {
           pm_backend: 'tmux',
           created_ts: 1_700_000_000_000,
           last_active_ts: 1_700_000_000_123,
+          spawn_profile_id: null,
         },
       );
       upgraded.upsertProviderSession({
