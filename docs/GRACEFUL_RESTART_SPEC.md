@@ -1,9 +1,10 @@
 # Deploy and restart without losing unrelated agent sessions
 
-Status: IMPLEMENTED AND REVIEWED in code for independent runtime ownership,
-Claude and Codex containment, and dual-provider clean-restart continuation.
-Release, production activation, the controlled OOM trials, and the reboot proof
-remain to be completed.
+Status: RELEASED AND ACTIVE. Polygram 0.37.0 with
+`@shumkov/orchestra` 0.10.13 is deployed locally and on the UMI VPS.
+Independent ownership, Claude and Codex containment, dual-provider
+clean-restart continuation, both controlled low-limit OOM trials, and the real
+VPS reboot topology proof are complete.
 
 Live tmux adoption and detached/background-work preservation are postponed
 unless production telemetry shows they are genuinely needed.
@@ -45,17 +46,25 @@ These are independent claims. Passing one does not imply the others.
 - The aggregate slice and each Claude scope have finite memory, swap, and task
   limits.
 - Claude CLI and native Codex clean-restart resume/continue are implemented
-  behind independent rollout flags. Production still has only Claude enabled
-  for Shumabit until this release is activated.
+  behind independent rollout flags. Shumabit has both enabled; UMI Assistant
+  has both disabled.
 - Native Codex app-server/tool-process containment is wired through the same
   attested session launcher and pinned in `@shumkov/orchestra` 0.10.13.
+- The Claude and Codex disposable OOM trials each killed only their low-limit
+  test scope. All six production service/tmux witnesses and the production
+  workload-slice limits and counters remained unchanged.
+- A real reboot reconstructed the six-owner topology, all three tmux sockets,
+  the lingering user manager, workload slice limits, IPC ownership, Water
+  ownership, and the rollout flags. Both bot databases recorded one new start
+  and one admission-open event, zero continuation intents, and no continuation
+  dispatch.
 
-### Remaining
+### Rollout observation
 
-- Release and production activation of the reviewed Claude+Codex path.
-- One controlled low-limit OOM proof for each provider launch seam.
-- One real VPS reboot proof after the final Claude+Codex topology is installed.
-- A real eligible production resume success for each enabled backend.
+- Production telemetry has not yet naturally produced a real eligible
+  clean-restart continuation for each enabled backend. The pinned-provider
+  gates cover the behavior; broader rollout remains gated on observing the
+  same one-continue, one-final, zero-duplicate result in Shumabit telemetry.
 
 ### Intentionally postponed
 
