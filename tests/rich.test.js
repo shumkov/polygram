@@ -92,8 +92,30 @@ describe('needsRichRendering — the content-adaptive gate', () => {
     assert.equal(needsRichRendering('### Subsection'), true);
   });
 
-  test('a bare bullet list (no checkboxes) does NOT trigger rich', () => {
-    assert.equal(needsRichRendering('- item one\n- item two'), false);
+  test('a bare bullet list triggers rich — lists are structure', () => {
+    // Plain is for a paragraph or two of prose; anything with list structure
+    // is a document and renders rich. The original conservative gate
+    // (headings/tables/checklists only) predates the rich rollout soaking;
+    // a production reply with two lists and section labels rendered plain
+    // and read as a regression to the user.
+    assert.equal(needsRichRendering('- item one\n- item two'), true);
+    assert.equal(needsRichRendering('* starred\n* items'), true);
+    assert.equal(needsRichRendering('1. first\n2. second'), true);
+  });
+
+  test('the production drive-docs reply shape renders as a rich document', () => {
+    const md = 'Готово. Да, перенёс.\n\n'
+      + 'Лежат три файла:\n\n'
+      + '- **Plan & Costing** (таблица)\n'
+      + '- **Overview**\n\n'
+      + 'Два момента:\n\n'
+      + '- доступ у всех\n'
+      + '- владелец — драйв';
+    assert.equal(needsRichRendering(md), true);
+    const out = toTelegramRichBlocks(md, {});
+    assert.equal(out.usedRich, true);
+    assert.ok(out.blocks.some((b) => b.type === 'list'),
+      'the lists arrive as list blocks, not flattened prose');
   });
 
   test('a single dash in prose does not false-positive as a task item', () => {
