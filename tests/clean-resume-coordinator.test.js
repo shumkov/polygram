@@ -54,6 +54,40 @@ function strictSpawnFixture(overrides = {}) {
 }
 
 describe('strict clean-resume spawn validation', () => {
+  test('accepts only the exact dormant Codex thread, profile, and settings', () => {
+    assert.equal(
+      validateStrictResumeSpawn({
+        strictResume: {
+          expectedGenerationId: 'generation-codex',
+          expectedSessionId: 'thread-codex',
+          expectedInterruptedTurnId: 'turn-interrupted',
+          expectedSpawnProfileId: 'profile-codex',
+        },
+        promptBackend: 'codex',
+        liveProcess: null,
+        runtime: {
+          namespace: 'codex:app-server',
+          generation_id: 'generation-codex',
+          provider_session_id: 'thread-codex',
+          pm_backend: 'codex',
+          cwd: '/srv/polygram',
+          model: 'gpt-5.6-sol',
+          effort: 'xhigh',
+          spawn_profile_id: 'profile-codex',
+        },
+        resolved: {
+          runtime: 'codex',
+          backend: 'codex',
+          cwd: '/srv/polygram',
+          model: 'gpt-5.6-sol',
+          effort: 'xhigh',
+          spawnProfileId: 'profile-codex',
+        },
+      }),
+      'thread-codex',
+    );
+  });
+
   test('accepts only the exact dormant Claude CLI session generation', () => {
     assert.equal(
       validateStrictResumeSpawn(strictSpawnFixture()),
@@ -143,6 +177,8 @@ function fixture(overrides = {}) {
     discard: [],
     complete: [],
     events: [],
+    settle: [],
+    order: [],
   };
   const deps = {
     enabled: overrides.enabled ?? true,
@@ -184,16 +220,25 @@ function fixture(overrides = {}) {
     },
     deliverResult: async (input) => {
       calls.deliver.push(input);
+      calls.order.push('deliver');
       if (overrides.deliveryError) throw overrides.deliveryError;
       return overrides.deliveryResult || { ok: true };
     },
+    settleProviderDelivery: async (input) => {
+      calls.settle.push(input);
+      calls.order.push(`settle:${input.disposition}`);
+      if (overrides.settlementError) throw overrides.settlementError;
+      return { committed: true };
+    },
     sendNotice: async (input) => {
       calls.notice.push(input);
+      calls.order.push('notice');
       if (overrides.noticeError) throw overrides.noticeError;
       return { ok: true };
     },
     complete: async (input) => {
       calls.complete.push(input);
+      calls.order.push(`complete:${input.status}`);
       if (overrides.completeError) throw overrides.completeError;
       return overrides.completeResult;
     },
@@ -203,6 +248,202 @@ function fixture(overrides = {}) {
 }
 
 describe('clean resume boot coordinator', () => {
+  test('rejects a malformed Codex policy-v1 claim before spawning', async () => {
+    const malformed = {
+      ...claim,
+      policy_version: 1,
+      provider_namespace: 'codex:app-server',
+      interrupted_provider_turn_id: 'turn-interrupted',
+      interrupted_spawn_profile_id: 'profile-codex',
+    };
+    const { deps, calls } = fixture();
+
+    const result = await executeCleanResumeClaim(malformed, deps);
+
+    assert.equal(result.reason, 'unsupported-codex-policy');
+    assert.equal(calls.spawn.length, 0);
+    assert.equal(calls.send.length, 0);
+  });
+
+  test('rejects a profile-only malformed claim before treating it as Claude', async () => {
+    const malformed = {
+      ...claim,
+      policy_version: 1,
+      interrupted_provider_turn_id: null,
+      interrupted_spawn_profile_id: '',
+    };
+    const { deps, calls } = fixture();
+
+    const result = await executeCleanResumeClaim(malformed, deps);
+
+    assert.equal(result.reason, 'unsupported-codex-policy');
+    assert.equal(calls.spawn.length, 0);
+    assert.equal(calls.send.length, 0);
+  });
+
+  test('Codex resumes the exact interrupted tail and settles delivery before source completion', async () => {
+    const codexClaim = {
+      ...claim,
+      policy_version: 2,
+      session_generation_id: 'generation-codex',
+      provider_namespace: 'codex:app-server',
+      interrupted_provider_turn_id: 'turn-interrupted',
+      interrupted_spawn_profile_id: 'profile-codex',
+    };
+    const { deps, calls } = fixture({
+      runtimeSession: {
+        namespace: 'codex:app-server',
+        generation_id: 'generation-codex',
+        provider_session_id: 'thread-codex',
+        pm_backend: 'codex',
+        spawn_profile_id: 'profile-codex',
+      },
+      spawnResult: {
+        process: resumedProcess,
+        attestation: {
+          namespace: 'codex:app-server',
+          sessionId: 'thread-codex',
+          interruptedTurnId: 'turn-interrupted',
+          resumed: true,
+          freshFallback: false,
+          idle: true,
+        },
+      },
+      sendResult: {
+        runtime: 'codex',
+        text: 'finished answer',
+        alreadyDelivered: false,
+        generationId: 'generation-codex-new',
+        attemptId: 'attempt-continue',
+        providerSessionId: 'thread-codex',
+        providerTurnId: 'turn-continue',
+      },
+    });
+
+    await executeCleanResumeClaim(codexClaim, deps);
+
+    assert.equal(calls.send[0].sourceMsgId, null);
+    assert.equal(calls.deliver.length, 1);
+    assert.deepEqual(calls.settle, [{
+      claim: codexClaim,
+      result: calls.send[0] && {
+        runtime: 'codex',
+        text: 'finished answer',
+        alreadyDelivered: false,
+        generationId: 'generation-codex-new',
+        attemptId: 'attempt-continue',
+        providerSessionId: 'thread-codex',
+        providerTurnId: 'turn-continue',
+      },
+      disposition: 'delivered',
+    }]);
+    assert.equal(calls.complete[0].status, 'replied');
+    assert.deepEqual(calls.order, [
+      'deliver',
+      'settle:delivered',
+      'complete:replied',
+    ]);
+  });
+
+  test('Codex records failed delivery before notice and source completion', async () => {
+    const codexClaim = {
+      ...claim,
+      policy_version: 2,
+      session_generation_id: 'generation-codex',
+      provider_namespace: 'codex:app-server',
+      interrupted_provider_turn_id: 'turn-interrupted',
+      interrupted_spawn_profile_id: 'profile-codex',
+    };
+    const { deps, calls } = fixture({
+      runtimeSession: {
+        namespace: 'codex:app-server',
+        generation_id: 'generation-codex',
+        provider_session_id: 'thread-codex',
+        pm_backend: 'codex',
+        spawn_profile_id: 'profile-codex',
+      },
+      spawnResult: {
+        process: resumedProcess,
+        attestation: {
+          namespace: 'codex:app-server',
+          sessionId: 'thread-codex',
+          interruptedTurnId: 'turn-interrupted',
+          resumed: true,
+          freshFallback: false,
+          idle: true,
+        },
+      },
+      sendResult: {
+        runtime: 'codex',
+        text: 'finished answer',
+        alreadyDelivered: false,
+        generationId: 'generation-codex-new',
+        attemptId: 'attempt-continue',
+        providerSessionId: 'thread-codex',
+        providerTurnId: 'turn-continue',
+      },
+      deliveryResult: { ok: false, ambiguous: false },
+    });
+
+    const result = await executeCleanResumeClaim(codexClaim, deps);
+
+    assert.equal(result.reason, 'continuation-delivery-failed');
+    assert.deepEqual(calls.order, [
+      'deliver',
+      'settle:failed',
+      'notice',
+      'complete:replay-skipped',
+    ]);
+  });
+
+  test('Codex settlement failure blocks source completion', async () => {
+    const codexClaim = {
+      ...claim,
+      policy_version: 2,
+      session_generation_id: 'generation-codex',
+      provider_namespace: 'codex:app-server',
+      interrupted_provider_turn_id: 'turn-interrupted',
+      interrupted_spawn_profile_id: 'profile-codex',
+    };
+    const { deps, calls } = fixture({
+      runtimeSession: {
+        namespace: 'codex:app-server',
+        generation_id: 'generation-codex',
+        provider_session_id: 'thread-codex',
+        pm_backend: 'codex',
+        spawn_profile_id: 'profile-codex',
+      },
+      spawnResult: {
+        process: resumedProcess,
+        attestation: {
+          namespace: 'codex:app-server',
+          sessionId: 'thread-codex',
+          interruptedTurnId: 'turn-interrupted',
+          resumed: true,
+          freshFallback: false,
+          idle: true,
+        },
+      },
+      sendResult: {
+        runtime: 'codex',
+        text: 'finished answer',
+        alreadyDelivered: false,
+        generationId: 'generation-codex-new',
+        attemptId: 'attempt-continue',
+        providerSessionId: 'thread-codex',
+        providerTurnId: 'turn-continue',
+      },
+      settlementError: new Error('delivery fence unavailable'),
+    });
+
+    await assert.rejects(
+      () => executeCleanResumeClaim(codexClaim, deps),
+      /delivery fence unavailable/,
+    );
+    assert.deepEqual(calls.order, ['deliver', 'settle:delivered']);
+    assert.equal(calls.complete.length, 0);
+  });
+
   test('strictly resumes the exact generation and sends one tracked literal continue', async () => {
     const { deps, calls } = fixture();
     const result = await executeCleanResumeClaim(claim, deps);
@@ -482,6 +723,41 @@ describe('clean resume boot coordinator', () => {
     assert.equal(settled, false);
     finishContinuation();
     await Promise.all(recovery.tasks);
+  });
+
+  test('one boot claims both Claude and Codex recovery policies', async () => {
+    const codexClaim = {
+      ...claim,
+      policy_version: 2,
+      provider_namespace: 'codex:app-server',
+      interrupted_provider_turn_id: 'turn-interrupted',
+      interrupted_spawn_profile_id: 'profile-codex',
+    };
+    let claimOptions;
+    const executed = [];
+
+    const recovery = await startCleanRestartRecovery({
+      db: {
+        claimCleanRestartRecovery: (options) => {
+          claimOptions = options;
+          return {
+            clean: true,
+            claims: [claim, codexClaim],
+            stranded: [],
+          };
+        },
+      },
+      botName: 'shumabit',
+      sessionKeyForSource: () => claim.session_key,
+      executeClaim: async (candidate, { onReady }) => {
+        executed.push(candidate);
+        onReady();
+      },
+    });
+
+    await Promise.all(recovery.tasks);
+    assert.deepEqual(claimOptions.supportedPolicyVersions, [1, 2]);
+    assert.deepEqual(executed, [claim, codexClaim]);
   });
 
   test('boot recovery rejects when a claim fails before declaring its session ready', async () => {

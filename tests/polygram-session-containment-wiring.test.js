@@ -8,7 +8,7 @@ const path = require('node:path');
 const src = fs.readFileSync(path.join(__dirname, '..', 'polygram.js'), 'utf8');
 
 describe('polygram session containment wiring', () => {
-  test('passes the configured launcher path explicitly to the process factory', () => {
+  test('passes the configured launcher path to Claude and Codex launch preparation', () => {
     assert.match(
       src,
       /const sessionLauncher = process\.env\.ORCHESTRA_SESSION_LAUNCHER;/,
@@ -16,6 +16,15 @@ describe('polygram session containment wiring', () => {
     assert.match(
       src,
       /const orchestraProcessFactory = createProcessFactory\(\{[\s\S]*?\n\s+sessionLauncher,/,
+    );
+    const controllerStart = src.indexOf(
+      'codexRuntimeController = createCodexRuntimeController({',
+    );
+    const controllerEnd = src.indexOf('\n      });', controllerStart);
+    assert.ok(controllerStart >= 0 && controllerEnd > controllerStart);
+    assert.match(
+      src.slice(controllerStart, controllerEnd),
+      /\n\s+sessionLauncher,/,
     );
   });
 

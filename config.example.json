@@ -18,6 +18,8 @@
       "replayWindowMs": 180000,
       "_comment_resumeInterruptedCliTurns": "Temporary staged-rollout flag. Default false. When true, a deliberate clean restart may strictly resume an interrupted CLI session and send one tracked literal `continue`; crashes still replay the original message. Enable only after the exact pinned-CLI recovery gate passes for the installed Orchestra version.",
       "resumeInterruptedCliTurns": false,
+      "_comment_resumeInterruptedCodexTurns": "Independent staged-rollout flag for exact native Codex clean-restart resume plus one literal `continue`. Default false; crashes and reboot never authorize continuation.",
+      "resumeInterruptedCodexTurns": false,
       "_comment_chrome": "Opt-in to Claude Code's Chrome-extension browser-automation integration. Default false. Requires the 'Claude in Chrome' extension installed in the daemon-user's Chrome browser AND a live GUI session (Chrome must be running). See https://code.claude.com/docs/en/chrome. Per-chat override via `config.chats.<id>.chrome`.",
       "chrome": false,
       "_comment_pairedChatDefaults": "When a user sends /pair <CODE> from a private chat that isn't in config.chats yet, polygram auto-creates a chat entry using these defaults (merged over top-level `defaults`). Leave out `cwd` at your peril — without it, auto-onboarded DMs have no working directory and pairing will fail.",

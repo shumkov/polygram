@@ -13,6 +13,7 @@ const SESSION_KEY = '-100:3';
 const NOW = 1_800_000_000_000;
 const MAX_AGE_MS = 60_000;
 const POLICY_VERSION = 1;
+const CODEX_POLICY_VERSION = 2;
 
 let db;
 let dbPath;
@@ -50,6 +51,7 @@ function recordIntent(sourceMessageId, overrides = {}) {
   return db.recordCleanShutdown({
     botName: BOT_NAME,
     now: NOW,
+    continuationAuthorized: true,
     resumeIntents: [{
       sessionKey: SESSION_KEY,
       sourceMessageId,
@@ -101,6 +103,9 @@ describe('clean restart resume intents', () => {
       'source_message_id',
       'shutdown_at',
       'policy_version',
+      'interrupted_provider_turn_id',
+      'interrupted_spawn_profile_id',
+      'continuation_authorized',
     ]);
     const generations = migrated.raw.prepare(`
       SELECT generation_id
@@ -110,6 +115,40 @@ describe('clean restart resume intents', () => {
     assert.equal(generations.length, 2);
     assert.ok(generations.every((value) => /^[0-9a-f]{32}$/.test(value)));
     assert.equal(new Set(generations).size, generations.length);
+  });
+
+  test('migration 019 upgrades an existing v18 production database', (t) => {
+    const legacyPath = `${dbPath}-v18`;
+    let migrated = null;
+    t.after(() => cleanupDb(legacyPath, migrated));
+    const legacy = new Database(legacyPath);
+    const migrationsDir = path.join(__dirname, '..', 'migrations');
+    for (const file of fs.readdirSync(migrationsDir).sort()) {
+      const version = Number.parseInt(file.slice(0, 3), 10);
+      if (!Number.isSafeInteger(version) || version > 18) continue;
+      legacy.exec(fs.readFileSync(path.join(migrationsDir, file), 'utf8'));
+      legacy.pragma(`user_version = ${version}`);
+    }
+    legacy.close();
+
+    migrated = open(legacyPath);
+
+    assert.equal(
+      migrated.raw.pragma('user_version', { simple: true }),
+      19,
+    );
+    const providerColumns = migrated.raw
+      .prepare('PRAGMA table_info(agent_runtime_sessions)')
+      .all()
+      .map((column) => column.name);
+    assert.ok(providerColumns.includes('spawn_profile_id'));
+    const intentColumns = migrated.raw
+      .prepare('PRAGMA table_info(clean_restart_resume_intents)')
+      .all()
+      .map((column) => column.name);
+    assert.ok(intentColumns.includes('interrupted_provider_turn_id'));
+    assert.ok(intentColumns.includes('interrupted_spawn_profile_id'));
+    assert.ok(intentColumns.includes('continuation_authorized'));
   });
 
   test('provider-session generation is stable for the same identity and rotates on replacement', () => {
@@ -146,6 +185,9 @@ describe('clean restart resume intents', () => {
         source_message_id: sourceMessageId,
         shutdown_at: NOW,
         policy_version: POLICY_VERSION,
+        interrupted_provider_turn_id: null,
+        interrupted_spawn_profile_id: null,
+        continuation_authorized: 1,
       },
     );
     assert.equal(
@@ -153,6 +195,233 @@ describe('clean restart resume intents', () => {
         .get(BOT_NAME).clean_shutdown_at,
       NOW,
     );
+  });
+
+  test('legacy restart intents cannot authorize continuation after migration', () => {
+    upsertChannelsSession();
+    const sourceMessageId = insertSource();
+    recordIntent(sourceMessageId);
+    db.raw.prepare(`
+      UPDATE clean_restart_resume_intents
+         SET continuation_authorized = 0
+       WHERE bot_name = ?
+    `).run(BOT_NAME);
+
+    const [claim] = db.claimCleanRestartRecovery({
+      botName: BOT_NAME,
+      now: NOW + 1,
+      maxAgeMs: MAX_AGE_MS,
+      supportedPolicyVersions: [POLICY_VERSION, CODEX_POLICY_VERSION],
+    }).claims;
+
+    assert.equal(claim.executable, false);
+    assert.equal(claim.reason, 'unauthorized-restart');
+  });
+
+  test('Codex intent binds the exact interrupted turn and retired spawn profile', () => {
+    db.upsertProviderSession({
+      session_key: SESSION_KEY,
+      namespace: 'codex:app-server',
+      provider: 'codex',
+      provider_session_id: 'thread-codex',
+      agent: null,
+      cwd: '/workspace',
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      pm_backend: 'codex',
+      spawn_profile_id: 'profile-codex',
+      chat_id: '-100',
+      thread_id: '3',
+      ts: NOW - 2_000,
+    });
+    const sourceMessageId = insertSource();
+
+    db.recordCleanShutdown({
+      botName: BOT_NAME,
+      now: NOW,
+      continuationAuthorized: true,
+      resumeIntents: [{
+        sessionKey: SESSION_KEY,
+        sourceMessageId,
+        policyVersion: CODEX_POLICY_VERSION,
+        interruptedProviderTurnId: 'turn-interrupted',
+        interruptedSpawnProfileId: 'profile-codex',
+        expectedProviderSessionId: 'thread-codex',
+        expectedCwd: '/workspace',
+        expectedModel: 'gpt-5.6-sol',
+        expectedEffort: 'xhigh',
+      }],
+    });
+    const [claim] = db.claimCleanRestartRecovery({
+      botName: BOT_NAME,
+      now: NOW + 1,
+      maxAgeMs: MAX_AGE_MS,
+      supportedPolicyVersions: [POLICY_VERSION, CODEX_POLICY_VERSION],
+    }).claims;
+
+    assert.equal(claim.executable, true);
+    assert.equal(claim.provider_namespace, 'codex:app-server');
+    assert.equal(claim.provider_session_id, 'thread-codex');
+    assert.equal(claim.interrupted_provider_turn_id, 'turn-interrupted');
+    assert.equal(claim.interrupted_spawn_profile_id, 'profile-codex');
+    assert.equal(claim.current_spawn_profile_id, 'profile-codex');
+  });
+
+  test('Codex intent rejects a provider row that no longer matches the retired process', () => {
+    db.upsertProviderSession({
+      session_key: SESSION_KEY,
+      namespace: 'codex:app-server',
+      provider: 'codex',
+      provider_session_id: 'thread-current',
+      agent: null,
+      cwd: '/workspace',
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      pm_backend: 'codex',
+      spawn_profile_id: 'profile-codex',
+      chat_id: '-100',
+      thread_id: '3',
+      ts: NOW - 2_000,
+    });
+    const sourceMessageId = insertSource();
+
+    assert.throws(
+      () => db.recordCleanShutdown({
+        botName: BOT_NAME,
+        now: NOW,
+        continuationAuthorized: true,
+        resumeIntents: [{
+          sessionKey: SESSION_KEY,
+          sourceMessageId,
+          policyVersion: CODEX_POLICY_VERSION,
+          interruptedProviderTurnId: 'turn-interrupted',
+          interruptedSpawnProfileId: 'profile-codex',
+          expectedProviderSessionId: 'thread-retired',
+          expectedCwd: '/workspace',
+          expectedModel: 'gpt-5.6-sol',
+          expectedEffort: 'xhigh',
+        }],
+      }),
+      /provider session changed/,
+    );
+    assert.equal(
+      db.raw.prepare(
+        'SELECT clean_shutdown_at FROM polling_state WHERE bot_name = ?',
+      ).get(BOT_NAME),
+      undefined,
+    );
+  });
+
+  test('Codex-shaped clean restart intents require policy version 2', () => {
+    const sourceMessageId = insertSource();
+    assert.throws(
+      () => db.recordCleanShutdown({
+        botName: BOT_NAME,
+        now: NOW,
+        continuationAuthorized: true,
+        resumeIntents: [{
+          sessionKey: SESSION_KEY,
+          sourceMessageId,
+          policyVersion: POLICY_VERSION,
+          interruptedProviderTurnId: 'turn-interrupted',
+          interruptedSpawnProfileId: 'profile-codex',
+          expectedProviderSessionId: 'thread-codex',
+          expectedCwd: '/workspace',
+          expectedModel: 'gpt-5.6-sol',
+          expectedEffort: 'xhigh',
+        }],
+      }),
+      /policy version 2/,
+    );
+  });
+
+  test('claim tombstones a corrupted Codex-shaped policy-v1 row', () => {
+    db.upsertProviderSession({
+      session_key: SESSION_KEY,
+      namespace: 'codex:app-server',
+      provider: 'codex',
+      provider_session_id: 'thread-codex',
+      agent: null,
+      cwd: '/workspace',
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      pm_backend: 'codex',
+      spawn_profile_id: 'profile-codex',
+      chat_id: '-100',
+      thread_id: '3',
+      ts: NOW - 2_000,
+    });
+    const sourceMessageId = insertSource();
+    const runtime = db.getProviderSession(SESSION_KEY, 'codex:app-server');
+    db.raw.prepare(`
+      INSERT INTO clean_restart_resume_intents (
+        bot_name, session_key, session_generation_id, source_message_id,
+        shutdown_at, policy_version, interrupted_provider_turn_id,
+        interrupted_spawn_profile_id, continuation_authorized
+      ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, 1)
+    `).run(
+      BOT_NAME,
+      SESSION_KEY,
+      runtime.generation_id,
+      sourceMessageId,
+      NOW,
+      'turn-interrupted',
+      'profile-codex',
+    );
+    db.raw.prepare(`
+      INSERT INTO polling_state (
+        bot_name, last_update_id, ts, clean_shutdown_at
+      ) VALUES (?, 0, ?, ?)
+    `).run(BOT_NAME, NOW, NOW);
+
+    const result = db.claimCleanRestartRecovery({
+      botName: BOT_NAME,
+      now: NOW + 1,
+      maxAgeMs: MAX_AGE_MS,
+      supportedPolicyVersions: [POLICY_VERSION, CODEX_POLICY_VERSION],
+    });
+
+    assert.equal(result.claims[0].executable, false);
+    assert.equal(result.claims[0].reason, 'unsupported-codex-policy');
+    assert.equal(
+      db.raw.prepare(
+        'SELECT COUNT(*) AS count FROM clean_restart_resume_intents',
+      ).get().count,
+      0,
+    );
+  });
+
+  test('claim tombstones profile-only malformed controls instead of treating them as Claude', () => {
+    const runtime = upsertChannelsSession();
+    const sourceMessageId = insertSource();
+    db.raw.prepare(`
+      INSERT INTO clean_restart_resume_intents (
+        bot_name, session_key, session_generation_id, source_message_id,
+        shutdown_at, policy_version, interrupted_provider_turn_id,
+        interrupted_spawn_profile_id, continuation_authorized
+      ) VALUES (?, ?, ?, ?, ?, 1, NULL, '', 1)
+    `).run(
+      BOT_NAME,
+      SESSION_KEY,
+      runtime.generation_id,
+      sourceMessageId,
+      NOW,
+    );
+    db.raw.prepare(`
+      INSERT INTO polling_state (
+        bot_name, last_update_id, ts, clean_shutdown_at
+      ) VALUES (?, 0, ?, ?)
+    `).run(BOT_NAME, NOW, NOW);
+
+    const result = db.claimCleanRestartRecovery({
+      botName: BOT_NAME,
+      now: NOW + 1,
+      maxAgeMs: MAX_AGE_MS,
+      supportedPolicyVersions: [POLICY_VERSION, CODEX_POLICY_VERSION],
+    });
+
+    assert.equal(result.claims[0].executable, false);
+    assert.equal(result.claims[0].reason, 'unsupported-codex-policy');
   });
 
   test('clean shutdown rolls back replay and marker when an intent cannot bind a session generation', () => {
@@ -208,6 +477,7 @@ describe('clean restart resume intents', () => {
     db.recordCleanShutdown({
       botName: BOT_NAME,
       now: NOW,
+      continuationAuthorized: true,
       resumeIntents: [
         {
           sessionKey: SESSION_KEY,

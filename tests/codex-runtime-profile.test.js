@@ -321,6 +321,42 @@ test('denied parent collapses redundant descendants without weakening coverage',
 });
 
 describe('owned Codex native-beta runtime profile', () => {
+  test('attests and binds the configured session launcher before characterization', async (t) => {
+    const f = fixture(t);
+    const launcher = '/usr/local/libexec/session-scope-launcher';
+    const launcherSha256 = 'a'.repeat(64);
+    const attestationCalls = [];
+    const clients = [];
+    const builder = createCodexRuntimeProfileBuilder({
+      temporaryRoots: [],
+      resolveTargetPin: () => TARGET_PIN,
+      attestSessionLauncher: async (pathToLauncher) => {
+        attestationCalls.push(pathToLauncher);
+        return Object.freeze({
+          path: pathToLauncher,
+          sha256: launcherSha256,
+        });
+      },
+      clientFactory: (options) => {
+        clients.push(options);
+        return new FakeClient(options, projectedResults(f));
+      },
+    });
+
+    const profile = await builder.prepare(prepareOptions(f, {
+      sessionLauncher: launcher,
+    }));
+
+    assert.deepEqual(attestationCalls, [launcher]);
+    assert.equal(profile.sessionLauncher, launcher);
+    assert.equal(profile.sessionLauncherSha256, launcherSha256);
+    assert.equal(clients[0].sessionLauncher, launcher);
+    assert.equal(
+      clients[0].expectedSessionLauncherSha256,
+      launcherSha256,
+    );
+  });
+
   test('provisions exact private files, characterizes projected policy, and builds a frozen static profile', async (t) => {
     const f = fixture(t);
     const { builder, clients } = createBuilder(f);
