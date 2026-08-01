@@ -159,3 +159,51 @@ read the cross-owner `/proc` evidence and query a stable system-manager
 snapshot under production hardening. Any failure blocks U3; the design must
 not silently fall back to UID-only authorization. This spike establishes only
 the same-UID kernel/systemd mechanics, not production authorization.
+
+## Partner publication atomicity gate
+
+Status: **PASS for the process-crash visibility/reconciliation model; real
+memsearch publication and concurrent boot admission remain U3/G5 gates.**
+
+The gate checkpoints one normalized candidate and its complete partner/general
+destination set in one SQLite transaction. The two siblings then use separate
+body directories and index databases. Recall consults one protected logical
+activation marker and validates the complete linked artifact set before either
+scope can return the record.
+
+An independent Node regression pins the exact ordered matrix of 22 child
+process crashes:
+
+- before, during, and after the candidate/destination checkpoint;
+- before, during, and after each atomic staged-file write;
+- before and after each staged-to-record move;
+- before, during, and after each scope index transaction;
+- before, during, and after the logical activation transaction.
+
+Before the checkpoint, both recall scopes are unavailable. After the checkpoint
+and before activation, both return no record. Only a crash after committed
+activation exposes both. Every crash then starts a fresh recovery subprocess,
+which must converge to one equivalent sibling in each destination. A second
+fresh recovery must preserve an exact normalized snapshot of logical and
+destination rows, all body/staging names and contents, every index row, and
+both recall results. Missing persisted destinations fail closed; partial
+staged bytes are rebuilt from the protected candidate checkpoint rather than
+promoted.
+
+The separate boot-sequencing prototype removed one active partner index entry
+and one active general body. It rejected both recall scopes until repair
+completed, then returned both siblings. This does not prove a concurrent
+request-versus-boot race. The matrix proves abrupt userspace process-crash
+recovery with SQLite-backed stand-in indexes, not power-loss durability or the
+pinned memsearch mutation surface. U3 must run the unchanged crash matrix
+through the real per-scope memsearch adapter and instrument the sole request
+admission path while boot reconciliation is in flight. Direct memsearch access
+must remain technically unavailable because it cannot apply the logical
+visibility marker.
+
+The Node regression failed before the gate existed and passed after the first
+implementation. Independent review then demonstrated false-pass cases for a
+vacuous crash list, pre-activation dual visibility, partial staged writes,
+non-authoritative destination rows, and count-only idempotence; the final gate
+pins all five corrections and passes 8 pure tests plus the 22-point standalone
+matrix.
