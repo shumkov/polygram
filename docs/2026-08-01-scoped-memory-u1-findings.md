@@ -78,3 +78,84 @@ per-scope topology passes isolation and durability. Before U3, choose the actual
 embedding boundary and the production write scheduler, encode their expected
 burst shape in the gate, and rerun the unchanged functional matrix repeatedly.
 Do not weaken or average away the 2x threshold merely to obtain a pass.
+
+## Provider-session receipt tamper gate
+
+Status: **PASS for the prototype behavior; protected storage and live-provider
+replay remain U3/U7 runtime gates.**
+
+The gate opens Polygram's real current schema in a private temporary database,
+adds the two planned receipt columns there only, and seeds both persisted
+session representations:
+
+- Claude through `sessions`;
+- Codex through `agent_runtime_sessions`.
+
+An independent child process at the same uid then performs each direct SQLite
+rewrite. The receipt authority remains outside that child and binds a random
+256-bit opaque receipt to the exact `{session_key, provider_namespace,
+provider_session_id, policy_identity}` tuple.
+
+The sanitized matrix passed for both tables:
+
+- a valid exact receipt resumes the persisted provider session;
+- a missing receipt forces a fresh session and deletes the target row;
+- restoring a previously valid receipt after rebinding the same logical
+  session forces fresh because rebinding revokes its predecessor;
+- changing only the provider session ID forces fresh;
+- rewriting an old row's `memory_identity` to the current value forces fresh;
+- copying both the provider session ID and receipt from another row forces
+  fresh because the session key remains different.
+
+Unit coverage also changes each tuple field independently, including provider
+namespace. The standalone evidence required numeric and equal parent/child
+UIDs, reported `same_uid_child: true`, and every check true. It verifies exact
+target-row deletion after rejection while an unrelated sibling in each table
+remains byte-for-byte unchanged. The first standalone regression failed before
+the runner existed and passed after the separate-process tamper path was
+implemented. A second regression restored a previously valid receipt after a
+rebind; it resumed before predecessor revocation and forced fresh afterward.
+
+This spike deliberately does not add production migrations or resume wiring.
+Its in-memory authority is only a stand-in for protected memoryd state. U3/U7
+must repeat the matrix against the real service, including already-live process
+reuse and a real Claude/Codex child, before rollout.
+
+## Linux systemd peer-attestation gate
+
+Status: **PASS for the same-UID kernel/systemd mechanics; the final cross-owner
+gate remains blocked on U10's service identity.**
+
+The target Linux host ran one disposable auto-collected user-systemd unit. Its
+main process and a child with the same uid, executable, invocation, and cgroup
+connected to a private Unix socket and sent malformed bytes. The server:
+
+1. captured PID and UID from Linux `SO_PEERCRED`;
+2. obtained `SO_PEERPIDFD` atomically from the accepted socket, correlated its
+   `/proc/self/fdinfo/<pidfd>` `Pid` to the credential PID, and checked pidfd
+   liveness before and after numeric `/proc/<pid>` reads;
+3. required an active/running unit with non-empty `MainPID`, `InvocationID`, and
+   `ControlGroup`;
+4. required the peer PID to equal `MainPID`, `/proc/<pid>/exe` to equal the
+   pinned executable, and `/proc/<pid>/cgroup` to contain the exact unit cgroup;
+5. reread the unit snapshot and required it to remain identical;
+6. routed the sole request read through an instrumented authorization gate.
+
+Sanitized evidence was `PASS`: the exact main process returned `accepted`, the
+same-UID child returned `not-main-pid`, exactly one authorized request read
+occurred, pidfd correlation stayed live, and the transient unit both exited
+cleanly and was confirmed absent afterward. No production service was
+restarted or reconfigured.
+
+This same-UID run is necessary but not sufficient. Memoryd will run under a
+different system identity. U10 must provision that identity and repeat the
+same gate against a root-owned disposable system unit. The final gate must
+prove that the client identity cannot start, stop, or reconfigure the unit;
+the unit file, configuration, `ExecStart` argv, scripts, executable, and
+package inputs are root-owned and immutable to it; deployed executable and
+package digests match an allowlist; and both processes share the expected PID
+namespace and hardened `/proc` visibility. It must also prove that memoryd can
+read the cross-owner `/proc` evidence and query a stable system-manager
+snapshot under production hardening. Any failure blocks U3; the design must
+not silently fall back to UID-only authorization. This spike establishes only
+the same-UID kernel/systemd mechanics, not production authorization.
