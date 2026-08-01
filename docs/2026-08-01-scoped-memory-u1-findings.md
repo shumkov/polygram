@@ -207,3 +207,93 @@ vacuous crash list, pre-activation dual visibility, partial staged writes,
 non-authoritative destination rows, and count-only idempotence; the final gate
 pins all five corrections and passes 8 pure tests plus the 22-point standalone
 matrix.
+
+## Extraction processor G3 gate
+
+Status: **the contract, corpus, and bounded runner code pass; neither candidate
+has been executed or approved. U1 and G3 remain blocked.** No model, container,
+or image was downloaded, no Anthropic request was sent, and no credential was
+used.
+
+### Frozen corpus and evidence contract
+
+The shared provider-neutral harness now fixes the processor input/output
+boundary and a canonical 200-fixture manifest:
+
+- 60 team-private/private, 50 team-private/general, 25 team-shared, 20 partner,
+  30 adversarial, and 15 no-durable-memory fixtures;
+- 170 expected durable claims, including 64 critical private claims;
+- 18 synthetic secret cases: six each at high, medium, and low detector tiers;
+- 12 instruction attacks, each with an attack-specific rejection oracle; six
+  true multi-fact fixtures and six instruction-plus-safe-fact cases; and
+- 40 disjoint development fixtures which are never included in the locked
+  score.
+
+Every scored candidate must run the complete canonical corpus three times. A
+run is rejected unless it contains 200 unique fixture receipts, the exact
+170/64/12 denominators, the canonical fixture-manifest hash, and matching
+non-empty prompt, schema, processor, and processor-config identities. Results
+are never pooled: every run must independently meet the approved precision,
+routing, private-recall, instruction-rejection, and zero-leak thresholds.
+
+The text-free oracle self-test passes with 170/170 extraction and routing,
+64/64 private recall, 12/12 instruction rejection, and zero secret hits. This
+proves the harness and arithmetic only; it is not model-quality evidence.
+
+### Anthropic comparator
+
+The direct comparator is pinned to `claude-haiku-4-5-20251001`, synchronous
+Messages API structured output, `standard_only`, temperature 0, and 2048 output
+tokens. Each request is limited to 10 seconds; up to two retries with bounded
+jitter share one hard 60-second whole-job deadline. Retry waits cannot exceed
+the remaining deadline, response cleanup cannot stall it, and HTTP redirects
+are rejected so the key and body stay at the pinned endpoint.
+
+Durable evidence retains the validated processor ID and deterministic config
+hash while excluding prompts, responses, candidate facts, exception messages,
+and credentials. Billing is marked exact only when every fixture used one
+attempt and returned valid input/output usage for the expected standard/global
+route with no prompt-cache token classes. Missing metadata can no longer appear
+as an exact zero-dollar result.
+
+This comparator still requires Ivan's explicit approval for sanitized
+synthetic-fixture egress and a dedicated commercial Anthropic API credential.
+A Claude consumer subscription is not API authentication. The documented
+retention mode must be selected for the exact API organization; Zero Data
+Retention is never assumed.
+
+### Local comparator
+
+The local candidate remains pinned to `Qwen/Qwen3-4B-GGUF` revision
+`bc640142c66e1fdd12af0bd68f40445458f3869b`, file
+`Qwen3-4B-Q4_K_M.gguf`, 2,497,280,256 bytes, SHA-256
+`7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5`.
+The llama.cpp Linux/amd64 image is pinned to digest
+`sha256:d281935c6cb43621ec96b187c3636c257ca19223068f8f1fe3038fdbc89f9548`.
+
+The dependency-injected local runner is explicitly a test core: it always
+returns `admissible:false` and `passed:false`. The production entry point fails
+closed with `LOCAL_RUNTIME_SEALED_COLLECTOR_REQUIRED`. Caller-supplied Docker
+inspection, cgroup paths, model readers, or Unix transports therefore cannot
+produce G3 evidence. Before a real local run, a separately reviewed collector
+must bind the verified image, stable container ID/PID/start time, that PID's
+cgroup-v2 limits and counters, the container-visible model inode/content, and
+the private Unix socket to the same process for all three runs.
+
+Running this candidate requires Ivan's approval to download approximately
+2.5 GB of model data plus the pinned image and to start only the disposable
+offline container. That approval has not been requested or granted yet.
+
+### Verification and remaining decision
+
+The focused processor suite passes 27/27 tests, both oracle/local self-tests
+pass, and the final repository-wide suite passes 4,039 tests total: 4,024
+passed, 0 failed, and 15 explicitly skipped. Three independent final reviews
+covered fixture/scoring completeness, Anthropic evidence/security, and
+local-runtime admissibility; their must-fixes were folded into the files above.
+
+No processor recommendation can be made until both real candidates have valid
+three-run evidence. G3 remains blocked on: (1) the sealed local collector and
+approved local assets, (2) approved synthetic Anthropic egress plus a commercial
+API key, (3) Ivan's review of the locked labels, and finally (4) Ivan's measured
+processor/data-boundary choice. U3 must not begin before that choice.
