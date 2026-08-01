@@ -63,6 +63,14 @@ describe('shutdown signal-time sampling', () => {
     assert.match(body, /\}, invocationId\)\)/);
   });
 
+  test('reports restart authorization and committed intent count in lifecycle evidence', () => {
+    const body = shutdownBody();
+    assert.match(body, /restart_trigger: trigger/);
+    assert.match(body, /continuation_authorized: continuationAuthorized === true/);
+    assert.match(body, /resume_intents_recorded: res\.intentsRecorded \?\? 0/);
+    assert.match(body, /restart_request_id: trigger === 'deploy-ipc'[\s\S]*?restartRequestId[\s\S]*?: null/);
+  });
+
   test('the post-drain count is measured after the drain, not reused', () => {
     const body = shutdownBody();
     const drain = body.indexOf('const drainStart');
@@ -124,7 +132,7 @@ describe('clean restart lifecycle ordering', () => {
     );
     assert.match(
       src,
-      /requestDeployRestart: \(\) => \{[\s\S]{0,500}?shutdown\(\{[\s\S]{0,180}?continuationAuthorized: true,[\s\S]{0,180}?trigger: 'deploy-ipc'/,
+      /requestDeployRestart: \(req\) => \{[\s\S]{0,700}?requireRestartRequestId\(req\.id\)[\s\S]{0,300}?shutdown\(\{[\s\S]{0,220}?continuationAuthorized: true,[\s\S]{0,220}?trigger: 'deploy-ipc',[\s\S]{0,220}?restartRequestId/,
       'the authenticated IPC handler must directly begin the authorized shutdown',
     );
     for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {

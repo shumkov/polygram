@@ -31,6 +31,9 @@ const {
 const { buildPrompt, resolvePromptBackend } = require('./lib/prompt');
 const { countInFlight } = require('./lib/queue-utils');
 const { createIpcHandlers } = require('./lib/ipc/handlers');
+const {
+  requireRestartRequestId,
+} = require('./lib/ipc/restart-request-id');
 const { classifyOrphanSweep } = require('./lib/ops/tmux-preflight');
 const {
   parseSystemdInvocationId,
@@ -98,6 +101,10 @@ const { createDownloadAttachments } = require('./lib/handlers/download');
 const { createHandleConfigCallback } = require('./lib/handlers/config-callback');
 const { createHandleAbort } = require('./lib/handlers/abort');
 const { createAutosteerHandlers } = require('./lib/handlers/autosteer');
+const {
+  settleAcceptedAutosteerOwnership,
+  shouldDispatchPrimaryAfterAutosteer,
+} = require('./lib/handlers/claude-autosteer-ownership');
 const { createEditCorrectionInjector } = require('./lib/handlers/edit-correction');
 const { createEditRedelivery } = require('./lib/handlers/edit-redelivery');
 const { createGateInbound, ADMIN_CMD_RE, PAIR_CLAIM_RE } = require('./lib/handlers/gate-inbound');
@@ -2024,6 +2031,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   let sendPromise = null;
   let codexDispatch = null;
   let codexDispatchDecision = null;
+  let acceptedAutosteerProvider = null;
   try {
     const current = pm.get(sessionKey);
     const liveCodexGeneration = Boolean(
@@ -2070,6 +2078,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
               msg,
               prompt,
             });
+            acceptedAutosteerProvider = 'codex';
             if (steered.outcome === 'accepted') {
               try {
                 codexRuntimeController.finalizeAcceptedSteer({
@@ -2196,12 +2205,23 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         msg,
         prompt,
       });
+      acceptedAutosteerProvider = 'claude';
     }
-    if (
-      !steered.autosteered
-      && !['duplicate', 'ambiguous', 'unavailable']
-        .includes(codexDispatchDecision)
-    ) {
+    steered = settleAcceptedAutosteerOwnership({
+      selectedProvider: acceptedAutosteerProvider,
+      steered,
+      db,
+      chatId,
+      msgId: msg.message_id,
+      sessionKey,
+      logLabel: label,
+      logEvent,
+      logger: console,
+    });
+    if (shouldDispatchPrimaryAfterAutosteer({
+      steered,
+      codexDispatchDecision,
+    })) {
       if (codexDispatchDecision === 'queue') {
         reactor.setState('THINKING');
       }
@@ -2277,6 +2297,31 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         status: terminalDuplicateStatus,
       }), 'restore duplicate Codex handler status');
     }
+    return;
+  }
+  if (steered.outcome === 'accepted-persistence-ambiguous') {
+    stopTyping();
+    await finishStreamer();
+    await reactor.clear().catch(() => {});
+    reactor.stop();
+    await tg(bot, 'sendMessage', {
+      chat_id: chatId,
+      text: 'This follow-up may have been incorporated. Please wait for the current turn to finish before retrying it.',
+      ...replyOpts(threadId),
+    }, {
+      source: 'claude-autosteer-notice',
+      botName: BOT_NAME,
+    }).catch((error) => {
+      console.error(
+        `[${label}] failed to send Claude autosteer ambiguity notice: ${error.message}`,
+      );
+      logEvent('autosteer-ambiguity-notice-failed', {
+        chat_id: chatId,
+        msg_id: msg.message_id,
+        session_key: sessionKey,
+        code: error?.code || error?.name || 'unknown',
+      });
+    });
     return;
   }
   if (['ambiguous', 'unavailable'].includes(codexDispatchDecision)) {
@@ -4419,7 +4464,11 @@ async function main() {
   // replay picks it up. Prevents "Sorry, I couldn't process that message"
   // from showing on every restart.
   const SHUTDOWN_DRAIN_MS = 30_000;
-  const shutdown = async ({ continuationAuthorized = false, trigger = 'signal' } = {}) => {
+  const shutdown = async ({
+    continuationAuthorized = false,
+    trigger = 'signal',
+    restartRequestId = null,
+  } = {}) => {
     if (isShuttingDown) return;
     const shutdownObservation = cgroupOomObserver.sample();
     // Sample in-flight work at SIGNAL time, alongside the OOM observation and
@@ -4611,6 +4660,12 @@ async function main() {
           elapsed_ms: drainElapsed,
           clean: res.clean,
           shutdown_reason: res.shutdownReason,
+          restart_trigger: trigger,
+          continuation_authorized: continuationAuthorized === true,
+          resume_intents_recorded: res.intentsRecorded ?? 0,
+          restart_request_id: trigger === 'deploy-ipc'
+            ? restartRequestId
+            : null,
           ...(res.oomKillDelta != null ? { oom_kill_delta: res.oomKillDelta } : {}),
         }, invocationId));
         console.log(`[shutdown] ${res.clean ? 'clean' : 'crash-like'} shutdown recorded (${res.shutdownReason}); ${inFlightAtSignal} in-flight at signal, drained ${drainElapsed}ms, ${remaining} still in-flight, ${res.replayMarked} marked replay-pending`);
@@ -4684,16 +4739,18 @@ async function main() {
         botName: BOT_NAME,
         getInFlightHandlers: () => inFlightHandlers,
         handleSendOverIpc: (req) => handleSendOverIpc(req),
-        requestDeployRestart: () => {
+        requestDeployRestart: (req) => {
           if (isShuttingDown) {
             const error = new Error('shutdown already in progress');
             error.code = 'SHUTDOWN_IN_PROGRESS';
             throw error;
           }
+          const restartRequestId = requireRestartRequestId(req.id);
           const oldPid = process.pid;
           shutdown({
             continuationAuthorized: true,
             trigger: 'deploy-ipc',
+            restartRequestId,
           }).catch((error) => {
             console.error(`[shutdown] deploy restart failed: ${error.message}`);
           });

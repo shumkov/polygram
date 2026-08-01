@@ -1,10 +1,18 @@
 #!/usr/bin/env node
 /**
  * Quick IPC round-trip probe.
- * Usage: node scripts/ipc-smoke.js <bot-name> [busy|restart]
+ * Usage: node scripts/ipc-smoke.js <bot-name> [busy|restart] [restart-request-id]
  */
 
+const crypto = require('node:crypto');
 const { call, readSecret, socketPathFor } = require('../lib/ipc/client');
+const {
+  requireRestartRequestId,
+} = require('../lib/ipc/restart-request-id');
+
+function restartRequestId(value) {
+  return requireRestartRequestId(value || crypto.randomUUID());
+}
 
 (async () => {
   const bot = process.argv[2] || 'shumabit';
@@ -33,15 +41,18 @@ const { call, readSecret, socketPathFor } = require('../lib/ipc/client');
   }
 
   if (command === 'restart') {
+    const requestId = restartRequestId(process.argv[4]);
     const result = await call({
       path,
       op: 'deploy_restart',
+      id: requestId,
       secret: readSecret(bot),
       callTimeoutMs: 60_000,
     });
     if (
       result.ok !== true
       || result.accepted !== true
+      || result.id !== requestId
       || !Number.isSafeInteger(result.old_pid)
       || result.old_pid <= 1
     ) {
@@ -51,6 +62,7 @@ const { call, readSecret, socketPathFor } = require('../lib/ipc/client');
       bot,
       accepted: true,
       old_pid: result.old_pid,
+      restart_request_id: requestId,
     }));
     return;
   }
