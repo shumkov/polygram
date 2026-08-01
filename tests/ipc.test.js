@@ -12,6 +12,9 @@ const os = require('os');
 const ipcServer = require('../lib/ipc/server');
 const ipcClient = require('../lib/ipc/client');
 const { createIpcHandlers } = require('../lib/ipc/handlers');
+const {
+  requireRestartRequestId,
+} = require('../lib/ipc/restart-request-id');
 
 const silentLogger = { log: () => {}, error: () => {} };
 
@@ -122,16 +125,23 @@ describe('ipc round-trip', () => {
       getInFlightHandlers: () => new Map(),
       handleSendOverIpc: async () => ({}),
       requestDeployRestart: (req) => {
-        calls.push(req.op);
+        calls.push({ op: req.op, id: req.id });
         return { accepted: true, old_pid: 4242 };
       },
     }));
 
-    const res = await ipcClient.call({ path: sockPath, op: 'deploy_restart' });
+    const res = await ipcClient.call({
+      path: sockPath,
+      op: 'deploy_restart',
+      id: 'restart-request-42',
+    });
 
-    assert.deepEqual(calls, ['deploy_restart']);
+    assert.deepEqual(calls, [{
+      op: 'deploy_restart',
+      id: 'restart-request-42',
+    }]);
     assert.deepEqual(res, {
-      id: null,
+      id: 'restart-request-42',
       ok: true,
       accepted: true,
       old_pid: 4242,
@@ -198,6 +208,22 @@ describe('ipc round-trip', () => {
       }),
       /call timeout/,
     );
+  });
+});
+
+describe('deploy restart request IDs', () => {
+  test('accepts a bounded opaque correlation ID', () => {
+    const value = 'r'.repeat(128);
+    assert.equal(requireRestartRequestId(value), value);
+  });
+
+  test('rejects missing, oversized, control-bearing, and non-string IDs', () => {
+    for (const value of [undefined, '', 'r'.repeat(129), 'bad\nvalue', 42]) {
+      assert.throws(
+        () => requireRestartRequestId(value),
+        (error) => error?.code === 'INVALID_DEPLOY_RESTART_REQUEST_ID',
+      );
+    }
   });
 });
 
