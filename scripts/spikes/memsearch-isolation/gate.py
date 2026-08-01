@@ -39,6 +39,18 @@ def _query_ms(adapter: Any, scope: str, query: str) -> tuple[float, list[dict[st
     return (time.perf_counter() - started) * 1000, records
 
 
+def _visible_probe_ids(
+    adapter: Any,
+    scope: str,
+    probes: Iterable[tuple[str, str]],
+) -> list[str]:
+    visible = []
+    for query, record_id in probes:
+        if record_id in _ids(adapter.search(scope, query, k=10)):
+            visible.append(record_id)
+    return sorted(visible)
+
+
 def run_topology(*, adapter: Any, topology: str, thresholds: GateThresholds) -> dict[str, Any]:
     """Run the complete isolation matrix against one configured topology."""
 
@@ -50,13 +62,13 @@ def run_topology(*, adapter: Any, topology: str, thresholds: GateThresholds) -> 
     adapter.rebuild("alpha")
     adapter.rebuild("beta")
 
-    cross_scope_results = (
-        len(adapter.search("alpha", beta, k=10))
-        + len(adapter.search("beta", alpha, k=10))
+    forbidden_cross_scope = (
+        _ids(adapter.search("alpha", beta, k=10)).count("beta-sentinel")
+        + _ids(adapter.search("beta", alpha, k=10)).count("alpha-sentinel")
     )
-    staged_results = len(adapter.search("alpha", "gate-staged", k=10))
-    expected_alpha = _ids(adapter.search("alpha", alpha, k=10))
-    expected_beta = _ids(adapter.search("beta", beta, k=10))
+    staged_results = _ids(
+        adapter.search("alpha", "gate-staged", k=10)
+    ).count("alpha-staged")
 
     baseline_ms = [
         _query_ms(adapter, "beta", beta)[0]
@@ -88,25 +100,39 @@ def run_topology(*, adapter: Any, topology: str, thresholds: GateThresholds) -> 
     if hasattr(adapter, "set_concurrent_probe"):
         adapter.set_concurrent_probe(False)
 
+    alpha_probes = [(alpha, "alpha-sentinel")] + [
+        (f"gate-concurrent-{ordinal}", f"concurrent-{ordinal}")
+        for ordinal in range(thresholds.samples)
+    ]
+    beta_probes = [(beta, "beta-sentinel")]
+    expected_alpha = sorted(record_id for _query, record_id in alpha_probes)
+    expected_beta = sorted(record_id for _query, record_id in beta_probes)
+    visible_alpha_before_delete = _visible_probe_ids(adapter, "alpha", alpha_probes)
+    visible_beta_before_delete = _visible_probe_ids(adapter, "beta", beta_probes)
+
     baseline_p95 = _p95(baseline_ms)
     concurrent_p95 = _p95(concurrent_ms)
     latency_ratio = concurrent_p95 / max(baseline_p95, 0.001)
 
     adapter.delete_collection("alpha")
     alpha_after_delete = adapter.search("alpha", alpha, k=10)
-    beta_after_delete = _ids(adapter.search("beta", beta, k=10))
+    beta_after_delete = _visible_probe_ids(adapter, "beta", beta_probes)
     delete_ok = not alpha_after_delete and beta_after_delete == expected_beta
 
     adapter.rebuild("alpha")
     adapter.rebuild("beta")
-    rebuilt_alpha = _ids(adapter.search("alpha", alpha, k=10))
-    rebuilt_beta = _ids(adapter.search("beta", beta, k=10))
+    rebuilt_alpha = _visible_probe_ids(adapter, "alpha", alpha_probes)
+    rebuilt_beta = _visible_probe_ids(adapter, "beta", beta_probes)
     rebuild_ok = rebuilt_alpha == expected_alpha and rebuilt_beta == expected_beta
 
     checks = {
-        "cross_scope_isolation": cross_scope_results == 0,
+        "cross_scope_isolation": forbidden_cross_scope == 0,
         "staged_sibling_excluded": staged_results == 0,
-        "concurrent_query_write": not writer_errors,
+        "concurrent_query_write": (
+            not writer_errors
+            and visible_alpha_before_delete == expected_alpha
+            and visible_beta_before_delete == expected_beta
+        ),
         "concurrent_latency": (
             concurrent_p95 <= thresholds.max_concurrent_p95_ms
             and latency_ratio <= thresholds.max_concurrent_ratio
@@ -122,7 +148,7 @@ def run_topology(*, adapter: Any, topology: str, thresholds: GateThresholds) -> 
         "status": "PASS" if all(checks.values()) else "FAIL",
         "checks": checks,
         "counts": {
-            "cross_scope_results": cross_scope_results,
+            "cross_scope_results": forbidden_cross_scope,
             "staged_results": staged_results,
             "writer_errors": len(writer_errors),
         },
@@ -135,6 +161,16 @@ def run_topology(*, adapter: Any, topology: str, thresholds: GateThresholds) -> 
             "samples": thresholds.samples,
             "max_concurrent_ratio": thresholds.max_concurrent_ratio,
             "max_concurrent_p95_ms": thresholds.max_concurrent_p95_ms,
+        },
+        "sanitized_diagnostics": {
+            "expected_alpha_ids": expected_alpha,
+            "expected_beta_ids": expected_beta,
+            "visible_alpha_ids_before_delete": visible_alpha_before_delete,
+            "visible_beta_ids_before_delete": visible_beta_before_delete,
+            "alpha_ids_after_delete": _ids(alpha_after_delete),
+            "beta_ids_after_delete": beta_after_delete,
+            "rebuilt_alpha_ids": rebuilt_alpha,
+            "rebuilt_beta_ids": rebuilt_beta,
         },
     }
 
@@ -150,12 +186,27 @@ def run_matrix(
     for topology in topologies:
         topology_dir = work_dir / topology
         topology_dir.mkdir(parents=True, exist_ok=True)
-        adapter = adapter_factory(topology=topology, work_dir=topology_dir)
-        results.append(run_topology(
-            adapter=adapter,
-            topology=topology,
-            thresholds=thresholds,
-        ))
+        adapter = None
+        try:
+            adapter = adapter_factory(topology=topology, work_dir=topology_dir)
+            result = run_topology(
+                adapter=adapter,
+                topology=topology,
+                thresholds=thresholds,
+            )
+        except Exception as error:  # sanitized release-gate evidence
+            result = {
+                "topology": topology,
+                "adapter": str(getattr(adapter, "name", "unavailable")),
+                "backend_version": str(getattr(adapter, "backend_version", "unknown")),
+                "authoritative": bool(getattr(adapter, "authoritative", False)),
+                "status": "FAIL",
+                "error_code": type(error).__name__,
+            }
+        finally:
+            if adapter is not None and hasattr(adapter, "close"):
+                adapter.close()
+        results.append(result)
 
     return {
         "status": "PASS" if all(result["status"] == "PASS" for result in results) else "FAIL",

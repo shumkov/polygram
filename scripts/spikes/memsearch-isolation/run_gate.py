@@ -26,6 +26,12 @@ def main() -> int:
     parser.add_argument("--work-dir", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--samples", type=int, default=40)
+    parser.add_argument(
+        "--topology",
+        action="append",
+        choices=("shared-file", "per-scope-file"),
+        dest="topologies",
+    )
     args = parser.parse_args()
 
     if args.samples < 5:
@@ -55,7 +61,7 @@ def main() -> int:
     evidence = run_matrix(
         adapter_factory=_factory(args.adapter),
         work_dir=work_dir,
-        topologies=("shared-file", "per-scope-file"),
+        topologies=tuple(args.topologies or ("shared-file", "per-scope-file")),
         thresholds=GateThresholds(samples=args.samples),
     )
     rendered = json.dumps(evidence, indent=2, sort_keys=True)

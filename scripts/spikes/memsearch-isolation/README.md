@@ -18,15 +18,35 @@ python3 -m unittest discover -s scripts/spikes/memsearch-isolation -p 'test_*.py
 python3 scripts/spikes/memsearch-isolation/run_gate.py
 ```
 
-An authoritative release gate supplies an adapter factory as
-`module:function`:
+The bundled real adapter uses the installed memsearch/Milvus-Lite package and a
+loopback-only deterministic OpenAI-compatible embedding stub. It never needs an
+API credential or embedding-network request:
 
 ```sh
+MEMSEARCH_GATE_EXPECTED_VERSION=0.4.17 \
 python3 scripts/spikes/memsearch-isolation/run_gate.py \
   --adapter deployed_memsearch_adapter:create_adapter \
   --work-dir /absolute/mode-0700/gate-directory \
   --output /absolute/private/sanitized-result.json
 ```
+
+Run it from the environment that contains the exact expected memsearch package.
+The adapter records both memsearch and pymilvus versions and refuses a mismatch.
+The loopback embeddings test storage behavior only, not semantic quality.
+
+If the combined run shows that shared-file access fails, rerun the complete
+matrix for the fallback alone. Only that authoritative fallback result gates
+the selected topology:
+
+```sh
+MEMSEARCH_GATE_EXPECTED_VERSION=0.4.17 \
+python3 scripts/spikes/memsearch-isolation/run_gate.py \
+  --adapter deployed_memsearch_adapter:create_adapter \
+  --topology per-scope-file \
+  --work-dir /absolute/mode-0700/fallback-gate-directory
+```
+
+Another authoritative adapter may also be supplied as `module:function`.
 
 The factory receives `topology` and `work_dir` and returns an object with:
 

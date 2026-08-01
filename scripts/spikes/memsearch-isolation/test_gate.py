@@ -12,6 +12,7 @@ from unittest import mock
 from fake_adapter import create_adapter
 from gate import GateThresholds, run_matrix, run_topology
 import run_gate
+from deployed_memsearch_adapter import deterministic_embedding
 
 
 class MemsearchIsolationGateTests(unittest.TestCase):
@@ -98,6 +99,21 @@ class MemsearchIsolationGateTests(unittest.TestCase):
         self.assertFalse(evidence["checks"]["per_collection_delete"])
         self.assertTrue(evidence["checks"]["rebuild_equivalence"])
 
+    def test_rebuild_accepts_a_changed_tie_window_when_every_record_is_recoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = run_topology(
+                adapter=create_adapter(
+                    topology="per-scope-file",
+                    work_dir=Path(tmp),
+                    faults={"unstable_tie_window"},
+                ),
+                topology="per-scope-file",
+                thresholds=GateThresholds(samples=12),
+            )
+
+        self.assertEqual("PASS", evidence["status"])
+        self.assertTrue(evidence["checks"]["rebuild_equivalence"])
+
     def test_runner_refuses_to_repurpose_an_existing_non_private_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "existing"
@@ -109,6 +125,15 @@ class MemsearchIsolationGateTests(unittest.TestCase):
 
         self.assertEqual(2, raised.exception.code)
 
+    def test_loopback_embedding_is_deterministic_and_normalized(self) -> None:
+        first = deterministic_embedding("gate alpha", dimension=32)
+        repeated = deterministic_embedding("gate alpha", dimension=32)
+        other = deterministic_embedding("gate beta", dimension=32)
+
+        self.assertEqual(first, repeated)
+        self.assertNotEqual(first, other)
+        self.assertEqual(32, len(first))
+        self.assertAlmostEqual(1.0, sum(value * value for value in first), places=6)
 
 if __name__ == "__main__":
     unittest.main()

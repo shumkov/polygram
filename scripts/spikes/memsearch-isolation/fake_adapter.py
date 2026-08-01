@@ -20,6 +20,7 @@ class FakeAdapter:
         self.staged: dict[str, dict[str, str]] = defaultdict(dict)
         self.indexes: dict[str, dict[str, str]] = defaultdict(dict)
         self.concurrent_probe = False
+        self.after_delete = False
 
     def write_source(self, scope: str, record_id: str, text: str, *, staged: bool = False) -> None:
         target = self.staged if staged else self.sources
@@ -45,12 +46,26 @@ class FakeAdapter:
         matches = []
         for index in indexes:
             for record_id, text in index.items():
-                if query in text:
+                if query in text or (
+                    "unstable_tie_window" in self.faults
+                    and query == "gate-alpha"
+                    and scope == "alpha"
+                ):
                     matches.append({"id": record_id, "text": text})
-        return sorted(matches, key=lambda record: record["id"])[:k]
+        ordered = sorted(
+            matches,
+            key=lambda record: record["id"],
+            reverse=("unstable_tie_window" in self.faults and self.after_delete),
+        )
+        if "unstable_tie_window" in self.faults and query == "gate-alpha":
+            sentinel = [record for record in ordered if record["id"] == "alpha-sentinel"]
+            others = [record for record in ordered if record["id"] != "alpha-sentinel"]
+            return (sentinel + others)[:k]
+        return ordered[:k]
 
     def delete_collection(self, scope: str) -> None:
         self.indexes.pop(scope, None)
+        self.after_delete = True
         if "delete_sibling" in self.faults:
             self.indexes.clear()
 
