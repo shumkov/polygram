@@ -176,6 +176,31 @@ describe('rich media display hint', () => {
     assert.match(richHint, /markdown table/i);
   });
 
+  test('rich mode names the hand-aligned-fence table as an anti-pattern', () => {
+    // Production: a reply hand-aligned an invoice table inside a ``` fence
+    // instead of writing a markdown table. Fenced content is stripped before
+    // the rich gate reads it, so the reply rendered plain and its 59-char
+    // rows wrapped at the ~36-char <pre> budget on a phone. The other fakes
+    // (bold pseudo-headings, emoji bullets) are already called out by name;
+    // this one is the most tempting because the alignment looks correct
+    // while authoring and only collapses on the reader's screen.
+    // Scoped to the bullet, not the whole hint: the section already contains
+    // a fenced worked example and the word "wrap" in the <details> guidance,
+    // so hint-wide assertions match unrelated text and pass with the rule
+    // deleted. Property assertions inside the located bullet, so a reworded
+    // rule survives and a dropped one cannot.
+    const bullet = buildPolygramDisplayHint(true)
+      .split('\n')
+      .find((l) => /^- .*(```|fence|code block)/i.test(l));
+    assert.ok(bullet, 'the fence anti-pattern is called out as its own bullet');
+    assert.match(bullet, /(table|column)/i, 'names the replacement construct');
+    assert.match(bullet, /(wrap|re-?flow|width|screen|narrow)/i,
+      'says why the fence cannot carry a table');
+    assert.match(bullet, /(verbatim|quot|yourself|by hand|hand-align)/i,
+      'keeps the self-authored vs quoted-verbatim discriminator, so the rule '
+      + 'cannot be read as "retype command output as a markdown table"');
+  });
+
   test('plain mode remains media-free and equals the legacy default export', () => {
     const plainHint = buildPolygramDisplayHint(false);
     assert.equal(plainHint, POLYGRAM_DISPLAY_HINT);
