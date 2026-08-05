@@ -194,6 +194,7 @@ const { createCgroupOomObserver } = require('./lib/ops/cgroup-oom-observer');
 const { persistShutdownDisposition } = require('./lib/ops/shutdown-disposition');
 const {
   prepareCleanRetirement,
+  settleCrashShutdown,
   buildResumeIntents,
 } = require('./lib/ops/clean-shutdown');
 const {
@@ -3539,6 +3540,8 @@ function createBot(token) {
 // ─── Manual polling — extracted to lib/handlers/poll.js ────────────
 let pollBot = null;
 let startPollWatchdog = null;
+let stopPolling = null;
+let awaitPollSettlement = null;
 
 // ─── Main ───────────────────────────────────────────────────────────
 
@@ -4483,7 +4486,7 @@ async function main() {
   dropRedeliverer = createDropRedeliverer({
     db, redeliver: redeliverAsFreshTurn, logEvent, logger: console,
   });
-  ({ pollBot, startPollWatchdog } = createPollLoop({
+  ({ pollBot, startPollWatchdog, stopPolling, awaitPollSettlement } = createPollLoop({
     db, dbWrite, config, botName: BOT_NAME,
     isWellFormedMessage, getTopicName,
     logger: console,
@@ -4545,22 +4548,30 @@ async function main() {
     isShuttingDown = true;
     console.log(`\nShutting down (${trigger})...`);
     // 1. Stop accepting new inbound first so nothing new queues behind the drain.
-    if (bot && bot._stop) bot._stop();
+    stopPolling();
+    const awaitIngressSettlement = ({ timeoutMs } = {}) => (
+      awaitPollSettlement({ timeoutMs })
+    );
 
-    // 1.5 (0.13 D1): expire open interactive questions {cancelled} BEFORE the
-    // drain. With D1 the asking turn stays in flight for the whole wait, so a
-    // deploy during a question would otherwise eat the entire 30s drain and
-    // mark the inbound replay-pending mid-ask. Cancelling unblocks claude's
-    // ask so the cycle can end inside the drain; the boot-replay re-ask is the
-    // documented recovery path (design §3 D1 ask-wait semantics).
+    // Resolve open questions before provider settlement. Authorized deploys
+    // register the card edit and cancel the row without answering the retiring
+    // provider; ordinary stops keep the existing answer-and-await behavior.
     try {
       const openQuestions = questionStore.listOpen?.(BOT_NAME) || [];
-      for (const row of openQuestions) {
-        // eslint-disable-next-line no-await-in-loop
-        await questionHandlers.expireQuestion(row, {
-          status: 'cancelled',
-          message: 'Bot is restarting — this question was cancelled. It may be re-asked in a moment.',
-        }).catch(() => {});
+      if (continuationAuthorized) {
+        for (const row of openQuestions) {
+          questionHandlers.beginShutdownDisposition(row, {
+            message: 'Bot is restarting — this question was cancelled. It may be re-asked in a moment.',
+          });
+        }
+      } else {
+        for (const row of openQuestions) {
+          // eslint-disable-next-line no-await-in-loop
+          await questionHandlers.expireQuestion(row, {
+            status: 'cancelled',
+            message: 'Bot is restarting — this question was cancelled. It may be re-asked in a moment.',
+          }).catch(() => {});
+        }
       }
       if (openQuestions.length) {
         logEvent('shutdown-questions-cancelled', { count: openQuestions.length });
@@ -4619,13 +4630,15 @@ async function main() {
     // 2. Drain in-flight handlers. Wait for inFlightHandlers to empty or
     //    SHUTDOWN_DRAIN_MS to elapse. pm handlers resolve naturally when
     //    result events arrive; the dispatcher's .finally decrements.
-    const drainStart = Date.now();
-    while (inFlightHandlers.size > 0) {
-      if (Date.now() - drainStart >= SHUTDOWN_DRAIN_MS) break;
-      await new Promise((r) => setTimeout(r, 100));
+    let drainElapsed = 0;
+    if (!continuationAuthorized) {
+      const drainStart = Date.now();
+      while (inFlightHandlers.size > 0) {
+        if (Date.now() - drainStart >= SHUTDOWN_DRAIN_MS) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      drainElapsed = Date.now() - drainStart;
     }
-    const drainElapsed = Date.now() - drainStart;
-    const remaining = countInFlight(inFlightHandlers);
 
     // 3. A clean stop closes both output boundaries before persisting any
     //    recovery intent. The ProcessManager receipt is the only authority for
@@ -4636,11 +4649,25 @@ async function main() {
       ? 'provider-process-terminated'
       : null;
     let resumeIntents = [];
-    if (shutdownObservation?.detected !== true) {
+    if (shutdownObservation?.detected === true) {
+      try {
+        await settleCrashShutdown({
+          pm,
+          deliveryBarrier,
+          awaitIngressSettlement,
+          awaitHandlerSettlement,
+          settlementTimeoutMs: SHUTDOWN_DRAIN_MS,
+        });
+      } catch (err) {
+        console.error(`[shutdown] crash settlement failed: ${err.message}`);
+      }
+      pmRetired = true;
+    } else {
       try {
         const retirement = await prepareCleanRetirement({
           pm,
           deliveryBarrier,
+          awaitIngressSettlement,
           awaitHandlerSettlement,
           settlementTimeoutMs: SHUTDOWN_DRAIN_MS,
         });
@@ -4686,12 +4713,16 @@ async function main() {
           });
         }
       } catch (err) {
-        forceCrashReason = 'clean-retirement-failed';
+        forceCrashReason = err?.code === 'POLL_OFFSET_PERSISTENCE_FAILED'
+          ? 'poll-offset-persistence-failed'
+          : err?.code === 'POLL_SETTLEMENT_TIMEOUT'
+            ? 'poll-settlement-timeout'
+            : 'clean-retirement-failed';
         console.error(`[shutdown] clean retirement failed: ${err.message}`);
-        if (pm) await pm.shutdown().catch(() => {});
         pmRetired = true;
       }
     }
+    const remaining = countInFlight(inFlightHandlers);
 
     // 4. Persist only after the old delivery/process boundary is closed and
     //    every dispatcher-owned continuation has settled. Any uncertainty is

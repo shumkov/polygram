@@ -40,7 +40,7 @@ describe('shutdown signal-time sampling', () => {
     // giving in-flight handlers a chance to settle or fail first.
     const mustComeAfter = {
       'the isShuttingDown latch': 'isShuttingDown = true',
-      'refusing new inbound (bot._stop)': 'bot._stop()',
+      'refusing new inbound (stable polling controller)': 'stopPolling()',
       'cancelling open questions': 'expireQuestion',
       'the drain loop': 'const drainStart',
     };
@@ -73,10 +73,10 @@ describe('shutdown signal-time sampling', () => {
 
   test('the post-drain count is measured after the drain, not reused', () => {
     const body = shutdownBody();
-    const drain = body.indexOf('const drainStart');
+    const retire = body.indexOf('await prepareCleanRetirement({');
     const remaining = body.indexOf('const remaining = countInFlight(inFlightHandlers)');
     assert.notEqual(remaining, -1, 'post-drain in-flight count is missing');
-    assert.ok(remaining > drain, 'post-drain count must be taken after the drain loop');
+    assert.ok(remaining > retire, 'final in-flight count must be taken after clean retirement and handler settlement');
   });
 });
 
@@ -144,9 +144,32 @@ describe('clean restart lifecycle ordering', () => {
     }
   });
 
+  test('authorized deploy starts retirement without the legacy natural drain', () => {
+    const body = shutdownBody();
+    assert.match(
+      body,
+      /if \(!continuationAuthorized\) \{[\s\S]*?while \(inFlightHandlers\.size > 0\)[\s\S]*?\}/,
+      'only non-authorizing shutdowns may run the legacy natural-handler drain',
+    );
+    assert.match(
+      body,
+      /let drainElapsed = 0;[\s\S]*?if \(!continuationAuthorized\) \{[\s\S]*?drainElapsed = Date\.now\(\) - drainStart/,
+      'authorized shutdown must report zero legacy drain time',
+    );
+  });
+
+  test('authorized question cleanup never answers the retiring provider while signals retain normal expiry', () => {
+    const body = shutdownBody();
+    assert.match(
+      body,
+      /if \(continuationAuthorized\) \{[\s\S]*?beginShutdownDisposition[\s\S]*?\} else \{[\s\S]*?expireQuestion/,
+      'deploy-only question disposition must remain separate from ordinary signal expiry',
+    );
+  });
+
   test('fences inbound admission before delivery/process retirement and clean persistence', () => {
     const body = shutdownBody();
-    const stopInbound = body.indexOf('bot._stop()');
+    const stopInbound = body.indexOf('stopPolling()');
     const retire = body.indexOf('await prepareCleanRetirement({');
     const persist = body.indexOf('persistShutdownDisposition({');
     assert.notEqual(stopInbound, -1, 'Telegram intake fence is missing');
@@ -158,8 +181,27 @@ describe('clean restart lifecycle ordering', () => {
     );
     assert.match(
       body,
-      /prepareCleanRetirement\(\{[\s\S]{0,250}?deliveryBarrier,[\s\S]{0,250}?awaitHandlerSettlement,/,
-      'the retirement barrier must include reply delivery and handler settlement',
+      /prepareCleanRetirement\(\{[\s\S]{0,350}?deliveryBarrier,[\s\S]{0,350}?awaitIngressSettlement,[\s\S]{0,350}?awaitHandlerSettlement,/,
+      'the retirement barrier must include reply delivery, admitted ingress, and handler settlement',
+    );
+  });
+
+  test('constructs and uses a stable polling fence before pollBot can start', () => {
+    assert.match(
+      src,
+      /\(\{ pollBot, startPollWatchdog, stopPolling, awaitPollSettlement \} = createPollLoop\(/,
+      'poll admission and settlement controls must exist before pollBot starts',
+    );
+    const body = shutdownBody();
+    assert.match(
+      body,
+      /stopPolling\(\);[\s\S]{0,250}?const awaitIngressSettlement = \(\{ timeoutMs \} = \{\}\) => \([\s\S]{0,120}?awaitPollSettlement\(\{ timeoutMs \}\)/,
+      'shutdown must close the stable controller and preserve its settlement timeout',
+    );
+    assert.match(
+      body,
+      /err\?\.code === 'POLL_SETTLEMENT_TIMEOUT'[\s\S]{0,100}?poll-settlement-timeout/,
+      'uncertain ingress settlement must force an explicit crash-like disposition',
     );
   });
 
@@ -172,12 +214,24 @@ describe('clean restart lifecycle ordering', () => {
     assert.ok(retire < persist, 'clean retirement must finish before persistence');
     assert.match(
       body,
-      /prepareCleanRetirement\(\{[\s\S]{0,250}?awaitHandlerSettlement,/,
+      /prepareCleanRetirement\(\{[\s\S]{0,450}?awaitIngressSettlement,[\s\S]{0,250}?awaitHandlerSettlement,/,
     );
     assert.match(
       body,
       /if \(pm && !pmRetired\) await pm\.shutdown\(\)/,
       'a retired ProcessManager must not be shut down a second time',
+    );
+  });
+
+  test('OOM shutdown joins delivery, poll ingress, process teardown, and handlers before persistence', () => {
+    const body = shutdownBody();
+    const settle = body.indexOf('await settleCrashShutdown({');
+    const persist = body.indexOf('persistShutdownDisposition({');
+    assert.notEqual(settle, -1, 'crash/OOM settlement helper is missing');
+    assert.ok(settle < persist, 'crash/OOM branches must settle before persistence');
+    assert.match(
+      body,
+      /settleCrashShutdown\(\{[\s\S]{0,450}?deliveryBarrier,[\s\S]{0,450}?awaitIngressSettlement,[\s\S]{0,450}?awaitHandlerSettlement/,
     );
   });
 

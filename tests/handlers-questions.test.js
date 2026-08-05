@@ -10,6 +10,16 @@ const Database = require('better-sqlite3');
 const { createQuestionStore } = require('../lib/questions/store');
 const { createQuestionHandlers } = require('../lib/handlers/questions');
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 function migratedDb() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-'));
   const db = new Database(path.join(dir, 't.db'));
@@ -45,6 +55,9 @@ function harness(opts = {}) {
         sends += 1;
         if (opts.failSendAfter != null && sends > opts.failSendAfter) throw new Error('telegram send failed');
         return { message_id: ++nextMsgId };
+      }
+      if (method === 'editMessageText' && opts.editPromise) {
+        return opts.editPromise;
       }
       return { ok: true };
     },
@@ -175,6 +188,25 @@ describe('question handler — anti-hang on failures (review)', () => {
       assert.ok(H.answers.find((a) => a.tc === 'tc1' && a.result.timedout), 'claude answered {timedout}');
       assert.equal(H.store.getById(row.id).status, 'timeout');
       assert.ok(H.edits().some((e) => /timed out/i.test(e.params.text)), 'keyboard stripped with a notice');
+    } finally { H.db.close(); fs.rmSync(H.dir, { recursive: true, force: true }); }
+  });
+
+  test('authorized deploy cancellation registers the card edit without answering the retiring provider', async () => {
+    const edit = deferred();
+    const H = harness({ editPromise: edit.promise });
+    try {
+      await H.h.renderAsk({ sessionKey: 's:1', chatId: '100', toolCallId: 'tc1', questions: SINGLE });
+      const row = H.store.getOpenForSession('s:1');
+      const editing = H.h.beginShutdownDisposition(row, {
+        message: 'Bot is restarting — this question was cancelled.',
+      });
+
+      assert.equal(H.store.getById(row.id).status, 'cancelled');
+      assert.deepEqual(H.answers, [], 'the old provider must not resume from a synthetic cancellation answer');
+      assert.equal(H.edits().length, 1, 'the already-admitted card edit is registered immediately');
+
+      edit.resolve({ ok: true });
+      await editing;
     } finally { H.db.close(); fs.rmSync(H.dir, { recursive: true, force: true }); }
   });
 });

@@ -4,6 +4,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   prepareCleanRetirement,
+  settleCrashShutdown,
   buildResumeIntents,
 } = require('../lib/ops/clean-shutdown');
 
@@ -53,11 +54,15 @@ describe('clean shutdown retirement boundary', () => {
     const awaitHandlerSettlement = async () => {
       sequence.push('handlers-settled');
     };
+    const awaitIngressSettlement = async () => {
+      sequence.push('ingress-settled');
+    };
 
     let finished = false;
     const preparing = prepareCleanRetirement({
       pm,
       deliveryBarrier: barrier,
+      awaitIngressSettlement,
       awaitHandlerSettlement,
       settlementTimeoutMs: 1234,
     }).then((value) => {
@@ -79,6 +84,7 @@ describe('clean shutdown retirement boundary', () => {
     assert.deepEqual(sequence, [
       'delivery-fenced',
       'process-fenced',
+      'ingress-settled',
       'handlers-settled',
     ]);
     assert.deepEqual(result.snapshots, [{
@@ -88,24 +94,36 @@ describe('clean shutdown retirement boundary', () => {
     }]);
   });
 
-  test('retirement failure prevents handler settlement and clean persistence inputs', async () => {
-    let settled = false;
+  test('retirement failure joins delivery, fallback teardown, ingress, and handlers before rejecting clean persistence inputs', async () => {
+    const sequence = [];
     await assert.rejects(
       () => prepareCleanRetirement({
         pm: {
           retireForCleanRestart: async () => {
+            sequence.push('retirement-failed');
             throw new Error('tmux termination uncertain');
           },
+          shutdown: async () => { sequence.push('fallback-shutdown'); },
         },
         deliveryBarrier: {
-          fenceAndDrain: async () => ({ pending: 0 }),
+          fenceAndDrain: async () => {
+            sequence.push('delivery-settled');
+            return { pending: 0 };
+          },
           inspect: () => ({ outputAttempted: false, pending: 0, fenced: true }),
         },
-        awaitHandlerSettlement: async () => { settled = true; },
+        awaitIngressSettlement: async () => { sequence.push('ingress-settled'); },
+        awaitHandlerSettlement: async () => { sequence.push('handlers-settled'); },
       }),
       /termination uncertain/,
     );
-    assert.equal(settled, false);
+    assert.deepEqual(sequence, [
+      'delivery-settled',
+      'retirement-failed',
+      'fallback-shutdown',
+      'ingress-settled',
+      'handlers-settled',
+    ]);
   });
 
   test('handler settlement timeout rejects clean retirement snapshots', async () => {
@@ -125,6 +143,7 @@ describe('clean shutdown retirement boundary', () => {
           fenceAndDrain: async () => ({ pending: 0 }),
           inspect: () => ({ outputAttempted: false, pending: 0, fenced: true }),
         },
+        awaitIngressSettlement: async () => {},
         awaitHandlerSettlement: async () => { throw timeout; },
       }),
       (error) => error?.code === 'HANDLER_SETTLEMENT_TIMEOUT',
@@ -139,10 +158,80 @@ describe('clean shutdown retirement boundary', () => {
           fenceAndDrain: async () => ({ pending: 0 }),
           inspect: () => ({ outputAttempted: false, pending: 0, fenced: true }),
         },
+        awaitIngressSettlement: async () => {},
         awaitHandlerSettlement: async () => {},
       }),
       /retireForCleanRestart/,
     );
+  });
+});
+
+describe('crash shutdown settlement boundary', () => {
+  test('fences delivery and stops providers together, then joins ingress and handlers', async () => {
+    const sequence = [];
+    const delivery = deferred();
+    const shutdown = deferred();
+
+    let finished = false;
+    const settling = settleCrashShutdown({
+      pm: {
+        shutdown() {
+          sequence.push('process-stopped');
+          return shutdown.promise;
+        },
+      },
+      deliveryBarrier: {
+        fenceAndDrain() {
+          sequence.push('delivery-fenced');
+          return delivery.promise;
+        },
+      },
+      awaitIngressSettlement: async () => { sequence.push('ingress-settled'); },
+      awaitHandlerSettlement: async () => { sequence.push('handlers-settled'); },
+      settlementTimeoutMs: 4321,
+    }).then(() => { finished = true; });
+
+    assert.deepEqual(sequence, ['delivery-fenced', 'process-stopped']);
+    delivery.resolve({ pending: 0 });
+    await Promise.resolve();
+    assert.equal(finished, false);
+    shutdown.resolve();
+
+    await settling;
+    assert.deepEqual(sequence, [
+      'delivery-fenced',
+      'process-stopped',
+      'ingress-settled',
+      'handlers-settled',
+    ]);
+  });
+
+  test('joins ingress and handlers before reporting a provider shutdown failure', async () => {
+    const sequence = [];
+
+    await assert.rejects(
+      () => settleCrashShutdown({
+        pm: {
+          shutdown: async () => {
+            sequence.push('process-failed');
+            throw new Error('provider shutdown failed');
+          },
+        },
+        deliveryBarrier: {
+          fenceAndDrain: async () => { sequence.push('delivery-settled'); },
+        },
+        awaitIngressSettlement: async () => { sequence.push('ingress-settled'); },
+        awaitHandlerSettlement: async () => { sequence.push('handlers-settled'); },
+      }),
+      /provider shutdown failed/,
+    );
+
+    assert.deepEqual(sequence, [
+      'delivery-settled',
+      'process-failed',
+      'ingress-settled',
+      'handlers-settled',
+    ]);
   });
 });
 
