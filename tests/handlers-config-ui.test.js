@@ -250,12 +250,24 @@ describe('buildConfigKeyboard', () => {
   });
 
   test('Codex card intersects the authenticated catalog with the compact product model set', () => {
+    const catalogByModel = new Map(
+      CODEX_VIEW.models.map((entry) => [entry.model, entry]),
+    );
+    const shuffledRuntimeView = {
+      ...CODEX_VIEW,
+      models: [
+        catalogByModel.get('gpt-5.6-luna'),
+        catalogByModel.get('gpt-5.5'),
+        catalogByModel.get('gpt-5.6-sol'),
+        catalogByModel.get('gpt-5.6-terra'),
+      ],
+    };
     const kb = buildConfigKeyboard({
       model: 'sonnet',
       effort: 'max',
       codexModel: 'gpt-5.6-sol',
       codexEffort: 'xhigh',
-    }, 'all', null, false, CODEX_VIEW);
+    }, 'all', null, false, shuffledRuntimeView);
     assert.deepEqual(
       kb.inline_keyboard[1].map((button) => button.callback_data),
       [
@@ -264,7 +276,10 @@ describe('buildConfigKeyboard', () => {
         'cfg:model:gpt-5.6-luna',
       ],
     );
-    assert.match(kb.inline_keyboard[1][0].text, /^✓ GPT-5\.6 SOL$/);
+    assert.deepEqual(
+      kb.inline_keyboard[1].map((button) => button.text),
+      ['✓ Sol', 'Terra', 'Luna'],
+    );
     assert.deepEqual(
       kb.inline_keyboard[2].map((button) => button.callback_data),
       ['cfg:effort:high', 'cfg:effort:xhigh'],
@@ -398,6 +413,21 @@ describe('createFormatConfigInfoText', () => {
     assert.match(out, /\*\*Effort\*\*/);
   });
 
+  test('Claude card keeps the compact model and effort guide', () => {
+    const fmt = buildFormat();
+    const out = fmt({ model: 'sonnet', effort: 'medium' }, 'all', 'sk');
+
+    assert.match(out, /🧠 \*\*opus\*\* — deepest reasoning/);
+    assert.match(out, /🤖 \*\*sonnet\*\* — balanced default/);
+    assert.match(out, /⚡ \*\*haiku\*\* — fastest/);
+    assert.match(
+      out,
+      /\*\*low\*\* · \*\*medium\*\* · \*\*high\*\* · \*\*xhigh\*\* · \*\*max\*\*/,
+    );
+    assert.match(out, /Higher values allow more reasoning when needed\./);
+    assert.doesNotMatch(out, /~1\.7× sonnet cost/);
+  });
+
   test('async runtime resolver still decides which help blocks the card gets', async () => {
     const calls = [];
     const fmt = createFormatConfigInfoText({
@@ -441,18 +471,21 @@ describe('createFormatConfigInfoText', () => {
     // The runtime view still decides Codex-vs-Claude: the beta warning and the
     // authenticated model catalog are Codex-only, and the Claude help must not
     // leak into a Codex card.
-    assert.match(out, /Native Codex beta/);
+    assert.match(out, /_Codex beta:/);
     assert.doesNotMatch(out, /macOS/);
-    assert.match(out, /network and web search are disabled/);
-    assert.match(out, /Product MCP tools and interactive approvals are unavailable/);
-    assert.match(out, /Detached\/background servers are unsupported/);
+    assert.match(out, /no command network, web search, product MCP tools/);
+    assert.match(out, /or interactive approvals\./);
     assert.match(
       out,
-      /Native goals are disabled for Polygram-managed Codex sessions until native goal support is implemented/,
+      /Detached\/background servers are unsupported and may survive hard runtime loss\./,
     );
-    assert.match(out, /\*\*gpt-5\.6-sol\*\* — GPT-5\.6 SOL/);
-    assert.doesNotMatch(out, /GPT-5\.5/);
-    assert.doesNotMatch(out, /deep analysis, code refactor/);
+    assert.match(out, /Native goals are currently disabled/);
+    assert.match(out, /\*\*Sol\*\* — gpt-5\.6-sol/);
+    assert.match(out, /\*\*Effort for Sol\*\*/);
+    assert.match(out, /\*\*high\*\* · \*\*xhigh\*\*/);
+    assert.match(out, /Changes apply on the next turn; an active turn is unchanged\./);
+    assert.doesNotMatch(out, /gpt-5\.5/i);
+    assert.doesNotMatch(out, /deepest reasoning/);
     assertNoTechnicalLines(out);
   });
 
@@ -476,7 +509,7 @@ describe('createFormatConfigInfoText', () => {
         }),
       });
       assert.match(out, /^⚙️ Settings/);
-      assert.match(out, /Native Codex beta/);
+      assert.match(out, /_Codex beta:/);
       assert.doesNotMatch(out, /containment/, 'the unavailable reason was card copy');
       assert.doesNotMatch(out, /not loaded; its next message may be busy/);
       assert.doesNotMatch(out, /Saved selection awaiting live reconciliation/);
@@ -531,6 +564,32 @@ describe('createFormatConfigInfoText', () => {
     assert.doesNotMatch(out, /\bnull\/null\b/);
     assert.doesNotMatch(out, /incomplete Codex selection/);
     assertNoTechnicalLines(out);
+  });
+
+  test('Codex card distinguishes an unavailable curated set from failed preflight', () => {
+    const fmt = buildFormat();
+    const legacyModel = CODEX_VIEW.models.find(
+      (entry) => entry.model === 'gpt-5.5',
+    );
+    const out = fmt({
+      codexModel: 'gpt-5.5',
+      codexEffort: 'medium',
+    }, 'all', '42', null, false, {
+      ...CODEX_VIEW,
+      model: 'gpt-5.5',
+      effort: 'medium',
+      models: [legacyModel],
+      efforts: legacyModel.supportedReasoningEfforts,
+    });
+
+    assert.match(
+      out,
+      /Sol, Terra, and Luna are unavailable for this account\./,
+    );
+    assert.doesNotMatch(out, /Models are unavailable until Codex preflight/);
+    assert.match(out, /\*\*Effort for gpt-5\.5\*\*/);
+    assert.match(out, /\*\*medium\*\* · \*\*high\*\*/);
+    assert.doesNotMatch(out, /\*\*xhigh\*\*/);
   });
 });
 
