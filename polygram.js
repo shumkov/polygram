@@ -39,6 +39,8 @@ const {
   parseSystemdInvocationId,
   lifecycleDetail,
 } = require('./lib/ops/systemd-invocation');
+const { createDaemonIdentity } = require('./lib/ops/daemon-identity');
+const packageMetadata = require('./package.json');
 const { filterAttachments, resolveFileCaps, resolveMaxFileOverride, MAX_TOTAL_BYTES } = require('./lib/attachments');
 // 0.9.0: SDK ProcessManager is the only pm. CLI pm
 // (lib/process-manager.js) deleted in commit 6.
@@ -3546,6 +3548,10 @@ let awaitPollSettlement = null;
 // ─── Main ───────────────────────────────────────────────────────────
 
 async function main() {
+  const daemonIdentity = createDaemonIdentity({
+    mainPath: __filename,
+    packageVersion: packageMetadata.version,
+  });
   const cgroupOomObserver = createCgroupOomObserver();
   const invocationId = parseSystemdInvocationId();
   let abnormalProviderTermination = null;
@@ -3790,7 +3796,7 @@ async function main() {
     db.logEvent('polygram-start', lifecycleDetail({
       migration: migration.reason,
       imported: migration.imported,
-    }, invocationId));
+    }, invocationId, daemonIdentity));
     if (cgroupOomObserver.startup.status === 'unavailable') {
       console.warn(`[oom-observer] unavailable (${cgroupOomObserver.startup.reason}); handled shutdown signals will retain clean-restart behavior`);
       db.logEvent('oom-observer-unavailable', { reason: cgroupOomObserver.startup.reason });
@@ -4763,7 +4769,7 @@ async function main() {
             ? restartRequestId
             : null,
           ...(res.oomKillDelta != null ? { oom_kill_delta: res.oomKillDelta } : {}),
-        }, invocationId));
+        }, invocationId, daemonIdentity));
         console.log(`[shutdown] ${res.clean ? 'clean' : 'crash-like'} shutdown recorded (${res.shutdownReason}); ${inFlightAtSignal} in-flight at signal, drained ${drainElapsed}ms, ${remaining} still in-flight, ${res.replayMarked} marked replay-pending`);
       } catch (err) {
         console.error(`[shutdown] persistence failed: ${err.message}`);
@@ -4797,7 +4803,7 @@ async function main() {
     if (pm && !pmRetired) await pm.shutdown().catch(() => {});
     if (db) {
       try {
-        db.logEvent('polygram-stop', lifecycleDetail({}, invocationId));
+        db.logEvent('polygram-stop', lifecycleDetail({}, invocationId, daemonIdentity));
         db.raw.close();
       } catch {}
     }
@@ -4833,6 +4839,7 @@ async function main() {
       secret: ipcSecret,
       handlers: createIpcHandlers({
         botName: BOT_NAME,
+        daemonIdentity,
         getInFlightHandlers: () => inFlightHandlers,
         handleSendOverIpc: (req) => handleSendOverIpc(req),
         requestDeployRestart: (req) => {
@@ -5368,7 +5375,7 @@ async function main() {
 
   logEvent('polygram-admission-open', lifecycleDetail({
     bot: BOT_NAME,
-  }, invocationId));
+  }, invocationId, daemonIdentity));
   console.log(`[${BOT_NAME}] Starting...`);
   const pollPromise = pollBot(bot).catch(err => {
     console.error(`[${BOT_NAME}] Fatal:`, err.message);

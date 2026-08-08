@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Quick IPC round-trip probe.
- * Usage: node scripts/ipc-smoke.js <bot-name> [busy|restart] [restart-request-id]
+ * Usage: node scripts/ipc-smoke.js <bot-name> [busy|identity|restart] [restart-request-id]
  */
 
 const crypto = require('node:crypto');
@@ -13,6 +13,9 @@ const {
 function restartRequestId(value) {
   return requireRestartRequestId(value || crypto.randomUUID());
 }
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const SHA256_RE = /^[0-9a-f]{64}$/;
 
 (async () => {
   const bot = process.argv[2] || 'shumabit';
@@ -67,12 +70,44 @@ function restartRequestId(value) {
     return;
   }
 
+  if (command === 'identity') {
+    const result = await call({
+      path,
+      op: 'identity',
+      secret: readSecret(bot),
+      connectTimeoutMs: 5_000,
+      callTimeoutMs: 5_000,
+    });
+    if (
+      result.ok !== true
+      || result.bot !== bot
+      || !Number.isSafeInteger(result.pid)
+      || result.pid <= 1
+      || !UUID_RE.test(result.daemon_instance_id)
+      || typeof result.package_version !== 'string'
+      || result.package_version.length === 0
+      || result.package_version.length > 128
+      || !SHA256_RE.test(result.main_realpath_sha256)
+    ) {
+      throw new Error('invalid daemon identity response');
+    }
+    console.log(JSON.stringify({
+      bot: result.bot,
+      pid: result.pid,
+      daemon_instance_id: result.daemon_instance_id,
+      package_version: result.package_version,
+      main_realpath_sha256: result.main_realpath_sha256,
+    }));
+    return;
+  }
+
   console.log('path:', path);
   console.log('ping:', JSON.stringify(await call({ path, op: 'ping' })));
   console.log('DONE');
 })().catch((err) => {
-  const message = process.argv[3] === 'busy'
-    ? 'busy request failed'
+  const command = process.argv[3];
+  const message = command === 'busy' || command === 'identity'
+    ? `${command} request failed`
     : err.message;
   console.error('ERR:', message);
   process.exit(1);

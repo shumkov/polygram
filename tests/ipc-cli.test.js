@@ -35,6 +35,7 @@ async function startProductionServer({
   runtimeDir,
   inFlightHandlers,
   requestDeployRestart,
+  daemonIdentity,
 }) {
   const options = {
     cwd: path.dirname(runtimeDir),
@@ -45,6 +46,7 @@ async function startProductionServer({
     path: ipcServer.socketPathFor(bot, options),
     handlers: createIpcHandlers({
       botName: bot,
+      daemonIdentity,
       getInFlightHandlers: () => inFlightHandlers,
       handleSendOverIpc: async () => ({}),
       requestDeployRestart,
@@ -117,6 +119,35 @@ describe('polygram-ipc operator CLI', () => {
         '',
       ].join('\n'),
     );
+  });
+
+  test('identity prints one bounded content-free readiness object', async () => {
+    const bot = 'ops';
+    const { elsewhere, runtimeDir } = createFixture();
+    const daemonIdentity = Object.freeze({
+      pid: 4242,
+      daemon_instance_id: 'e565dbae-44cf-4fc0-b7df-91ee3305e588',
+      package_version: '0.38.1',
+      main_realpath_sha256: 'a'.repeat(64),
+    });
+    await startProductionServer({
+      bot,
+      runtimeDir,
+      daemonIdentity,
+      inFlightHandlers: new Map(),
+    });
+
+    const { stdout, stderr } = await runCli([bot, 'identity'], {
+      cwd: elsewhere,
+      runtimeDir,
+    });
+
+    assert.equal(stderr, '');
+    assert.equal(stdout, `${JSON.stringify({ bot, ...daemonIdentity })}\n`);
+    assert.doesNotMatch(stdout, /socket|session|message/i);
+    assert.doesNotMatch(stdout, new RegExp(runtimeDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.doesNotMatch(stdout, new RegExp(elsewhere.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.ok(Buffer.byteLength(stdout) < 512);
   });
 
   test('restart generates one opaque request ID and proves the echoed response', async () => {

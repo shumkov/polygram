@@ -118,6 +118,42 @@ describe('ipc round-trip', () => {
     assert.equal(res.bot, 'shumabit');
   });
 
+  test('identity op returns only content-free daemon readiness fields', async () => {
+    const daemonIdentity = Object.freeze({
+      pid: 4242,
+      daemon_instance_id: 'e565dbae-44cf-4fc0-b7df-91ee3305e588',
+      package_version: '0.38.1',
+      main_realpath_sha256: 'a'.repeat(64),
+    });
+    await startServer(createIpcHandlers({
+      botName: 'shumabit',
+      daemonIdentity,
+      getInFlightHandlers: () => new Map(),
+      handleSendOverIpc: async () => ({}),
+    }));
+
+    const res = await ipcClient.call({ path: sockPath, op: 'identity' });
+
+    assert.deepEqual(res, {
+      id: null,
+      ok: true,
+      bot: 'shumabit',
+      ...daemonIdentity,
+    });
+    assert.deepEqual(
+      Object.keys(res).sort(),
+      [
+        'bot',
+        'daemon_instance_id',
+        'id',
+        'main_realpath_sha256',
+        'ok',
+        'package_version',
+        'pid',
+      ],
+    );
+  });
+
   test('deploy restart op directly invokes the daemon restart request', async () => {
     const calls = [];
     await startServer(createIpcHandlers({
@@ -511,5 +547,46 @@ describe('ipc auth (rc.69)', () => {
     });
     assert.equal(res.ok, true);
     assert.deepEqual(res.result, { ok: 1 });
+  });
+
+  test('daemon identity requires the current secret while ping stays public', async () => {
+    const daemonIdentity = Object.freeze({
+      pid: 4242,
+      daemon_instance_id: 'e565dbae-44cf-4fc0-b7df-91ee3305e588',
+      package_version: '0.38.1',
+      main_realpath_sha256: 'a'.repeat(64),
+    });
+    await startWithSecret(createIpcHandlers({
+      botName: 'shumabit',
+      daemonIdentity,
+      getInFlightHandlers: () => new Map(),
+      handleSendOverIpc: async () => ({}),
+    }), 's3cret');
+
+    const missing = await ipcClient.call({ path: sockPath, op: 'identity' });
+    const bad = await ipcClient.call({
+      path: sockPath,
+      op: 'identity',
+      secret: 'wrong',
+    });
+    const ping = await ipcClient.call({ path: sockPath, op: 'ping' });
+    const identity = await ipcClient.call({
+      path: sockPath,
+      op: 'identity',
+      secret: 's3cret',
+    });
+
+    assert.deepEqual({ ok: missing.ok, error: missing.error }, { ok: false, error: 'auth' });
+    assert.deepEqual({ ok: bad.ok, error: bad.error }, { ok: false, error: 'auth' });
+    assert.deepEqual(
+      { ok: ping.ok, pong: ping.pong, bot: ping.bot },
+      { ok: true, pong: true, bot: 'shumabit' },
+    );
+    assert.deepEqual(identity, {
+      id: null,
+      ok: true,
+      bot: 'shumabit',
+      ...daemonIdentity,
+    });
   });
 });

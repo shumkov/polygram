@@ -60,7 +60,7 @@ describe('shutdown signal-time sampling', () => {
     // actually cost versus how much the drain managed to finish.
     assert.match(body, /logEvent\('shutdown-drain', lifecycleDetail\(\{[\s\S]*?in_flight: remaining,/);
     assert.match(body, /logEvent\('shutdown-drain', lifecycleDetail\(\{[\s\S]*?in_flight_at_signal: inFlightAtSignal,/);
-    assert.match(body, /\}, invocationId\)\)/);
+    assert.match(body, /\}, invocationId, daemonIdentity\)\)/);
   });
 
   test('reports restart authorization and committed intent count in lifecycle evidence', () => {
@@ -302,6 +302,41 @@ describe('ipc handler wiring', () => {
     // would silently stop covering what a running daemon actually answers.
     assert.match(src, /handlers: createIpcHandlers\(\{/);
     assert.match(src, /getInFlightHandlers: \(\) => inFlightHandlers/);
+  });
+
+  test('one per-boot identity is created before DB or IPC and reaches every lifecycle witness', () => {
+    const createIdentity = src.indexOf('const daemonIdentity = createDaemonIdentity({');
+    const openDb = src.indexOf('db = dbClient.open(DB_PATH)');
+    const startIpc = src.indexOf('ipcCloser = await ipcServer.start({');
+    assert.ok(createIdentity >= 0, 'daemon identity is not created during boot');
+    assert.ok(createIdentity < openDb, 'daemon identity must exist before the DB opens');
+    assert.ok(createIdentity < startIpc, 'daemon identity must exist before IPC starts');
+    assert.match(
+      src.slice(createIdentity, createIdentity + 300),
+      /mainPath: __filename,[\s\S]*?packageVersion: packageMetadata\.version,/,
+      'daemon identity must describe the real production entrypoint and installed package',
+    );
+
+    for (const kind of [
+      'polygram-start',
+      'shutdown-drain',
+      'polygram-stop',
+      'polygram-admission-open',
+    ]) {
+      const event = src.indexOf(`'${kind}'`);
+      assert.notEqual(event, -1, `${kind} event is missing`);
+      assert.match(
+        src.slice(event, event + 1_200),
+        /\}, invocationId, daemonIdentity\)\)/,
+        `${kind} must include the per-boot identity and PID`,
+      );
+    }
+
+    assert.match(
+      src.slice(startIpc, startIpc + 1_500),
+      /createIpcHandlers\(\{[\s\S]*?daemonIdentity,/,
+      'authenticated IPC readiness must use the same per-boot identity',
+    );
   });
 });
 
