@@ -286,10 +286,10 @@ Replace the all-in-one production mutation with explicit phases:
   continuation, and zero fallback/replay notices. It prints booleans and
   counts, not identifiers or bodies.
 - aged-warm Codex canary mode: write a distinct same-version receipt only when
-  metadata binds an unrelated Codex generation that was continuously warm and
-  idle for at least six hours, had no active turn or background ownership, and
-  was retired while a second exact Codex session passed foreground
-  continuation.
+  metadata binds an unrelated Codex generation that remained the same live,
+  idle generation for at least six hours, had no active turn or background
+  ownership, and was retired while an exact foreground Claude session passed
+  continuation. Foreground Codex continuation remains a separate receipt.
 - `--vps-only`: require the exact published version plus same-version passing
   local Claude, foreground Codex, and aged-warm Codex receipts before checking
   the split-owner topology or mutating the shared VPS tree. Then retain the
@@ -297,15 +297,90 @@ Replace the all-in-one production mutation with explicit phases:
   UMI-Assistant-second daemon-owned IPC flow and Water/tmux invariants.
 
 The active-turn design's aged-warm-session canary remains a release
-qualification: an unrelated Codex session must have been warm and idle for at
-least six hours while a second session is the foreground continuation target.
-If that gate is not yet mature, the local release may remain installed for the
-observation window, but the partner VPS phase remains blocked.
+qualification. The daemon's single Orchestra `ProcessManager` deliberately
+permits only one live native Codex generation, so two simultaneously warm
+Codex sessions are not a representable production state. The aged-warm gate
+therefore reproduces the actual cross-provider blocker: one unrelated Codex
+session remains warm and
+idle for at least six hours while a Claude session is the foreground
+continuation target. The separate foreground-Codex receipt proves the Codex
+resume path without weakening the daemon-wide ownership fence. If the
+aged-warm gate is not yet mature, the local release may remain installed for
+the observation window, but the partner VPS phase remains blocked.
+
+The aged-warm proof needs two content-free observations, at least six hours
+apart, from the same daemon instance and the same live Codex generation. Both
+must report idle state, zero active turns, zero pending delivery work, and an
+empty background-terminal registry. Orchestra maintains a monotonic
+per-generation activity epoch, incremented synchronously before every admitted
+send/steer and whenever provider background ownership becomes active. The
+epoch must be unchanged between observations, and durable generation metadata
+must also show no turn attempt, reservation, checkpoint, or state transition.
+This closes the pre-checkpoint turn-start failure case that database evidence
+alone cannot observe.
+
+The first observation is a standalone authenticated read. The second is not:
+the helper passes the expected generation digest and activity epoch with its
+one `deploy_restart` request, and Orchestra repeats the read-only observation
+inside clean retirement after daemon-wide lifecycle admission is closed but
+before any process is retired. Polygram records a content-free
+`clean-restart-qualification-observed` event for that fenced result. Its exact,
+closed schema contains the restart-request digest, old daemon instance, package
+version, observation time, generation digest, expected and observed activity
+epochs, enum-only state, the same readiness/background counts, an exact-match
+boolean, and a bounded outcome code. It contains no raw provider error or
+identity field. Require exactly one request/instance-matching event in the
+fixed lifecycle interval and bind the receipt to that event cursor. A mismatch
+does not retry the request or reopen admission; the restart proceeds safely but
+the aged-warm gate fails. The result must show exact zero-work Codex retirement
+and no Codex continuation intent while the bounded foreground-Claude lifecycle
+and the generation's terminal retirement bind the idle process to that restart.
+
+To make those observations exact, add a lifecycle-fenced, read-only Orchestra
+inspection method. It validates that the selected generation is still current
+and idle, calls `thread/backgroundTerminals/list` without cleaning or otherwise
+mutating provider state, and checks the exact process, lease, generation,
+lifecycle, and activity epoch again after the asynchronous read. A nonzero
+count or non-null pagination cursor is nonempty. Expose that
+method through an authenticated Polygram IPC operation that accepts no
+chat/session selector. The daemon-wide single live Codex generation is the
+only possible target. Its exact, closed response schema contains bot, daemon
+instance, package version, observation time, a SHA-256 generation digest,
+bounded monotonic activity epoch, enum-only process state, and the active-turn,
+pending-delivery, background-owner, and background-terminal counts/booleans.
+It never returns a
+chat/session identity, raw generation, provider handle, thread ID, command,
+working directory, or filesystem path. Unknown fields, incomplete pagination,
+generation/lifecycle drift, and unsanitized provider failures all fail with a
+bounded code.
+
+The helper compares the generation digest across observations and against the
+internally hashed durable generation. Its 0600 receipt includes the digest,
+activity epoch, daemon instance, package version, observation times/cursors,
+exact counts, and the foreground-Claude receipt/restart-request digest it
+qualifies. The receipt
+schema is closed and versioned; file presence or a same-version string alone is
+never sufficient.
+
+Foreground qualification also records one content-free
+`clean-resume-continuation-dispatched` event from the existing `onDispatched`
+boundary. It carries the existing content-free correlation tuple (`bot`,
+`session_key`, `source_message_id`, `policy_version`) plus enum-only `provider`
+and `command_kind=continue`; it never carries prompt or reply content. The
+canary requires exactly one matching tuple in the ordered
+claim/attestation/dispatch/success chain and rejects interleaved or duplicate
+dispatches. That chain is bounded by the one request-bound lifecycle interval,
+proving the production run crossed the hard-coded literal `continue` dispatch
+once instead of inferring it from terminal success alone.
 
 ### 7. Release integration
 
 Orchestra 0.10.15 is already published from reviewed main through the signed
-tag and GitHub OIDC. Integrate the Polygram implementation onto current 0.38.0
+tag and GitHub OIDC. Release the smallest follow-up Orchestra patch containing
+the read-only qualification inspection, per-generation activity-epoch
+instrumentation, and the admission-closed pre-retirement qualification
+hook/result, then pin that exact published version in Polygram. Integrate the
+Polygram implementation onto current 0.38.0
 main, preserve the unrelated rich-text changes, and release the next patch.
 Install Orchestra from the clean registry, verify the exact manifest/lockfile
 resolution and integrity, then run both full suites before tagging Polygram.
@@ -391,10 +466,17 @@ the unfixed sources, then passing after the implementation.
 6. Plist tests require unconditional `KeepAlive=true`; `plutil -lint` passes.
    Definition fixtures cover exact label/path/program/full argv/cwd matching.
 7. Canary-verifier tests prove provider/name/request/version binding, one
-   logical success, zero notices, and content-free output for Claude and Codex.
-   A separate receipt test requires the unrelated generation's six-hour age,
-   continuous idle state, zero active/background ownership, and same-version
-   foreground Codex proof; `--vps-only` rejects its absence.
+   literal-continuation dispatch, one logical success, zero notices, and
+   content-free output for Claude and Codex. A separate receipt test requires
+   two same-daemon/same-generation observations at least six hours apart, no
+   intervening generation activity, continuous idle state, zero
+   active/background ownership, and same-version foreground Claude proof;
+   `--vps-only` rejects its absence. Orchestra tests prove the background
+   registry inspection is read-only and fails if the process generation or
+   lifecycle/activity epoch changes during the observation. They also prove a
+   pre-checkpoint send failure increments the epoch, background activation
+   invalidates an observation, and the final observation runs after global
+   admission closure but before the first process retirement.
 8. Full shared-skill tests, `bash -n`, Node syntax checks, and shared-skill
    frontmatter validation pass with every skip reported.
 9. Polygram and Orchestra full suites pass after current-main integration and
@@ -422,6 +504,7 @@ the unfixed sources, then passing after the implementation.
 - Local qualification finishes before either VPS package tree changes.
 - Local, Shumabit, and UMI Assistant require daemon-owned, request-bound
   authorized lifecycle proof.
-- The tagged Polygram artifact contains the exact published Orchestra 0.10.15
-  dependency.
+- The tagged Polygram artifact contains the exact reviewed follow-up Orchestra
+  patch that adds the qualification inspection, monotonic activity-epoch
+  fence, and admission-closed pre-retirement qualification result.
 - Background preservation remains postponed and is not claimed.
