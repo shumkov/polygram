@@ -144,6 +144,41 @@ describe('clean restart lifecycle ordering', () => {
     }
   });
 
+  test('qualified deploy forwards one closed fence while routine deploy remains unchanged', () => {
+    const body = shutdownBody();
+    assert.match(
+      src,
+      /const qualificationExpectation = normalizeDeployQualificationExpectation\(req\)/,
+      'the authenticated deploy request must be reduced to the closed qualification fence',
+    );
+    assert.match(
+      body,
+      /const shutdown = async \(\{[\s\S]{0,180}?qualificationExpectation,[\s\S]*?prepareCleanRetirement\(\{[\s\S]{0,500}?qualificationExpectation,/,
+      'the shutdown must forward the normalized fence into clean retirement',
+    );
+  });
+
+  test('logs exactly one bounded qualification result before any retirement snapshot', () => {
+    const body = shutdownBody();
+    const retirement = body.indexOf('const retirement = await prepareCleanRetirement({');
+    const qualificationEvent = body.indexOf("logEvent('clean-restart-qualification-observed'", retirement);
+    const snapshots = body.indexOf("logEvent('clean-retirement-snapshot'", retirement);
+    assert.notEqual(retirement, -1, 'clean retirement call is missing');
+    assert.notEqual(qualificationEvent, -1, 'qualification event is missing');
+    assert.notEqual(snapshots, -1, 'retirement snapshot event is missing');
+    assert.ok(retirement < qualificationEvent && qualificationEvent < snapshots);
+    assert.equal(
+      body.match(/logEvent\('clean-restart-qualification-observed'/g)?.length,
+      1,
+      'shutdown must have one qualification event call site',
+    );
+    assert.match(
+      body.slice(retirement, snapshots),
+      /if \(qualificationExpectation !== undefined\) \{[\s\S]*?buildQualificationEvent\(/,
+      'routine deploys must not emit a qualification result',
+    );
+  });
+
   test('authorized deploy starts retirement without the legacy natural drain', () => {
     const body = shutdownBody();
     assert.match(

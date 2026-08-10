@@ -375,13 +375,12 @@ once instead of inferring it from terminal success alone.
 
 ### 7. Release integration
 
-Orchestra 0.10.15 is already published from reviewed main through the signed
-tag and GitHub OIDC. Release the smallest follow-up Orchestra patch containing
-the read-only qualification inspection, per-generation activity-epoch
-instrumentation, and the admission-closed pre-retirement qualification
-hook/result, then pin that exact published version in Polygram. Integrate the
-Polygram implementation onto current 0.38.0
-main, preserve the unrelated rich-text changes, and release the next patch.
+Orchestra 0.10.16 is published from reviewed main through a signed tag and
+GitHub OIDC. It contains the read-only qualification inspection,
+per-generation activity-epoch instrumentation, and the admission-closed
+pre-retirement qualification hook/result. Pin that exact published version in
+Polygram. Integrate the Polygram implementation onto current 0.38.0 main,
+preserve the unrelated rich-text changes, and release the next patch.
 Install Orchestra from the clean registry, verify the exact manifest/lockfile
 resolution and integrity, then run both full suites before tagging Polygram.
 

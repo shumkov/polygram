@@ -34,6 +34,10 @@ const { createIpcHandlers } = require('./lib/ipc/handlers');
 const {
   requireRestartRequestId,
 } = require('./lib/ipc/restart-request-id');
+const {
+  buildQualificationEvent,
+  normalizeDeployQualificationExpectation,
+} = require('./lib/ops/clean-restart-qualification');
 const { classifyOrphanSweep } = require('./lib/ops/tmux-preflight');
 const {
   parseSystemdInvocationId,
@@ -4542,6 +4546,7 @@ async function main() {
     continuationAuthorized = false,
     trigger = 'signal',
     restartRequestId = null,
+    qualificationExpectation,
   } = {}) => {
     if (isShuttingDown) return;
     const shutdownObservation = cgroupOomObserver.sample();
@@ -4676,7 +4681,17 @@ async function main() {
           awaitIngressSettlement,
           awaitHandlerSettlement,
           settlementTimeoutMs: SHUTDOWN_DRAIN_MS,
+          qualificationExpectation,
         });
+        if (qualificationExpectation !== undefined) {
+          logEvent('clean-restart-qualification-observed', buildQualificationEvent({
+            botName: BOT_NAME,
+            daemonIdentity,
+            restartRequestId,
+            expectation: qualificationExpectation,
+            observation: retirement.qualification,
+          }));
+        }
         pmRetired = true;
         const projected = continuationAuthorized ? buildResumeIntents({
           snapshots: retirement.snapshots,
@@ -4842,6 +4857,9 @@ async function main() {
         daemonIdentity,
         getInFlightHandlers: () => inFlightHandlers,
         handleSendOverIpc: (req) => handleSendOverIpc(req),
+        inspectCleanRestartQualification: () => (
+          pm.inspectCleanRestartQualification(undefined)
+        ),
         requestDeployRestart: (req) => {
           if (isShuttingDown) {
             const error = new Error('shutdown already in progress');
@@ -4849,11 +4867,13 @@ async function main() {
             throw error;
           }
           const restartRequestId = requireRestartRequestId(req.id);
+          const qualificationExpectation = normalizeDeployQualificationExpectation(req);
           const oldPid = process.pid;
           shutdown({
             continuationAuthorized: true,
             trigger: 'deploy-ipc',
             restartRequestId,
+            qualificationExpectation,
           }).catch((error) => {
             console.error(`[shutdown] deploy restart failed: ${error.message}`);
           });

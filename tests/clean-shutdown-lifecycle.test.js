@@ -2,6 +2,7 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
+const { ProcessManager } = require('@shumkov/orchestra');
 const {
   prepareCleanRetirement,
   settleCrashShutdown,
@@ -40,6 +41,7 @@ describe('clean shutdown retirement boundary', () => {
     };
     const pm = {
       retireForCleanRestart(options) {
+        this.retirementOptions = options;
         sequence.push('process-fenced');
         assert.deepEqual(options.getDeliveryEvidence('chat:3', 9), {
           sessionKey: 'chat:3',
@@ -65,6 +67,10 @@ describe('clean shutdown retirement boundary', () => {
       awaitIngressSettlement,
       awaitHandlerSettlement,
       settlementTimeoutMs: 1234,
+      qualificationExpectation: {
+        expectedGenerationDigest: 'a'.repeat(64),
+        expectedActivityEpoch: 7,
+      },
     }).then((value) => {
       finished = true;
       return value;
@@ -74,11 +80,16 @@ describe('clean shutdown retirement boundary', () => {
     delivery.resolve({ pending: 0 });
     await Promise.resolve();
     assert.equal(finished, false);
-    retirement.resolve([{
+    const snapshots = [{
       sessionKey: 'chat:3',
       sourceMsgId: 9,
       eligible: true,
-    }]);
+    }];
+    Object.defineProperty(snapshots, 'qualification', {
+      value: { outcome: 'qualified', reason: 'eligible' },
+      enumerable: false,
+    });
+    retirement.resolve(snapshots);
 
     const result = await preparing;
     assert.deepEqual(sequence, [
@@ -92,6 +103,118 @@ describe('clean shutdown retirement boundary', () => {
       sourceMsgId: 9,
       eligible: true,
     }]);
+    assert.equal(result.snapshots, snapshots);
+    assert.deepEqual(result.qualification, {
+      outcome: 'qualified',
+      reason: 'eligible',
+    });
+    assert.deepEqual(pm.retirementOptions.qualificationExpectation, {
+      expectedGenerationDigest: 'a'.repeat(64),
+      expectedActivityEpoch: 7,
+    });
+  });
+
+  test('routine retirement omits qualification and an empty snapshot array does not drop it', async () => {
+    const optionsSeen = [];
+    const qualifiedEmpty = [];
+    Object.defineProperty(qualifiedEmpty, 'qualification', {
+      value: { outcome: 'mismatch', reason: 'no-codex-generation' },
+      enumerable: false,
+    });
+    const common = {
+      deliveryBarrier: {
+        fenceAndDrain: async () => ({ pending: 0 }),
+        inspect: () => ({ outputAttempted: false, pending: 0, fenced: true }),
+      },
+      awaitIngressSettlement: async () => {},
+      awaitHandlerSettlement: async () => {},
+    };
+
+    const routine = await prepareCleanRetirement({
+      ...common,
+      pm: {
+        retireForCleanRestart: async (options) => {
+          optionsSeen.push(options);
+          return [];
+        },
+      },
+    });
+    assert.equal(Object.hasOwn(optionsSeen[0], 'qualificationExpectation'), false);
+    assert.equal(routine.qualification, null);
+
+    const qualified = await prepareCleanRetirement({
+      ...common,
+      qualificationExpectation: null,
+      pm: {
+        retireForCleanRestart: async (options) => {
+          optionsSeen.push(options);
+          return qualifiedEmpty;
+        },
+      },
+    });
+    assert.equal(optionsSeen[1].qualificationExpectation, null);
+    assert.equal(qualified.snapshots, qualifiedEmpty);
+    assert.deepEqual(qualified.qualification, {
+      outcome: 'mismatch',
+      reason: 'no-codex-generation',
+    });
+  });
+
+  test('released Orchestra preserves a bounded no-generation qualification through retirement', async () => {
+    const pm = new ProcessManager({
+      processFactory: () => {
+        throw new Error('no process may spawn during qualification');
+      },
+      logger: { log() {}, warn() {}, error() {} },
+    });
+    const result = await prepareCleanRetirement({
+      pm,
+      deliveryBarrier: {
+        fenceAndDrain: async () => ({ pending: 0 }),
+        inspect: () => ({ outputAttempted: false, pending: 0, fenced: true }),
+      },
+      awaitIngressSettlement: async () => {},
+      awaitHandlerSettlement: async () => {},
+      qualificationExpectation: {
+        expectedGenerationDigest: 'a'.repeat(64),
+        expectedActivityEpoch: 7,
+      },
+    });
+
+    assert.deepEqual(result.snapshots, []);
+    assert.deepEqual(
+      Object.keys(result.qualification),
+      [
+        'outcome',
+        'reason',
+        'generationDigest',
+        'activityEpoch',
+        'processState',
+        'activeTurnCount',
+        'pendingDeliveryCount',
+        'backgroundOwnerCount',
+        'backgroundTerminalCount',
+        'backgroundTerminalRegistryComplete',
+        'observedAtMs',
+      ],
+    );
+    assert.deepEqual(
+      { ...result.qualification, observedAtMs: 0 },
+      {
+        outcome: 'mismatch',
+        reason: 'no-codex-generation',
+        generationDigest: null,
+        activityEpoch: null,
+        processState: 'unknown',
+        activeTurnCount: 0,
+        pendingDeliveryCount: 0,
+        backgroundOwnerCount: 0,
+        backgroundTerminalCount: 0,
+        backgroundTerminalRegistryComplete: false,
+        observedAtMs: 0,
+      },
+    );
+    assert.equal(Number.isSafeInteger(result.qualification.observedAtMs), true);
   });
 
   test('retirement failure joins delivery, fallback teardown, ingress, and handlers before rejecting clean persistence inputs', async () => {
