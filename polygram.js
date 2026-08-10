@@ -482,6 +482,13 @@ let richEditMessageText;
 // classification, but it never throws: its caller holds the only copy of the
 // reply and owns the plain fallback.
 let richSendMessage;
+// The rich half of the reply-tool delivery chain, hoisted so the interactive
+// turn path can reuse the same instance rather than configure a second one.
+// Two instances would be two capability latches, two styling verdicts and two
+// sets of ceilings to keep in step; one is the only way they cannot drift.
+// Null until main() wires it — callers fall back to plain, which is what a
+// chat without rich gets anyway.
+let makeRichDeliverText = null;
 let richMediaFileIdCache;
 
 // 0.15 secret redaction (agent-flagged path): the agent marks a secret it saw
@@ -1554,12 +1561,15 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // path — same contract for "not opted in", "capability known
   // unsupported", and "content doesn't need it" (needsRichRendering
   // inside toTelegramRichBlocks handles the last one).
-  // Rich delivery is limited to this interactive streamer instance.
-  // A reply that never crosses minChars (stays idle → delivered via
-  // deliverReplies) and any non-streaming send path — autonomous-wakeup/
+  // This callback covers the streamed bubble only. A turn that ends with
+  // text instead of streaming it renders rich too, through the reply tool's
+  // own factory reused at the non-streamed branch below — one gate, one
+  // sender, one latch, so the same markdown cannot format two ways
+  // depending on how the answer arrived.
+  // Still plain: the non-streaming send paths — autonomous-wakeup/
   // auto-resume/autosteer via lib/telegram/process-agent-reply.js, cron/
-  // IPC sends — never render rich even when richText is on and the
-  // content qualifies. Those delivery paths intentionally remain plain.
+  // IPC sends. Those render plain even when richText is on and the content
+  // qualifies.
   // Re-read both controls for every flush so a config change or a
   // capability result applies to the turn already in progress.
   // Typed media resolution for rich replies. Same
@@ -2907,27 +2917,78 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         console.error(`[${label}] sendSticker failed: ${err.message}`);
       });
     } else if (parsed.text) {
-      // 0.7.0: use markdown-aware chunker + deliverReplies primitive.
-      // The old chunkText was newline/byte-only; chunkMarkdownText also
-      // respects code-fence boundaries (closes + reopens across chunks).
-      // Short replies never went live-rich, so image markdown from a
-      // rich-enabled chat degrades to caption text here too — never a
-      // raw local path in the bubble.
-      const shortText = resolveRichTextEnabled(config, chatId, threadId)
-        ? stripMediaMarkdown(parsed.text)
-        : parsed.text;
-      const chunks = chunkMarkdownText(shortText, TG_CHUNK_BUDGET);
-      const deliveryResult = await deliverReplies({
-        bot,
-        send: (b, method, params, m) => tg(b, method, params, m),
-        chatId,
-        threadId,
-        chunks,
-        replyToMessageId: msg.message_id,
-        meta: outMeta,
-        logger: { error: (m) => console.error(`[${label}] ${m}`) },
-      });
-      mediaContext.recordTextFailures(deliveryResult.failed.length);
+      // A turn that ends with text instead of calling the reply tool lands
+      // here. It is the same agent writing the same markdown as the reply
+      // tool, so it renders through the same gate and the same sender —
+      // otherwise a table is a table or a wall of pipes depending only on
+      // which way the answer happened to arrive, which is not a distinction
+      // the reader can see or act on.
+      //
+      // Text-only by construction: no allowedRoots, so media stays degraded
+      // to caption text exactly as it was here before, and this path opens no
+      // upload surface of its own.
+      // Wrapped even though the factory is contracted not to throw: that
+      // contract is convention, and its styling-retry ladder evaluates
+      // blocksAreStyled/flattenStyledBlocks outside any try. A throw escaping
+      // here would skip the plain arm and cost the whole reply, so this catch
+      // is the difference between a flat answer and no answer.
+      let richOut = null;
+      try {
+        richOut = makeRichDeliverText
+          ? await makeRichDeliverText({ chatId, threadId })({
+            text: parsed.text,
+            replyToMessageId: msg.message_id,
+            // Its own source, because rich-message-sent carries none and the
+            // streamed rich open reports as bot-reply-stream-open-rich.
+            // Without a distinct tag nothing downstream can tell this branch
+            // from the other sites writing the bare streamer tag.
+            meta: { ...outMeta, source: 'bot-reply-final-rich' },
+          })
+          : null;
+      } catch (richErr) {
+        // Named apart from the turn's own `err` on purpose: this is the
+        // rich attempt failing, not the turn, and the completion tail is
+        // located in tests by scanning for the turn handler's catch.
+        console.error(`[${label}] rich delivery threw, falling back to plain: ${richErr.message}`);
+        richOut = null;
+      }
+      if (richOut?.handled) {
+        // One bubble, no chunks, nothing failed — but still report, because
+        // this is the same incomplete-delivery gate the plain arm feeds and
+        // it must hear from whichever arm ran.
+        mediaContext.recordTextFailures(richOut.failed.length);
+      } else {
+        // 0.7.0: use markdown-aware chunker + deliverReplies primitive.
+        // The old chunkText was newline/byte-only; chunkMarkdownText also
+        // respects code-fence boundaries (closes + reopens across chunks).
+        // Image markdown from a rich-enabled chat degrades to caption text
+        // here too — never a raw local path in the bubble.
+        //
+        // The `??` arm is load-bearing: a chat with rich off declines with
+        // no body at all, and chunking `undefined` would drop the reply
+        // entirely for most of the fleet. Both arms strip through the same
+        // call, so the delivered text is byte-identical either way.
+        const shortText = richOut?.text ?? (resolveRichTextEnabled(config, chatId, threadId)
+          ? stripMediaMarkdown(parsed.text)
+          : parsed.text);
+        const chunks = chunkMarkdownText(shortText, TG_CHUNK_BUDGET);
+        const deliveryResult = await deliverReplies({
+          bot,
+          send: (b, method, params, m) => tg(b, method, params, m),
+          chatId,
+          threadId,
+          chunks,
+          replyToMessageId: msg.message_id,
+          // Tagged like its rich sibling. Five call sites write the bare
+          // 'bot-reply-stream' tag and three of them deliver reply bodies,
+          // so a row carrying it says nothing about which one produced it.
+          // Naming both arms makes this branch identifiable from the
+          // messages table whichever way the reply went out.
+          meta: { ...outMeta, source: 'bot-reply-final' },
+          logger: { error: (m) => console.error(`[${label}] ${m}`) },
+        });
+        mediaContext.recordTextFailures(deliveryResult.failed.length);
+      }
     }
 
     // A turn whose final output was a solo sticker/reaction skips the
@@ -4062,6 +4123,38 @@ async function main() {
   //
   // Neither feature may switch the other off, which a single strategy slot
   // could not express.
+  // Built before the chain rather than inline in it, because the interactive
+  // turn path reuses this exact instance for its non-streamed replies. See
+  // the makeRichDeliverText declaration for why it must be one instance.
+  // Injected rather than imported by the dispatcher: rich-media.js requires
+  // the dispatcher module, so the reverse direction would be a require cycle.
+  makeRichDeliverText = createRichDeliveryFactory({
+    bot,
+    sendRich: (args) => richSendMessage(args),
+    isRichTextEnabled: (chatId, threadId) => resolveRichTextEnabled(config, chatId, threadId),
+    getRichKnownUnsupported: () => richSendKnownUnsupported,
+    // No config knob: the automatic flatten-and-retry below IS the control,
+    // and it needs no operator to notice anything. A knob would add a state
+    // where styling is off while the server accepts it, which nothing in
+    // the system can detect or correct.
+    isInlineStylingEnabled: () => !richInlineStylingUnsupported,
+    onStylingRejected: () => richStylingLatch?.recordStylingRejection(),
+    onStylingAccepted: () => richStylingLatch?.recordHealthyOutcome(),
+    redactError: redactBotToken,
+    // Media for one reply. The envelope itself (no URL media, the `files:`
+    // fan-out ceiling, the shared stat) lives in rich-media.js so it is
+    // pinned by behavior rather than by this literal — nothing executes
+    // this file. `allowedRoots` arrives per call from the dispatcher, which
+    // computed it once and validates `files:` against that very array, so a
+    // path the reply tool may upload is exactly a path image syntax may
+    // upload. The interactive path passes none, so it renders text-only.
+    makeMediaWiring: makeReplyMediaWiring({
+      config,
+      fileIdCache: richMediaFileIdCache,
+      logEvent,
+      botName: BOT_NAME,
+    }),
+  });
   const makeDeliverText = composeDeliverTextFactories([
     createDeliverTextFactory({
       registry: streamerRegistry,
@@ -4079,35 +4172,7 @@ async function main() {
         resolveRichTextEnabled(config, chatId, threadId) ? stripMediaMarkdown(text) : text
       ),
     }),
-    // Injected rather than imported by the dispatcher: rich-media.js requires
-    // the dispatcher module, so the reverse direction would be a require cycle.
-    createRichDeliveryFactory({
-      bot,
-      sendRich: (args) => richSendMessage(args),
-      isRichTextEnabled: (chatId, threadId) => resolveRichTextEnabled(config, chatId, threadId),
-      getRichKnownUnsupported: () => richSendKnownUnsupported,
-      // No config knob: the automatic flatten-and-retry below IS the control,
-      // and it needs no operator to notice anything. A knob would add a state
-      // where styling is off while the server accepts it, which nothing in
-      // the system can detect or correct.
-      isInlineStylingEnabled: () => !richInlineStylingUnsupported,
-      onStylingRejected: () => richStylingLatch?.recordStylingRejection(),
-      onStylingAccepted: () => richStylingLatch?.recordHealthyOutcome(),
-      redactError: redactBotToken,
-      // Media for one reply. The envelope itself (no URL media, the `files:`
-      // fan-out ceiling, the shared stat) lives in rich-media.js so it is
-      // pinned by behavior rather than by this literal — nothing executes
-      // this file. `allowedRoots` arrives per call from the dispatcher, which
-      // computed it once and validates `files:` against that very array, so a
-      // path the reply tool may upload is exactly a path image syntax may
-      // upload.
-      makeMediaWiring: makeReplyMediaWiring({
-        config,
-        fileIdCache: richMediaFileIdCache,
-        logEvent,
-        botName: BOT_NAME,
-      }),
-    }),
+    makeRichDeliverText,
   ]);
 
   // The edit tool's counterpart to the reply chain above. An agent that posts
