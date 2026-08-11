@@ -1,9 +1,8 @@
 # Local daemon-owned deploy restart
 
-Status: REVIEWED DRAFT 2026-08-05 — release-blocking amendment discovered
-during the 0.38.x preflight. Independent launchd, scope, and failure/security
-reviewers passed the revised design after their must-fixes were incorporated.
-Implementation and production activation require Ivan's explicit alignment.
+Status: AMENDMENT UNDER REVIEW 2026-08-11 — real-host preflight corrected the
+compatibility baseline and the dispatch-uncertainty policy. Implementation is
+being re-reviewed; production activation requires Ivan's explicit alignment.
 
 Scope: Polygram's content-free daemon identity and IPC readiness contract, the
 canonical `polygram-deploy` skill, the local shumorobot launchd contract,
@@ -52,6 +51,8 @@ later-spawned bridge or supervisor files after npm has changed them on disk.
   a later replacement cannot hide behind an earlier valid start.
 - Local release and foreground Claude/Codex canaries finish before any partner
   VPS package mutation.
+- One owner-only local transaction lock serializes recovery, local deployment,
+  local receipt qualification, and the complete partner VPS rollout.
 - Validation reads lifecycle fields, counts, and identities only. It never
   selects or prints message bodies, session keys, provider thread/turn IDs, or
   event paths.
@@ -129,6 +130,13 @@ restart request ID, and the last completed phase. It contains no chat/session
 identity. A rerun resumes or reconciles the recorded transaction; it never
 generates a second request after the dispatch boundary.
 
+The helper also holds one host-native advisory lock from before journal
+recovery through local completion. `--vps-only` takes the same lock before
+authenticating the local daemon and receipts and retains it through the VPS
+rollout. A second helper fails before it can create, replace, or qualify a
+transaction; a VPS rollout cannot consume a local proof while another helper
+changes the local daemon beneath it.
+
 Rollback is deliberately bounded:
 
 - Before a restart request is dispatched, the helper may atomically restore
@@ -160,6 +168,8 @@ Before staging or switching a release, require all of the following:
 - the loaded launchd job path, program, complete arguments, and working
   directory equal the plist;
 - launchd's positive PID equals the PID file and authenticated IPC identity;
+- every local IPC call explicitly binds `~/.polygram/.ipc`, independent of the
+  helper's repository working directory;
 - the installed stable target is a complete verified release; and
 - routine steady-state deployment sees effective unconditional KeepAlive.
 
@@ -202,25 +212,37 @@ bounded diagnosis/recovery and blocks every later rollout phase.
 
 ### 5. One-time migration from the current crash-only/global job
 
-The currently running Polygram 0.37.2 daemon has neither `daemon_instance_id` nor
+The currently running Polygram 0.38.0 daemon has neither `daemon_instance_id` nor
 the corrected active-turn retirement order. No procedure can retroactively
 give that process those guarantees. The one-time boundary is therefore an
 explicit, operator-approved compatibility activation, not a claimed smooth
 deploy.
 
+This baseline is grounded in the 2026-08-11 read-only host preflight. The NVM
+global package reports 0.38.0 and its package metadata was installed at
+23:50:28 local time on 2026-08-10; the loaded launchd PID started three seconds
+later from that exact global entry. Its latest start row is from the
+pre-identity schema, its canonical plist still has the exact crash-only
+predicates, and no activation receipt exists. The earlier 0.37.2 assumption is
+therefore stale, not a safe production gate.
+
 The activation sequence is:
 
 1. Enter transition mode only when every legacy predicate matches: no prior
-   activation receipt exists; the installed package is exactly 0.37.2; the
+   activation receipt exists; the installed package is exactly 0.38.0; the
    loaded job has the canonical label and plist path, exact old NVM global
    entry, exact `--bot shumorobot` argv and working directory, positive launchd
-   PID equal to the PID file, authenticated legacy IPC, and the exact
-   crash-only `Crashed=true`/`SuccessfulExit=false` definition. Persist this
-   one-time eligibility in the journal. Any mismatch fails closed.
+   PID equal to the PID file, and authenticated legacy IPC. Require the exact
+   crash-only `Crashed=true`/`SuccessfulExit=false` predicates in the canonical
+   on-disk plist and require the loaded snapshot not to advertise effective
+   unconditional KeepAlive. Current `launchctl print` does not reproduce the
+   nested crash-only dictionary, so the helper must not claim that the loaded
+   output alone proves those two nested values. Persist this one-time
+   eligibility in the journal. Any mismatch fails closed.
 2. Stage and validate the first versioned release and a temporary new plist
    completely. Record the exact legacy canonical-plist fingerprint and retain
-   that file for abort recovery; do not change the loaded definition or stable
-   target yet.
+   that file for recovery evidence; do not change the loaded definition or
+   stable target yet.
 3. Confirm an operator-coordinated quiet window. The zero-busy sample reduces
    risk but is explicitly not called an admission fence; a turn admitted before
    the old daemon receives IPC could still be interrupted by the old bug.
@@ -256,14 +278,15 @@ recovery. This residual risk must be accepted before activation.
 
 Persisting `dispatch-possible` necessarily creates a smaller uncertainty
 window: the helper may die after the durable write but before the socket send.
-On rerun, if the exact old PID is still alive and no matching lifecycle appears
-after bounded observation, stop in `dispatch-uncertain/no-effect`. Do not send.
-An operator must explicitly authorize aborting that transaction: verify the
-same old legacy witness, atomically restore the exact fingerprinted legacy
-canonical plist and pre-transaction `current` state, revalidate that the loaded
-job still matches it, retire the journal as no-effect, then start a new
-transaction with a new request. This is the only allowed second attempt, and
-the audit retains both request IDs.
+Silence cannot distinguish that case from a request the daemon accepted before
+entering a slow or unbounded clean drain: process retirement can wait on
+provider and delivery fences before the first request-bound lifecycle row is
+durable. Therefore a time-based “no effect” observation never authorizes
+rollback, journal retirement, or a second request. Reruns reconcile only the
+stored request. If the old PID remains and no matching lifecycle appears, fail
+closed with the journal retained. Automated abort requires a future positive,
+durable daemon acceptance/status protocol; the pre-identity 0.38.0 process
+cannot provide one for this one-time activation.
 
 After the new zero-work KeepAlive proof, atomically write a permanent activation
 receipt containing the new package/integrity and instance proof. Transition
@@ -292,9 +315,15 @@ Replace the all-in-one production mutation with explicit phases:
   continuation. Foreground Codex continuation remains a separate receipt.
 - `--vps-only`: require the exact published version plus same-version passing
   local Claude, foreground Codex, and aged-warm Codex receipts before checking
-  the split-owner topology or mutating the shared VPS tree. Then retain the
-  existing Shumabit-first,
+  the split-owner topology or mutating the shared VPS tree. Hold the local
+  transaction lock across that qualification and the complete rollout. Then
+  retain the existing Shumabit-first,
   UMI-Assistant-second daemon-owned IPC flow and Water/tmux invariants.
+
+For each VPS bot, IPC responsiveness is only an early boot witness. Admission
+opens after awaited clean-resume recovery, so lifecycle qualification retries
+the same request within a bounded window while reasserting the exact systemd
+invocation and PID on every attempt. It never sends a second restart request.
 
 The active-turn design's aged-warm-session canary remains a release
 qualification. The daemon's single Orchestra `ProcessManager` deliberately
@@ -408,15 +437,21 @@ resolution and integrity, then run both full suites before tagging Polygram.
 - **Retry only selected IPC failures:** today's client cannot prove whether a
   rejected-looking transport outcome reached the daemon. Treating every
   unvalidated acknowledgement as ambiguous gives one safe rule.
+- **Abort after a quiet timeout:** the daemon may have accepted the request but
+  still be waiting in an unbounded provider or delivery fence before emitting
+  request-bound lifecycle evidence. Absence over time is not proof of no
+  effect; only a future positive durable acceptance/status protocol can make
+  that transition safe.
 
 ## Failure modes and recovery
 
 - Contract mismatch before mutation: fail without staging or changing state.
 - Candidate install/native/dependency verification failure: remove only the
   never-activated temporary prefix; the old immutable daemon remains owner.
-- Helper death before IPC dispatch: old daemon remains active; journaled rerun
-  stops at the dispatch-uncertain/no-effect gate if the durable boundary was
-  crossed; only explicit operator abort may retire it and permit a new request.
+- Helper death around IPC dispatch: old daemon may remain active; once the
+  durable boundary was crossed, a journaled rerun reconciles the original
+  request only. Lifecycle silence cannot authorize retry or rollback, so an
+  unresolved request remains fail-closed pending positive forensic evidence.
 - Any unvalidated IPC acknowledgement: never retry; reconcile the stored
   request, old instance/PID, and lifecycle.
 - Old daemon remains alive without the exact authorized drain: fail with the
@@ -457,13 +492,18 @@ the unfixed sources, then passing after the implementation.
    old real tree.
 4. Journal tests cover every dispatch boundary, ambiguous response recovery,
    helper death between one-time stop/bootstrap, and idempotent bootstrap
-   completion without IPC retry. They also cover the
-   dispatch-possible-before-send death window and explicit no-effect abort.
+   completion without IPC retry. They also prove the
+   dispatch-possible-before-send window exposes no time-based abort or second
+   request, and concurrent helpers cannot acquire the same transaction lock.
 5. Lifecycle verifier tests use a fixed upper cursor and reject wrong request,
    wrong old/new instance, duplicate start/admission, a second replacement
-   before proof, or any later transition before the final witness.
+   before proof, or any later transition before the final witness. Delayed
+   admission fixtures prove local and VPS qualification retry evidence, not
+   restart dispatch, while continuously binding the same process generation.
 6. Plist tests require unconditional `KeepAlive=true`; `plutil -lint` passes.
-   Definition fixtures cover exact label/path/program/full argv/cwd matching.
+   Definition fixtures cover exact label/path/program/full argv/cwd matching,
+   including the production crash-only loaded format without a generic
+   `keepalive` property.
 7. Canary-verifier tests prove provider/name/request/version binding, one
    literal-continuation dispatch, one logical success, zero notices, and
    content-free output for Claude and Codex. A separate receipt test requires
@@ -501,6 +541,8 @@ the unfixed sources, then passing after the implementation.
   literal continuation, produce one logical result, and emit no generic restart
   notice.
 - Local qualification finishes before either VPS package tree changes.
+- Local qualification cannot change concurrently with a receipt-gated VPS
+  rollout because both phases hold the same host-native transaction lock.
 - Local, Shumabit, and UMI Assistant require daemon-owned, request-bound
   authorized lifecycle proof.
 - The tagged Polygram artifact contains the exact reviewed follow-up Orchestra
