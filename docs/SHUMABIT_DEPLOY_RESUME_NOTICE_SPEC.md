@@ -1,7 +1,10 @@
 # Shumabit deploy-resume false notice
 
-Status: APPROVED 2026-08-01. Implemented and independently code-reviewed;
-release and production activation remain pending.
+Status: APPROVED 2026-08-01. Implemented, independently code-reviewed,
+released as v0.37.2, and activated in production. The idle canary passed; the
+controlled foreground-provider canaries exposed separate retirement-ordering
+and Codex lifecycle failures tracked in
+`DEPLOY_ACTIVE_TURN_RETIREMENT_SPEC.md`.
 
 ## Problem
 
@@ -322,5 +325,104 @@ Keep the runtime fix and deploy guardrail as separate commits/deliverables. The
 direct restart did not create the stale candidate, and an IPC deploy would
 still have announced a preexisting stale Claude row.
 
-Ivan approved this approach on 2026-08-01. Production activation remains gated
-on independent code review, release review, and the canary sequence above.
+## Production evidence — 2026-08-01
+
+- PR #95 merged the runtime fix after 4,003 tests passed, 0 failed, and 15
+  intentional real-provider/signal tests were skipped. Three independent code
+  reviews approved provider correctness, test scope, and deploy safety.
+- PR #96 released v0.37.2 from a separately reviewed, signed version-only
+  commit. The release tree repeated the same 4,003/0/15 test result.
+- The one-time v0.37.1 activation found zero in-flight work and zero stale
+  Claude-autosteer candidates for both Shumabit and UMI Assistant before the
+  VPS package mutation. Both old daemons accepted authenticated IPC restart;
+  Water and all three tmux owners retained their exact generations.
+- After both bots ran v0.37.2, the temporary fieldless compatibility mode was
+  removed from the deploy helper. Its steady-state evidence, contract, and
+  topology/isolation suites pass with exact request-bound proof only.
+- The next idle restart was the definitive steady-state canary. Both bot
+  databases recorded an authorized `deploy-ipc` drain with zero committed
+  intents, followed by the exact old stop, replacement start, and admission
+  opening. Neither database recorded a `replay-on-boot` event after that drain;
+  aggregate noticed count was zero. Water and tmux owners remained unchanged.
+- Controlled foreground Claude and Codex continuation canaries remain the
+  final manual verification steps. Background-work preservation remains
+  explicitly postponed.
+
+### Follow-up canary — 2026-08-03
+
+The attempted active-turn canary was not observed in `Ivan DM`. A
+metadata-only, name-bound read of the live config and database found no inbound
+message, provider selection, or turn metric for that chat in the canary window;
+its last inbound was approximately six hours earlier. The deploy helper's
+bot-wide busy watcher therefore caught a different concurrent Shumabit handler.
+That handler completed during the shutdown drain: aggregate in-flight count
+fell from one to zero and the latest successful turn metric ended 367 ms before
+the `shutdown-drain` record. No chat or message identity was selected or
+printed for that unrelated work.
+
+The same name-bound read showed that `Ivan DM` explicitly selected `pm=codex`
+with Codex enabled, conflicting with the host infrastructure note that says the
+private chat is back on Claude. Its approximately six-hour-old Codex generation
+was warm but idle: there was no current turn attempt or terminal-reconciliation
+checkpoint in the canary window. `ProcessManager` nevertheless strictly
+retires every warm generation, and idle Codex retirement calls
+`thread/backgroundTerminals/clean` to prove that the registry is empty.
+
+That independent idle cleanup failed. The daemon durably prepared the clean
+request, recorded its write attempt 14 ms later, and entered containment 25 ms
+after that with `CODEX_RPC_OUTCOME_UNKNOWN` / `stop-cleanup-failed`. This rules
+out the 20-second cleanup deadline. Because one process retirement rejected,
+the all-process clean-retirement transaction returned no snapshots and built
+no continuation intents for any provider. The shutdown was correctly persisted
+crash-like with `continuation_authorized=1`, zero intents, and reason
+`clean-retirement-failed`; the strict deploy verifier rejected the lifecycle
+and did not retry. The replacement settled the old containment fence through
+`exclusive-takeover-grace`. No replay-on-boot or replay-notice event followed.
+
+This does not weaken the v0.37.2 diagnosis or idle canary: the false generic
+notice remains fixed, while the exact active-Claude resume/continue production
+proof is still pending. It does expose a separate issue: an unrelated warm,
+idle Codex generation can fail retirement and prevent every provider's
+authorized-resume path from reaching intent persistence. The durable evidence
+establishes that boundary but does not retain the underlying immediate
+transport/protocol fault, so a causal fix must not be guessed from this trace.
+
+### Controlled Ivan DM Codex canary — 2026-08-03
+
+A later name-bound canary did observe an exact foreground Codex turn. The
+inbound arrived at `14:12:22.000Z`, selected Codex at `14:12:22.894Z`, and
+durably accepted `turn/start` at `14:12:23.062Z`. The authenticated one-shot
+restart was requested while that turn was active; no retry was issued when the
+IPC socket disappeared during shutdown.
+
+The authorized path did not capture or interrupt the turn immediately.
+`polygram.js` first ran the legacy handler-drain loop, before
+`prepareCleanRetirement()` fences reply delivery and retires provider
+processes. The turn remained live in that pre-retirement window for 27,377 ms.
+No `turn/interrupt` request was prepared. At `14:12:50.551Z`, Codex emitted a
+notification for a thread other than the one owned by the generation.
+Orchestra correctly entered containment with `cross-thread-notification` /
+`CODEX_PROTOCOL_ERROR`; the handler became `codex-ambiguous` and the provider
+closed. Retirement then saw no active candidate and recorded three
+`no-active-turn` snapshots. The authorized drain was crash-like with zero
+intents and reason `provider-process-terminated`.
+
+This establishes two independent follow-up defects. First, the authorized
+deploy caller violates the released ordering contract by retaining the legacy
+natural drain before the new delivery/process barrier; the exact resume path
+was not reached in time. Second, the long-lived Codex generation received a
+genuinely foreign-thread notification. Existing durable telemetry retains the
+fault reason but not the allowlisted notification method or local phase, so it
+does not justify weakening containment. The replacement daemon became ready,
+and no `replay-on-boot`, `replay-notice-sent`, or generic restart notice
+followed.
+
+The corrective ordering design and verification gates are in
+`DEPLOY_ACTIVE_TURN_RETIREMENT_SPEC.md`. The independent, content-free provider
+diagnostics are in `CODEX_RETIREMENT_FAULT_TELEMETRY_SPEC.md`. The v0.37.2
+false-notice fix remains valid and separately proven.
+
+Ivan approved the corrective ordering and telemetry implementation on
+2026-08-05. Implementation and independent code review are complete;
+Orchestra/Polygram release pinning, production activation, and foreground
+canaries remain pending.

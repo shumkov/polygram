@@ -2,8 +2,10 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
+const { ProcessManager } = require('@shumkov/orchestra');
 const {
   prepareCleanRetirement,
+  settleCrashShutdown,
   buildResumeIntents,
 } = require('../lib/ops/clean-shutdown');
 
@@ -39,6 +41,7 @@ describe('clean shutdown retirement boundary', () => {
     };
     const pm = {
       retireForCleanRestart(options) {
+        this.retirementOptions = options;
         sequence.push('process-fenced');
         assert.deepEqual(options.getDeliveryEvidence('chat:3', 9), {
           sessionKey: 'chat:3',
@@ -53,13 +56,21 @@ describe('clean shutdown retirement boundary', () => {
     const awaitHandlerSettlement = async () => {
       sequence.push('handlers-settled');
     };
+    const awaitIngressSettlement = async () => {
+      sequence.push('ingress-settled');
+    };
 
     let finished = false;
     const preparing = prepareCleanRetirement({
       pm,
       deliveryBarrier: barrier,
+      awaitIngressSettlement,
       awaitHandlerSettlement,
       settlementTimeoutMs: 1234,
+      qualificationExpectation: {
+        expectedGenerationDigest: 'a'.repeat(64),
+        expectedActivityEpoch: 7,
+      },
     }).then((value) => {
       finished = true;
       return value;
@@ -69,16 +80,22 @@ describe('clean shutdown retirement boundary', () => {
     delivery.resolve({ pending: 0 });
     await Promise.resolve();
     assert.equal(finished, false);
-    retirement.resolve([{
+    const snapshots = [{
       sessionKey: 'chat:3',
       sourceMsgId: 9,
       eligible: true,
-    }]);
+    }];
+    Object.defineProperty(snapshots, 'qualification', {
+      value: { outcome: 'qualified', reason: 'eligible' },
+      enumerable: false,
+    });
+    retirement.resolve(snapshots);
 
     const result = await preparing;
     assert.deepEqual(sequence, [
       'delivery-fenced',
       'process-fenced',
+      'ingress-settled',
       'handlers-settled',
     ]);
     assert.deepEqual(result.snapshots, [{
@@ -86,26 +103,150 @@ describe('clean shutdown retirement boundary', () => {
       sourceMsgId: 9,
       eligible: true,
     }]);
+    assert.equal(result.snapshots, snapshots);
+    assert.deepEqual(result.qualification, {
+      outcome: 'qualified',
+      reason: 'eligible',
+    });
+    assert.deepEqual(pm.retirementOptions.qualificationExpectation, {
+      expectedGenerationDigest: 'a'.repeat(64),
+      expectedActivityEpoch: 7,
+    });
   });
 
-  test('retirement failure prevents handler settlement and clean persistence inputs', async () => {
-    let settled = false;
+  test('routine retirement omits qualification and an empty snapshot array does not drop it', async () => {
+    const optionsSeen = [];
+    const qualifiedEmpty = [];
+    Object.defineProperty(qualifiedEmpty, 'qualification', {
+      value: { outcome: 'mismatch', reason: 'no-codex-generation' },
+      enumerable: false,
+    });
+    const common = {
+      deliveryBarrier: {
+        fenceAndDrain: async () => ({ pending: 0 }),
+        inspect: () => ({ outputAttempted: false, pending: 0, fenced: true }),
+      },
+      awaitIngressSettlement: async () => {},
+      awaitHandlerSettlement: async () => {},
+    };
+
+    const routine = await prepareCleanRetirement({
+      ...common,
+      pm: {
+        retireForCleanRestart: async (options) => {
+          optionsSeen.push(options);
+          return [];
+        },
+      },
+    });
+    assert.equal(Object.hasOwn(optionsSeen[0], 'qualificationExpectation'), false);
+    assert.equal(routine.qualification, null);
+
+    const qualified = await prepareCleanRetirement({
+      ...common,
+      qualificationExpectation: null,
+      pm: {
+        retireForCleanRestart: async (options) => {
+          optionsSeen.push(options);
+          return qualifiedEmpty;
+        },
+      },
+    });
+    assert.equal(optionsSeen[1].qualificationExpectation, null);
+    assert.equal(qualified.snapshots, qualifiedEmpty);
+    assert.deepEqual(qualified.qualification, {
+      outcome: 'mismatch',
+      reason: 'no-codex-generation',
+    });
+  });
+
+  test('released Orchestra preserves a bounded no-generation qualification through retirement', async () => {
+    const pm = new ProcessManager({
+      processFactory: () => {
+        throw new Error('no process may spawn during qualification');
+      },
+      logger: { log() {}, warn() {}, error() {} },
+    });
+    const result = await prepareCleanRetirement({
+      pm,
+      deliveryBarrier: {
+        fenceAndDrain: async () => ({ pending: 0 }),
+        inspect: () => ({ outputAttempted: false, pending: 0, fenced: true }),
+      },
+      awaitIngressSettlement: async () => {},
+      awaitHandlerSettlement: async () => {},
+      qualificationExpectation: {
+        expectedGenerationDigest: 'a'.repeat(64),
+        expectedActivityEpoch: 7,
+      },
+    });
+
+    assert.deepEqual(result.snapshots, []);
+    assert.deepEqual(
+      Object.keys(result.qualification),
+      [
+        'outcome',
+        'reason',
+        'generationDigest',
+        'activityEpoch',
+        'processState',
+        'activeTurnCount',
+        'pendingDeliveryCount',
+        'backgroundOwnerCount',
+        'backgroundTerminalCount',
+        'backgroundTerminalRegistryComplete',
+        'observedAtMs',
+      ],
+    );
+    assert.deepEqual(
+      { ...result.qualification, observedAtMs: 0 },
+      {
+        outcome: 'mismatch',
+        reason: 'no-codex-generation',
+        generationDigest: null,
+        activityEpoch: null,
+        processState: 'unknown',
+        activeTurnCount: 0,
+        pendingDeliveryCount: 0,
+        backgroundOwnerCount: 0,
+        backgroundTerminalCount: 0,
+        backgroundTerminalRegistryComplete: false,
+        observedAtMs: 0,
+      },
+    );
+    assert.equal(Number.isSafeInteger(result.qualification.observedAtMs), true);
+  });
+
+  test('retirement failure joins delivery, fallback teardown, ingress, and handlers before rejecting clean persistence inputs', async () => {
+    const sequence = [];
     await assert.rejects(
       () => prepareCleanRetirement({
         pm: {
           retireForCleanRestart: async () => {
+            sequence.push('retirement-failed');
             throw new Error('tmux termination uncertain');
           },
+          shutdown: async () => { sequence.push('fallback-shutdown'); },
         },
         deliveryBarrier: {
-          fenceAndDrain: async () => ({ pending: 0 }),
+          fenceAndDrain: async () => {
+            sequence.push('delivery-settled');
+            return { pending: 0 };
+          },
           inspect: () => ({ outputAttempted: false, pending: 0, fenced: true }),
         },
-        awaitHandlerSettlement: async () => { settled = true; },
+        awaitIngressSettlement: async () => { sequence.push('ingress-settled'); },
+        awaitHandlerSettlement: async () => { sequence.push('handlers-settled'); },
       }),
       /termination uncertain/,
     );
-    assert.equal(settled, false);
+    assert.deepEqual(sequence, [
+      'delivery-settled',
+      'retirement-failed',
+      'fallback-shutdown',
+      'ingress-settled',
+      'handlers-settled',
+    ]);
   });
 
   test('handler settlement timeout rejects clean retirement snapshots', async () => {
@@ -125,6 +266,7 @@ describe('clean shutdown retirement boundary', () => {
           fenceAndDrain: async () => ({ pending: 0 }),
           inspect: () => ({ outputAttempted: false, pending: 0, fenced: true }),
         },
+        awaitIngressSettlement: async () => {},
         awaitHandlerSettlement: async () => { throw timeout; },
       }),
       (error) => error?.code === 'HANDLER_SETTLEMENT_TIMEOUT',
@@ -139,10 +281,80 @@ describe('clean shutdown retirement boundary', () => {
           fenceAndDrain: async () => ({ pending: 0 }),
           inspect: () => ({ outputAttempted: false, pending: 0, fenced: true }),
         },
+        awaitIngressSettlement: async () => {},
         awaitHandlerSettlement: async () => {},
       }),
       /retireForCleanRestart/,
     );
+  });
+});
+
+describe('crash shutdown settlement boundary', () => {
+  test('fences delivery and stops providers together, then joins ingress and handlers', async () => {
+    const sequence = [];
+    const delivery = deferred();
+    const shutdown = deferred();
+
+    let finished = false;
+    const settling = settleCrashShutdown({
+      pm: {
+        shutdown() {
+          sequence.push('process-stopped');
+          return shutdown.promise;
+        },
+      },
+      deliveryBarrier: {
+        fenceAndDrain() {
+          sequence.push('delivery-fenced');
+          return delivery.promise;
+        },
+      },
+      awaitIngressSettlement: async () => { sequence.push('ingress-settled'); },
+      awaitHandlerSettlement: async () => { sequence.push('handlers-settled'); },
+      settlementTimeoutMs: 4321,
+    }).then(() => { finished = true; });
+
+    assert.deepEqual(sequence, ['delivery-fenced', 'process-stopped']);
+    delivery.resolve({ pending: 0 });
+    await Promise.resolve();
+    assert.equal(finished, false);
+    shutdown.resolve();
+
+    await settling;
+    assert.deepEqual(sequence, [
+      'delivery-fenced',
+      'process-stopped',
+      'ingress-settled',
+      'handlers-settled',
+    ]);
+  });
+
+  test('joins ingress and handlers before reporting a provider shutdown failure', async () => {
+    const sequence = [];
+
+    await assert.rejects(
+      () => settleCrashShutdown({
+        pm: {
+          shutdown: async () => {
+            sequence.push('process-failed');
+            throw new Error('provider shutdown failed');
+          },
+        },
+        deliveryBarrier: {
+          fenceAndDrain: async () => { sequence.push('delivery-settled'); },
+        },
+        awaitIngressSettlement: async () => { sequence.push('ingress-settled'); },
+        awaitHandlerSettlement: async () => { sequence.push('handlers-settled'); },
+      }),
+      /provider shutdown failed/,
+    );
+
+    assert.deepEqual(sequence, [
+      'delivery-settled',
+      'process-failed',
+      'ingress-settled',
+      'handlers-settled',
+    ]);
   });
 });
 

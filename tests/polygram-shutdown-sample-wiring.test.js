@@ -40,7 +40,7 @@ describe('shutdown signal-time sampling', () => {
     // giving in-flight handlers a chance to settle or fail first.
     const mustComeAfter = {
       'the isShuttingDown latch': 'isShuttingDown = true',
-      'refusing new inbound (bot._stop)': 'bot._stop()',
+      'refusing new inbound (stable polling controller)': 'stopPolling()',
       'cancelling open questions': 'expireQuestion',
       'the drain loop': 'const drainStart',
     };
@@ -60,7 +60,7 @@ describe('shutdown signal-time sampling', () => {
     // actually cost versus how much the drain managed to finish.
     assert.match(body, /logEvent\('shutdown-drain', lifecycleDetail\(\{[\s\S]*?in_flight: remaining,/);
     assert.match(body, /logEvent\('shutdown-drain', lifecycleDetail\(\{[\s\S]*?in_flight_at_signal: inFlightAtSignal,/);
-    assert.match(body, /\}, invocationId\)\)/);
+    assert.match(body, /\}, invocationId, daemonIdentity\)\)/);
   });
 
   test('reports restart authorization and committed intent count in lifecycle evidence', () => {
@@ -73,10 +73,10 @@ describe('shutdown signal-time sampling', () => {
 
   test('the post-drain count is measured after the drain, not reused', () => {
     const body = shutdownBody();
-    const drain = body.indexOf('const drainStart');
+    const retire = body.indexOf('await prepareCleanRetirement({');
     const remaining = body.indexOf('const remaining = countInFlight(inFlightHandlers)');
     assert.notEqual(remaining, -1, 'post-drain in-flight count is missing');
-    assert.ok(remaining > drain, 'post-drain count must be taken after the drain loop');
+    assert.ok(remaining > retire, 'final in-flight count must be taken after clean retirement and handler settlement');
   });
 });
 
@@ -144,9 +144,67 @@ describe('clean restart lifecycle ordering', () => {
     }
   });
 
+  test('qualified deploy forwards one closed fence while routine deploy remains unchanged', () => {
+    const body = shutdownBody();
+    assert.match(
+      src,
+      /const qualificationExpectation = normalizeDeployQualificationExpectation\(req\)/,
+      'the authenticated deploy request must be reduced to the closed qualification fence',
+    );
+    assert.match(
+      body,
+      /const shutdown = async \(\{[\s\S]{0,180}?qualificationExpectation,[\s\S]*?prepareCleanRetirement\(\{[\s\S]{0,500}?qualificationExpectation,/,
+      'the shutdown must forward the normalized fence into clean retirement',
+    );
+  });
+
+  test('logs exactly one bounded qualification result before any retirement snapshot', () => {
+    const body = shutdownBody();
+    const retirement = body.indexOf('const retirement = await prepareCleanRetirement({');
+    const qualificationEvent = body.indexOf("logEvent('clean-restart-qualification-observed'", retirement);
+    const snapshots = body.indexOf("logEvent('clean-retirement-snapshot'", retirement);
+    assert.notEqual(retirement, -1, 'clean retirement call is missing');
+    assert.notEqual(qualificationEvent, -1, 'qualification event is missing');
+    assert.notEqual(snapshots, -1, 'retirement snapshot event is missing');
+    assert.ok(retirement < qualificationEvent && qualificationEvent < snapshots);
+    assert.equal(
+      body.match(/logEvent\('clean-restart-qualification-observed'/g)?.length,
+      1,
+      'shutdown must have one qualification event call site',
+    );
+    assert.match(
+      body.slice(retirement, snapshots),
+      /if \(qualificationExpectation !== undefined\) \{[\s\S]*?buildQualificationEvent\(/,
+      'routine deploys must not emit a qualification result',
+    );
+  });
+
+  test('authorized deploy starts retirement without the legacy natural drain', () => {
+    const body = shutdownBody();
+    assert.match(
+      body,
+      /if \(!continuationAuthorized\) \{[\s\S]*?while \(inFlightHandlers\.size > 0\)[\s\S]*?\}/,
+      'only non-authorizing shutdowns may run the legacy natural-handler drain',
+    );
+    assert.match(
+      body,
+      /let drainElapsed = 0;[\s\S]*?if \(!continuationAuthorized\) \{[\s\S]*?drainElapsed = Date\.now\(\) - drainStart/,
+      'authorized shutdown must report zero legacy drain time',
+    );
+  });
+
+  test('authorized question cleanup never answers the retiring provider while signals retain normal expiry', () => {
+    const body = shutdownBody();
+    assert.match(
+      body,
+      /if \(continuationAuthorized\) \{[\s\S]*?beginShutdownDisposition[\s\S]*?\} else \{[\s\S]*?expireQuestion/,
+      'deploy-only question disposition must remain separate from ordinary signal expiry',
+    );
+  });
+
   test('fences inbound admission before delivery/process retirement and clean persistence', () => {
     const body = shutdownBody();
-    const stopInbound = body.indexOf('bot._stop()');
+    const stopInbound = body.indexOf('stopPolling()');
     const retire = body.indexOf('await prepareCleanRetirement({');
     const persist = body.indexOf('persistShutdownDisposition({');
     assert.notEqual(stopInbound, -1, 'Telegram intake fence is missing');
@@ -158,8 +216,27 @@ describe('clean restart lifecycle ordering', () => {
     );
     assert.match(
       body,
-      /prepareCleanRetirement\(\{[\s\S]{0,250}?deliveryBarrier,[\s\S]{0,250}?awaitHandlerSettlement,/,
-      'the retirement barrier must include reply delivery and handler settlement',
+      /prepareCleanRetirement\(\{[\s\S]{0,350}?deliveryBarrier,[\s\S]{0,350}?awaitIngressSettlement,[\s\S]{0,350}?awaitHandlerSettlement,/,
+      'the retirement barrier must include reply delivery, admitted ingress, and handler settlement',
+    );
+  });
+
+  test('constructs and uses a stable polling fence before pollBot can start', () => {
+    assert.match(
+      src,
+      /\(\{ pollBot, startPollWatchdog, stopPolling, awaitPollSettlement \} = createPollLoop\(/,
+      'poll admission and settlement controls must exist before pollBot starts',
+    );
+    const body = shutdownBody();
+    assert.match(
+      body,
+      /stopPolling\(\);[\s\S]{0,250}?const awaitIngressSettlement = \(\{ timeoutMs \} = \{\}\) => \([\s\S]{0,120}?awaitPollSettlement\(\{ timeoutMs \}\)/,
+      'shutdown must close the stable controller and preserve its settlement timeout',
+    );
+    assert.match(
+      body,
+      /err\?\.code === 'POLL_SETTLEMENT_TIMEOUT'[\s\S]{0,100}?poll-settlement-timeout/,
+      'uncertain ingress settlement must force an explicit crash-like disposition',
     );
   });
 
@@ -172,12 +249,24 @@ describe('clean restart lifecycle ordering', () => {
     assert.ok(retire < persist, 'clean retirement must finish before persistence');
     assert.match(
       body,
-      /prepareCleanRetirement\(\{[\s\S]{0,250}?awaitHandlerSettlement,/,
+      /prepareCleanRetirement\(\{[\s\S]{0,450}?awaitIngressSettlement,[\s\S]{0,250}?awaitHandlerSettlement,/,
     );
     assert.match(
       body,
       /if \(pm && !pmRetired\) await pm\.shutdown\(\)/,
       'a retired ProcessManager must not be shut down a second time',
+    );
+  });
+
+  test('OOM shutdown joins delivery, poll ingress, process teardown, and handlers before persistence', () => {
+    const body = shutdownBody();
+    const settle = body.indexOf('await settleCrashShutdown({');
+    const persist = body.indexOf('persistShutdownDisposition({');
+    assert.notEqual(settle, -1, 'crash/OOM settlement helper is missing');
+    assert.ok(settle < persist, 'crash/OOM branches must settle before persistence');
+    assert.match(
+      body,
+      /settleCrashShutdown\(\{[\s\S]{0,450}?deliveryBarrier,[\s\S]{0,450}?awaitIngressSettlement,[\s\S]{0,450}?awaitHandlerSettlement/,
     );
   });
 
@@ -248,6 +337,41 @@ describe('ipc handler wiring', () => {
     // would silently stop covering what a running daemon actually answers.
     assert.match(src, /handlers: createIpcHandlers\(\{/);
     assert.match(src, /getInFlightHandlers: \(\) => inFlightHandlers/);
+  });
+
+  test('one per-boot identity is created before DB or IPC and reaches every lifecycle witness', () => {
+    const createIdentity = src.indexOf('const daemonIdentity = createDaemonIdentity({');
+    const openDb = src.indexOf('db = dbClient.open(DB_PATH)');
+    const startIpc = src.indexOf('ipcCloser = await ipcServer.start({');
+    assert.ok(createIdentity >= 0, 'daemon identity is not created during boot');
+    assert.ok(createIdentity < openDb, 'daemon identity must exist before the DB opens');
+    assert.ok(createIdentity < startIpc, 'daemon identity must exist before IPC starts');
+    assert.match(
+      src.slice(createIdentity, createIdentity + 300),
+      /mainPath: __filename,[\s\S]*?packageVersion: packageMetadata\.version,/,
+      'daemon identity must describe the real production entrypoint and installed package',
+    );
+
+    for (const kind of [
+      'polygram-start',
+      'shutdown-drain',
+      'polygram-stop',
+      'polygram-admission-open',
+    ]) {
+      const event = src.indexOf(`'${kind}'`);
+      assert.notEqual(event, -1, `${kind} event is missing`);
+      assert.match(
+        src.slice(event, event + 1_200),
+        /\}, invocationId, daemonIdentity\)\)/,
+        `${kind} must include the per-boot identity and PID`,
+      );
+    }
+
+    assert.match(
+      src.slice(startIpc, startIpc + 1_500),
+      /createIpcHandlers\(\{[\s\S]*?daemonIdentity,/,
+      'authenticated IPC readiness must use the same per-boot identity',
+    );
   });
 });
 

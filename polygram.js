@@ -34,11 +34,17 @@ const { createIpcHandlers } = require('./lib/ipc/handlers');
 const {
   requireRestartRequestId,
 } = require('./lib/ipc/restart-request-id');
+const {
+  buildQualificationEvent,
+  normalizeDeployQualificationExpectation,
+} = require('./lib/ops/clean-restart-qualification');
 const { classifyOrphanSweep } = require('./lib/ops/tmux-preflight');
 const {
   parseSystemdInvocationId,
   lifecycleDetail,
 } = require('./lib/ops/systemd-invocation');
+const { createDaemonIdentity } = require('./lib/ops/daemon-identity');
+const packageMetadata = require('./package.json');
 const { filterAttachments, resolveFileCaps, resolveMaxFileOverride, MAX_TOTAL_BYTES } = require('./lib/attachments');
 // 0.9.0: SDK ProcessManager is the only pm. CLI pm
 // (lib/process-manager.js) deleted in commit 6.
@@ -194,6 +200,7 @@ const { createCgroupOomObserver } = require('./lib/ops/cgroup-oom-observer');
 const { persistShutdownDisposition } = require('./lib/ops/shutdown-disposition');
 const {
   prepareCleanRetirement,
+  settleCrashShutdown,
   buildResumeIntents,
 } = require('./lib/ops/clean-shutdown');
 const {
@@ -3539,10 +3546,16 @@ function createBot(token) {
 // ─── Manual polling — extracted to lib/handlers/poll.js ────────────
 let pollBot = null;
 let startPollWatchdog = null;
+let stopPolling = null;
+let awaitPollSettlement = null;
 
 // ─── Main ───────────────────────────────────────────────────────────
 
 async function main() {
+  const daemonIdentity = createDaemonIdentity({
+    mainPath: __filename,
+    packageVersion: packageMetadata.version,
+  });
   const cgroupOomObserver = createCgroupOomObserver();
   const invocationId = parseSystemdInvocationId();
   let abnormalProviderTermination = null;
@@ -3787,7 +3800,7 @@ async function main() {
     db.logEvent('polygram-start', lifecycleDetail({
       migration: migration.reason,
       imported: migration.imported,
-    }, invocationId));
+    }, invocationId, daemonIdentity));
     if (cgroupOomObserver.startup.status === 'unavailable') {
       console.warn(`[oom-observer] unavailable (${cgroupOomObserver.startup.reason}); handled shutdown signals will retain clean-restart behavior`);
       db.logEvent('oom-observer-unavailable', { reason: cgroupOomObserver.startup.reason });
@@ -4483,7 +4496,7 @@ async function main() {
   dropRedeliverer = createDropRedeliverer({
     db, redeliver: redeliverAsFreshTurn, logEvent, logger: console,
   });
-  ({ pollBot, startPollWatchdog } = createPollLoop({
+  ({ pollBot, startPollWatchdog, stopPolling, awaitPollSettlement } = createPollLoop({
     db, dbWrite, config, botName: BOT_NAME,
     isWellFormedMessage, getTopicName,
     logger: console,
@@ -4533,6 +4546,7 @@ async function main() {
     continuationAuthorized = false,
     trigger = 'signal',
     restartRequestId = null,
+    qualificationExpectation,
   } = {}) => {
     if (isShuttingDown) return;
     const shutdownObservation = cgroupOomObserver.sample();
@@ -4545,22 +4559,30 @@ async function main() {
     isShuttingDown = true;
     console.log(`\nShutting down (${trigger})...`);
     // 1. Stop accepting new inbound first so nothing new queues behind the drain.
-    if (bot && bot._stop) bot._stop();
+    stopPolling();
+    const awaitIngressSettlement = ({ timeoutMs } = {}) => (
+      awaitPollSettlement({ timeoutMs })
+    );
 
-    // 1.5 (0.13 D1): expire open interactive questions {cancelled} BEFORE the
-    // drain. With D1 the asking turn stays in flight for the whole wait, so a
-    // deploy during a question would otherwise eat the entire 30s drain and
-    // mark the inbound replay-pending mid-ask. Cancelling unblocks claude's
-    // ask so the cycle can end inside the drain; the boot-replay re-ask is the
-    // documented recovery path (design §3 D1 ask-wait semantics).
+    // Resolve open questions before provider settlement. Authorized deploys
+    // register the card edit and cancel the row without answering the retiring
+    // provider; ordinary stops keep the existing answer-and-await behavior.
     try {
       const openQuestions = questionStore.listOpen?.(BOT_NAME) || [];
-      for (const row of openQuestions) {
-        // eslint-disable-next-line no-await-in-loop
-        await questionHandlers.expireQuestion(row, {
-          status: 'cancelled',
-          message: 'Bot is restarting — this question was cancelled. It may be re-asked in a moment.',
-        }).catch(() => {});
+      if (continuationAuthorized) {
+        for (const row of openQuestions) {
+          questionHandlers.beginShutdownDisposition(row, {
+            message: 'Bot is restarting — this question was cancelled. It may be re-asked in a moment.',
+          });
+        }
+      } else {
+        for (const row of openQuestions) {
+          // eslint-disable-next-line no-await-in-loop
+          await questionHandlers.expireQuestion(row, {
+            status: 'cancelled',
+            message: 'Bot is restarting — this question was cancelled. It may be re-asked in a moment.',
+          }).catch(() => {});
+        }
       }
       if (openQuestions.length) {
         logEvent('shutdown-questions-cancelled', { count: openQuestions.length });
@@ -4619,13 +4641,15 @@ async function main() {
     // 2. Drain in-flight handlers. Wait for inFlightHandlers to empty or
     //    SHUTDOWN_DRAIN_MS to elapse. pm handlers resolve naturally when
     //    result events arrive; the dispatcher's .finally decrements.
-    const drainStart = Date.now();
-    while (inFlightHandlers.size > 0) {
-      if (Date.now() - drainStart >= SHUTDOWN_DRAIN_MS) break;
-      await new Promise((r) => setTimeout(r, 100));
+    let drainElapsed = 0;
+    if (!continuationAuthorized) {
+      const drainStart = Date.now();
+      while (inFlightHandlers.size > 0) {
+        if (Date.now() - drainStart >= SHUTDOWN_DRAIN_MS) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      drainElapsed = Date.now() - drainStart;
     }
-    const drainElapsed = Date.now() - drainStart;
-    const remaining = countInFlight(inFlightHandlers);
 
     // 3. A clean stop closes both output boundaries before persisting any
     //    recovery intent. The ProcessManager receipt is the only authority for
@@ -4636,14 +4660,38 @@ async function main() {
       ? 'provider-process-terminated'
       : null;
     let resumeIntents = [];
-    if (shutdownObservation?.detected !== true) {
+    if (shutdownObservation?.detected === true) {
+      try {
+        await settleCrashShutdown({
+          pm,
+          deliveryBarrier,
+          awaitIngressSettlement,
+          awaitHandlerSettlement,
+          settlementTimeoutMs: SHUTDOWN_DRAIN_MS,
+        });
+      } catch (err) {
+        console.error(`[shutdown] crash settlement failed: ${err.message}`);
+      }
+      pmRetired = true;
+    } else {
       try {
         const retirement = await prepareCleanRetirement({
           pm,
           deliveryBarrier,
+          awaitIngressSettlement,
           awaitHandlerSettlement,
           settlementTimeoutMs: SHUTDOWN_DRAIN_MS,
+          qualificationExpectation,
         });
+        if (qualificationExpectation !== undefined) {
+          logEvent('clean-restart-qualification-observed', buildQualificationEvent({
+            botName: BOT_NAME,
+            daemonIdentity,
+            restartRequestId,
+            expectation: qualificationExpectation,
+            observation: retirement.qualification,
+          }));
+        }
         pmRetired = true;
         const projected = continuationAuthorized ? buildResumeIntents({
           snapshots: retirement.snapshots,
@@ -4686,12 +4734,16 @@ async function main() {
           });
         }
       } catch (err) {
-        forceCrashReason = 'clean-retirement-failed';
+        forceCrashReason = err?.code === 'POLL_OFFSET_PERSISTENCE_FAILED'
+          ? 'poll-offset-persistence-failed'
+          : err?.code === 'POLL_SETTLEMENT_TIMEOUT'
+            ? 'poll-settlement-timeout'
+            : 'clean-retirement-failed';
         console.error(`[shutdown] clean retirement failed: ${err.message}`);
-        if (pm) await pm.shutdown().catch(() => {});
         pmRetired = true;
       }
     }
+    const remaining = countInFlight(inFlightHandlers);
 
     // 4. Persist only after the old delivery/process boundary is closed and
     //    every dispatcher-owned continuation has settled. Any uncertainty is
@@ -4732,7 +4784,7 @@ async function main() {
             ? restartRequestId
             : null,
           ...(res.oomKillDelta != null ? { oom_kill_delta: res.oomKillDelta } : {}),
-        }, invocationId));
+        }, invocationId, daemonIdentity));
         console.log(`[shutdown] ${res.clean ? 'clean' : 'crash-like'} shutdown recorded (${res.shutdownReason}); ${inFlightAtSignal} in-flight at signal, drained ${drainElapsed}ms, ${remaining} still in-flight, ${res.replayMarked} marked replay-pending`);
       } catch (err) {
         console.error(`[shutdown] persistence failed: ${err.message}`);
@@ -4766,7 +4818,7 @@ async function main() {
     if (pm && !pmRetired) await pm.shutdown().catch(() => {});
     if (db) {
       try {
-        db.logEvent('polygram-stop', lifecycleDetail({}, invocationId));
+        db.logEvent('polygram-stop', lifecycleDetail({}, invocationId, daemonIdentity));
         db.raw.close();
       } catch {}
     }
@@ -4802,8 +4854,12 @@ async function main() {
       secret: ipcSecret,
       handlers: createIpcHandlers({
         botName: BOT_NAME,
+        daemonIdentity,
         getInFlightHandlers: () => inFlightHandlers,
         handleSendOverIpc: (req) => handleSendOverIpc(req),
+        inspectCleanRestartQualification: () => (
+          pm.inspectCleanRestartQualification(undefined)
+        ),
         requestDeployRestart: (req) => {
           if (isShuttingDown) {
             const error = new Error('shutdown already in progress');
@@ -4811,11 +4867,13 @@ async function main() {
             throw error;
           }
           const restartRequestId = requireRestartRequestId(req.id);
+          const qualificationExpectation = normalizeDeployQualificationExpectation(req);
           const oldPid = process.pid;
           shutdown({
             continuationAuthorized: true,
             trigger: 'deploy-ipc',
             restartRequestId,
+            qualificationExpectation,
           }).catch((error) => {
             console.error(`[shutdown] deploy restart failed: ${error.message}`);
           });
@@ -5337,7 +5395,7 @@ async function main() {
 
   logEvent('polygram-admission-open', lifecycleDetail({
     bot: BOT_NAME,
-  }, invocationId));
+  }, invocationId, daemonIdentity));
   console.log(`[${BOT_NAME}] Starting...`);
   const pollPromise = pollBot(bot).catch(err => {
     console.error(`[${BOT_NAME}] Fatal:`, err.message);
