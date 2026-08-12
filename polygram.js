@@ -32,16 +32,14 @@ const { buildPrompt, resolvePromptBackend } = require('./lib/prompt');
 const { countInFlight } = require('./lib/queue-utils');
 const { createIpcHandlers } = require('./lib/ipc/handlers');
 const {
-  requireRestartRequestId,
-} = require('./lib/ipc/restart-request-id');
-const {
   buildQualificationEvent,
-  normalizeDeployQualificationExpectation,
 } = require('./lib/ops/clean-restart-qualification');
 const {
   createForegroundCanaryAuthorizer,
-  normalizeDeployForegroundExpectation,
 } = require('./lib/ops/foreground-canary-target');
+const {
+  createDeployRestartHandler,
+} = require('./lib/ops/deploy-restart-handler');
 const { classifyOrphanSweep } = require('./lib/ops/tmux-preflight');
 const {
   parseSystemdInvocationId,
@@ -4865,6 +4863,14 @@ async function main() {
         db.getForegroundCanaryTarget(input)
       ),
     });
+    const requestDeployRestart = createDeployRestartHandler({
+      getIsShuttingDown: () => isShuttingDown,
+      getPid: () => process.pid,
+      foregroundCanaryAuthorizer,
+      logEvent,
+      shutdown,
+      logger: console,
+    });
     ipcCloser = await ipcServer.start({
       path: ipcServer.socketPathFor(BOT_NAME),
       secret: ipcSecret,
@@ -4880,69 +4886,7 @@ async function main() {
         inspectCleanRestartQualification: () => (
           pm.inspectCleanRestartQualification(undefined)
         ),
-        requestDeployRestart: (req) => {
-          const oldPid = process.pid;
-          let restartRequestId;
-          try {
-            restartRequestId = requireRestartRequestId(req.id);
-          } catch {
-            return {
-              accepted: false,
-              old_pid: oldPid,
-              restart_request_id: null,
-              rejection_code: 'invalid-request',
-            };
-          }
-          if (isShuttingDown) {
-            return {
-              accepted: false,
-              old_pid: oldPid,
-              restart_request_id: restartRequestId,
-              rejection_code: 'shutdown-in-progress',
-            };
-          }
-          const qualificationExpectation = normalizeDeployQualificationExpectation(req);
-          const foregroundExpectation = normalizeDeployForegroundExpectation(req);
-          if (qualificationExpectation === null || foregroundExpectation === null) {
-            return {
-              accepted: false,
-              old_pid: oldPid,
-              restart_request_id: restartRequestId,
-              rejection_code: 'invalid-request',
-            };
-          }
-          if (foregroundExpectation !== undefined) {
-            const authorization = foregroundCanaryAuthorizer.authorizeRestart({
-              requestId: restartRequestId,
-              expectation: foregroundExpectation,
-            });
-            if (!authorization.accepted) {
-              return {
-                accepted: false,
-                old_pid: oldPid,
-                restart_request_id: restartRequestId,
-                rejection_code: authorization.rejectionCode,
-              };
-            }
-            logEvent(
-              'foreground-canary-target-authorized',
-              authorization.authorizationEvent,
-            );
-          }
-          shutdown({
-            continuationAuthorized: true,
-            trigger: 'deploy-ipc',
-            restartRequestId,
-            qualificationExpectation,
-          }).catch((error) => {
-            console.error(`[shutdown] deploy restart failed: ${error.message}`);
-          });
-          return {
-            accepted: true,
-            old_pid: oldPid,
-            restart_request_id: restartRequestId,
-          };
-        },
+        requestDeployRestart,
       }),
       logger: console,
     });

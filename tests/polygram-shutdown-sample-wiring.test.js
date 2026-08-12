@@ -16,6 +16,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const src = fs.readFileSync(path.join(__dirname, '..', 'polygram.js'), 'utf8');
+const deployRestartSrc = fs.readFileSync(
+  path.join(__dirname, '..', 'lib', 'ops', 'deploy-restart-handler.js'),
+  'utf8',
+);
 
 // Body of the SIGTERM/SIGINT/SIGHUP handler.
 function shutdownBody() {
@@ -131,8 +135,8 @@ describe('clean restart lifecycle ordering', () => {
       'ordinary handled signals must not reach continuation-intent projection',
     );
     assert.match(
-      src,
-      /requestDeployRestart: \(req\) => \{[\s\S]{0,4000}?requireRestartRequestId\(req\.id\)[\s\S]{0,4000}?shutdown\(\{[\s\S]{0,220}?continuationAuthorized: true,[\s\S]{0,220}?trigger: 'deploy-ipc',[\s\S]{0,220}?restartRequestId/,
+      deployRestartSrc,
+      /return function requestDeployRestart\(request\)[\s\S]*?requireRestartRequestId\(request\?\.id\)[\s\S]*?shutdown\(\{[\s\S]{0,220}?continuationAuthorized: true,[\s\S]{0,220}?trigger: 'deploy-ipc',[\s\S]{0,220}?restartRequestId/,
       'the authenticated IPC handler must directly begin the authorized shutdown',
     );
     for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
@@ -147,8 +151,8 @@ describe('clean restart lifecycle ordering', () => {
   test('qualified deploy forwards one closed fence while routine deploy remains unchanged', () => {
     const body = shutdownBody();
     assert.match(
-      src,
-      /const qualificationExpectation = normalizeDeployQualificationExpectation\(req\)/,
+      deployRestartSrc,
+      /const qualificationExpectation = normalizeDeployQualificationExpectation\(request\)/,
       'the authenticated deploy request must be reduced to the closed qualification fence',
     );
     assert.match(
@@ -339,11 +343,15 @@ describe('ipc handler wiring', () => {
     assert.match(src, /getInFlightHandlers: \(\) => inFlightHandlers/);
     assert.match(src, /getActiveHandlerTargets: \(\) => getActiveHandlerTargets\(\)/);
     assert.match(src, /requestForegroundCanaryTarget:/);
+    assert.match(src, /const requestDeployRestart = createDeployRestartHandler\(\{/);
+    assert.match(src, /requestDeployRestart,/);
   });
 
   test('foreground restart authorization is rechecked and logged before shutdown starts', () => {
-    const restartHandler = src.indexOf('requestDeployRestart: (req) => {');
-    const handlerBody = src.slice(restartHandler, restartHandler + 5_000);
+    const restartHandler = deployRestartSrc.indexOf(
+      'return function requestDeployRestart(request)',
+    );
+    const handlerBody = deployRestartSrc.slice(restartHandler);
     const authorize = handlerBody.indexOf('authorizeRestart({');
     const event = handlerBody.indexOf("'foreground-canary-target-authorized'");
     const shutdown = handlerBody.indexOf('shutdown({');

@@ -271,6 +271,12 @@ describe('foreground canary target authorization', () => {
       outcome: 'rejected',
       rejection_code: 'invalid-request',
     });
+    assert.deepEqual(fx.authorizer.probe(probeRequest(fx.scopeDigest, {
+      id: 'not-a-restart-uuid',
+    })), {
+      outcome: 'rejected',
+      rejection_code: 'invalid-request',
+    });
 
     const probe = fx.authorizer.probe(probeRequest(fx.scopeDigest));
     const expected = {
@@ -303,6 +309,12 @@ describe('foreground canary target authorization', () => {
         ...foregroundExpectation(probe),
         session_key: 'must-not-select',
       },
+    }), null);
+    assert.equal(normalizeDeployForegroundExpectation({
+      op: 'deploy_restart',
+      id: 'not-a-restart-uuid',
+      secret: 'secret',
+      foreground_expectation: foregroundExpectation(probe),
     }), null);
   });
 });
