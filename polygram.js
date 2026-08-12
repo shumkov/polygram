@@ -4878,7 +4878,6 @@ async function main() {
         botName: BOT_NAME,
         daemonIdentity,
         getInFlightHandlers: () => inFlightHandlers,
-        getActiveHandlerTargets: () => getActiveHandlerTargets(),
         handleSendOverIpc: (req) => handleSendOverIpc(req),
         requestForegroundCanaryTarget: (req) => (
           foregroundCanaryAuthorizer.probe(req)

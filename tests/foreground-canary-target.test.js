@@ -317,6 +317,22 @@ describe('foreground canary target authorization', () => {
       foreground_expectation: foregroundExpectation(probe),
     }), null);
   });
+
+  test('bounds abandoned target tokens and admits a new probe after expiry', () => {
+    const fx = fixture({ tokenTtlMs: 10, tokenLimit: 1 });
+    assert.equal(fx.authorizer.probe(probeRequest(fx.scopeDigest)).outcome, 'live');
+    assert.deepEqual(fx.authorizer.probe(probeRequest(fx.scopeDigest, {
+      id: '5b92e0aa-c3b8-4f3f-8fd8-74fae3fbd013',
+    })), {
+      outcome: 'rejected',
+      rejection_code: 'target-unavailable',
+    });
+
+    fx.advance(11);
+    assert.equal(fx.authorizer.probe(probeRequest(fx.scopeDigest, {
+      id: 'd4bb72bb-7388-4346-9eb5-b8a552c7bb15',
+    })).outcome, 'live');
+  });
 });
 
 describe('configured scope digest', () => {
@@ -375,5 +391,10 @@ describe('foreground target database projection', () => {
       provider: 'claude',
       handlerStatus: 'processing',
     });
+    assert.equal(db.getForegroundCanaryTarget({
+      botName: 'shumorobot',
+      chatId: '100',
+      telegramMessageId: '77 OR 1=1',
+    }), null);
   });
 });

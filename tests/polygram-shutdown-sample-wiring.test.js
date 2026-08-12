@@ -341,7 +341,7 @@ describe('ipc handler wiring', () => {
     // would silently stop covering what a running daemon actually answers.
     assert.match(src, /handlers: createIpcHandlers\(\{/);
     assert.match(src, /getInFlightHandlers: \(\) => inFlightHandlers/);
-    assert.match(src, /getActiveHandlerTargets: \(\) => getActiveHandlerTargets\(\)/);
+    assert.match(src, /createForegroundCanaryAuthorizer\(\{[\s\S]{0,500}?getActiveHandlerTargets:/);
     assert.match(src, /requestForegroundCanaryTarget:/);
     assert.match(src, /const requestDeployRestart = createDeployRestartHandler\(\{/);
     assert.match(src, /requestDeployRestart,/);
