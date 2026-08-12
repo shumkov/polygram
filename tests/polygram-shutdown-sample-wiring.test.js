@@ -341,19 +341,24 @@ describe('ipc handler wiring', () => {
     // would silently stop covering what a running daemon actually answers.
     assert.match(src, /handlers: createIpcHandlers\(\{/);
     assert.match(src, /getInFlightHandlers: \(\) => inFlightHandlers/);
-    assert.match(src, /createForegroundCanaryAuthorizer\(\{[\s\S]{0,500}?getActiveHandlerTargets:/);
+    assert.match(src, /createForegroundCanaryAuthorizer\(\{[\s\S]{0,500}?getActiveHandlerCount:/);
+    assert.match(src, /createForegroundCanaryAuthorizer\(\{[\s\S]{0,700}?getActiveHandlerTargets:/);
     assert.match(src, /requestForegroundCanaryTarget:/);
     assert.match(src, /const requestDeployRestart = createDeployRestartHandler\(\{/);
+    assert.match(
+      src,
+      /persistForegroundCanaryAuthorization: \(detail\) =>[\s\S]{0,150}?db\.logEvent\([\s\S]{0,100}?'foreground-canary-target-authorized'/,
+    );
     assert.match(src, /requestDeployRestart,/);
   });
 
-  test('foreground restart authorization is rechecked and logged before shutdown starts', () => {
+  test('foreground restart authorization is rechecked and persisted before shutdown starts', () => {
     const restartHandler = deployRestartSrc.indexOf(
       'return function requestDeployRestart(request)',
     );
     const handlerBody = deployRestartSrc.slice(restartHandler);
     const authorize = handlerBody.indexOf('authorizeRestart({');
-    const event = handlerBody.indexOf("'foreground-canary-target-authorized'");
+    const event = handlerBody.indexOf('persistForegroundCanaryAuthorization(');
     const shutdown = handlerBody.indexOf('shutdown({');
 
     assert.ok(restartHandler >= 0);

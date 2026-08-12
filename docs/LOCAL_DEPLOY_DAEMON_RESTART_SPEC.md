@@ -467,6 +467,9 @@ body. Reads use no-follow open plus `fstat`; existing nodes must be owner-owned
 0600 temporary file, fsyncs it, publishes without following or clobbering a
 different node, and fsyncs the owner-only directory. Shell tracing is disabled,
 and raw config/SQLite/IPC errors collapse to bounded codes.
+Exact owner-only temporary journal and staged-receipt names left by a process
+death are tolerated during recovery scans; unknown names, symlinks, open modes,
+and malformed temporary names still fail closed.
 
 `awaiting-target` contains its already chosen request ID so a rerun continues
 the same observation instead of sampling a new request. A bounded target-wait
@@ -503,8 +506,14 @@ the old daemon for an opaque token bound to the proposed request ID, its exact
 identity/PID, provider, scope digest, and exact sole live source. Any other busy
 value or non-live token response fails before `target-bound`.
 
-The `target-bound` transition revalidates that same request-bound token, then
-durably publishes `dispatch-possible` before its sole socket send. An
+Before crossing the `target-bound` boundary, the driver requires a non-empty
+IPC secret and authenticates that the live daemon still has the journaled
+instance, PID, and package version. Identity drift becomes
+`precondition-rejected` without a restart attempt. The runner also repeats the
+metadata-only turn observation after binding; a completed or replaced scoped
+turn rejects the attempt before restart. The daemon then revalidates the same
+request-bound token, and the driver durably publishes
+`dispatch-possible` before its sole restart socket send. An
 authenticated negative response becomes `precondition-rejected` without
 stopping the daemon. Silence or transport failure after `dispatch-possible` is
 permanently ambiguous: reruns reconcile only the original request and never
@@ -526,12 +535,20 @@ notice, negative/duplicate/interleaved evidence, terminal handler conflict, or
 invalid binding. `proof-pending` is durable immediately after lifecycle
 qualification and before this loop. A replied row whose success event has not
 yet followed the terminal status remains pending for at most 30 seconds; expiry
-is terminal `incomplete-evidence`. Before a `success-capable` verification the
-helper persists that candidate cursor and freezes it. Reruns try the same cursor
-first and never widen a successful or terminal-failure interval.
+is terminal `incomplete-evidence`. A terminal failure is not journal-terminal
+until `authorized-turn-state` binds the single authorization event to its exact
+source row and durable provider/session selection, reports that row terminal,
+daemon-wide busy count is zero, and the final replacement witness passes. The
+helper then freezes the same evidence cursor before writing `proof-failed`.
+Before a `success-capable` verification the helper likewise persists that
+candidate cursor and freezes it. Reruns try the same cursor first and never
+widen a successful or terminal-failure interval. `--new-attempt` rechecks a
+prior `proof-failed` journal through that exact authorization tuple rather than
+the whole configured scope, so a later message cannot permanently wedge retry.
 
 The verifier CLI retains `validate-receipt` and adds `scope-digest`,
-`message-baseline`, `observe-turn`, `classify-interval`, and `stage-receipt`.
+`message-baseline`, `observe-turn`, `authorized-turn-state`,
+`classify-interval`, and `stage-receipt`.
 `stage-receipt` takes the existing strict lifecycle/daemon/request inputs plus
 a runner-chosen absent staging path; it writes one 0600 closed-schema file but
 cannot publish the fixed receipt. The strict verifier writes that no-clobber
@@ -574,11 +591,12 @@ digest, and token; it may coexist with the aged-warm qualification expectation.
 In one synchronous Node event-loop critical section the daemon rechecks old
 identity, requires the complete daemon-wide in-flight count still equal one,
 and proves that sole handler is the exact token-bound target/provider. It
-returns a bounded authenticated rejection on mismatch, or logs one content-free
-target-authorization tuple and enters shutdown before yielding. The shutdown
-call immediately stops polling and closes ProcessManager lifecycle/output
-admission in that same stack, so no turn can replace the authorized target
-between validation and retirement. The final verifier requires that
+returns a bounded authenticated rejection on mismatch, or synchronously
+persists one content-free target-authorization tuple before entering shutdown.
+Persistence failure returns a bounded rejection and does not start shutdown.
+The shutdown call immediately stops polling and closes ProcessManager
+lifecycle/output admission in that same stack, so no turn can replace the
+authorized target between validation and retirement. The final verifier requires that
 authorization tuple before the existing snapshot, intent, lifecycle, claim,
 attestation, dispatch, admission, and success chain.
 
@@ -607,8 +625,10 @@ probe, and writes the token directly into `target-bound`; `restart` reads the
 token from that journal, durably crosses `dispatch-possible`, and sends the
 expectation. The token and raw IPC responses never appear in argv, environment,
 stdout/stderr, temp filenames, or shell tracing. Driver output is one bounded
-phase/result enum. Contract tests reject every extra/malformed wire field and
-inspect process arguments and captured output for token disclosure.
+phase/result enum. The runner fixes `POLYGRAM_IPC_DIR` to the authenticated
+local data directory before invoking either operation. Contract tests reject
+every extra/malformed wire field and inspect process arguments and captured
+output for token disclosure.
 
 ### 7. Release integration
 
@@ -733,6 +753,10 @@ the unfixed sources, then passing after the implementation.
    frozen-upper receipt publication, exact recovery after fixed-receipt fsync
    but before `proof-passed`, notice/fallback/conflict/live-timeout
    failure, valid-receipt idempotence, and allowed/refused `--new-attempt`.
+   They also cover exact secure temporary-journal crash residue, journal
+   no-follow/mode/inode-swap rejection, live-daemon identity drift before
+   dispatch, strict authorization-event persistence, and the legacy ordinary
+   shutdown-in-progress IPC error envelope.
    Fixtures assert every journal and bounded output omits bodies and raw IDs.
    Canary-verifier tests additionally prove provider/name/request/version
    binding, one literal-continuation dispatch, one logical success, and zero

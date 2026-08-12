@@ -50,6 +50,7 @@ function fixture(overrides = {}) {
     threadId: null,
     telegramMessageId: '77',
   }];
+  let activeHandlerCount = 1;
   let selected = {
     messageId: 19,
     chatId: '100',
@@ -70,6 +71,7 @@ function fixture(overrides = {}) {
     config,
     getSessionKey,
     tokenSecret: 'foreground-canary-test-secret',
+    getActiveHandlerCount: () => activeHandlerCount,
     getActiveHandlerTargets: () => activeHandlers,
     getForegroundCanaryTarget: () => selected,
     now: () => now,
@@ -79,6 +81,7 @@ function fixture(overrides = {}) {
   return {
     authorizer,
     scopeDigest,
+    setActiveHandlerCount(value) { activeHandlerCount = value; },
     setActiveHandlers(value) { activeHandlers = value; },
     setSelected(value) { selected = value; },
     advance(ms) { now += ms; },
@@ -259,6 +262,16 @@ describe('foreground canary target authorization', () => {
     }), {
       accepted: false,
       rejectionCode: 'target-token-expired',
+    });
+  });
+
+  test('rejects when separately tracked dispatcher work makes the daemon busy', () => {
+    const fx = fixture();
+    fx.setActiveHandlerCount(2);
+
+    assert.deepEqual(fx.authorizer.probe(probeRequest(fx.scopeDigest)), {
+      outcome: 'rejected',
+      rejection_code: 'daemon-busy',
     });
   });
 

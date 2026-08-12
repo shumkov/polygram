@@ -1077,6 +1077,7 @@ let attemptAutoResume = null;
 let errorReplyText = null;
 let queueWarnThreshold = null;
 let inFlightHandlers = null;
+let getActiveHandlerCount = null;
 let getActiveHandlerTargets = null;
 let awaitHandlerSettlement = null;
 let trackHandlerTask = null;
@@ -4426,6 +4427,7 @@ async function main() {
     errorReplyText,
     queueWarnThreshold,
     inFlightHandlers,
+    getActiveHandlerCount,
     getActiveHandlerTargets,
     awaitSettlement: awaitHandlerSettlement,
     trackTask: trackHandlerTask,
@@ -4858,6 +4860,7 @@ async function main() {
       daemonIdentity,
       config,
       tokenSecret: ipcSecret,
+      getActiveHandlerCount: () => getActiveHandlerCount(),
       getActiveHandlerTargets: () => getActiveHandlerTargets(),
       getForegroundCanaryTarget: (input) => (
         db.getForegroundCanaryTarget(input)
@@ -4867,7 +4870,9 @@ async function main() {
       getIsShuttingDown: () => isShuttingDown,
       getPid: () => process.pid,
       foregroundCanaryAuthorizer,
-      logEvent,
+      persistForegroundCanaryAuthorization: (detail) => (
+        db.logEvent('foreground-canary-target-authorized', detail)
+      ),
       shutdown,
       logger: console,
     });

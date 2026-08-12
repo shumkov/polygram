@@ -38,8 +38,8 @@ function fixture(overrides = {}) {
         };
       },
     },
-    logEvent(kind, detail) {
-      sequence.push(`event:${kind}`);
+    persistForegroundCanaryAuthorization(detail) {
+      sequence.push('event:foreground-canary-target-authorized');
       assert.deepEqual(detail, {
         bot: 'shumorobot',
         restart_request_sha256: 'c'.repeat(64),
@@ -57,7 +57,7 @@ function fixture(overrides = {}) {
 }
 
 describe('deploy restart request handler', () => {
-  test('rechecks and logs an exact foreground target before synchronously entering shutdown', () => {
+  test('rechecks and persists an exact foreground target before synchronously entering shutdown', () => {
     const fx = fixture();
     const response = fx.handler({
       op: 'deploy_restart',
@@ -126,6 +126,29 @@ describe('deploy restart request handler', () => {
     assert.deepEqual(fx.shutdownCalls, []);
   });
 
+  test('rejects foreground restart when authorization evidence cannot be persisted', () => {
+    const fx = fixture({
+      persistForegroundCanaryAuthorization() {
+        fx.sequence.push('persist-failed');
+        throw new Error('database is read-only');
+      },
+    });
+
+    assert.deepEqual(fx.handler({
+      op: 'deploy_restart',
+      id: REQUEST_ID,
+      secret: 'secret',
+      foreground_expectation: foregroundExpectation(),
+    }), {
+      accepted: false,
+      old_pid: 4242,
+      restart_request_id: REQUEST_ID,
+      rejection_code: 'authorization-evidence-unavailable',
+    });
+    assert.deepEqual(fx.sequence, ['authorize', 'persist-failed']);
+    assert.deepEqual(fx.shutdownCalls, []);
+  });
+
   test('rejects malformed/unknown wire fields and an in-progress shutdown without side effects', () => {
     const malformed = fixture();
     assert.deepEqual(malformed.handler({
@@ -142,18 +165,32 @@ describe('deploy restart request handler', () => {
     });
     assert.deepEqual(malformed.sequence, []);
 
-    const shuttingDown = fixture({ getIsShuttingDown: () => true });
-    assert.deepEqual(shuttingDown.handler({
+    const foregroundShuttingDown = fixture({ getIsShuttingDown: () => true });
+    assert.deepEqual(foregroundShuttingDown.handler({
       op: 'deploy_restart',
       id: REQUEST_ID,
       secret: 'secret',
+      foreground_expectation: foregroundExpectation(),
     }), {
       accepted: false,
       old_pid: 4242,
       restart_request_id: REQUEST_ID,
       rejection_code: 'shutdown-in-progress',
     });
-    assert.deepEqual(shuttingDown.sequence, []);
+    assert.deepEqual(foregroundShuttingDown.sequence, []);
+  });
+
+  test('preserves the ordinary shutdown-in-progress IPC error contract', () => {
+    const fx = fixture({ getIsShuttingDown: () => true });
+    assert.throws(() => fx.handler({
+      op: 'deploy_restart',
+      id: 'routine-release-request',
+      secret: 'secret',
+    }), (error) => (
+      error?.code === 'SHUTDOWN_IN_PROGRESS'
+      && error.message === 'shutdown already in progress'
+    ));
+    assert.deepEqual(fx.sequence, []);
   });
 
   test('preserves ordinary daemon-owned deploy restart behavior', () => {

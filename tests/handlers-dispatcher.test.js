@@ -179,6 +179,25 @@ describe('createDispatcher — in-flight counter', () => {
 });
 
 describe('createDispatcher — settlement ownership', () => {
+  test('counts dispatcher-owned work without exact message target metadata', async () => {
+    const fx = fixture();
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+
+    let finishTrackedTask;
+    fx.dispatcher.trackTask(new Promise((resolve) => {
+      finishTrackedTask = resolve;
+    }));
+
+    assert.equal(fx.dispatcher.getActiveHandlerTargets().length, 1);
+    assert.equal(fx.dispatcher.getActiveHandlerCount(), 2);
+
+    finishTrackedTask();
+    fx.getResolver().resolve();
+    await fx.dispatcher.awaitSettlement({ timeoutMs: 1000 });
+    assert.equal(fx.dispatcher.getActiveHandlerCount(), 0);
+  });
+
   test('awaitSettlement waits for an ordinary handler to finish', async () => {
     const fx = fixture();
     fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
