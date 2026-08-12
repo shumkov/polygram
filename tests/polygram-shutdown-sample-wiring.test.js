@@ -132,7 +132,7 @@ describe('clean restart lifecycle ordering', () => {
     );
     assert.match(
       src,
-      /requestDeployRestart: \(req\) => \{[\s\S]{0,700}?requireRestartRequestId\(req\.id\)[\s\S]{0,300}?shutdown\(\{[\s\S]{0,220}?continuationAuthorized: true,[\s\S]{0,220}?trigger: 'deploy-ipc',[\s\S]{0,220}?restartRequestId/,
+      /requestDeployRestart: \(req\) => \{[\s\S]{0,4000}?requireRestartRequestId\(req\.id\)[\s\S]{0,4000}?shutdown\(\{[\s\S]{0,220}?continuationAuthorized: true,[\s\S]{0,220}?trigger: 'deploy-ipc',[\s\S]{0,220}?restartRequestId/,
       'the authenticated IPC handler must directly begin the authorized shutdown',
     );
     for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
@@ -337,6 +337,22 @@ describe('ipc handler wiring', () => {
     // would silently stop covering what a running daemon actually answers.
     assert.match(src, /handlers: createIpcHandlers\(\{/);
     assert.match(src, /getInFlightHandlers: \(\) => inFlightHandlers/);
+    assert.match(src, /getActiveHandlerTargets: \(\) => getActiveHandlerTargets\(\)/);
+    assert.match(src, /requestForegroundCanaryTarget:/);
+  });
+
+  test('foreground restart authorization is rechecked and logged before shutdown starts', () => {
+    const restartHandler = src.indexOf('requestDeployRestart: (req) => {');
+    const handlerBody = src.slice(restartHandler, restartHandler + 5_000);
+    const authorize = handlerBody.indexOf('authorizeRestart({');
+    const event = handlerBody.indexOf("'foreground-canary-target-authorized'");
+    const shutdown = handlerBody.indexOf('shutdown({');
+
+    assert.ok(restartHandler >= 0);
+    assert.ok(authorize >= 0, 'foreground target must be rechecked in the restart handler');
+    assert.ok(event > authorize, 'authorization event must follow the exact recheck');
+    assert.ok(shutdown > event, 'shutdown must begin only after the authorization event');
+    assert.match(handlerBody, /restart_request_id: restartRequestId/);
   });
 
   test('one per-boot identity is created before DB or IPC and reaches every lifecycle witness', () => {

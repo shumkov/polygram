@@ -45,6 +45,14 @@ describe('deploy qualification expectation', () => {
         generation_digest: DIGEST,
         activity_epoch: 7,
       },
+      foreground_expectation: {
+        schema_version: 1,
+        daemon_instance_id: 'instance-42',
+        pid: 4242,
+        provider: 'claude',
+        configured_scope_sha256: 'b'.repeat(64),
+        target_token: 'c'.repeat(64),
+      },
     }), {
       expectedGenerationDigest: DIGEST,
       expectedActivityEpoch: 7,

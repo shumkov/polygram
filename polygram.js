@@ -38,6 +38,10 @@ const {
   buildQualificationEvent,
   normalizeDeployQualificationExpectation,
 } = require('./lib/ops/clean-restart-qualification');
+const {
+  createForegroundCanaryAuthorizer,
+  normalizeDeployForegroundExpectation,
+} = require('./lib/ops/foreground-canary-target');
 const { classifyOrphanSweep } = require('./lib/ops/tmux-preflight');
 const {
   parseSystemdInvocationId,
@@ -1075,6 +1079,7 @@ let attemptAutoResume = null;
 let errorReplyText = null;
 let queueWarnThreshold = null;
 let inFlightHandlers = null;
+let getActiveHandlerTargets = null;
 let awaitHandlerSettlement = null;
 let trackHandlerTask = null;
 let recoverCodexRequest = null;
@@ -4423,6 +4428,7 @@ async function main() {
     errorReplyText,
     queueWarnThreshold,
     inFlightHandlers,
+    getActiveHandlerTargets,
     awaitSettlement: awaitHandlerSettlement,
     trackTask: trackHandlerTask,
   } = createDispatcher({
@@ -4849,6 +4855,16 @@ async function main() {
     // scripts, hook); also exported to spawned Claude processes via env.
     const ipcSecret = ipcServer.writeSecret(BOT_NAME);
     process.env.POLYGRAM_IPC_SECRET = ipcSecret;
+    const foregroundCanaryAuthorizer = createForegroundCanaryAuthorizer({
+      botName: BOT_NAME,
+      daemonIdentity,
+      config,
+      tokenSecret: ipcSecret,
+      getActiveHandlerTargets: () => getActiveHandlerTargets(),
+      getForegroundCanaryTarget: (input) => (
+        db.getForegroundCanaryTarget(input)
+      ),
+    });
     ipcCloser = await ipcServer.start({
       path: ipcServer.socketPathFor(BOT_NAME),
       secret: ipcSecret,
@@ -4856,19 +4872,63 @@ async function main() {
         botName: BOT_NAME,
         daemonIdentity,
         getInFlightHandlers: () => inFlightHandlers,
+        getActiveHandlerTargets: () => getActiveHandlerTargets(),
         handleSendOverIpc: (req) => handleSendOverIpc(req),
+        requestForegroundCanaryTarget: (req) => (
+          foregroundCanaryAuthorizer.probe(req)
+        ),
         inspectCleanRestartQualification: () => (
           pm.inspectCleanRestartQualification(undefined)
         ),
         requestDeployRestart: (req) => {
-          if (isShuttingDown) {
-            const error = new Error('shutdown already in progress');
-            error.code = 'SHUTDOWN_IN_PROGRESS';
-            throw error;
-          }
-          const restartRequestId = requireRestartRequestId(req.id);
-          const qualificationExpectation = normalizeDeployQualificationExpectation(req);
           const oldPid = process.pid;
+          let restartRequestId;
+          try {
+            restartRequestId = requireRestartRequestId(req.id);
+          } catch {
+            return {
+              accepted: false,
+              old_pid: oldPid,
+              restart_request_id: null,
+              rejection_code: 'invalid-request',
+            };
+          }
+          if (isShuttingDown) {
+            return {
+              accepted: false,
+              old_pid: oldPid,
+              restart_request_id: restartRequestId,
+              rejection_code: 'shutdown-in-progress',
+            };
+          }
+          const qualificationExpectation = normalizeDeployQualificationExpectation(req);
+          const foregroundExpectation = normalizeDeployForegroundExpectation(req);
+          if (qualificationExpectation === null || foregroundExpectation === null) {
+            return {
+              accepted: false,
+              old_pid: oldPid,
+              restart_request_id: restartRequestId,
+              rejection_code: 'invalid-request',
+            };
+          }
+          if (foregroundExpectation !== undefined) {
+            const authorization = foregroundCanaryAuthorizer.authorizeRestart({
+              requestId: restartRequestId,
+              expectation: foregroundExpectation,
+            });
+            if (!authorization.accepted) {
+              return {
+                accepted: false,
+                old_pid: oldPid,
+                restart_request_id: restartRequestId,
+                rejection_code: authorization.rejectionCode,
+              };
+            }
+            logEvent(
+              'foreground-canary-target-authorized',
+              authorization.authorizationEvent,
+            );
+          }
           shutdown({
             continuationAuthorized: true,
             trigger: 'deploy-ipc',
@@ -4877,7 +4937,11 @@ async function main() {
           }).catch((error) => {
             console.error(`[shutdown] deploy restart failed: ${error.message}`);
           });
-          return { accepted: true, old_pid: oldPid };
+          return {
+            accepted: true,
+            old_pid: oldPid,
+            restart_request_id: restartRequestId,
+          };
         },
       }),
       logger: console,

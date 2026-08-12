@@ -125,6 +125,33 @@ function fixture(overrides = {}) {
 const baseMsg = { message_id: 1, chat: { id: 100 } };
 
 describe('createDispatcher — in-flight counter', () => {
+  test('exposes exact active source metadata without retaining the message body', async () => {
+    const { dispatcher, getResolver } = fixture();
+    const msg = {
+      ...baseMsg,
+      message_thread_id: 5,
+      text: 'must not enter the target snapshot',
+    };
+
+    dispatcher.dispatchHandleMessage('100:5', 100, msg, {});
+    await nextTick();
+
+    assert.deepEqual(dispatcher.getActiveHandlerTargets(), [{
+      sessionKey: '100:5',
+      chatId: '100',
+      threadId: '5',
+      telegramMessageId: '1',
+    }]);
+    assert.doesNotMatch(
+      JSON.stringify(dispatcher.getActiveHandlerTargets()),
+      /must not enter/,
+    );
+
+    getResolver().resolve();
+    await nextTick(); await nextTick();
+    assert.deepEqual(dispatcher.getActiveHandlerTargets(), []);
+  });
+
   test('increments + decrements around handleMessage', async () => {
     const { dispatcher, getResolver } = fixture();
     dispatcher.dispatchHandleMessage('sk1', 100, baseMsg, {});
