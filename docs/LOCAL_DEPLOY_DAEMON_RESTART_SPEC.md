@@ -1,8 +1,9 @@
 # Local daemon-owned deploy restart
 
-Status: AMENDMENT UNDER REVIEW 2026-08-11 — real-host preflight corrected the
-compatibility baseline and the dispatch-uncertainty policy. Implementation is
-being re-reviewed; production activation requires Ivan's explicit alignment.
+Status: APPROVED 2026-08-12 — real-host preflight corrected the compatibility
+baseline and dispatch-uncertainty policy; multi-agent spec review passed and
+Ivan authorized implementation, release, and local activation. Partner VPS
+rollout remains blocked by the postponed aged-warm/background gate.
 
 Scope: Polygram's content-free daemon identity and IPC readiness contract, the
 canonical `polygram-deploy` skill, the local shumorobot launchd contract,
