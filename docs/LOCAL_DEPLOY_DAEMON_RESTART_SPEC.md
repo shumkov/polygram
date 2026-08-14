@@ -1,8 +1,9 @@
 # Local daemon-owned deploy restart
 
-Status: AMENDMENT UNDER REVIEW 2026-08-11 — real-host preflight corrected the
-compatibility baseline and the dispatch-uncertainty policy. Implementation is
-being re-reviewed; production activation requires Ivan's explicit alignment.
+Status: APPROVED 2026-08-12 — real-host preflight corrected the compatibility
+baseline and dispatch-uncertainty policy; multi-agent spec review passed and
+Ivan authorized implementation, release, and local activation. Partner VPS
+rollout remains blocked by the postponed aged-warm/background gate.
 
 Scope: Polygram's content-free daemon identity and IPC readiness contract, the
 canonical `polygram-deploy` skill, the local shumorobot launchd contract,
@@ -402,16 +403,245 @@ dispatches. That chain is bounded by the one request-bound lifecycle interval,
 proving the production run crossed the hard-coded literal `continue` dispatch
 once instead of inferring it from terminal success alone.
 
+The operator entry point for that proof is a dedicated helper, separate from
+release activation and partner rollout:
+
+```sh
+~/.claude/skills/polygram-deploy/run-polygram-foreground-canary.sh \
+  <version> <claude|codex> <configured-chat-name> <configured-topic-name|->
+```
+
+The helper resolves the name through the active bot configuration internally;
+neither numeric chat/thread IDs nor the derived session key are printed or
+stored. It acquires the same local deploy lock as `deploy.sh`, authenticates the
+installed immutable release and daemon, takes a content-free message baseline,
+and waits for exactly one newer inbound in that configured scope with the
+requested durable provider selection and a live handler status (`dispatched`
+or `processing`). This observation is only the operator prompt gate; it does
+not authorize restart.
+
+For shumorobot the trusted defaults are the canonical launchd plist
+`~/Library/LaunchAgents/com.polygram.shumorobot.plist`, its Node executable,
+`~/.polygram/config.json`, `~/.polygram/shumorobot.db`, and
+`~/.local/share/polygram/runtime`. Existing `POLYGRAM_LOCAL_*` test overrides
+remain supported, but there are no CLI path arguments. The fixed receipt is
+`runtime/receipts/<version>-foreground-<provider>.json`; attempt journals are
+UUID-named owner-only regular files under `runtime/canary-attempts/`. Terminal
+attempts remain there as immutable content-free audit records. A valid receipt
+bound to the requested version, bot, provider, and freshly resolved scope
+digest makes the normal command idempotently successful. It prints only `ok`,
+the receipt path, and the safe
+`POLYGRAM_FOREGROUND_<PROVIDER>_SCOPE_SHA256=<digest>` assignment consumed by
+the existing `--vps-only` gate.
+
+The foreground transaction is distinct from `runtime/deploy-state.json` but
+reuses its low-level one-shot dispatch, replacement, lifecycle, and final-live-
+witness primitives. Every local entry point first scans the release journal and
+all canary attempts under the shared lock. `deploy.sh --local-only`,
+`deploy.sh --vps-only`, the other provider runner, and the future aged-warm
+runner must resume their own matching transaction or refuse; none may begin a
+new request while another attempt is nonterminal or dispatch-uncertain. The
+process lock is not the sole arbitration after a helper crash.
+
+On every runner invocation, before observation or recovery, the supplied
+chat/topic is re-resolved through the authenticated active config. Bot,
+package version and recorded integrity, provider, and scope digest must match
+exactly one nonterminal journal; zero/multiple matches or any mismatch refuses
+recovery. After dispatch, all target/evidence inputs come from that journal,
+never directly from new CLI strings. This scan/recovery also runs before a
+fixed-receipt idempotence check.
+
+The canary journal phase set is closed: `awaiting-target`, `target-bound`,
+`dispatch-possible`, `request-acknowledged`, `precondition-rejected`,
+`replacement-observed`, `lifecycle-qualified`, `proof-pending`, `proof-passed`,
+and `proof-failed`. Its initial schema contains version/integrity/provider/scope
+digest, message baseline, attempt UUID, phase, bounded proof status/failure
+code, and creation time. `target-bound` additionally requires request ID, old
+identity/PID, event lower cursor, and an opaque foreground-target token.
+Replacement identity/PID and lifecycle upper cursor appear only after their
+existing boundaries. `proof-pending` may contain one frozen candidate evidence
+upper cursor and, after staging, its receipt SHA-256. Records never contain a
+chat/thread/session/message identifier or
+body. Reads use no-follow open plus `fstat`; existing nodes must be owner-owned
+0600 regular files. Every update rewrites the exact schema through a unique
+0600 temporary file, fsyncs it, publishes without following or clobbering a
+different node, and fsyncs the owner-only directory. Shell tracing is disabled,
+and raw config/SQLite/IPC errors collapse to bounded codes.
+Exact owner-only temporary journal and staged-receipt names left by a process
+death are tolerated during recovery scans; unknown names, symlinks, open modes,
+and malformed temporary names still fail closed.
+
+`awaiting-target` contains its already chosen request ID so a rerun continues
+the same observation instead of sampling a new request. A bounded target-wait
+timeout, conflict, wrong-provider result, busy-not-one result, or target-probe
+rejection may atomically become `precondition-rejected` because
+`dispatch-possible` has never been crossed. Ctrl-C/helper death leaves
+`awaiting-target` or `target-bound` resumable; explicit `--cancel` may reject
+only those two positively pre-send phases. Token expiry or drift discovered
+while revalidating `target-bound` is also `precondition-rejected`. Cancellation,
+timeout, helper-local rejection, silence, and malformed/unauthenticated response
+are forbidden from retiring `dispatch-possible`. The sole exception is the
+exact authenticated `accepted:false` response bound to the stored request and
+old daemon, which is positive evidence that shutdown did not begin and may
+transition to `precondition-rejected`.
+
+The metadata-only verifier exposes three helper operations. `scope-digest`
+resolves an exact unique configured chat/topic and prints only its SHA-256
+digest. `message-baseline` opens SQLite read-only with `query_only` and prints
+only `MAX(messages.id)`. `observe-turn` projects no body and returns one enum:
+
+- `waiting`: no newer scoped inbound exists, or the sole row is still
+  `received` without its durable selection;
+- `live`: exactly one newer scoped inbound has exactly one matching
+  session/provider selection and status `dispatched` or `processing`;
+- `resuming`: that same row is `resume-attempted` after replacement;
+- `replied`: that same row is terminal `replied`;
+- `failed`: it reached another terminal handler status; or
+- `conflict`: there is another scoped inbound or a missing, duplicate, or
+  mismatched selection after dispatch.
+
+The pre-restart wait is bounded to 300 one-second observations. Once it sees
+`live`, the helper requires authenticated daemon-wide busy count one and asks
+the old daemon for an opaque token bound to the proposed request ID, its exact
+identity/PID, provider, scope digest, and exact sole live source. Any other busy
+value or non-live token response fails before `target-bound`.
+
+Before crossing the `target-bound` boundary, the driver requires a non-empty
+IPC secret and authenticates that the live daemon still has the journaled
+instance, PID, and package version. Identity drift becomes
+`precondition-rejected` without a restart attempt. The runner also repeats the
+metadata-only turn observation after binding; a completed or replaced scoped
+turn rejects the attempt before restart. The daemon then revalidates the same
+request-bound token, and the driver durably publishes
+`dispatch-possible` before its sole restart socket send. An
+authenticated negative response becomes `precondition-rejected` without
+stopping the daemon. Silence or transport failure after `dispatch-possible` is
+permanently ambiguous: reruns reconcile only the original request and never
+send again. No timeout or `--new-attempt` overrides this boundary without a
+future positive daemon request-status protocol.
+
+The post-replacement wait allows 7,200 one-second observations. `waiting`,
+`live`, or `resuming` continues it; a timeout while work remains live leaves
+`proof-pending` and cannot authorize another attempt. `failed` or `conflict`
+becomes `proof-failed` only after exact request-bound lifecycle, replacement,
+final-live-witness, terminal selected turn, and authenticated daemon quiescence.
+On `replied`, the helper advances the event upper cursor only while the strict
+verifier's `classify-interval` operation returns exactly `pending`.
+`classify-interval` has one closed result: `pending` only for missing
+not-yet-terminal positive evidence with no negative/conflict;
+`success-capable` only when the selected row is replied and the complete exact
+ordered chain is present; or `terminal-failure:<bounded-code>` for fallback,
+notice, negative/duplicate/interleaved evidence, terminal handler conflict, or
+invalid binding. `proof-pending` is durable immediately after lifecycle
+qualification and before this loop. A replied row whose success event has not
+yet followed the terminal status remains pending for at most 30 seconds; expiry
+is terminal `incomplete-evidence`. A terminal failure is not journal-terminal
+until `authorized-turn-state` binds the single authorization event to its exact
+source row and durable provider/session selection, reports that row terminal,
+daemon-wide busy count is zero, and the final replacement witness passes. The
+helper then freezes the same evidence cursor before writing `proof-failed`.
+Before a `success-capable` verification the helper likewise persists that
+candidate cursor and freezes it. Reruns try the same cursor first and never
+widen a successful or terminal-failure interval. `--new-attempt` rechecks a
+prior `proof-failed` journal through that exact authorization tuple rather than
+the whole configured scope, so a later message cannot permanently wedge retry.
+
+The verifier CLI retains `validate-receipt` and adds `scope-digest`,
+`message-baseline`, `observe-turn`, `authorized-turn-state`,
+`classify-interval`, and `stage-receipt`.
+`stage-receipt` takes the existing strict lifecycle/daemon/request inputs plus
+a runner-chosen absent staging path; it writes one 0600 closed-schema file but
+cannot publish the fixed receipt. The strict verifier writes that no-clobber
+staged receipt for the frozen interval. Before publishing the fixed path, the
+helper reauthenticates the launchd/PID/daemon/release final witness and observes
+the bounded selected row as `replied`. The final no-replace publication and
+directory fsync precede `proof-passed`. If the helper dies between those two
+writes, the next scan opens the fixed receipt no-follow and requires it to be
+byte-identical to the journal-bound staged-receipt digest and to bind the same
+request, frozen cursor, old/new identities, version, provider, bot, and scope.
+That exact positive evidence advances the matching journal directly to
+`proof-passed` without re-sampling or widening the interval; absence or mismatch
+fails closed. This receipt is deliberately historical proof of the frozen
+request interval; ordinary work admitted after its upper cursor does not
+invalidate it. Within the frozen interval, additional scoped
+messages conflict, and the verifier rejects every continuation tuple for
+another scope, every bot-wide replay/fallback notice event or source, and
+duplicate or out-of-order evidence.
+
+`--new-attempt` never edits or archives a prior attempt. Under the same lock it
+creates a new absent UUID-named `awaiting-target` journal, so a crash cannot
+create an unjournaled authorization gap. It is refused unless every prior
+attempt is `precondition-rejected` or has lifecycle-qualified `proof-failed`
+evidence, the prior selected turn is terminal, the daemon is quiescent, and no
+receipt node of any kind exists. It is refused for `dispatch-possible`, every
+incomplete phase, live/pending proof, or malformed/symlink state. The helper
+only prompts the operator to send one ordinary long-running task and no other
+messages until completion; it never sends Telegram content itself.
+
+The daemon protocol closes the polling race. A new authenticated target-probe
+operation accepts only request ID, provider, and configured-scope digest. It
+resolves the digest from the daemon's active config, requires exactly one
+matching live inbound/runtime-selection tuple, requires the entire daemon-wide
+dispatcher-owned in-flight count to equal one, and proves that sole handler is
+the matching tuple. It returns only bounded metadata plus an HMAC token bound
+to that tuple, request, and daemon identity. `deploy_restart` accepts a closed
+`foreground_expectation` containing expected old instance/PID, provider, scope
+digest, and token; it may coexist with the aged-warm qualification expectation.
+
+In one synchronous Node event-loop critical section the daemon rechecks old
+identity, requires the complete daemon-wide in-flight count still equal one,
+and proves that sole handler is the exact token-bound target/provider. It
+returns a bounded authenticated rejection on mismatch, or synchronously
+persists one content-free target-authorization tuple before entering shutdown.
+Persistence failure returns a bounded rejection and does not start shutdown.
+The shutdown call immediately stops polling and closes ProcessManager
+lifecycle/output admission in that same stack, so no turn can replace the
+authorized target between validation and retirement. The final verifier requires that
+authorization tuple before the existing snapshot, intent, lifecycle, claim,
+attestation, dispatch, admission, and success chain.
+
+The target-probe request has exact keys `op`, `id`, `secret`, `provider`, and
+`configured_scope_sha256`, where `op=foreground_canary_target`, `id` is the
+restart UUID, provider is `claude|codex`, and the secret/digest are bounded
+strings. Its exact authenticated response is either
+`{id,ok:true,outcome:"live",bot,daemon_instance_id,pid,package_version,provider,
+configured_scope_sha256,target_token}` or
+`{id,ok:true,outcome:"rejected",rejection_code}`, using a bounded rejection
+enum. The opaque token is 64 lowercase hex characters.
+
+The foreground restart request has exact outer keys `op`, `id`, `secret`, and
+`foreground_expectation`, plus optional `qualification_expectation` for the
+aged-warm gate. `foreground_expectation` has exact keys `schema_version=1`,
+`daemon_instance_id`, `pid`, `provider`, `configured_scope_sha256`, and
+`target_token`. Its exact response is either
+`{id,ok:true,accepted:true,old_pid,restart_request_id}` or
+`{id,ok:true,accepted:false,old_pid,restart_request_id,rejection_code}`. Unknown
+keys, wrong types, or invalid bounds receive authenticated bounded rejection
+and never enter shutdown.
+
+A skill-owned Node driver receives only release root, bot, and 0600 attempt
+journal path on argv. `bind-target` reads the journal no-follow, performs the
+probe, and writes the token directly into `target-bound`; `restart` reads the
+token from that journal, durably crosses `dispatch-possible`, and sends the
+expectation. The token and raw IPC responses never appear in argv, environment,
+stdout/stderr, temp filenames, or shell tracing. Driver output is one bounded
+phase/result enum. The runner fixes `POLYGRAM_IPC_DIR` to the authenticated
+local data directory before invoking either operation. Contract tests reject
+every extra/malformed wire field and inspect process arguments and captured
+output for token disclosure.
+
 ### 7. Release integration
 
-Orchestra 0.10.16 is published from reviewed main through a signed tag and
-GitHub OIDC. It contains the read-only qualification inspection,
-per-generation activity-epoch instrumentation, and the admission-closed
-pre-retirement qualification hook/result. Pin that exact published version in
-Polygram. Integrate the Polygram implementation onto current 0.38.0 main,
-preserve the unrelated rich-text changes, and release the next patch.
-Install Orchestra from the clean registry, verify the exact manifest/lockfile
-resolution and integrity, then run both full suites before tagging Polygram.
+Orchestra 0.10.16 and Polygram 0.38.1 are already published and locally
+activated. Orchestra already supplies the clean retirement and exact resume
+attestation used here; foreground target authorization lives in Polygram's
+single-threaded intake/IPC boundary and requires no Orchestra change. Release a
+Polygram patch containing the closed target protocol and content-free
+authorization event, then update the deploy skill runner/verifier against that
+exact package. Run the full Polygram suite, the deploy-skill gates, signed
+release workflow, immutable local activation, and both real foreground canaries
+before treating the qualification receipts as valid. Partner VPS rollout
+remains separately blocked by the postponed aged-warm/background gate.
 
 ## Alternatives rejected
 
@@ -419,6 +649,11 @@ resolution and integrity, then run both full suites before tagging Polygram.
   local interruption path being fixed.
 - **Use the zero-busy sample as an activation gate:** a message can be admitted
   after the sample. Only daemon-owned admission closure is a correctness fence.
+- **Authorize a foreground canary from helper-side DB/busy samples:** the
+  intended turn can finish and another turn can become the sole busy owner
+  before IPC. A post-hoc receipt failure would detect the mistake only after
+  interrupting the wrong user, so the old daemon must bind and revalidate an
+  opaque exact-target token synchronously at restart acceptance.
 - **Mutate the current global npm tree after closing admission:** this narrows
   the race but still couples package integrity and recovery to a live tree;
   versioned staging is simpler to prove and retains a known-good artifact.
@@ -504,9 +739,28 @@ the unfixed sources, then passing after the implementation.
    Definition fixtures cover exact label/path/program/full argv/cwd matching,
    including the production crash-only loaded format without a generic
    `keepalive` property.
-7. Canary-verifier tests prove provider/name/request/version binding, one
-   literal-continuation dispatch, one logical success, zero notices, and
-   content-free output for Claude and Codex. A separate receipt test requires
+7. Foreground target-protocol tests prove the authenticated probe and restart
+   expectation use closed schemas; bind request, old instance/PID, scope,
+   provider, and exact sole dispatcher-owned source; reject every mismatch
+   synchronously without stopping admission; allow aged-warm and foreground
+   expectations together; and log one content-free authorization tuple before
+   retirement. Runner tests cover Claude/no-topic and Codex/topic resolution,
+   zero/multiple/wrong-provider/already-terminal/busy-not-one pre-send failure,
+   durable-before-send ordering, exact authenticated rejection versus
+   malformed/mismatched negative ambiguity, crash recovery at every phase
+   without redispatch, cross-entrypoint
+   refusal, replacement/lifecycle identity binding, delayed terminal evidence,
+   frozen-upper receipt publication, exact recovery after fixed-receipt fsync
+   but before `proof-passed`, notice/fallback/conflict/live-timeout
+   failure, valid-receipt idempotence, and allowed/refused `--new-attempt`.
+   They also cover exact secure temporary-journal crash residue, journal
+   no-follow/mode/inode-swap rejection, live-daemon identity drift before
+   dispatch, strict authorization-event persistence, and the legacy ordinary
+   shutdown-in-progress IPC error envelope.
+   Fixtures assert every journal and bounded output omits bodies and raw IDs.
+   Canary-verifier tests additionally prove provider/name/request/version
+   binding, one literal-continuation dispatch, one logical success, and zero
+   notices for Claude and Codex. A separate receipt test requires
    two same-daemon/same-generation observations at least six hours apart, no
    intervening generation activity, continuous idle state, zero
    active/background ownership, and same-version foreground Claude proof;
@@ -545,7 +799,6 @@ the unfixed sources, then passing after the implementation.
   rollout because both phases hold the same host-native transaction lock.
 - Local, Shumabit, and UMI Assistant require daemon-owned, request-bound
   authorized lifecycle proof.
-- The tagged Polygram artifact contains the exact reviewed follow-up Orchestra
-  patch that adds the qualification inspection, monotonic activity-epoch
-  fence, and admission-closed pre-retirement qualification result.
+- The tagged Polygram artifact contains the reviewed foreground-target protocol
+  and the exact Orchestra 0.10.16 qualification/activity-epoch dependency.
 - Background preservation remains postponed and is not claimed.

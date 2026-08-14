@@ -194,6 +194,48 @@ describe('ipc round-trip', () => {
     });
   });
 
+  test('foreground canary target op directly invokes the daemon target authorizer', async () => {
+    const calls = [];
+    await startServerWithSecret(createIpcHandlers({
+      botName: 'shumorobot',
+      getInFlightHandlers: () => new Map(),
+      handleSendOverIpc: async () => ({}),
+      requestForegroundCanaryTarget: (req) => {
+        calls.push(req);
+        return {
+          outcome: 'rejected',
+          rejection_code: 'daemon-busy',
+        };
+      },
+    }), 'secret');
+
+    const request = {
+      path: sockPath,
+      op: 'foreground_canary_target',
+      id: 'restart-request-42',
+      secret: 'secret',
+      payload: {
+        provider: 'claude',
+        configured_scope_sha256: 'a'.repeat(64),
+      },
+    };
+    const response = await ipcClient.call(request);
+
+    assert.deepEqual(calls, [{
+      op: request.op,
+      id: request.id,
+      secret: request.secret,
+      provider: request.payload.provider,
+      configured_scope_sha256: request.payload.configured_scope_sha256,
+    }]);
+    assert.deepEqual(response, {
+      id: 'restart-request-42',
+      ok: true,
+      outcome: 'rejected',
+      rejection_code: 'daemon-busy',
+    });
+  });
+
   test('clean restart qualification is authenticated, selector-free, and content-free', async () => {
     const calls = [];
     const daemonIdentity = Object.freeze({

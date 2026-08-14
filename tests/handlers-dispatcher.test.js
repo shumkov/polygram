@@ -125,6 +125,33 @@ function fixture(overrides = {}) {
 const baseMsg = { message_id: 1, chat: { id: 100 } };
 
 describe('createDispatcher — in-flight counter', () => {
+  test('exposes exact active source metadata without retaining the message body', async () => {
+    const { dispatcher, getResolver } = fixture();
+    const msg = {
+      ...baseMsg,
+      message_thread_id: 5,
+      text: 'must not enter the target snapshot',
+    };
+
+    dispatcher.dispatchHandleMessage('100:5', 100, msg, {});
+    await nextTick();
+
+    assert.deepEqual(dispatcher.getActiveHandlerTargets(), [{
+      sessionKey: '100:5',
+      chatId: '100',
+      threadId: '5',
+      telegramMessageId: '1',
+    }]);
+    assert.doesNotMatch(
+      JSON.stringify(dispatcher.getActiveHandlerTargets()),
+      /must not enter/,
+    );
+
+    getResolver().resolve();
+    await nextTick(); await nextTick();
+    assert.deepEqual(dispatcher.getActiveHandlerTargets(), []);
+  });
+
   test('increments + decrements around handleMessage', async () => {
     const { dispatcher, getResolver } = fixture();
     dispatcher.dispatchHandleMessage('sk1', 100, baseMsg, {});
@@ -152,6 +179,25 @@ describe('createDispatcher — in-flight counter', () => {
 });
 
 describe('createDispatcher — settlement ownership', () => {
+  test('counts dispatcher-owned work without exact message target metadata', async () => {
+    const fx = fixture();
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+
+    let finishTrackedTask;
+    fx.dispatcher.trackTask(new Promise((resolve) => {
+      finishTrackedTask = resolve;
+    }));
+
+    assert.equal(fx.dispatcher.getActiveHandlerTargets().length, 1);
+    assert.equal(fx.dispatcher.getActiveHandlerCount(), 2);
+
+    finishTrackedTask();
+    fx.getResolver().resolve();
+    await fx.dispatcher.awaitSettlement({ timeoutMs: 1000 });
+    assert.equal(fx.dispatcher.getActiveHandlerCount(), 0);
+  });
+
   test('awaitSettlement waits for an ordinary handler to finish', async () => {
     const fx = fixture();
     fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});

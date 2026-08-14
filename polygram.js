@@ -32,12 +32,14 @@ const { buildPrompt, resolvePromptBackend } = require('./lib/prompt');
 const { countInFlight } = require('./lib/queue-utils');
 const { createIpcHandlers } = require('./lib/ipc/handlers');
 const {
-  requireRestartRequestId,
-} = require('./lib/ipc/restart-request-id');
-const {
   buildQualificationEvent,
-  normalizeDeployQualificationExpectation,
 } = require('./lib/ops/clean-restart-qualification');
+const {
+  createForegroundCanaryAuthorizer,
+} = require('./lib/ops/foreground-canary-target');
+const {
+  createDeployRestartHandler,
+} = require('./lib/ops/deploy-restart-handler');
 const { classifyOrphanSweep } = require('./lib/ops/tmux-preflight');
 const {
   parseSystemdInvocationId,
@@ -1075,6 +1077,8 @@ let attemptAutoResume = null;
 let errorReplyText = null;
 let queueWarnThreshold = null;
 let inFlightHandlers = null;
+let getActiveHandlerCount = null;
+let getActiveHandlerTargets = null;
 let awaitHandlerSettlement = null;
 let trackHandlerTask = null;
 let recoverCodexRequest = null;
@@ -4423,6 +4427,8 @@ async function main() {
     errorReplyText,
     queueWarnThreshold,
     inFlightHandlers,
+    getActiveHandlerCount,
+    getActiveHandlerTargets,
     awaitSettlement: awaitHandlerSettlement,
     trackTask: trackHandlerTask,
   } = createDispatcher({
@@ -4849,6 +4855,27 @@ async function main() {
     // scripts, hook); also exported to spawned Claude processes via env.
     const ipcSecret = ipcServer.writeSecret(BOT_NAME);
     process.env.POLYGRAM_IPC_SECRET = ipcSecret;
+    const foregroundCanaryAuthorizer = createForegroundCanaryAuthorizer({
+      botName: BOT_NAME,
+      daemonIdentity,
+      config,
+      tokenSecret: ipcSecret,
+      getActiveHandlerCount: () => getActiveHandlerCount(),
+      getActiveHandlerTargets: () => getActiveHandlerTargets(),
+      getForegroundCanaryTarget: (input) => (
+        db.getForegroundCanaryTarget(input)
+      ),
+    });
+    const requestDeployRestart = createDeployRestartHandler({
+      getIsShuttingDown: () => isShuttingDown,
+      getPid: () => process.pid,
+      foregroundCanaryAuthorizer,
+      persistForegroundCanaryAuthorization: (detail) => (
+        db.logEvent('foreground-canary-target-authorized', detail)
+      ),
+      shutdown,
+      logger: console,
+    });
     ipcCloser = await ipcServer.start({
       path: ipcServer.socketPathFor(BOT_NAME),
       secret: ipcSecret,
@@ -4857,28 +4884,13 @@ async function main() {
         daemonIdentity,
         getInFlightHandlers: () => inFlightHandlers,
         handleSendOverIpc: (req) => handleSendOverIpc(req),
+        requestForegroundCanaryTarget: (req) => (
+          foregroundCanaryAuthorizer.probe(req)
+        ),
         inspectCleanRestartQualification: () => (
           pm.inspectCleanRestartQualification(undefined)
         ),
-        requestDeployRestart: (req) => {
-          if (isShuttingDown) {
-            const error = new Error('shutdown already in progress');
-            error.code = 'SHUTDOWN_IN_PROGRESS';
-            throw error;
-          }
-          const restartRequestId = requireRestartRequestId(req.id);
-          const qualificationExpectation = normalizeDeployQualificationExpectation(req);
-          const oldPid = process.pid;
-          shutdown({
-            continuationAuthorized: true,
-            trigger: 'deploy-ipc',
-            restartRequestId,
-            qualificationExpectation,
-          }).catch((error) => {
-            console.error(`[shutdown] deploy restart failed: ${error.message}`);
-          });
-          return { accepted: true, old_pid: oldPid };
-        },
+        requestDeployRestart,
       }),
       logger: console,
     });
