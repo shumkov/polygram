@@ -168,6 +168,12 @@ describe('enforceEventDetailSchema', () => {
         background_terminal_count: 0, background_terminal_registry_complete: true,
         exact_match: true, outcome_code: 'eligible',
       },
+      'foreground-canary-target-authorized': {
+        bot: 'b', daemon_instance_id: 'd1', pid: 42,
+        package_version: '0.38.3', provider: 'codex',
+        configured_scope_sha256: 'a'.repeat(64), session_key: '1:2',
+        source_message_id: 4, restart_request_sha256: 'f'.repeat(64),
+      },
       // Orchestra's own producers, under their real names.
       'cli-turn-resolved-by-stop': { turn_id: 't1', session_key: '1:2', backend: 'cli', reply_count: 2, final_len: 120 },
       'cli-hook-stream-stalled': { turn_id: 't1', last_hook_age_ms: 9000, session_key: '1:2' },
@@ -178,7 +184,9 @@ describe('enforceEventDetailSchema', () => {
       'session-age-dialog-fallback': { tmux_name: 'polygram-1-2', phase: 'startup-gate' },
     };
     for (const [kind, payload] of Object.entries(payloads)) {
-      const { dropped } = enforceEventDetailSchema(payload);
+      const { detail, dropped, droppedCount } = enforceEventDetailSchema(payload);
+      assert.deepEqual(detail, payload, `${kind} changed its durable payload`);
+      assert.equal(droppedCount, 0, `${kind} dropped ${droppedCount} field(s)`);
       assert.deepEqual(dropped, [], `${kind} lost fields: ${dropped.join(', ')}`);
     }
   });
