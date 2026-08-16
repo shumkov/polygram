@@ -629,6 +629,188 @@ describe('Codex synchronous durability ledger', () => {
     }
   }
 
+  function seedActiveTurn() {
+    const base = {
+      generationId: 'generation-a',
+      threadId: 'thread-a',
+      source: 'telegram-message-a',
+      ...identity,
+    };
+    for (const checkpoint of [
+      {
+        kind: 'request-prepared',
+        attemptId: 'attempt-a',
+        method: 'turn/start',
+        ts: 1100,
+      },
+      {
+        kind: 'request-write-attempted',
+        attemptId: 'attempt-a',
+        method: 'turn/start',
+        requestId: 'start-request',
+        ts: 1110,
+      },
+      {
+        kind: 'request-response-observed',
+        attemptId: 'attempt-a',
+        method: 'turn/start',
+        requestId: 'start-request',
+        outcome: 'result',
+        ts: 1120,
+      },
+      {
+        kind: 'turn-accepted',
+        attemptId: 'attempt-a',
+        turnId: 'turn-a',
+        ts: 1130,
+      },
+    ]) {
+      db.recordCodexCheckpoint({ ...base, ...checkpoint });
+    }
+  }
+
+  function cleanRetirementPreparation(overrides = {}) {
+    return {
+      generation_id: 'generation-a',
+      session_key: 'chat:topic',
+      attempt_id: 'attempt-a',
+      provider_session_id: 'thread-a',
+      provider_turn_id: 'turn-a',
+      source_message_id: 'telegram-message-a',
+      ...identity,
+      ts: 1140,
+      ...overrides,
+    };
+  }
+
+  test('clean retirement preparation marks only the exact active accepted turn', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    seedActiveTurn();
+
+    const partialPreparation = cleanRetirementPreparation();
+    delete partialPreparation.source_message_id;
+    assert.throws(
+      () => db.prepareCodexCleanRetirement(partialPreparation),
+      (error) => error.code === 'CODEX_PERSISTENCE_INPUT_INVALID',
+    );
+    assert.throws(
+      () => db.prepareCodexCleanRetirement(cleanRetirementPreparation({
+        source_message_id: 'other-message',
+      })),
+      (error) => error.code === 'CODEX_RETIREMENT_PREPARATION_REJECTED',
+    );
+    assert.deepEqual(
+      db.prepareCodexCleanRetirement(cleanRetirementPreparation()),
+      {
+        changes: 1,
+        disposition: 'retirement-requested',
+        generationId: 'generation-a',
+        attemptId: 'attempt-a',
+      },
+    );
+    assert.deepEqual(
+      db.prepareCodexCleanRetirement(cleanRetirementPreparation({ ts: 1150 })),
+      {
+        changes: 0,
+        disposition: 'retirement-requested',
+        generationId: 'generation-a',
+        attemptId: 'attempt-a',
+      },
+    );
+    assert.equal(
+      db.raw.prepare(`
+        SELECT COUNT(*) AS count
+          FROM codex_attempt_checkpoints
+         WHERE generation_id = 'generation-a'
+           AND attempt_id = 'attempt-a'
+           AND kind = 'clean-retirement-requested'
+      `).get().count,
+      1,
+    );
+
+    db.recordCodexCheckpoint({
+      kind: 'turn-terminal',
+      generationId: 'generation-a',
+      attemptId: 'attempt-a',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      source: 'telegram-message-a',
+      terminalStatus: 'interrupted',
+      ...identity,
+      ts: 1160,
+    });
+    assert.throws(
+      () => db.prepareCodexCleanRetirement(cleanRetirementPreparation({
+        ts: 1170,
+      })),
+      (error) => error.code === 'CODEX_RETIREMENT_PREPARATION_REJECTED',
+    );
+  });
+
+  test('terminal interruption immediately before preparation creates no deploy marker', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    seedActiveTurn();
+    db.recordCodexCheckpoint({
+      kind: 'turn-terminal',
+      generationId: 'generation-a',
+      attemptId: 'attempt-a',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      source: 'telegram-message-a',
+      terminalStatus: 'interrupted',
+      ...identity,
+      ts: 1140,
+    });
+
+    assert.throws(
+      () => db.prepareCodexCleanRetirement(cleanRetirementPreparation({
+        ts: 1150,
+      })),
+      (error) => error.code === 'CODEX_RETIREMENT_PREPARATION_REJECTED',
+    );
+    assert.equal(
+      db.raw.prepare(`
+        SELECT COUNT(*) AS count
+          FROM codex_attempt_checkpoints
+         WHERE generation_id = 'generation-a'
+           AND attempt_id = 'attempt-a'
+           AND kind = 'clean-retirement-requested'
+      `).get().count,
+      0,
+    );
+  });
+
+  test('conflicting clean retirement marker never authorizes the active turn', () => {
+    db.createCodexGeneration(generation());
+    acquire();
+    seedActiveTurn();
+    db.raw.prepare(`
+      INSERT INTO codex_attempt_checkpoints (
+        generation_id, attempt_id, kind, thread_id, turn_id,
+        request_id, item_id, detail_json, ts
+      ) VALUES (?, ?, 'clean-retirement-requested', ?, ?, NULL, NULL, NULL, ?)
+    `).run('generation-a', 'attempt-a', 'thread-a', 'turn-other', 1140);
+
+    assert.throws(
+      () => db.prepareCodexCleanRetirement(cleanRetirementPreparation({
+        ts: 1150,
+      })),
+      (error) => error.code === 'CODEX_RETIREMENT_PREPARATION_REJECTED',
+    );
+    assert.equal(
+      db.raw.prepare(`
+        SELECT COUNT(*) AS count
+          FROM codex_attempt_checkpoints
+         WHERE generation_id = 'generation-a'
+           AND attempt_id = 'attempt-a'
+           AND kind = 'clean-retirement-requested'
+      `).get().count,
+      1,
+    );
+  });
+
   test('stopped generation disposal and lease retirement commit together', () => {
     db.createCodexGeneration(generation());
     acquire();

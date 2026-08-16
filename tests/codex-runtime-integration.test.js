@@ -924,6 +924,139 @@ function completingTurnDescriptor(turnId, text) {
   };
 }
 
+async function exerciseCleanRetirementDeliveryRace(t, {
+  notificationFirst,
+}) {
+  const turnId = notificationFirst
+    ? 'turn-deploy-notification-first'
+    : 'turn-deploy-response-first';
+  const releaseFile = notificationFirst
+    ? 'release-interrupt-response'
+    : 'release-stop-clean';
+  const harness = await createHarness(t, {
+    methods: {
+      'turn/start': activeTurnDescriptor(turnId),
+      'turn/interrupt': notificationFirst
+        ? {
+            result: {},
+            beforeResponseMessages: [interruptedTurnMessage(turnId)],
+            waitForResponseFile: releaseFile,
+          }
+        : {
+            result: {},
+            lateDelayMs: 5,
+            lateMessages: [interruptedTurnMessage(turnId)],
+          },
+      ...(!notificationFirst ? {
+        'thread/backgroundTerminals/clean': {
+          result: {},
+          waitForResponseFile: releaseFile,
+        },
+      } : {}),
+    },
+  });
+  const {
+    db,
+    fixture,
+    proc,
+    runtime,
+  } = harness;
+  const active = runtime.manager.send('1', 'Interrupted by authorized deploy', {
+    context: { sourceMsgId: '41' },
+  });
+  await waitFor(
+    () => proc.activeTurnId === turnId && proc.state === 'Active',
+    'the active deploy target',
+  );
+
+  let retirementResolved = false;
+  const retirement = runtime.manager.retireForCleanRestart({
+    continuationAuthorized: true,
+    getDeliveryEvidence: () => ({
+      outputAttempted: false,
+      pending: 0,
+      fenced: true,
+    }),
+  }).then((snapshots) => {
+    retirementResolved = true;
+    return snapshots;
+  });
+  let result;
+  let markerCount;
+  let stateBeforeRelease;
+  let preReleaseError = null;
+  try {
+    result = await active;
+    assert.equal(result.error, 'interrupted');
+    await waitFor(
+      () => readRequests(fixture).some(
+        (message) => message.method === 'turn/interrupt',
+      ),
+      'the authorized deploy interrupt write',
+    );
+    if (!notificationFirst) {
+      await waitFor(
+        () => db.raw.prepare(`
+          SELECT 1 FROM codex_attempt_checkpoints
+           WHERE generation_id = ?
+             AND kind = 'stop-terminal-reconciled'
+        `).get(proc.generationId) != null,
+        'stop-terminal reconciliation before delivery',
+      );
+    }
+    markerCount = db.listCodexAttemptCheckpoints(result.attemptId)
+      .filter((row) => row.kind === 'clean-retirement-requested').length;
+
+    await runtime.controller.settleTelegramDelivery(
+      '1',
+      result,
+      { disposition: 'failed' },
+    );
+    stateBeforeRelease = db.getCodexAttempt(result.attemptId).recovery_state;
+    assert.equal(retirementResolved, false);
+  } catch (error) {
+    preReleaseError = error;
+  } finally {
+    writeFileSync(path.join(fixture.workspace, releaseFile), '', { mode: 0o600 });
+  }
+  const retirementResult = await Promise.allSettled([retirement]);
+  if (preReleaseError) throw preReleaseError;
+  if (retirementResult[0].status === 'rejected') {
+    throw retirementResult[0].reason;
+  }
+  const snapshots = retirementResult[0].value;
+
+  assert.equal(markerCount, 1, 'deploy ownership must remain durable');
+  assert.equal(
+    stateBeforeRelease,
+    notificationFirst ? 'terminal-pending' : 'clean-pending',
+  );
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual(
+    {
+      eligible: snapshots[0].eligible,
+      sessionKey: snapshots[0].sessionKey,
+      providerSessionId: snapshots[0].providerSessionId,
+      providerTurnId: snapshots[0].providerTurnId,
+      sourceMsgId: snapshots[0].sourceMsgId,
+    },
+    {
+      eligible: true,
+      sessionKey: '1',
+      providerSessionId: result.providerSessionId,
+      providerTurnId: result.providerTurnId,
+      sourceMsgId: '41',
+    },
+  );
+  assert.equal(db.getCodexAttempt(result.attemptId).recovery_state, 'cancelled');
+  assert.equal(db.getCodexLease().status, 'clear');
+  assert.equal(
+    db.listCodexAttemptCheckpoints(result.attemptId)
+      .filter((row) => row.kind === 'telegram-delivery-failed').length,
+    1,
+  );
+}
+
 async function waitFor(predicate, label, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   do {
@@ -1416,6 +1549,22 @@ test('fake app-server ambiguous steer is never queued or crash-replayed', {
     1,
     'ambiguous steering must not create a fallback turn',
   );
+});
+
+test('authorized deploy keeps Codex continuation ownership when interrupt response arrives first', {
+  timeout: 30_000,
+}, async (t) => {
+  await exerciseCleanRetirementDeliveryRace(t, {
+    notificationFirst: false,
+  });
+});
+
+test('authorized deploy keeps Codex continuation ownership when terminal notification arrives first', {
+  timeout: 30_000,
+}, async (t) => {
+  await exerciseCleanRetirementDeliveryRace(t, {
+    notificationFirst: true,
+  });
 });
 
 test('fake app-server stop orders exact terminal, clean, fresh-empty and cancels queued work', {

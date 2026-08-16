@@ -8,6 +8,8 @@ const {
   freshDb,
   insertInbound,
 } = require('./helpers/db-fixture');
+const { open } = require('../lib/db');
+const { classifyReplay } = require('../lib/handlers/replay-disposition');
 
 let db;
 let dbPath;
@@ -57,18 +59,20 @@ function checkpoint(row) {
   });
 }
 
-function seedAcceptedTurnAndSteer() {
+function seedAcceptedTurnAndSteer({ targetSource = null } = {}) {
   for (const row of [
     {
       kind: 'request-prepared',
       attemptId: 'turn-attempt',
       method: 'turn/start',
+      ...(targetSource == null ? {} : { source: targetSource }),
       ts: 1200,
     },
     {
       kind: 'request-write-attempted',
       attemptId: 'turn-attempt',
       method: 'turn/start',
+      ...(targetSource == null ? {} : { source: targetSource }),
       requestId: 'turn-request',
       ts: 1210,
     },
@@ -76,6 +80,7 @@ function seedAcceptedTurnAndSteer() {
       kind: 'request-response-observed',
       attemptId: 'turn-attempt',
       method: 'turn/start',
+      ...(targetSource == null ? {} : { source: targetSource }),
       requestId: 'turn-request',
       outcome: 'result',
       ts: 1220,
@@ -84,6 +89,7 @@ function seedAcceptedTurnAndSteer() {
       kind: 'turn-accepted',
       attemptId: 'turn-attempt',
       turnId: 'turn-a',
+      ...(targetSource == null ? {} : { source: targetSource }),
       ts: 1230,
     },
     {
@@ -120,6 +126,77 @@ function seedAcceptedTurnAndSteer() {
   ]) {
     checkpoint(row);
   }
+}
+
+function prepareAcceptedTurnForCleanRetirement(overrides = {}) {
+  return db.prepareCodexCleanRetirement({
+    generation_id: 'generation-a',
+    session_key: 'chat:topic',
+    attempt_id: 'turn-attempt',
+    provider_session_id: 'thread-a',
+    provider_turn_id: 'turn-a',
+    source_message_id: '41',
+    ...identity,
+    ts: 1280,
+    ...overrides,
+  });
+}
+
+function recordFailedTurnDelivery({ ts, retireGeneration = false }) {
+  return db.recordCodexDeliveryCheckpoint({
+    checkpoint: {
+      kind: 'telegram-delivery-failed',
+      generationId: 'generation-a',
+      attemptId: 'turn-attempt',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      ...identity,
+      ts,
+    },
+    retireGeneration,
+  });
+}
+
+function seedDeployOwnedPrimaryInput() {
+  insertInbound(db, {
+    chat_id: 'chat',
+    msg_id: 41,
+    bot_name: 'bot-a',
+    handler_status: 'processing',
+  });
+  db.recordInboundRuntimeSelection({
+    session_key: 'chat:topic',
+    bot_name: 'bot-a',
+    telegram_chat_id: 'chat',
+    telegram_message_id: '41',
+    provider: 'codex',
+    ts: 1100,
+  });
+}
+
+function reopenAndClassifyDeployOwnedPrimary() {
+  db.raw.close();
+  db = open(dbPath);
+  const candidate = { chat_id: 'chat', thread_id: null, msg_id: 41 };
+  const replay = classifyReplay({
+    candidates: [candidate],
+    cleanShutdown: false,
+    getProviderRecovery: () => db.getReplayProviderRecovery({
+      sessionKey: 'chat:topic',
+      botName: 'bot-a',
+      telegramChatId: 'chat',
+      telegramMessageId: '41',
+    }),
+  });
+  return { candidate, replay };
+}
+
+function assertNoCleanRestartIntent() {
+  assert.equal(
+    db.raw.prepare('SELECT COUNT(*) AS count FROM clean_restart_resume_intents')
+      .get().count,
+    0,
+  );
 }
 
 function seedCompletedStartAttempt({
@@ -698,6 +775,271 @@ describe('Codex inbound dispatch reservations', () => {
       `).get().handler_status,
       'failed',
     );
+  });
+
+  test('deploy-owned interrupted delivery stays stop-owned after reconciliation', () => {
+    seedGeneration();
+    insertInbound(db, {
+      chat_id: 'chat',
+      msg_id: 42,
+      bot_name: 'bot-a',
+      handler_status: 'processing',
+    });
+    db.claimCodexDispatchReservation(reservation());
+    seedAcceptedTurnAndSteer({ targetSource: '41' });
+    db.finalizeCodexAcceptedSteer({
+      reservation_id: 'dispatch-a',
+      generation_id: 'generation-a',
+      steer_attempt_id: 'steer-attempt',
+      target_attempt_id: 'turn-attempt',
+      ...identity,
+      ts: 1300,
+    });
+    prepareAcceptedTurnForCleanRetirement();
+    checkpoint({
+      kind: 'turn-terminal',
+      attemptId: 'turn-attempt',
+      turnId: 'turn-a',
+      source: '41',
+      terminalStatus: 'interrupted',
+      ts: 1400,
+    });
+    checkpoint({
+      kind: 'stop-terminal-reconciled',
+      turnId: 'turn-a',
+      terminalStatus: 'interrupted',
+      ts: 1410,
+    });
+
+    assert.deepEqual(recordFailedTurnDelivery({ ts: 1420 }), {
+      changes: 1,
+      attemptId: 'turn-attempt',
+      kind: 'telegram-delivery-failed',
+      deferred: true,
+      retired: false,
+    });
+    assert.deepEqual(recordFailedTurnDelivery({ ts: 1420 }), {
+      changes: 0,
+      attemptId: 'turn-attempt',
+      kind: 'telegram-delivery-failed',
+      deferred: true,
+      retired: false,
+    });
+    assert.equal(db.getCodexAttempt('turn-attempt').recovery_state, 'clean-pending');
+    assert.equal(db.getCodexAttempt('steer-attempt').recovery_state, 'active');
+    assert.equal(db.getCodexDispatchReservation('dispatch-a').state, 'steer-accepted');
+    assert.equal(
+      db.raw.prepare(`
+        SELECT state FROM codex_linked_inputs
+         WHERE linked_input_id = 'dispatch-a'
+      `).get().state,
+      'linked',
+    );
+
+    checkpoint({
+      kind: 'stop-empty-registry-observed',
+      turnId: 'turn-a',
+      ts: 1430,
+    });
+    assert.deepEqual(db.settleCodexStoppedGeneration({
+      generation_id: 'generation-a',
+      ...identity,
+      ts: 1440,
+    }), {
+      changes: 1,
+      disposition: 'stop-cancelled',
+      attemptId: 'turn-attempt',
+      retired: true,
+    });
+    assert.equal(db.getCodexAttempt('turn-attempt').recovery_state, 'cancelled');
+    assert.equal(db.getCodexDispatchReservation('dispatch-a').state, 'interrupted');
+  });
+
+  test('deploy-owned interrupted delivery stays stop-owned before reconciliation', () => {
+    seedGeneration();
+    insertInbound(db, {
+      chat_id: 'chat',
+      msg_id: 42,
+      bot_name: 'bot-a',
+      handler_status: 'processing',
+    });
+    db.claimCodexDispatchReservation(reservation());
+    seedAcceptedTurnAndSteer({ targetSource: '41' });
+    db.finalizeCodexAcceptedSteer({
+      reservation_id: 'dispatch-a',
+      generation_id: 'generation-a',
+      steer_attempt_id: 'steer-attempt',
+      target_attempt_id: 'turn-attempt',
+      ...identity,
+      ts: 1300,
+    });
+    prepareAcceptedTurnForCleanRetirement();
+    checkpoint({
+      kind: 'turn-terminal',
+      attemptId: 'turn-attempt',
+      turnId: 'turn-a',
+      source: '41',
+      terminalStatus: 'interrupted',
+      ts: 1400,
+    });
+
+    assert.equal(recordFailedTurnDelivery({ ts: 1410 }).deferred, true);
+    assert.equal(db.getCodexAttempt('turn-attempt').recovery_state, 'terminal-pending');
+
+    checkpoint({
+      kind: 'stop-terminal-reconciled',
+      turnId: 'turn-a',
+      terminalStatus: 'interrupted',
+      ts: 1420,
+    });
+    checkpoint({
+      kind: 'stop-empty-registry-observed',
+      turnId: 'turn-a',
+      ts: 1430,
+    });
+    assert.equal(
+      db.settleCodexStoppedGeneration({
+        generation_id: 'generation-a',
+        ...identity,
+        ts: 1440,
+      }).disposition,
+      'stop-cancelled',
+    );
+  });
+
+  test('background-only clean-pending interruption still settles failed delivery', () => {
+    seedGeneration();
+    insertInbound(db, {
+      chat_id: 'chat',
+      msg_id: 42,
+      bot_name: 'bot-a',
+      handler_status: 'processing',
+    });
+    db.claimCodexDispatchReservation(reservation());
+    seedAcceptedTurnAndSteer();
+    checkpoint({
+      kind: 'turn-terminal',
+      attemptId: 'turn-attempt',
+      turnId: 'turn-a',
+      terminalStatus: 'interrupted',
+      ts: 1400,
+    });
+    checkpoint({
+      kind: 'background-terminal-reconciled',
+      turnId: 'turn-a',
+      terminalStatus: 'interrupted',
+      ts: 1410,
+    });
+    checkpoint({
+      kind: 'telegram-delivery-failed',
+      attemptId: 'turn-attempt',
+      turnId: 'turn-a',
+      ts: 1420,
+    });
+
+    assert.equal(db.getCodexAttempt('turn-attempt').recovery_state, 'settled');
+    assert.equal(db.getCodexDispatchReservation('dispatch-a').state, 'failed');
+  });
+
+  test('late deploy-owned delivery waits for the stopped-generation verifier', () => {
+    seedGeneration();
+    seedAcceptedTurnAndSteer({ targetSource: '41' });
+    prepareAcceptedTurnForCleanRetirement();
+    checkpoint({
+      kind: 'turn-terminal',
+      attemptId: 'turn-attempt',
+      turnId: 'turn-a',
+      source: '41',
+      terminalStatus: 'interrupted',
+      ts: 1400,
+    });
+    checkpoint({
+      kind: 'stop-terminal-reconciled',
+      turnId: 'turn-a',
+      terminalStatus: 'interrupted',
+      ts: 1410,
+    });
+    checkpoint({
+      kind: 'stop-empty-registry-observed',
+      turnId: 'turn-a',
+      ts: 1420,
+    });
+
+    const result = recordFailedTurnDelivery({
+      ts: 1430,
+      retireGeneration: true,
+    });
+
+    assert.equal(result.deferred, true);
+    assert.equal(result.retired, false);
+    assert.equal(db.getCodexAttempt('turn-attempt').recovery_state, 'clean-pending');
+    assert.equal(db.getCodexLease().status, 'active');
+  });
+
+  test('crash after deploy ownership and deferred delivery never redispatches the original message', () => {
+    seedGeneration();
+    seedDeployOwnedPrimaryInput();
+    seedAcceptedTurnAndSteer({ targetSource: '41' });
+    prepareAcceptedTurnForCleanRetirement();
+    checkpoint({
+      kind: 'turn-terminal',
+      attemptId: 'turn-attempt',
+      turnId: 'turn-a',
+      source: '41',
+      terminalStatus: 'interrupted',
+      ts: 1400,
+    });
+    assert.equal(recordFailedTurnDelivery({ ts: 1410 }).deferred, true);
+    db.recordCrashShutdown({ botName: 'bot-a', now: 1420 });
+
+    const { candidate, replay } = reopenAndClassifyDeployOwnedPrimary();
+
+    assert.deepEqual(replay.recover, []);
+    assert.equal(replay.recoverCodex, undefined);
+    assert.deepEqual(replay.skip, []);
+    assert.deepEqual(replay.defer, [candidate]);
+    assertNoCleanRestartIntent();
+  });
+
+  test('crash after exact stop cancellation defers original redispatch without an intent', () => {
+    seedGeneration();
+    seedDeployOwnedPrimaryInput();
+    seedAcceptedTurnAndSteer({ targetSource: '41' });
+    prepareAcceptedTurnForCleanRetirement();
+    checkpoint({
+      kind: 'turn-terminal',
+      attemptId: 'turn-attempt',
+      turnId: 'turn-a',
+      source: '41',
+      terminalStatus: 'interrupted',
+      ts: 1400,
+    });
+    checkpoint({
+      kind: 'stop-terminal-reconciled',
+      turnId: 'turn-a',
+      terminalStatus: 'interrupted',
+      ts: 1410,
+    });
+    checkpoint({
+      kind: 'stop-empty-registry-observed',
+      turnId: 'turn-a',
+      ts: 1420,
+    });
+    assert.equal(db.settleCodexStoppedGeneration({
+      generation_id: 'generation-a',
+      ...identity,
+      ts: 1430,
+    }).disposition, 'stop-cancelled');
+    db.recordCrashShutdown({ botName: 'bot-a', now: 1440 });
+
+    const { candidate, replay } = reopenAndClassifyDeployOwnedPrimary();
+
+    assert.deepEqual(replay.recover, []);
+    assert.equal(replay.recoverCodex, undefined);
+    assert.deepEqual(replay.defer, [candidate]);
+    assert.deepEqual(replay.skip, []);
+    assert.deepEqual(replay.notices, []);
+    assertNoCleanRestartIntent();
   });
 
   test('exact healthy stop cancels an interrupted target without Telegram delivery', () => {
