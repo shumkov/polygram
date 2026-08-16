@@ -16,6 +16,7 @@ function makeDeps({ procBackend = 'sdk', proc = null, ...overrides } = {}) {
   const tgCalls = [];
   const pmCalls = [];
   const aborted = [];
+  const retiredQuestions = [];
   // Default cli-shaped proc: in-flight, probe says "just thinking, no bg".
   const defaultProc = {
     inFlight: true,
@@ -24,7 +25,7 @@ function makeDeps({ procBackend = 'sdk', proc = null, ...overrides } = {}) {
     hasActiveBackgroundWork: () => false,
   };
   return {
-    events, tgCalls, pmCalls, aborted,
+    events, tgCalls, pmCalls, aborted, retiredQuestions,
     deps: {
       pm: {
         has: (k) => true,
@@ -42,6 +43,7 @@ function makeDeps({ procBackend = 'sdk', proc = null, ...overrides } = {}) {
       logEvent: (kind, detail) => events.push({ kind, detail }),
       isAbortRequest: (text) => /^\s*(stop|стоп|cancel|отмена|\/(stop|abort|cancel))\s*$/i.test(text),
       markSessionAborted: (k) => aborted.push(k),
+      retireQuestionSession: async (k) => { retiredQuestions.push(k); },
       clearAutosteeredReactions: async () => {},
       getSessionKey: (chatId) => String(chatId),
       botName: 'test-bot',
@@ -255,6 +257,16 @@ describe('handleAbortIfRequested — abort path', () => {
       'with neither a turn nor a background shell → silence (no lie-👍, no text)');
   });
 
+  test('a verified stop retires the session question state', async () => {
+    // A stop that actually stopped the turn retires the process that owned any
+    // open question, so whatever is held exactly for it goes with the same
+    // operation every other retirement path uses.
+    const m = makeDeps();
+    const fn = createHandleAbort(m.deps);
+    await fn(makeMsg('stop'), '12345', {}, 'stop');
+    assert.deepEqual(m.retiredQuestions, ['12345']);
+  });
+
   test('logs abort-requested event with had_active flag', async () => {
     const m = makeDeps();
     const fn = createHandleAbort(m.deps);
@@ -263,7 +275,10 @@ describe('handleAbortIfRequested — abort path', () => {
     assert.ok(evt);
     assert.equal(evt.detail.had_active, true);
     assert.equal(evt.detail.user_id, 99);
-    assert.equal(evt.detail.trigger, 'cancel');
+    // The stop phrasing is the user's own message: the event carries its size,
+    // never the words.
+    assert.equal(evt.detail.text_len, 'cancel'.length);
+    assert.equal(evt.detail.trigger, undefined);
   });
 
   test('the 👍 lands on the stop message itself (thread implicit in message_id)', async () => {
@@ -291,16 +306,17 @@ describe('handleAbortIfRequested — abort path', () => {
     assert.equal(m.tgCalls[0].method, 'setMessageReaction');
   });
 
-  test('trigger text is truncated to 40 chars in the event detail', async () => {
-    // Predicate is the gate — using a permissive predicate to test
-    // the truncation independently. The actual production predicate's
+  test('a long stop message contributes its length, never its text', async () => {
+    // Predicate is the gate — using a permissive predicate to test the
+    // telemetry shape independently. The actual production predicate's
     // shape is the concern of lib/abort-detector.js's tests.
     const m = makeDeps({ isAbortRequest: () => true });
     const fn = createHandleAbort(m.deps);
     const long = 'x'.repeat(100);
     await fn(makeMsg(long), '12345', {}, long);
     const evt = m.events.find((e) => e.kind === 'abort-requested');
-    assert.equal(evt.detail.trigger.length, 40);
+    assert.equal(evt.detail.text_len, 100);
+    assert.ok(!JSON.stringify(evt.detail).includes('xxxx'));
   });
 });
 
@@ -420,6 +436,21 @@ describe('handleAbortIfRequested — Codex verified stop', () => {
     ]);
     assert.equal(m.events[0].detail.had_active, false);
     assert.equal(m.events[0].detail.queue_drained, 3);
+  });
+
+  test('a verified Codex stop retires leftover question state; an unverified one does not', async () => {
+    // Codex cannot raise a question, so this only ever cleans up a row a
+    // Claude turn left behind on a session that later moved to Codex — and
+    // only once the stop is proven, so no existing semantics move.
+    const verified = makeCodexStop();
+    const fn = createHandleAbort(verified.deps);
+    await fn(makeMsg('stop'), '12345', {}, 'stop');
+    assert.deepEqual(verified.retiredQuestions, ['12345']);
+
+    const unverified = makeCodexStop({ interruptResult: false });
+    const fn2 = createHandleAbort(unverified.deps);
+    await fn2(makeMsg('stop'), '12345', {}, 'stop');
+    assert.deepEqual(unverified.retiredQuestions, []);
   });
 
   test('Codex interrupt false clears feedback and shows an error reaction, never 👍', async () => {

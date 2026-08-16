@@ -8,7 +8,8 @@ const { test, describe, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 const { sweepSecrets } = require('../lib/db/secret-sweep');
-const { sha256 } = require('../lib/secret-detect');
+const crypto = require('node:crypto');
+const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 
 let db; let dbPath;
 const NOW = 1_800_000_000_000;
@@ -35,7 +36,7 @@ describe('secret sweep', () => {
     assert.ok(db.raw.prepare('PRAGMA table_info(messages)').all().some((c) => c.name === 'secret_scanned_at'));
   });
 
-  test('HIGH secret redacted in place + audit fingerprint + scanned stamp', () => {
+  test('HIGH secret redacted in place + content-free audit + scanned stamp', () => {
     const id = insert(`my key is ${AWS} thanks`);
     const res = sweepSecrets(db.raw, { now: NOW });
     assert.equal(res.redactedMsgs, 1);
@@ -44,7 +45,9 @@ describe('secret sweep', () => {
     assert.equal(a.length, 1);
     assert.equal(a[0].action, 'redacted');
     assert.equal(a[0].rule, 'aws-akia');
-    assert.equal(a[0].sha256, sha256(AWS));
+    // The audit says what was redacted and where — never a hash of the value,
+    // which would be a correlation handle for the secret itself.
+    assert.ok(!JSON.stringify(a[0]).includes(sha256(AWS)), 'no value fingerprint');
     assert.ok(db.raw.prepare('SELECT secret_scanned_at FROM messages WHERE id=?').get(id).secret_scanned_at);
   });
 
