@@ -157,8 +157,8 @@ describe('clean restart lifecycle ordering', () => {
     );
     assert.match(
       body,
-      /const shutdown = async \(\{[\s\S]{0,180}?qualificationExpectation,[\s\S]*?prepareCleanRetirement\(\{[\s\S]{0,500}?qualificationExpectation,/,
-      'the shutdown must forward the normalized fence into clean retirement',
+      /const shutdown = async \(\{[\s\S]{0,180}?qualificationExpectation,[\s\S]*?prepareCleanRetirement\(\{[\s\S]{0,500}?continuationAuthorized,[\s\S]{0,220}?qualificationExpectation,/,
+      'the shutdown must forward deploy authorization and the normalized fence into clean retirement',
     );
   });
 

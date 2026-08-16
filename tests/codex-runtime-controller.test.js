@@ -89,6 +89,15 @@ function fixture({
       checkpointPayloads.push(input);
       calls.push(['checkpoint', input.kind]);
     },
+    prepareCodexCleanRetirement(input) {
+      calls.push(['prepare-clean-retirement', input]);
+      return {
+        changes: 1,
+        disposition: 'retirement-requested',
+        generationId: input.generation_id,
+        attemptId: input.attempt_id,
+      };
+    },
     recordCodexDeliveryCheckpoint(input) {
       calls.push(['delivery-checkpoint', input.retireGeneration]);
       this.recordCodexCheckpoint(input.checkpoint);
@@ -1609,6 +1618,8 @@ test('restores durable ownership before preparing an exact Codex session', async
   assert.deepEqual(
     {
       ...initialized.managerOptions,
+      codexRetirementPreparer:
+        typeof initialized.managerOptions.codexRetirementPreparer,
       codexRetirementVerifier:
         typeof initialized.managerOptions.codexRetirementVerifier,
     },
@@ -1616,6 +1627,7 @@ test('restores durable ownership before preparing an exact Codex session', async
       codexHostIdentity: 'host:current',
       codexBootSessionIdentity: 'boot:current',
       codexRecoveryState: { status: 'clear' },
+      codexRetirementPreparer: 'function',
       codexRetirementVerifier: 'function',
     },
   );
@@ -2140,6 +2152,255 @@ test('retirement waits for healthy stop, transport close, and the manager handsh
     disposition: 'retired',
   });
   assert.equal(calls.filter((entry) => entry[0] === 'retire').length, 1);
+});
+
+test('authorized retirement preparation durably binds and replays the exact live turn without retiring it', async () => {
+  const attempt = {
+    attempt_id: 'attempt-retirement-preparation',
+    generation_id: 'generation-retirement-preparation',
+    session_key: '100',
+    thread_id: 'thread-retirement-preparation',
+    turn_id: 'turn-retirement-preparation',
+    telegram_source_message_id: '41',
+  };
+  const { calls, controller, db, receipt } = fixture({ codexAttempt: attempt });
+  const { managerOptions } = controller.initialize();
+  await controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+    threadId: null,
+  });
+  const proc = Object.assign(new EventEmitter(), {
+    runtime: 'codex',
+    backend: 'codex',
+    sessionKey: '100',
+    generationId: attempt.generation_id,
+    providerSessionId: attempt.thread_id,
+    spawnProfileId: receipt.spawnProfileId,
+    startupReleaseSafe: false,
+    closed: false,
+  });
+  controller.registerProcess(proc);
+  await controller.checkpointSink({
+    kind: 'request-prepared',
+    generationId: attempt.generation_id,
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    attemptId: attempt.attempt_id,
+    method: 'turn/start',
+  });
+  const candidate = {
+    sessionKey: '100',
+    generationId: attempt.generation_id,
+    attemptId: attempt.attempt_id,
+    providerSessionId: attempt.thread_id,
+    providerTurnId: attempt.turn_id,
+    sourceMsgId: 41,
+  };
+
+  assert.deepEqual(managerOptions.codexRetirementPreparer(candidate), {
+    committed: true,
+    disposition: 'retirement-requested',
+    ...candidate,
+  });
+  db.prepareCodexCleanRetirement = (input) => {
+    calls.push(['prepare-clean-retirement', input]);
+    return {
+      changes: 0,
+      disposition: 'retirement-requested',
+      generationId: input.generation_id,
+      attemptId: input.attempt_id,
+    };
+  };
+  assert.deepEqual(managerOptions.codexRetirementPreparer(candidate), {
+    committed: true,
+    disposition: 'retirement-requested',
+    ...candidate,
+  });
+  const preparationCall = calls.find(
+    (entry) => entry[0] === 'prepare-clean-retirement',
+  );
+  const { ts, ...preparation } = preparationCall[1];
+  assert.deepEqual(
+    [preparationCall[0], preparation],
+    [
+      'prepare-clean-retirement',
+      {
+        generation_id: attempt.generation_id,
+        session_key: '100',
+        attempt_id: attempt.attempt_id,
+        provider_session_id: attempt.thread_id,
+        provider_turn_id: attempt.turn_id,
+        source_message_id: '41',
+        stable_host_id: 'host:current',
+        boot_session_id: 'boot:current',
+      },
+    ],
+  );
+  assert.equal(Number.isSafeInteger(ts), true);
+  assert.equal(calls.some((entry) => entry[0] === 'retire'), false);
+});
+
+test('deferred failed delivery remains owned by the stopped-generation verifier', async () => {
+  const attempt = {
+    attempt_id: 'attempt-deferred-retirement',
+    generation_id: 'generation-deferred-retirement',
+    session_key: '100',
+    thread_id: 'thread-deferred-retirement',
+    turn_id: 'turn-deferred-retirement',
+  };
+  const { calls, controller, db, receipt } = fixture({ codexAttempt: attempt });
+  db.settleCodexStoppedGeneration = () => ({
+    changes: 0,
+    disposition: 'pending-delivery',
+  });
+  db.recordCodexDeliveryCheckpoint = (input) => {
+    calls.push(['delivery-checkpoint', input.retireGeneration]);
+    return {
+      changes: 1,
+      attemptId: input.checkpoint.attemptId,
+      kind: input.checkpoint.kind,
+      deferred: true,
+      retired: false,
+    };
+  };
+  db.markCodexGenerationRetired = () => {
+    const error = new Error('delivery remains stop-owned');
+    error.code = 'CODEX_RETIREMENT_UNVERIFIED';
+    throw error;
+  };
+  controller.initialize();
+  await controller.prepareSession({ sessionKey: '100', chatId: '100' });
+  const proc = Object.assign(new EventEmitter(), {
+    runtime: 'codex',
+    backend: 'codex',
+    sessionKey: '100',
+    generationId: attempt.generation_id,
+    providerSessionId: attempt.thread_id,
+    spawnProfileId: receipt.spawnProfileId,
+    startupReleaseSafe: false,
+    closed: false,
+    blockDurability(error) {
+      calls.push(['block-durability', error]);
+    },
+  });
+  controller.registerProcess(proc);
+  await controller.checkpointSink({
+    kind: 'request-prepared',
+    generationId: attempt.generation_id,
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    attemptId: attempt.attempt_id,
+    method: 'turn/start',
+  });
+  await controller.checkpointSink({
+    kind: 'stop-empty-registry-observed',
+    generationId: attempt.generation_id,
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+  });
+  proc.closed = true;
+  proc.emit('close');
+  const abortController = new AbortController();
+  const retirement = controller.verifyCodexRetirement({
+    sessionKey: '100',
+    generationId: attempt.generation_id,
+    signal: abortController.signal,
+  });
+
+  assert.deepEqual(await controller.settleTelegramDelivery('100', {
+    runtime: 'codex',
+    backend: 'codex',
+    generationId: attempt.generation_id,
+    attemptId: attempt.attempt_id,
+    providerSessionId: attempt.thread_id,
+    providerTurnId: attempt.turn_id,
+  }, { disposition: 'failed' }), {
+    committed: true,
+    disposition: 'failed',
+    generationId: attempt.generation_id,
+    attemptId: attempt.attempt_id,
+  });
+  assert.equal(
+    calls.some((entry) => entry[0] === 'block-durability'),
+    false,
+  );
+  abortController.abort(new Error('test cleanup'));
+  await assert.rejects(
+    retirement,
+    (error) => error.code === 'CODEX_RETIREMENT_VERIFICATION_ABORTED',
+  );
+});
+
+test('retirement preparation maps a stale durable target and rejects an inexact acknowledgement', async () => {
+  const attempt = {
+    attempt_id: 'attempt-retirement-preparation',
+    generation_id: 'generation-retirement-preparation',
+    session_key: '100',
+    thread_id: 'thread-retirement-preparation',
+    turn_id: 'turn-retirement-preparation',
+    telegram_source_message_id: '41',
+  };
+  const { calls, controller, db, receipt } = fixture({ codexAttempt: attempt });
+  const { managerOptions } = controller.initialize();
+  await controller.prepareSession({ sessionKey: '100', chatId: '100' });
+  const proc = Object.assign(new EventEmitter(), {
+    runtime: 'codex',
+    backend: 'codex',
+    sessionKey: '100',
+    generationId: attempt.generation_id,
+    providerSessionId: attempt.thread_id,
+    spawnProfileId: receipt.spawnProfileId,
+    startupReleaseSafe: false,
+    closed: false,
+  });
+  controller.registerProcess(proc);
+  await controller.checkpointSink({
+    kind: 'request-prepared',
+    generationId: attempt.generation_id,
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    attemptId: attempt.attempt_id,
+    method: 'turn/start',
+  });
+  const candidate = {
+    sessionKey: '100',
+    generationId: attempt.generation_id,
+    attemptId: attempt.attempt_id,
+    providerSessionId: attempt.thread_id,
+    providerTurnId: attempt.turn_id,
+    sourceMsgId: 41,
+  };
+
+  db.prepareCodexCleanRetirement = (input) => {
+    calls.push(['prepare-clean-retirement', input]);
+    const error = new Error('stale source');
+    error.code = 'CODEX_RETIREMENT_PREPARATION_REJECTED';
+    throw error;
+  };
+  assert.throws(
+    () => managerOptions.codexRetirementPreparer({
+      ...candidate,
+      sourceMsgId: 42,
+    }),
+    (error) => error.code === 'CODEX_RETIREMENT_PREPARATION_REJECTED',
+  );
+  assert.equal(
+    calls.filter((entry) => entry[0] === 'prepare-clean-retirement').length,
+    1,
+  );
+
+  db.prepareCodexCleanRetirement = () => ({
+    changes: 1,
+    disposition: 'retirement-requested',
+    generationId: attempt.generation_id,
+    attemptId: 'other-attempt',
+  });
+  assert.throws(
+    () => managerOptions.codexRetirementPreparer(candidate),
+    (error) => error.code === 'CODEX_RETIREMENT_PREPARATION_REJECTED',
+  );
+  assert.equal(calls.some((entry) => entry[0] === 'retire'), false);
 });
 
 test('an aborted retirement verifier keeps late delivery from releasing the durable lease', async () => {

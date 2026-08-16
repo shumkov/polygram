@@ -8,6 +8,9 @@ const {
   settleCrashShutdown,
   buildResumeIntents,
 } = require('../lib/ops/clean-shutdown');
+const {
+  persistShutdownDisposition,
+} = require('../lib/ops/shutdown-disposition');
 
 function deferred() {
   let resolve;
@@ -67,6 +70,7 @@ describe('clean shutdown retirement boundary', () => {
       awaitIngressSettlement,
       awaitHandlerSettlement,
       settlementTimeoutMs: 1234,
+      continuationAuthorized: true,
       qualificationExpectation: {
         expectedGenerationDigest: 'a'.repeat(64),
         expectedActivityEpoch: 7,
@@ -112,6 +116,7 @@ describe('clean shutdown retirement boundary', () => {
       expectedGenerationDigest: 'a'.repeat(64),
       expectedActivityEpoch: 7,
     });
+    assert.equal(pm.retirementOptions.continuationAuthorized, true);
   });
 
   test('routine retirement omits qualification and an empty snapshot array does not drop it', async () => {
@@ -140,6 +145,7 @@ describe('clean shutdown retirement boundary', () => {
       },
     });
     assert.equal(Object.hasOwn(optionsSeen[0], 'qualificationExpectation'), false);
+    assert.equal(optionsSeen[0].continuationAuthorized, false);
     assert.equal(routine.qualification, null);
 
     const qualified = await prepareCleanRetirement({
@@ -219,14 +225,24 @@ describe('clean shutdown retirement boundary', () => {
 
   test('retirement failure joins delivery, fallback teardown, ingress, and handlers before rejecting clean persistence inputs', async () => {
     const sequence = [];
+    const preparationError = Object.assign(
+      new Error('Codex retirement preparation failed'),
+      { code: 'CODEX_RETIREMENT_PREPARATION_FAILED' },
+    );
     await assert.rejects(
       () => prepareCleanRetirement({
         pm: {
           retireForCleanRestart: async () => {
             sequence.push('retirement-failed');
-            throw new Error('tmux termination uncertain');
+            throw preparationError;
           },
-          shutdown: async () => { sequence.push('fallback-shutdown'); },
+          shutdown: async () => {
+            sequence.push('fallback-shutdown');
+            return [{
+              committed: true,
+              disposition: 'stop-cancelled',
+            }];
+          },
         },
         deliveryBarrier: {
           fenceAndDrain: async () => {
@@ -237,8 +253,9 @@ describe('clean shutdown retirement boundary', () => {
         },
         awaitIngressSettlement: async () => { sequence.push('ingress-settled'); },
         awaitHandlerSettlement: async () => { sequence.push('handlers-settled'); },
+        continuationAuthorized: true,
       }),
-      /termination uncertain/,
+      (error) => error === preparationError,
     );
     assert.deepEqual(sequence, [
       'delivery-settled',
@@ -247,6 +264,66 @@ describe('clean shutdown retirement boundary', () => {
       'ingress-settled',
       'handlers-settled',
     ]);
+  });
+
+  test('preparation failure stays crash-like after an exact fallback cancellation', async () => {
+    const preparationError = Object.assign(
+      new Error('Codex retirement preparation failed'),
+      { code: 'CODEX_RETIREMENT_PREPARATION_FAILED' },
+    );
+    let forceCrashReason = null;
+    let resumeIntents = [];
+    try {
+      const retirement = await prepareCleanRetirement({
+        pm: {
+          retireForCleanRestart: async () => { throw preparationError; },
+          shutdown: async () => ({
+            committed: true,
+            disposition: 'stop-cancelled',
+          }),
+        },
+        deliveryBarrier: {
+          fenceAndDrain: async () => ({ pending: 0 }),
+          inspect: () => ({ outputAttempted: false, pending: 0, fenced: true }),
+        },
+        awaitIngressSettlement: async () => {},
+        awaitHandlerSettlement: async () => {},
+        continuationAuthorized: true,
+      });
+      resumeIntents = buildResumeIntents({
+        snapshots: retirement.snapshots,
+        policyVersion: 2,
+        resolveSourceMessageId: () => 1,
+      }).resumeIntents;
+    } catch (error) {
+      assert.equal(error, preparationError);
+      forceCrashReason = 'clean-retirement-failed';
+    }
+
+    let cleanCalls = 0;
+    const result = persistShutdownDisposition({
+      db: {
+        recordCleanShutdown() {
+          cleanCalls += 1;
+          throw new Error('must not record clean');
+        },
+        recordCrashShutdown() {
+          return { replayMarked: 1 };
+        },
+      },
+      botName: 'bot-a',
+      resumeIntents,
+      continuationAuthorized: true,
+      forceCrashReason,
+    });
+
+    assert.equal(cleanCalls, 0);
+    assert.deepEqual(resumeIntents, []);
+    assert.deepEqual(result, {
+      clean: false,
+      shutdownReason: 'clean-retirement-failed',
+      replayMarked: 1,
+    });
   });
 
   test('handler settlement timeout rejects clean retirement snapshots', async () => {

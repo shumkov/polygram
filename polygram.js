@@ -4687,6 +4687,7 @@ async function main() {
           awaitIngressSettlement,
           awaitHandlerSettlement,
           settlementTimeoutMs: SHUTDOWN_DRAIN_MS,
+          continuationAuthorized,
           qualificationExpectation,
         });
         if (qualificationExpectation !== undefined) {

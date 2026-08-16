@@ -191,12 +191,28 @@ async function emitDescriptorMessages(descriptor) {
   }
 }
 
+async function waitForResponseRelease(file) {
+  if (file == null) return;
+  if (
+    typeof file !== 'string'
+    || file.length === 0
+    || path.basename(file) !== file
+  ) {
+    throw new Error('waitForResponseFile must be a basename');
+  }
+  const releasePath = path.join(cwd, file);
+  while (!existsSync(releasePath)) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 async function sendResponse(entry) {
   const { message, descriptor } = entry;
   if (descriptor.delayMs) {
     await new Promise((resolve) => setTimeout(resolve, descriptor.delayMs));
   }
   await emitDescriptorMessages(descriptor);
+  await waitForResponseRelease(descriptor.waitForResponseFile);
   if (descriptor.stderr) process.stderr.write(descriptor.stderr);
   if (descriptor.closeAfterRead) {
     process.exit(descriptor.exitCode ?? 0);
