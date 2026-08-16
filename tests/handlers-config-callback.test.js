@@ -1796,12 +1796,13 @@ describe('handleConfigCallback — richtext toggle', () => {
     const detail = swept[0][2];
     assert.equal(detail.chat_id, '-100');
     assert.equal(detail.field, 'richText');
-    assert.deepEqual(detail.topics, [
-      { thread_id: '3', old_value: true },
-      { thread_id: '5', old_value: false },
-    ], 'only the topics that actually carried an override, with what they carried');
+    assert.deepEqual(detail.topic_ids, ['3', '5'],
+      'only the topics that actually carried an override, identified by id');
+    assert.equal(detail.topics_cleared, 2);
+    assert.equal(detail.topics, undefined,
+      'the values those topics held are configuration content, not audit data');
     assert.doesNotMatch(JSON.stringify(detail), /General|Music|Ads/,
-      'topic names are not audit data');
+      'topic names are not audit data either');
   });
 
   test('the already-current cleanup is audited the same way', async () => {
@@ -1828,7 +1829,8 @@ describe('handleConfigCallback — richtext toggle', () => {
       (c) => c[0] === 'logEvent' && c[1] === 'config-topic-override-swept',
     );
     assert.equal(swept.length, 1);
-    assert.deepEqual(swept[0][2].topics, [{ thread_id: '3', old_value: true }]);
+    assert.deepEqual(swept[0][2].topic_ids, ['3']);
+    assert.equal(swept[0][2].topics_cleared, 1);
   });
 
   test('nothing swept, nothing logged', async () => {

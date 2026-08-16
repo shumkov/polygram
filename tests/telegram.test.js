@@ -160,7 +160,12 @@ describe('send — failure path', () => {
     assert.ok(ev, 'telegram-api-error event should be logged');
     const detail = JSON.parse(ev.detail_json);
     assert.equal(detail.method, 'sendMessage');
-    assert.match(detail.error, /Forbidden/);
+    // The API's message can echo the text that was refused, so the event keeps
+    // the class and the size; the row's own `error` column still carries the
+    // (masked) message for that message's own history.
+    assert.equal(detail.error, undefined);
+    assert.ok(detail.error_code, 'the failure is still classified');
+    assert.ok(detail.error_len > 0);
   });
 
   test('api error without db doesn\'t crash — just re-throws', async () => {

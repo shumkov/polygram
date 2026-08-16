@@ -18,12 +18,14 @@ function harness({ session = { session_key: 's', chat_id: '1', thread_id: null, 
   };
   const pm = { kill: async (sk, reason) => { kills.push({ sk, reason }); } };
   const tg = async (_b, method, params) => { tgCalls.push({ method, params }); return { ok: true }; };
+  const retiredQuestions = [];
   const exec = createRewindExecutor({
     db, pm, tg, bot: {}, botName: 'b', logEvent: () => {}, logger: { error: () => {} },
     buildForkImpl: () => fork,
+    retireQuestionSession: async (sk) => { retiredQuestions.push(sk); },
   });
   const req = { sessionKey: 's', chatId: '1', threadId: null, target: { msg_id: 200, text: 'go', ts: 1 } };
-  return { exec, req, upserts, kills, tgCalls };
+  return { exec, req, upserts, kills, tgCalls, retiredQuestions };
 }
 
 // Finding A (code-reviewer): transcriptPathFor MUST compute the same path cli-process.js:604
@@ -59,6 +61,22 @@ describe('createRewindExecutor', () => {
     const deletes = H.tgCalls.filter((c) => c.method === 'deleteMessage');
     assert.equal(deletes.length, 2);
     assert.deepEqual(deletes.map((c) => c.params.message_id), [201, 202]);
+  });
+
+  test('retiring the old proc retires its question state too', async () => {
+    // The killed process owned any open question; its exact state must not
+    // outlive it into the rewound session.
+    const h = harness();
+    await h.exec(h.req);
+    assert.deepEqual(h.retiredQuestions, ['s']);
+  });
+
+  test('a fork that never happened retires nothing', async () => {
+    // Retirement follows the process actually being replaced. No fork, no
+    // kill, no retirement — the live interaction is untouched.
+    const H = harness({ fork: { ok: false, error: 'mid-tool-call' } });
+    await H.exec(H.req);
+    assert.deepEqual(H.retiredQuestions, []);
   });
 
   test('fork failure → original session UNTOUCHED, no kill, error surfaced', async () => {

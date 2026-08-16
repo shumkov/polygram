@@ -96,7 +96,10 @@ test('forensics: abort-requested event records the raw busy-probe signals', asyn
   assert.equal(ev.detail.busy_probe.streaming, true);
   assert.equal(ev.detail.busy_probe.in_flight, false);
   assert.equal(ev.detail.busy_probe.captured, true);
-  assert.match(ev.detail.busy_probe.pane_tail, /esc to interrupt/);
+  // The signals are recorded; the pane tail that produced them is live TUI
+  // transcript and must not be carried into a durable telemetry row.
+  assert.equal(ev.detail.busy_probe.pane_tail, undefined);
+  assert.ok(!JSON.stringify(ev.detail).includes('esc to interrupt'));
 });
 
 // ── CliProcess.probeBusyState unit ──────────────────────────────────

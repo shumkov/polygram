@@ -12,6 +12,7 @@ function fixture(overrides = {}) {
     pmCalls: [],
     db: { configChanges: [] },
     pairings: [],
+    discarded: [],
   };
 
   // 0.10.0 P0.2/P0.3 fix: slash-commands routes through Process
@@ -94,6 +95,7 @@ function fixture(overrides = {}) {
     saveConfig: overrides.saveConfig || (() => {}),
     botName: 'testbot',
     logEvent: (kind, detail) => calls.events.push({ kind, detail }),
+    retireQuestionSession: async (sk) => { calls.discarded.push(sk); },
     logger: { log: () => {}, error: () => {} },
   });
 
@@ -196,6 +198,20 @@ describe('slash-commands — /reload', () => {
     await fx.dispatch(fx.makeCtx({ text: '/reload' }));
     assert.match(fx.calls.sendReply[0], /couldn.t reload Codex/i);
     assert.doesNotMatch(fx.calls.sendReply[0], /^🔄 Reloaded/);
+  });
+
+  test('reload disposes the live question context for the session', async () => {
+    // /reload retires the provider that owns any open question, so whatever
+    // the handler is holding exactly for that session must go with it.
+    const fx = fixture();
+    await fx.dispatch(fx.makeCtx({ text: '/reload', chatId: '999' }));
+    assert.deepEqual(fx.calls.discarded, ['sk:999']);
+  });
+
+  test('reload with no live process still disposes', async () => {
+    const fx = fixture({ pmEntry: null });
+    await fx.dispatch(fx.makeCtx({ text: '/reload', chatId: '999' }));
+    assert.deepEqual(fx.calls.discarded, ['sk:999']);
   });
 
   test('with active session: kills and replies', async () => {

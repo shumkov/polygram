@@ -255,7 +255,10 @@ test('bot tokens never reach the event log', async () => {
 
   const logged = JSON.stringify(events);
   assert.ok(!logged.includes('AAHsecrettoken'), `token leaked into events: ${logged}`);
-  assert.ok(logged.includes('bot<redacted>'), 'the redacted marker is present');
+  // Telemetry records the failure as a code, so a request URL carrying the bot
+  // token has no field to ride in on at all — stronger than redacting it.
+  assert.ok(!logged.includes('api.telegram.org'), `request URL leaked: ${logged}`);
+  assert.ok(logged.includes('error_code'), 'the failure is still recorded');
 });
 
 test('a DB failure does not turn a delivered rich message into a failure', async () => {
@@ -312,7 +315,7 @@ test('a response without a message id is a fallback, not a delivery', async () =
   assert.equal(rows.length, 0, 'no row rather than one keyed on a placeholder id');
   const ev = events.find(e => e.kind === 'rich-content-fallback');
   assert.ok(ev, `expected a content-class fallback: ${JSON.stringify(events.map(e => e.kind))}`);
-  assert.match(ev.detail.error, /message_id/);
+  assert.equal(ev.detail.error_code, 'no-message-id');
 });
 
 test('sendRich never throws, whatever the failure', async () => {
@@ -406,7 +409,7 @@ test('a source changed since it was resolved uploads nothing and never throws', 
   assert.equal(tgCalls.length, 0, 'not one byte of the swapped file reached Telegram');
   assert.equal(rows.length, 0);
   const ev = events.find(e => e.kind === 'rich-content-fallback');
-  assert.equal(ev.detail.error, 'media-source-changed');
+  assert.equal(ev.detail.error_code, 'media-source-changed');
   assert.equal(ev.detail.media_count, 1);
 });
 

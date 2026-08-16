@@ -85,7 +85,7 @@ describe('db.redactSecretInChat', () => {
     assert.doesNotMatch(textOf(b), /hunter2/);
   });
 
-  test('audit row carries sha256 fingerprint + rule/tier=reported, never the secret', () => {
+  test('audit row records rule/tier=reported and no value-derived fingerprint', () => {
     insert(`key ${SECRET}`);
     db.redactSecretInChat({ chat_id: '-100', secret: SECRET, now: NOW });
     const a = audits();
@@ -94,10 +94,24 @@ describe('db.redactSecretInChat', () => {
     assert.equal(a[0].rule, 'reported');
     assert.equal(a[0].tier, 'reported');
     assert.equal(a[0].length, SECRET.length);
-    assert.equal(a[0].sha256, crypto.createHash('sha256').update(SECRET).digest('hex'));
-    // the audit table must not store the plaintext anywhere
+    // A hash of the secret is a correlation handle for the secret itself: it
+    // answers "did this exact value appear elsewhere" for anyone who can guess
+    // or replay the value. The audit keeps what/where/when, not a fingerprint.
+    assert.equal(a[0].sha256, undefined, 'no sha256 column survives');
+    const digest = crypto.createHash('sha256').update(SECRET).digest('hex');
+    assert.ok(!JSON.stringify(a[0]).includes(digest), 'no fingerprint under any column');
     assert.doesNotMatch(JSON.stringify(a[0]), /hunter2/);
   });
+
+  test('the schema itself carries no secret fingerprint column or index', () => {
+    const cols = db.raw.prepare('PRAGMA table_info(secret_redactions)').all().map((c) => c.name);
+    assert.ok(!cols.includes('sha256'), `sha256 column still present: ${cols.join(',')}`);
+    const idx = db.raw
+      .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='secret_redactions'")
+      .all().map((r) => r.name);
+    assert.ok(!idx.includes('idx_secret_redactions_sha'), 'fingerprint index still present');
+  });
+
 
   test('purges the secret from the FTS index', () => {
     // Hyphen-free so the FTS5 MATCH query itself is well-formed (a bare hyphen

@@ -402,7 +402,7 @@ describe('createDispatcher — error → terminal status mapping', () => {
     assert.match(calls.tg[0].params.text, /error: boom/);
   });
 
-  test('tmux spawn telemetry retains error codes and the stderr tail', async () => {
+  test('tmux spawn telemetry retains error codes and the stderr SIZE', async () => {
     const stderr = `${'x'.repeat(600)}duplicate session: opaque`;
     const error = Object.assign(new Error('tmux spawn failed'), {
       code: 'TMUX_SPAWN_FAILED',
@@ -414,7 +414,11 @@ describe('createDispatcher — error → terminal status mapping', () => {
 
     assert.equal(event.detail.code, 'TMUX_SPAWN_FAILED');
     assert.equal(event.detail.cause_code, 1);
-    assert.equal(event.detail.stderr_tail, stderr.slice(-500));
+    // The child's stderr is process output, not a telemetry field: its size
+    // still separates "tmux refused" from "tmux said nothing", without
+    // persisting whatever the process printed.
+    assert.equal(event.detail.stderr_len, stderr.length);
+    assert.equal(event.detail.stderr_tail, undefined);
   });
 
   test('SESSION_PROCESS_LOST clears the saved session before guidance and never auto-resumes', async () => {

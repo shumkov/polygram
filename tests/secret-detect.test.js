@@ -6,7 +6,7 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const { detectSecrets, redactText, sha256 } = require('../lib/secret-detect');
+const { detectSecrets, redactText } = require('../lib/secret-detect');
 
 const names = (text) => detectSecrets(text).map((d) => d.rule);
 
@@ -114,7 +114,10 @@ describe('redactText — HIGH+MEDIUM auto-redact, LOW flagged', () => {
     assert.equal(r.text, 'my key is ‹redacted:aws-akia› thanks');
     assert.equal(r.changed, true);
     assert.equal(r.redacted[0].rule, 'aws-akia');
-    assert.equal(r.redacted[0].sha256, sha256('AKIAIOSFODNN7EXAMPLE'));
+    // Records are content-free: rule, tier and length, never a digest of the
+    // value — an unsalted hash of a guessable secret is a handle for it.
+    assert.equal(r.redacted[0].length, 'AKIAIOSFODNN7EXAMPLE'.length);
+    assert.equal(r.redacted[0].sha256, undefined);
   });
   test('redacts JWT (medium)', () => {
     const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3In0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP';
@@ -150,5 +153,47 @@ describe('redactText — HIGH+MEDIUM auto-redact, LOW flagged', () => {
   test('empty / non-string → no-op', () => {
     assert.deepEqual(redactText('').redacted, []);
     assert.deepEqual(redactText(null).redacted, []);
+  });
+});
+
+// The prose rule joins the SAME ruleset the sweep and the redact_secret tool
+// read, so its tier decides their behavior too: low means "flag, let a human
+// or the durable boundary decide", never "auto-destroy this text".
+describe('detectSecrets — prose-form credential declaration (low tier)', () => {
+  test('"my password is <value>" captures the value only', () => {
+    const d = detectSecrets('my password is swordfish-fake');
+    assert.equal(d.length, 1);
+    assert.equal(d[0].rule, 'prose-secret');
+    assert.equal(d[0].tier, 'low');
+    assert.equal(d[0].value, 'swordfish-fake');
+  });
+
+  test('"the api key is <value>" is covered', () => {
+    assert.ok(names('the api key is abcdef123456').includes('prose-secret'));
+  });
+
+  test('a flag-style token assignment is a kv hit', () => {
+    // An unquoted value runs to a safe delimiter, so the captured span can
+    // include the words after it — the credential itself is what matters.
+    const d = detectSecrets('deploy --token=abcdef123456 now');
+    assert.equal(d.length, 1);
+    assert.equal(d[0].rule, 'kv-secret');
+    assert.ok(d[0].value.startsWith('abcdef123456'), d[0].value);
+  });
+
+  test('a token COUNT is not a credential assignment', () => {
+    assert.deepEqual(detectSecrets('input tokens: 1500000 for that turn'), []);
+  });
+
+  test('the rule stays tight — a bare noun without a credential word is not a hit', () => {
+    assert.deepEqual(detectSecrets('the response is unavailable right now'), []);
+    assert.deepEqual(detectSecrets('the deploy was successful today'), []);
+  });
+
+  test('sweep-facing behavior is unchanged: prose hits are flagged, not redacted', () => {
+    const r = redactText('my password is swordfish-fake');
+    assert.equal(r.changed, false);
+    assert.equal(r.text, 'my password is swordfish-fake');
+    assert.equal(r.flagged[0].rule, 'prose-secret');
   });
 });
