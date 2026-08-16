@@ -1024,7 +1024,10 @@ describe('R8 — onInjectFail surfaces a failed autosteer paste promptly', () =>
     const ev = h.events.find((e) => e.kind === 'inject-fail');
     assert.ok(ev, 'inject-fail must be logged so a failed paste is diagnosable');
     assert.equal(ev.detail.msg_id, 658);
-    assert.match(ev.detail.error, /no server running/);
+    // The paste error text can quote whatever was being pasted, so the event
+    // carries its size; the message itself stays in the process log.
+    assert.equal(ev.detail.error_len, 'tmux paste-buffer: no server running'.length);
+    assert.equal(ev.detail.error, undefined);
 
     // The ✍ reaction (applied by autosteeredRefs.add when the message
     // was classified as an autosteer) must be cleared — otherwise it

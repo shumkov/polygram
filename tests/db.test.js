@@ -20,9 +20,48 @@ describe('schema + migrations', () => {
   beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
   afterEach(() => cleanupDb(dbPath, db));
 
+  test('a populated v19 database upgrades to v20 and loses its fingerprints', () => {
+    // Downgrade is not supported past this migration: the column is gone and
+    // the values it held are unrecoverable by design. The upgrade path is what
+    // must work, on a database that already has audit rows in it.
+    const legacyPath = `${dbPath}-v19`;
+    const legacy = new Database(legacyPath);
+    const migrationsDir = path.join(__dirname, '..', 'migrations');
+    for (const file of fs.readdirSync(migrationsDir).sort()) {
+      const version = Number.parseInt(file.slice(0, 3), 10);
+      if (!Number.isSafeInteger(version) || version > 19) continue;
+      legacy.exec(fs.readFileSync(path.join(migrationsDir, file), 'utf8'));
+      legacy.pragma(`user_version = ${version}`);
+    }
+    const insert = legacy.prepare(`INSERT INTO secret_redactions
+      (chat_id, msg_id, rule, tier, length, sha256, action, ts) VALUES (?,?,?,?,?,?,?,?)`);
+    insert.run('-100', 1, 'aws-akia', 'high', 20, 'a'.repeat(64), 'redacted', 1);
+    insert.run('-100', 2, 'kv-secret', 'low', 8, 'b'.repeat(64), 'flagged', 2);
+    legacy.close();
+
+    const migrated = open(legacyPath);
+    try {
+      assert.equal(migrated.raw.pragma('user_version', { simple: true }), 20);
+      const columns = migrated.raw.prepare('PRAGMA table_info(secret_redactions)')
+        .all().map((c) => c.name);
+      assert.ok(!columns.includes('sha256'), columns.join(','));
+      const rows = migrated.raw.prepare('SELECT * FROM secret_redactions ORDER BY id').all();
+      assert.equal(rows.length, 2, 'audit history survives the column drop');
+      assert.deepEqual(rows.map((r) => r.rule), ['aws-akia', 'kv-secret']);
+      assert.ok(!JSON.stringify(rows).includes('a'.repeat(64)));
+      assert.ok(!JSON.stringify(rows).includes('b'.repeat(64)));
+      const indexes = migrated.raw
+        .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='secret_redactions'")
+        .all().map((r) => r.name);
+      assert.ok(!indexes.includes('idx_secret_redactions_sha'));
+    } finally {
+      cleanupDb(legacyPath, migrated);
+    }
+  });
+
   test('user_version is at current schema after migration', () => {
     const v = db.raw.pragma('user_version', { simple: true });
-    assert.equal(v, 19);
+    assert.equal(v, 20);
   });
 
   test('WAL mode is enabled', () => {
@@ -2534,20 +2573,20 @@ describe('findOrphanedCompactCommands — rc.61', () => {
   test('compact-command WITHOUT matching boundary → orphan returned', () => {
     db.logEvent('compact-command', {
       chat_id: '-100', thread_id: '24', session_key: '-100:24',
-      text_len: 50, user: 'Ivan', user_id: 1,
+      text_len: 50, user_id: 1,
     });
     const orphans = db.findOrphanedCompactCommands();
     assert.equal(orphans.length, 1);
     assert.equal(orphans[0].session_key, '-100:24');
     assert.equal(orphans[0].chat_id, '-100');
     assert.equal(orphans[0].thread_id, '24');
-    assert.equal(orphans[0].user, 'Ivan');
+    assert.equal(orphans[0].user_id, 1);
   });
 
   test('compact-command followed by matching boundary → NOT orphaned', () => {
     db.logEvent('compact-command', {
       chat_id: '-100', thread_id: '24', session_key: '-100:24',
-      text_len: 50, user: 'Ivan', user_id: 1,
+      text_len: 50, user_id: 1,
     });
     db.logEvent('compact-boundary', {
       session_key: '-100:24', trigger: 'manual', pre_tokens: 170000, post_tokens: 8000,
@@ -2562,7 +2601,7 @@ describe('findOrphanedCompactCommands — rc.61', () => {
     });
     db.logEvent('compact-command', {
       chat_id: '-100', thread_id: '24', session_key: '-100:24',
-      text_len: 50, user: 'Ivan', user_id: 1,
+      text_len: 50, user_id: 1,
     });
     const orphans = db.findOrphanedCompactCommands();
     assert.equal(orphans.length, 1, 'NEW /compact after earlier boundary is still orphaned');
@@ -2571,7 +2610,7 @@ describe('findOrphanedCompactCommands — rc.61', () => {
   test('boundary with DIFFERENT session_key does NOT count as a match', () => {
     db.logEvent('compact-command', {
       chat_id: '-100', thread_id: '24', session_key: '-100:24',
-      text_len: 50, user: 'Ivan', user_id: 1,
+      text_len: 50, user_id: 1,
     });
     db.logEvent('compact-boundary', {
       session_key: '-200:5', // different session
@@ -2626,32 +2665,93 @@ describe('findOrphanedCompactCommands — rc.61', () => {
   });
 });
 
-describe('findOrphanedCompactCommands — rc.65 returns full text', () => {
+describe('findOrphanedCompactCommands — recovers the command text', () => {
   beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
   afterEach(() => cleanupDb(dbPath, db));
 
-  test('rc.65 events include the full /compact text in the result', () => {
+  // The hint the user typed is message content, so telemetry records only the
+  // message id that points at it; the text itself is read back from the stored
+  // inbound row, which the durable-write boundary has already sanitized.
+  test('the hint is read from the recorded inbound message, not from telemetry', () => {
+    db.insertMessage({
+      chat_id: '-100', thread_id: '24', msg_id: 77, direction: 'in',
+      text: '/compact keep the Q3 commission decisions', ts: Date.now(),
+    });
     db.logEvent('compact-command', {
       chat_id: '-100', thread_id: '24', session_key: '-100:24',
-      text_len: 50, text: '/compact keep the Q3 commission decisions',
-      user: 'Ivan', user_id: 1,
+      text_len: 50, msg_id: 77, user: 'Ivan', user_id: 1,
     });
     const [orphan] = db.findOrphanedCompactCommands();
     assert.equal(orphan.text, '/compact keep the Q3 commission decisions');
   });
 
-  test('pre-rc.65 events (no text field) return text=null gracefully', () => {
-    // Simulate a legacy event written before rc.65.
+  test('no raw command text is persisted in the event row', () => {
+    db.logEvent('compact-command', {
+      chat_id: '-100', session_key: '-100:24', msg_id: 78,
+      text: '/compact my password is hunter2-fake-value',
+    });
+    const row = db.raw
+      .prepare("SELECT detail_json FROM events WHERE kind='compact-command'").get();
+    assert.ok(!row.detail_json.includes('hunter2-fake-value'), row.detail_json);
+    assert.ok(!row.detail_json.includes('/compact my password'), row.detail_json);
+    assert.deepEqual(JSON.parse(row.detail_json).dropped_fields, ['text']);
+  });
+
+  test('a historical event still recovers, with its stored text sanitized', () => {
+    // Events written before the hint moved out of telemetry still hold the
+    // raw line. They stay recoverable, but what comes back is sanitized on
+    // the way out so a legacy row cannot resurrect a credential.
     db.raw.prepare(`
       INSERT INTO events (ts, chat_id, kind, detail_json) VALUES (?, ?, ?, ?)
     `).run(Date.now(), '-100', 'compact-command', JSON.stringify({
       chat_id: '-100', thread_id: '24', session_key: '-100:24',
-      text_len: 50, /* no text field */
+      text_len: 50, text: '/compact keep the db password: hunter2-fake-value',
+    }));
+    const [orphan] = db.findOrphanedCompactCommands();
+    assert.ok(orphan.text.startsWith('/compact keep the db password:'));
+    assert.ok(!orphan.text.includes('hunter2-fake-value'), orphan.text);
+  });
+
+  test('a pre-boundary source row is sanitized on the way out', () => {
+    // Rows written before the durable boundary existed still hold raw text.
+    // The recovery reads them, so the read is sanitized too — otherwise the
+    // oldest rows are exactly the ones that hand a credential back.
+    db.raw.prepare(`
+      INSERT INTO messages (chat_id, thread_id, msg_id, direction, text, ts)
+      VALUES (?,?,?,?,?,?)
+    `).run('-100', '24', 91, 'in', '/compact keep the db password: hunter2-fake-value', Date.now());
+    db.logEvent('compact-command', {
+      chat_id: '-100', thread_id: '24', session_key: '-100:24', msg_id: 91,
+    });
+    const [orphan] = db.findOrphanedCompactCommands();
+    assert.ok(orphan.text.startsWith('/compact keep the db password:'));
+    assert.ok(!orphan.text.includes('hunter2-fake-value'), orphan.text);
+  });
+
+  test('the message row wins over a legacy detail copy', () => {
+    db.insertMessage({
+      chat_id: '-100', msg_id: 90, direction: 'in', text: '/compact from the row', ts: Date.now(),
+    });
+    db.raw.prepare(`
+      INSERT INTO events (ts, chat_id, kind, detail_json) VALUES (?, ?, ?, ?)
+    `).run(Date.now(), '-100', 'compact-command', JSON.stringify({
+      chat_id: '-100', session_key: '-100:24', msg_id: 90, text: '/compact stale legacy copy',
+    }));
+    const [orphan] = db.findOrphanedCompactCommands();
+    assert.equal(orphan.text, '/compact from the row');
+  });
+
+  test('an event whose message row is gone returns text=null gracefully', () => {
+    db.raw.prepare(`
+      INSERT INTO events (ts, chat_id, kind, detail_json) VALUES (?, ?, ?, ?)
+    `).run(Date.now(), '-100', 'compact-command', JSON.stringify({
+      chat_id: '-100', thread_id: '24', session_key: '-100:24',
+      text_len: 50, /* no msg_id, no recoverable row */
       user: 'Ivan', user_id: 1,
     }));
     const [orphan] = db.findOrphanedCompactCommands();
     assert.equal(orphan.text, null,
-      'caller can fall back to "please retry" when text is null');
+      'caller can fall back to "please retry" when the text cannot be recovered');
   });
 });
 

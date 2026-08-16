@@ -121,7 +121,7 @@ const { createRedeliver } = require('./lib/handlers/redeliver');
 const { classifyReplay, executeReplayPlan } = require('./lib/handlers/replay-disposition');
 const { createDropRedeliverer } = require('./lib/handlers/drop-redeliver');
 const { createSessionFeedback } = require('./lib/feedback/session-feedback');
-const { createSlashCommands } = require('./lib/handlers/slash-commands');
+const { createSlashCommands, normalizeCompactCommand } = require('./lib/handlers/slash-commands');
 const {
   buildCodexReconciliationView,
   createHandleCodexReconciliationCallback,
@@ -1398,7 +1398,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // /pair-code /pairings /unpair /pair. Returns true when handled;
   // caller short-circuits.
   if (await dispatchSlashCommand({
-    text, sessionKey, chatId, threadIdStr, chatConfig,
+    text, msgId: msg.message_id, sessionKey, chatId, threadIdStr, chatConfig,
     cmdUser, cmdUserId, label, sendReply,
   })) return;
 
@@ -1511,7 +1511,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       console.error(`[${label}] failed to notify user of skipped attachments: ${err.message}`);
       logEvent('attachment-skip-notice-failed', {
         chat_id: chatId, msg_id: msg.message_id,
-        error: err.message?.slice(0, 200),
+        error_class: err.name || 'Error',
         rejected_count: rejected.length,
       });
     }
@@ -1793,7 +1793,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           // Network errors can embed the request URL, which carries the
           // bot token — redact before persisting, matching rich-edit.js
           // and api.js's handling of the same error class.
-          api_error: redactBotToken(err.message)?.slice(0, 200),
+          api_error_code: err.code || err.name || 'error',
+          error_len: err.message?.length ?? 0,
           bot: BOT_NAME,
         });
         throw err;
@@ -2453,7 +2454,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       logEvent('wedged-session-detected', {
         chat_id: chatId, session_key: sessionKey,
         kind: wedge.kind,
-        text_preview: result.text.slice(0, 200),
+        // The wrapper's classification is the forensic signal; the wrapped
+        // payload is provider content and stays out of the row.
+        text_len: result.text.length,
       });
       // Promote the wrapped error to result.error so the existing
       // auto-recover + thrown-error machinery handles it uniformly.
@@ -2474,6 +2477,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // to type /new.
       const cls = classifyError(result.error);
       if (cls.autoRecover === 'reset_session') {
+        // The process that owns any open question is going away with the
+        // session. Retirement closes the row and drops what is held exactly
+        // for it — that part runs synchronously, so starting it here is enough
+        // to have happened before the reset. Only the card edit it leaves
+        // behind is awaited, and the reset must not wait on Telegram.
+        questionHandlers?.retireSession(sessionKey)
+          ?.catch((err) => console.error(`[${label}] question retire failed: ${err.message}`));
         pm.resetSession(sessionKey, { reason: cls.kind })
           .catch((err) => console.error(`[${label}] auto-reset failed: ${err.message}`));
         logEvent('auto-recover', {
@@ -2648,7 +2658,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         reactor.setState('ERROR');
         logEvent('telegram-empty-response-fallback-failed', {
           chat_id: chatId, msg_id: msg.message_id, bot: BOT_NAME,
-          error: err.message?.slice(0, 200),
+          error_class: err.name || 'Error',
         });
         throw new Error(`empty-response fallback send failed: ${err.message}`);
       }
@@ -2737,7 +2747,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         logEvent('canned-reply-suppressed', {
           chat_id: chatId,
           msg_id: msg.message_id,
-          original: sanitized.original,
+          // The suppressed reply is provider content; its size is the signal.
+          original_len: sanitized.original?.length ?? 0,
           backend: result?.backend || null,
         });
         parsed.text = sanitized.text;
@@ -3535,7 +3546,7 @@ function createBot(token) {
       bot: BOT_NAME,
       update_id: updateId,
       msg_id: msgId,
-      error: err.message?.slice(0, 300),
+      error_class: err.name || 'Error',
     });
   });
 
@@ -3875,7 +3886,7 @@ async function main() {
       }
     } catch (err) {
       console.error(`[secret-sweep] FAILED (${trigger}): ${err.message}`);
-      try { db.logEvent('secret-sweep-failed', { trigger, error: err.message }); } catch {}
+      try { db.logEvent('secret-sweep-failed', { trigger, error_class: err.name || 'Error' }); } catch {}
     }
   };
   if (secretSweepCfg.enabled) {
@@ -4046,6 +4057,20 @@ async function main() {
     answerQuestion: (sk, tc, result) => pm.answerQuestion(sk, tc, result),
     logger: console,
   });
+  // A question whose answer was held in memory cannot be completed by this
+  // process: the exact value went with the one that died. Cancel those rows
+  // here — before replay, redelivery, provider recovery, polling or any other
+  // path can act on them — so none is ever answered from a marker.
+  // A failure here is fatal on purpose. Rows this could not cancel would meet
+  // replay and inbound traffic with an answer no live process can complete, so
+  // startup stops instead of admitting messages behind an open fence.
+  try {
+    await questionHandlers.reconcileMarkedQuestionsAtBoot(questionStore.listOpen(BOT_NAME));
+  } catch (e) {
+    console.error(`[${BOT_NAME}] question boot reconciliation failed; refusing to admit traffic: ${e.message}`);
+    throw e;
+  }
+
   // Resolve expired questions with {timedout} so claude never hangs on an ignored ask.
   setInterval(() => {
     try {
@@ -4059,7 +4084,10 @@ async function main() {
   // the copy-only transcript-fork executor (P2/P3: fork → repoint the session → kill → delete
   // orphaned bot messages). channels/cli only; the fork mechanism was proven in P0.6.
   // See docs/0.13-rewind-design.md.
-  const executeRewind = createRewindExecutor({ db, pm, tg, bot, botName: BOT_NAME, logEvent, logger: console });
+  const executeRewind = createRewindExecutor({
+    db, pm, tg, bot, botName: BOT_NAME, logEvent, logger: console,
+    retireQuestionSession: (sessionKey) => questionHandlers?.retireSession(sessionKey),
+  });
   rewindHandler = createRewindHandler({
     pm, tg, bot, botName: BOT_NAME, logEvent, logger: console, executeRewind,
   });
@@ -4407,6 +4435,7 @@ async function main() {
   handleAbortIfRequested = createHandleAbort({
     pm, bot, tg, logEvent, isAbortRequest,
     markSessionAborted, clearAutosteeredReactions, getSessionKey,
+    retireQuestionSession: (sessionKey) => questionHandlers?.retireSession(sessionKey),
     botName: BOT_NAME, logger: console,
   });
   autosteer = createAutosteerHandlers({
@@ -4514,6 +4543,7 @@ async function main() {
     modelVersionsDesc: MODEL_VERSIONS_DESC, saveConfig,
     resolveRuntimeView: resolveSessionRuntimeView,
     botName: BOT_NAME, logEvent, logger: console,
+    retireQuestionSession: (sessionKey) => questionHandlers?.retireSession(sessionKey),
   });
   console.log('[polygram] using SDK ProcessManager');
 
@@ -4575,19 +4605,19 @@ async function main() {
     // provider; ordinary stops keep the existing answer-and-await behavior.
     try {
       const openQuestions = questionStore.listOpen?.(BOT_NAME) || [];
-      if (continuationAuthorized) {
-        for (const row of openQuestions) {
-          questionHandlers.beginShutdownDisposition(row, {
-            message: 'Bot is restarting — this question was cancelled. It may be re-asked in a moment.',
-          });
-        }
-      } else {
-        for (const row of openQuestions) {
-          // eslint-disable-next-line no-await-in-loop
-          await questionHandlers.expireQuestion(row, {
-            status: 'cancelled',
-            message: 'Bot is restarting — this question was cancelled. It may be re-asked in a moment.',
-          }).catch(() => {});
+      const shutdownNotice = 'Bot is restarting — this question was cancelled. It may be re-asked in a moment.';
+      // Each row is disposed on its own: one that throws must not take the
+      // rows after it, nor the drop of everything held in memory, with it.
+      for (const row of openQuestions) {
+        try {
+          if (continuationAuthorized) {
+            questionHandlers.beginShutdownDisposition(row, { message: shutdownNotice });
+          } else {
+            // eslint-disable-next-line no-await-in-loop
+            await questionHandlers.expireQuestion(row, { status: 'cancelled', message: shutdownNotice });
+          }
+        } catch (err) {
+          console.error(`[shutdown] question ${row.id} disposition failed: ${err.message}`);
         }
       }
       if (openQuestions.length) {
@@ -4595,6 +4625,11 @@ async function main() {
       }
     } catch (err) {
       console.error(`[shutdown] question expiry failed: ${err.message}`);
+    } finally {
+      // Nothing exact survives the process on purpose, whatever any single row
+      // did on the way out.
+      try { questionHandlers.discardAll(); }
+      catch (err) { console.error(`[shutdown] question context drop failed: ${err.message}`); }
     }
 
     // 1.6 Album siblings still buffered (arrived <flushMs before shutdown,
@@ -4800,7 +4835,7 @@ async function main() {
           logEvent('shutdown-persistence-fallback', {
             bot: BOT_NAME,
             replay_marked: fallback.replayMarked,
-            error: err.message?.slice(0, 200),
+            error_class: err.name || 'Error',
           });
         } catch (fallbackErr) {
           console.error(
@@ -5287,18 +5322,17 @@ async function main() {
     console.error(`[replay] boot replay failed: ${err.message}`);
   }
 
-  // rc.61 + rc.65: handle compact-command events that were never
-  // paired with a compact-boundary (deploy / crash interrupted them
-  // before the SDK processed). rc.65 changes behaviour from
-  // "post a 'please retry' message and ask the user" to
-  // "silently retry by re-pushing the same /compact text to a
-  // freshly-spawned (resumed) Query." Same pattern as boot-replay
-  // for inbound messages — recovery should be invisible.
+  // Handle compact-command events that were never paired with a
+  // compact-boundary (a deploy or crash interrupted them before the SDK
+  // processed them). Recovery re-pushes the same /compact line into a
+  // freshly-spawned (resumed) session, invisibly — the same pattern as
+  // boot-replay for inbound messages.
   //
   // Requirements for a silent retry:
-  //   1. The compact-command event was logged with full `text`
-  //      (rc.65+ does this; pre-rc.65 events have only text_len —
-  //      we fall back to the old "please retry" message for those).
+  //   1. The command line is recoverable — from the inbound message row the
+  //      event points at, or from an older event that still stored it — and
+  //      it normalizes to a real /compact command. Otherwise the user gets
+  //      the "please retry" message instead.
   //   2. The chat is still configured (config.chats[chat_id] exists).
   //   3. The session has a saved claude_session_id we can resume.
   //
@@ -5326,9 +5360,13 @@ async function main() {
       const threadId = o.thread_id ? Number(o.thread_id) : null;
       const savedSessionId = getClaudeSessionId(db, o.session_key);
 
-      // Silent retry path: only when we have BOTH the original text
-      // (rc.65+) AND a session_id to resume into.
-      if (o.text && savedSessionId) {
+      // Silent retry path: only when the stored line is provably a compact
+      // command AND there is a session_id to resume into. The line comes back
+      // from storage, so it is normalized and validated before it is fired at
+      // a live session — a mention-suffixed command is accepted in its
+      // normalized form, anything else is refused and surfaced instead.
+      const replayCommand = normalizeCompactCommand(o.text);
+      if (replayCommand && savedSessionId) {
         try {
           const entry = await pm.getOrSpawn(
             o.session_key,
@@ -5340,7 +5378,7 @@ async function main() {
           if (!entry || typeof entry.fireUserMessage !== 'function') {
             throw new Error('Process.fireUserMessage not available');
           }
-          const ok = entry.fireUserMessage(o.text);
+          const ok = entry.fireUserMessage(replayCommand);
           if (!ok) {
             throw new Error('fireUserMessage refused (closed or empty content)');
           }
@@ -5349,8 +5387,7 @@ async function main() {
             thread_id: o.thread_id,
             session_key: o.session_key,
             original_ts: o.ts,
-            text_len: o.text.length,
-            user: o.user,
+            text_len: replayCommand.length,
             user_id: o.user_id,
           });
           replayed += 1;
@@ -5361,9 +5398,9 @@ async function main() {
         }
       }
 
-      // Fallback: surface the legacy "please retry" message. Only
-      // happens for pre-rc.65 events (no `text` field) or when
-      // the silent-retry spawn failed.
+      // Fallback: surface the "please retry" message. Happens when the hint
+      // could not be recovered, when the stored line is not a compact
+      // command, or when the silent retry failed.
       try {
         await tg(bot, 'sendMessage', {
           chat_id: o.chat_id,
@@ -5375,9 +5412,8 @@ async function main() {
           thread_id: o.thread_id,
           session_key: o.session_key,
           original_ts: o.ts,
-          user: o.user,
           user_id: o.user_id,
-          reason: o.text ? 'spawn-failed' : 'pre-rc65-event-no-text',
+          reason: replayCommand ? 'spawn-failed' : (o.text ? 'not-a-compact-command' : 'no-recoverable-text'),
         });
         surfacedFallback += 1;
       } catch (err) {
