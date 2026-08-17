@@ -117,7 +117,7 @@ describe('clean restart resume intents', () => {
     assert.equal(new Set(generations).size, generations.length);
   });
 
-  test('migration 019 upgrades an existing v18 production database', (t) => {
+  test('current migrations upgrade an existing v18 production database', (t) => {
     const legacyPath = `${dbPath}-v18`;
     let migrated = null;
     t.after(() => cleanupDb(legacyPath, migrated));
@@ -141,7 +141,7 @@ describe('clean restart resume intents', () => {
 
     assert.equal(
       migrated.raw.pragma('user_version', { simple: true }),
-      20,
+      21,
     );
     const auditColumns = migrated.raw
       .prepare('PRAGMA table_info(secret_redactions)')

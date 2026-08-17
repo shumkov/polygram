@@ -303,11 +303,42 @@ describe('clean restart lifecycle ordering', () => {
   test('same-session compact replay waits for the tracked continuation without delaying polling', () => {
     assert.match(
       src,
-      /cleanRecoveryTasksBySession\.get\(o\.session_key\)[\s\S]{0,500}trackHandlerTask\([\s\S]{0,500}\.then\(\(\) => recoverCompact\(o\)\)/,
+      /cleanRecoveryTasksBySession\.get\(o\.session_key\)[\s\S]{0,500}trackHandlerTask\([\s\S]{0,500}results\.every\(\(result\) => result\?\.status === 'replied'\)[\s\S]{0,200}recoverCompact\(o\)/,
     );
     const deferredCompact = src.indexOf('cleanRecoveryTasksBySession.get(o.session_key)');
     const polling = src.indexOf('const pollPromise = pollBot(bot)', deferredCompact);
     assert.notEqual(polling, -1);
+  });
+
+  test('clean-safe Codex followers use a session barrier and atomic replay rearm', () => {
+    const schedule = src.indexOf('scheduleCleanCodexReplaySessions({');
+    const execute = src.indexOf('const result = await executeReplayPlan({', schedule);
+    const poll = src.indexOf('const pollPromise = pollBot(bot)', schedule);
+    assert.notEqual(schedule, -1);
+    assert.ok(schedule < execute && execute < poll);
+    assert.match(
+      src.slice(schedule, execute),
+      /getContinuationTasks:[\s\S]*?cleanRecoveryTasksBySession\.get\(sessionKey\)[\s\S]*?coordinator: cleanReplaySessionCoordinator,[\s\S]*?db\.prepareCodexCleanReplay\(\{[\s\S]*?expectedEvidence:[\s\S]*?recoveryReceipt,[\s\S]*?expectedProcess,[\s\S]*?onDispatched/,
+    );
+    assert.match(
+      src,
+      /awaitSessionRecovery: \(sessionKey, receipt\) => \([\s\S]*?cleanReplaySessionCoordinator\.wait\(sessionKey, receipt\)/,
+    );
+    assert.match(
+      src,
+      /authorizeCleanReplayDispatch\(\{[\s\S]*?expectedProcess: cleanReplayDispatch\.expectedProcess,[\s\S]*?expectedProcess: cleanReplayDispatch\?\.expectedProcess \?\? null/,
+      'the handler must preserve the exact process fence through pm.send',
+    );
+    assert.doesNotMatch(
+      src,
+      /result\.recovered \+= cleanCodexScheduled/,
+      'scheduled work is not recovered until its later session outcome admits it',
+    );
+    assert.match(
+      src,
+      /logEvent\('codex-clean-replay-session',[\s\S]*?admitted_count: outcome\.admitted,[\s\S]*?terminal_count: outcome\.terminal,[\s\S]*?deferred_count: outcome\.deferred/,
+    );
+    assert.match(src, /codex_scheduled_count: cleanCodexScheduled/);
   });
 
   test('strict recovery spawn requires the expected existing session and attestation', () => {
@@ -331,6 +362,16 @@ describe('clean restart lifecycle ordering', () => {
       codexSpawnContext,
       /if \(strictResume\) \{[\s\S]{0,500}?validateStrictResumeSpawn\(\{/,
       'a Codex backend switch must pass through the tested strict-resume validator',
+    );
+    assert.match(
+      codexSpawnContext,
+      /expectedProviderGenerationId: strictResume\.expectedGenerationId/,
+      'the validated clean-resume claim must reach turn preparation unchanged',
+    );
+    assert.match(
+      src,
+      /registerProcess\(proc, \{[\s\S]{0,200}?spawnContext\.expectedProviderGenerationId/,
+      'the production process factory must bind strict lineage to its controller record',
     );
   });
 });

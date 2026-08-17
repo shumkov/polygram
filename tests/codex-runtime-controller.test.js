@@ -89,6 +89,14 @@ function fixture({
       checkpointPayloads.push(input);
       calls.push(['checkpoint', input.kind]);
     },
+    recordCodexTurnStartPrepared(input) {
+      calls.push(['turn-start-prepared', input]);
+      return {
+        changes: 1,
+        attemptId: input.checkpoint.attemptId,
+        kind: input.checkpoint.kind,
+      };
+    },
     prepareCodexCleanRetirement(input) {
       calls.push(['prepare-clean-retirement', input]);
       return {
@@ -289,6 +297,70 @@ function fixture({
     db,
     receipt,
   };
+}
+
+async function initializeRegisteredGeneration(controller, proc, attemptId) {
+  const owner = {
+    generationId: proc.generationId,
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    attemptId,
+    threadId: proc.providerSessionId,
+  };
+  await controller.checkpointSink({
+    ...owner,
+    kind: 'request-prepared',
+    method: 'thread/resume',
+  });
+  await controller.checkpointSink({
+    ...owner,
+    kind: 'request-write-attempted',
+    requestId: `${attemptId}-request`,
+  });
+  await controller.checkpointSink({
+    ...owner,
+    kind: 'request-response-observed',
+    requestId: `${attemptId}-request`,
+    outcome: 'result',
+  });
+  await controller.checkpointSink({
+    kind: 'thread-initialized',
+    generationId: proc.generationId,
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    threadId: proc.providerSessionId,
+    resumed: true,
+  });
+}
+
+function bindPreparedTurn(proc, {
+  attemptId,
+  source = null,
+  clientUserMessageId,
+}) {
+  const settings = Object.freeze({
+    model: 'gpt-5.6-sol',
+    effort: 'xhigh',
+  });
+  const pending = {
+    attemptId,
+    clientUserMessageId,
+    context: { sourceMsgId: source },
+    admittedSettings: settings,
+    startDeliveryState: 'preparing',
+    settled: false,
+  };
+  Object.assign(proc, {
+    backend: 'codex',
+    cwd: '/srv/workspace',
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    state: 'StartingTurn',
+    settingsAdmissionClosed: false,
+    current: pending,
+    pendingQueue: [pending],
+    admittingTurnSettings: settings,
+  });
 }
 
 test('different chats serialize native preflight admission daemon-wide', async () => {
@@ -1173,7 +1245,7 @@ test('settles Telegram delivery only for the exact registered Codex result', asy
     hostIdentity: 'host:current',
     bootSessionIdentity: 'boot:current',
     attemptId: attempt.attempt_id,
-    method: 'turn/start',
+    method: 'thread/resume',
   });
   const result = {
     runtime: 'codex',
@@ -1246,7 +1318,7 @@ test('persists an explicit failed delivery disposition for the exact registered 
     hostIdentity: 'host:current',
     bootSessionIdentity: 'boot:current',
     attemptId: attempt.attempt_id,
-    method: 'turn/start',
+    method: 'thread/resume',
   });
   const result = {
     runtime: 'codex',
@@ -1326,7 +1398,7 @@ test('delivery checkpoint failure fences the exact live generation before preser
     hostIdentity: 'host:current',
     bootSessionIdentity: 'boot:current',
     attemptId: attempt.attempt_id,
-    method: 'turn/start',
+    method: 'thread/resume',
   });
   const checkpointError = Object.assign(
     new Error('delivery checkpoint unavailable'),
@@ -1403,13 +1475,21 @@ test('real SQLite delivery settlement is idempotent through the controller', asy
     closed: false,
   });
   controller.registerProcess(proc);
+  await initializeRegisteredGeneration(
+    controller,
+    proc,
+    'attempt-init-delivery-real',
+  );
   const owner = {
     generationId: proc.generationId,
     hostIdentity: 'host:current',
     bootSessionIdentity: 'boot:current',
     attemptId: 'attempt-delivery-real',
     threadId: proc.providerSessionId,
+    source: 'telegram-delivery-real',
+    clientUserMessageId: 'client-delivery-real',
   };
+  bindPreparedTurn(proc, owner);
   await controller.checkpointSink({
     ...owner,
     kind: 'request-prepared',
@@ -1515,7 +1595,7 @@ test('rejects malformed, mismatched, stale, and Claude delivery results', async 
     hostIdentity: 'host:current',
     bootSessionIdentity: 'boot:current',
     attemptId: 'attempt-first',
-    method: 'turn/start',
+    method: 'thread/resume',
   });
   const validFirst = {
     runtime: 'codex',
@@ -1975,6 +2055,374 @@ test('first prepared checkpoint atomically establishes durable generation owners
   );
 });
 
+test('turn preparation persists the exact registered pending identity before transport', async () => {
+  const { calls, controller, receipt } = fixture();
+  controller.initialize();
+  await controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+    threadId: null,
+  });
+  const admittedSettings = Object.freeze({
+    model: 'gpt-5.6-sol',
+    effort: 'xhigh',
+  });
+  const pending = {
+    attemptId: 'attempt-turn',
+    clientUserMessageId: 'client-turn',
+    context: { sourceMsgId: 'telegram-turn' },
+    admittedSettings,
+    startDeliveryState: 'preparing',
+    settled: false,
+  };
+  const proc = Object.assign(new EventEmitter(), {
+    runtime: 'codex',
+    backend: 'codex',
+    sessionKey: '100',
+    generationId: 'generation-turn',
+    providerSessionId: 'thread-turn',
+    cwd: '/srv/workspace',
+    spawnProfileId: receipt.spawnProfileId,
+    spawnOptions: { existingSessionId: 'thread-turn' },
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    startupReleaseSafe: false,
+    closed: false,
+    state: 'StartingTurn',
+    settingsAdmissionClosed: false,
+    current: pending,
+    pendingQueue: [pending],
+    admittingTurnSettings: admittedSettings,
+  });
+  controller.registerProcess(proc);
+  await controller.checkpointSink({
+    kind: 'request-prepared',
+    generationId: 'generation-turn',
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    attemptId: 'attempt-init',
+    method: 'thread/resume',
+    threadId: 'thread-turn',
+  });
+
+  await controller.checkpointSink({
+    kind: 'request-prepared',
+    generationId: 'generation-turn',
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    attemptId: 'attempt-turn',
+    method: 'turn/start',
+    threadId: 'thread-turn',
+    source: 'telegram-turn',
+    clientUserMessageId: 'client-turn',
+    ts: 1200,
+  });
+
+  const persisted = calls.find((entry) => (
+    Array.isArray(entry) && entry[0] === 'turn-start-prepared'
+  ));
+  assert.deepEqual(persisted, ['turn-start-prepared', {
+    checkpoint: {
+      kind: 'request-prepared',
+      generationId: 'generation-turn',
+      hostIdentity: 'host:current',
+      bootSessionIdentity: 'boot:current',
+      attemptId: 'attempt-turn',
+      method: 'turn/start',
+      threadId: 'thread-turn',
+      source: 'telegram-turn',
+      clientUserMessageId: 'client-turn',
+      ts: 1200,
+    },
+    provider: {
+      session_key: '100',
+      namespace: 'codex:app-server',
+      provider: 'codex',
+      provider_session_id: 'thread-turn',
+      app_server_session_id: null,
+      agent: null,
+      cwd: '/srv/workspace',
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      pm_backend: 'codex',
+      spawn_profile_id: receipt.spawnProfileId,
+      ts: 1200,
+    },
+    expectedProviderGenerationId: null,
+  }]);
+
+  await assert.rejects(
+    controller.checkpointSink({
+      kind: 'request-prepared',
+      generationId: 'generation-turn',
+      hostIdentity: 'host:current',
+      bootSessionIdentity: 'boot:current',
+      attemptId: 'attempt-stale',
+      method: 'turn/start',
+      threadId: 'thread-turn',
+      source: 'telegram-turn',
+      clientUserMessageId: 'client-turn',
+      ts: 1210,
+    }),
+    (error) => (
+      error.code === 'CODEX_TURN_PREPARATION_REJECTED'
+      && error.checkpointDisposition === 'not-committed'
+    ),
+  );
+  assert.equal(
+    calls.filter((entry) => (
+      Array.isArray(entry) && entry[0] === 'turn-start-prepared'
+    )).length,
+    1,
+  );
+});
+
+test('first-ever turn start cannot bootstrap a Codex generation', async () => {
+  const { controller, receipt } = fixture();
+  controller.initialize();
+  await controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+    threadId: null,
+  });
+  const settings = Object.freeze({ model: 'gpt-5.6-sol', effort: 'xhigh' });
+  const pending = {
+    attemptId: 'attempt-turn',
+    clientUserMessageId: 'client-turn',
+    context: { sourceMsgId: 'telegram-turn' },
+    admittedSettings: settings,
+    startDeliveryState: 'preparing',
+    settled: false,
+  };
+  controller.registerProcess(Object.assign(new EventEmitter(), {
+    runtime: 'codex',
+    backend: 'codex',
+    sessionKey: '100',
+    generationId: 'generation-turn',
+    providerSessionId: 'thread-turn',
+    cwd: '/srv/workspace',
+    spawnProfileId: receipt.spawnProfileId,
+    spawnOptions: { existingSessionId: 'thread-turn' },
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    startupReleaseSafe: false,
+    closed: false,
+    state: 'StartingTurn',
+    settingsAdmissionClosed: false,
+    current: pending,
+    pendingQueue: [pending],
+    admittingTurnSettings: settings,
+  }));
+
+  await assert.rejects(
+    controller.checkpointSink({
+      kind: 'request-prepared',
+      generationId: 'generation-turn',
+      hostIdentity: 'host:current',
+      bootSessionIdentity: 'boot:current',
+      attemptId: 'attempt-turn',
+      method: 'turn/start',
+      threadId: 'thread-turn',
+      source: 'telegram-turn',
+      clientUserMessageId: 'client-turn',
+    }),
+    { code: 'CODEX_GENERATION_NOT_DURABLE' },
+  );
+});
+
+test('turn preparation remains durable while shutdown quiesces before cancellation', async () => {
+  const { calls, controller, receipt } = fixture();
+  controller.initialize();
+  await controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+    threadId: null,
+  });
+  const proc = Object.assign(new EventEmitter(), {
+    runtime: 'codex',
+    sessionKey: '100',
+    generationId: 'generation-quiescing',
+    providerSessionId: 'thread-quiescing',
+    spawnProfileId: receipt.spawnProfileId,
+    startupReleaseSafe: false,
+    closed: false,
+  });
+  bindPreparedTurn(proc, {
+    attemptId: 'attempt-quiescing',
+    source: 'telegram-quiescing',
+    clientUserMessageId: 'client-quiescing',
+  });
+  controller.registerProcess(proc);
+  await controller.checkpointSink({
+    kind: 'request-prepared',
+    generationId: proc.generationId,
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    attemptId: 'attempt-init-quiescing',
+    method: 'thread/resume',
+    threadId: proc.providerSessionId,
+  });
+
+  proc.state = 'Quiescing';
+  proc.settingsAdmissionClosed = true;
+  proc.current.startCancellationRequested = false;
+  await controller.checkpointSink({
+    kind: 'request-prepared',
+    generationId: proc.generationId,
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    attemptId: 'attempt-quiescing',
+    method: 'turn/start',
+    threadId: proc.providerSessionId,
+    source: 'telegram-quiescing',
+    clientUserMessageId: 'client-quiescing',
+  });
+
+  assert.equal(
+    calls.filter((entry) => (
+      Array.isArray(entry) && entry[0] === 'turn-start-prepared'
+    )).length,
+    1,
+  );
+});
+
+test('strict turn preparation carries the claimed provider lineage', async () => {
+  const { calls, controller, receipt } = fixture();
+  controller.initialize();
+  await controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+    threadId: null,
+  });
+  const settings = Object.freeze({ model: 'gpt-5.6-sol', effort: 'xhigh' });
+  const pending = {
+    attemptId: 'attempt-turn',
+    clientUserMessageId: 'client-turn',
+    context: { sourceMsgId: null },
+    admittedSettings: settings,
+    startDeliveryState: 'preparing',
+    settled: false,
+  };
+  const proc = Object.assign(new EventEmitter(), {
+    runtime: 'codex',
+    backend: 'codex',
+    sessionKey: '100',
+    generationId: 'generation-strict',
+    providerSessionId: 'thread-strict',
+    cwd: '/srv/workspace',
+    spawnProfileId: receipt.spawnProfileId,
+    spawnOptions: {
+      existingSessionId: 'thread-strict',
+      resumePolicy: 'require-interrupted-turn',
+    },
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    startupReleaseSafe: false,
+    closed: false,
+    state: 'StartingTurn',
+    settingsAdmissionClosed: false,
+    current: pending,
+    pendingQueue: [pending],
+    admittingTurnSettings: settings,
+  });
+  controller.registerProcess(proc, {
+    expectedProviderGenerationId: 'provider-lineage-claimed',
+  });
+  await controller.checkpointSink({
+    kind: 'request-prepared',
+    generationId: 'generation-strict',
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    attemptId: 'attempt-init',
+    method: 'thread/resume',
+    threadId: 'thread-strict',
+  });
+  await controller.checkpointSink({
+    kind: 'request-prepared',
+    generationId: 'generation-strict',
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    attemptId: 'attempt-turn',
+    method: 'turn/start',
+    threadId: 'thread-strict',
+    source: null,
+    clientUserMessageId: 'client-turn',
+  });
+
+  const persisted = calls.find((entry) => (
+    Array.isArray(entry) && entry[0] === 'turn-start-prepared'
+  ));
+  assert.equal(
+    persisted[1].expectedProviderGenerationId,
+    'provider-lineage-claimed',
+  );
+
+  const nextPending = {
+    ...pending,
+    attemptId: 'attempt-next',
+    clientUserMessageId: 'client-next',
+  };
+  proc.current = nextPending;
+  proc.pendingQueue = [nextPending];
+  proc.admittingTurnSettings = settings;
+  await controller.checkpointSink({
+    kind: 'request-prepared',
+    generationId: 'generation-strict',
+    hostIdentity: 'host:current',
+    bootSessionIdentity: 'boot:current',
+    attemptId: 'attempt-next',
+    method: 'turn/start',
+    threadId: 'thread-strict',
+    source: null,
+    clientUserMessageId: 'client-next',
+  });
+  const preparedCalls = calls.filter((entry) => (
+    Array.isArray(entry) && entry[0] === 'turn-start-prepared'
+  ));
+  assert.equal(
+    preparedCalls.at(-1)[1].expectedProviderGenerationId,
+    null,
+    'the deploy claim binds only the literal continue turn',
+  );
+});
+
+test('provider lineage metadata cannot be added to or omitted from strict resume', async () => {
+  const { controller, receipt } = fixture();
+  controller.initialize();
+  await controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+    threadId: null,
+  });
+  const processShape = (generationId, resumePolicy = null) => Object.assign(
+    new EventEmitter(),
+    {
+      runtime: 'codex',
+      sessionKey: '100',
+      generationId,
+      providerSessionId: 'thread-strict',
+      spawnProfileId: receipt.spawnProfileId,
+      spawnOptions: resumePolicy ? { resumePolicy } : {},
+      startupReleaseSafe: false,
+      closed: false,
+    },
+  );
+
+  assert.throws(
+    () => controller.registerProcess(processShape('generation-normal'), {
+      expectedProviderGenerationId: 'provider-lineage',
+    }),
+    /valid only for an exact strict resume/,
+  );
+  assert.throws(
+    () => controller.registerProcess(processShape(
+      'generation-strict-missing',
+      'require-interrupted-turn',
+    )),
+    /valid only for an exact strict resume/,
+  );
+});
+
 test('thread-accepted-before-startup-failure settles before the first durable checkpoint', async () => {
   const { calls, controller, receipt } = fixture();
   controller.initialize();
@@ -2187,7 +2635,7 @@ test('authorized retirement preparation durably binds and replays the exact live
     hostIdentity: 'host:current',
     bootSessionIdentity: 'boot:current',
     attemptId: attempt.attempt_id,
-    method: 'turn/start',
+    method: 'thread/resume',
   });
   const candidate = {
     sessionKey: '100',
@@ -2291,7 +2739,7 @@ test('deferred failed delivery remains owned by the stopped-generation verifier'
     hostIdentity: 'host:current',
     bootSessionIdentity: 'boot:current',
     attemptId: attempt.attempt_id,
-    method: 'turn/start',
+    method: 'thread/resume',
   });
   await controller.checkpointSink({
     kind: 'stop-empty-registry-observed',
@@ -2361,7 +2809,7 @@ test('retirement preparation maps a stale durable target and rejects an inexact 
     hostIdentity: 'host:current',
     bootSessionIdentity: 'boot:current',
     attemptId: attempt.attempt_id,
-    method: 'turn/start',
+    method: 'thread/resume',
   });
   const candidate = {
     sessionKey: '100',
@@ -2446,7 +2894,7 @@ test('an aborted retirement verifier keeps late delivery from releasing the dura
     hostIdentity: 'host:current',
     bootSessionIdentity: 'boot:current',
     attemptId: attempt.attempt_id,
-    method: 'turn/start',
+    method: 'thread/resume',
   });
   await controller.checkpointSink({
     kind: 'stop-empty-registry-observed',
@@ -2519,13 +2967,21 @@ test('real SQLite keeps the lease after an aborted verifier and late delivery', 
     closed: false,
   });
   controller.registerProcess(proc);
+  await initializeRegisteredGeneration(
+    controller,
+    proc,
+    'attempt-init-aborted-real',
+  );
   const owner = {
     generationId: proc.generationId,
     hostIdentity: 'host:current',
     bootSessionIdentity: 'boot:current',
     attemptId: 'attempt-aborted-real',
     threadId: proc.providerSessionId,
+    source: 'telegram-aborted-real',
+    clientUserMessageId: 'client-aborted-real',
   };
+  bindPreparedTurn(proc, owner);
   for (const checkpoint of [
     {
       kind: 'request-prepared',
