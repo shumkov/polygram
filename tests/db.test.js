@@ -20,7 +20,7 @@ describe('schema + migrations', () => {
   beforeEach(() => { ({ db, dbPath } = freshDb('polygram-test')); });
   afterEach(() => cleanupDb(dbPath, db));
 
-  test('a populated v19 database upgrades to v20 and loses its fingerprints', () => {
+  test('a populated v19 database upgrades through the current schema and loses its fingerprints', () => {
     // Downgrade is not supported past this migration: the column is gone and
     // the values it held are unrecoverable by design. The upgrade path is what
     // must work, on a database that already has audit rows in it.
@@ -41,7 +41,7 @@ describe('schema + migrations', () => {
 
     const migrated = open(legacyPath);
     try {
-      assert.equal(migrated.raw.pragma('user_version', { simple: true }), 20);
+      assert.equal(migrated.raw.pragma('user_version', { simple: true }), 21);
       const columns = migrated.raw.prepare('PRAGMA table_info(secret_redactions)')
         .all().map((c) => c.name);
       assert.ok(!columns.includes('sha256'), columns.join(','));
@@ -61,7 +61,7 @@ describe('schema + migrations', () => {
 
   test('user_version is at current schema after migration', () => {
     const v = db.raw.pragma('user_version', { simple: true });
-    assert.equal(v, 20);
+    assert.equal(v, 21);
   });
 
   test('WAL mode is enabled', () => {
@@ -102,6 +102,8 @@ describe('schema + migrations', () => {
     ).all().map((row) => row.name);
     assert.ok(indexes.includes('idx_codex_linked_inputs_attempt'));
     assert.ok(indexes.includes('idx_codex_linked_inputs_target'));
+    assert.ok(indexes.includes('idx_codex_attempts_replay_source'));
+    assert.ok(indexes.includes('idx_codex_linked_inputs_replay_source'));
   });
 
   test('production-shaped Claude row remains exact across v14 migration and legacy rollback writes', () => {
@@ -572,6 +574,362 @@ describe('Codex synchronous durability ledger', () => {
       ts,
     });
   }
+
+  function seedInitializedGeneration() {
+    db.createCodexGeneration(generation({ thread_id: null }));
+    acquire();
+    const base = {
+      generationId: 'generation-a',
+      attemptId: 'attempt-init',
+      method: 'thread/start',
+      ...identity,
+    };
+    db.recordCodexCheckpoint({
+      ...base,
+      kind: 'request-prepared',
+      ts: 1060,
+    });
+    db.recordCodexCheckpoint({
+      ...base,
+      kind: 'request-write-attempted',
+      requestId: 'request-init',
+      ts: 1070,
+    });
+    db.recordCodexCheckpoint({
+      ...base,
+      kind: 'request-response-observed',
+      requestId: 'request-init',
+      outcome: 'result',
+      ts: 1080,
+    });
+    db.recordCodexCheckpoint({
+      kind: 'thread-initialized',
+      generationId: 'generation-a',
+      threadId: 'thread-a',
+      ...identity,
+      ts: 1090,
+    });
+  }
+
+  function preparedTurn(overrides = {}) {
+    return {
+      kind: 'request-prepared',
+      generationId: 'generation-a',
+      hostIdentity: 'host-a',
+      bootSessionIdentity: 'boot-a',
+      attemptId: 'attempt-a',
+      method: 'turn/start',
+      threadId: 'thread-a',
+      source: 'telegram-message-a',
+      clientUserMessageId: 'client-message-a',
+      ts: 1100,
+      ...overrides,
+    };
+  }
+
+  function codexProvider(overrides = {}) {
+    return {
+      session_key: 'chat:topic',
+      namespace: 'codex:app-server',
+      provider: 'codex',
+      provider_session_id: 'thread-a',
+      app_server_session_id: null,
+      agent: null,
+      cwd: '/srv/workspace',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+      pm_backend: 'codex',
+      spawn_profile_id: 'a'.repeat(64),
+      ts: 1100,
+      ...overrides,
+    };
+  }
+
+  function providerIdentity(row) {
+    if (!row) return null;
+    return {
+      session_key: row.session_key,
+      namespace: row.namespace,
+      provider: row.provider,
+      provider_session_id: row.provider_session_id,
+      app_server_session_id: row.app_server_session_id,
+      agent: row.agent,
+      cwd: row.cwd,
+      model: row.model,
+      effort: row.effort,
+      pm_backend: row.pm_backend,
+      generation_id: row.generation_id,
+      spawn_profile_id: row.spawn_profile_id,
+    };
+  }
+
+  test('prepared Codex turn atomically persists its exact provider identity', () => {
+    seedInitializedGeneration();
+
+    assert.deepEqual(db.recordCodexTurnStartPrepared({
+      checkpoint: preparedTurn(),
+      provider: codexProvider(),
+    }), {
+      changes: 1,
+      attemptId: 'attempt-a',
+      kind: 'request-prepared',
+    });
+    const first = db.getProviderSession('chat:topic', 'codex:app-server');
+    assert.deepEqual(providerIdentity(first), {
+      session_key: 'chat:topic',
+      namespace: 'codex:app-server',
+      provider: 'codex',
+      provider_session_id: 'thread-a',
+      app_server_session_id: null,
+      agent: null,
+      cwd: '/srv/workspace',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+      pm_backend: 'codex',
+      generation_id: first.generation_id,
+      spawn_profile_id: 'a'.repeat(64),
+    });
+    assert.equal(db.getCodexAttempt('attempt-a').delivery_state, 'prepared');
+
+    assert.deepEqual(db.recordCodexTurnStartPrepared({
+      checkpoint: preparedTurn({ ts: 1110 }),
+      provider: codexProvider({ ts: 1110 }),
+    }), {
+      changes: 0,
+      attemptId: 'attempt-a',
+      kind: 'request-prepared',
+    });
+    assert.equal(
+      db.getProviderSession('chat:topic', 'codex:app-server').generation_id,
+      first.generation_id,
+    );
+
+    db.recordCodexTurnStartPrepared({
+      checkpoint: preparedTurn({
+        attemptId: 'attempt-b',
+        source: 'telegram-message-b',
+        clientUserMessageId: 'client-message-b',
+        ts: 1120,
+      }),
+      provider: codexProvider({ effort: 'xhigh', ts: 1120 }),
+    });
+    const advanced = db.getProviderSession(
+      'chat:topic',
+      'codex:app-server',
+    );
+    assert.equal(advanced.effort, 'xhigh');
+    assert.notEqual(advanced.generation_id, first.generation_id);
+
+    assert.throws(
+      () => db.recordCodexTurnStartPrepared({
+        checkpoint: preparedTurn({ ts: 1130 }),
+        provider: codexProvider({ ts: 1130 }),
+      }),
+      (error) => error.code === 'CODEX_TURN_PREPARATION_STALE',
+    );
+    assert.equal(
+      db.getProviderSession('chat:topic', 'codex:app-server').generation_id,
+      advanced.generation_id,
+    );
+  });
+
+  test('prepared Codex turn rolls back provider and checkpoint failures together', () => {
+    seedInitializedGeneration();
+    db.raw.exec(`
+      CREATE TRIGGER reject_codex_provider_insert
+      BEFORE INSERT ON agent_runtime_sessions
+      BEGIN
+        SELECT RAISE(ABORT, 'injected provider failure');
+      END
+    `);
+
+    assert.throws(() => db.recordCodexTurnStartPrepared({
+      checkpoint: preparedTurn(),
+      provider: codexProvider(),
+    }), /injected provider failure/);
+    assert.equal(db.getCodexAttempt('attempt-a'), undefined);
+    assert.equal(
+      db.getProviderSession('chat:topic', 'codex:app-server'),
+      undefined,
+    );
+    db.raw.exec('DROP TRIGGER reject_codex_provider_insert');
+
+    db.upsertProviderSession(codexProvider({ ts: 1140 }));
+    const before = providerIdentity(db.getProviderSession(
+      'chat:topic',
+      'codex:app-server',
+    ));
+    db.raw.exec(`
+      CREATE TRIGGER reject_codex_attempt_insert
+      BEFORE INSERT ON codex_turn_attempts
+      BEGIN
+        SELECT RAISE(ABORT, 'injected checkpoint failure');
+      END
+    `);
+    assert.throws(() => db.recordCodexTurnStartPrepared({
+      checkpoint: preparedTurn({
+        attemptId: 'attempt-checkpoint-failure',
+        source: 'telegram-message-checkpoint-failure',
+        clientUserMessageId: 'client-message-checkpoint-failure',
+        ts: 1145,
+      }),
+      provider: codexProvider({ effort: 'xhigh', ts: 1145 }),
+    }), /injected checkpoint failure/);
+    assert.equal(
+      db.getCodexAttempt('attempt-checkpoint-failure'),
+      undefined,
+    );
+    assert.deepEqual(providerIdentity(db.getProviderSession(
+      'chat:topic',
+      'codex:app-server',
+    )), before);
+    db.raw.exec('DROP TRIGGER reject_codex_attempt_insert');
+
+    db.recordCodexCheckpoint({
+      ...preparedTurn({
+        attemptId: 'attempt-conflict',
+        method: 'turn/steer',
+        ts: 1150,
+      }),
+    });
+    assert.throws(
+      () => db.recordCodexTurnStartPrepared({
+        checkpoint: preparedTurn({
+          attemptId: 'attempt-conflict',
+          source: 'telegram-message-new',
+          clientUserMessageId: 'client-message-new',
+          ts: 1160,
+        }),
+        provider: codexProvider({ effort: 'xhigh', ts: 1160 }),
+      }),
+      (error) => error.code === 'CODEX_ATTEMPT_IDENTITY_MISMATCH'
+        || error.code === 'CODEX_ATTEMPT_ID_REUSED',
+    );
+    assert.deepEqual(providerIdentity(db.getProviderSession(
+      'chat:topic',
+      'codex:app-server',
+    )), before);
+  });
+
+  test('prepared Codex turn requires exact active host boot thread and lease ownership', () => {
+    seedInitializedGeneration();
+    for (const checkpoint of [
+      preparedTurn({ hostIdentity: 'host-other' }),
+      preparedTurn({ bootSessionIdentity: 'boot-other' }),
+      preparedTurn({ threadId: 'thread-other' }),
+    ]) {
+      assert.throws(() => db.recordCodexTurnStartPrepared({
+        checkpoint,
+        provider: codexProvider(),
+      }));
+      assert.equal(db.getCodexAttempt('attempt-a'), undefined);
+      assert.equal(
+        db.getProviderSession('chat:topic', 'codex:app-server'),
+        undefined,
+      );
+    }
+
+    db.raw.prepare(`
+      UPDATE codex_daemon_lease SET status = 'quarantined'
+    `).run();
+    assert.throws(
+      () => db.recordCodexTurnStartPrepared({
+        checkpoint: preparedTurn(),
+        provider: codexProvider(),
+      }),
+      (error) => error.code === 'CODEX_CHECKPOINT_STALE_GENERATION',
+    );
+    assert.equal(db.getCodexAttempt('attempt-a'), undefined);
+    assert.equal(
+      db.getProviderSession('chat:topic', 'codex:app-server'),
+      undefined,
+    );
+
+    db.createCodexGeneration(generation({
+      generation_id: 'generation-other',
+      thread_id: 'thread-other',
+      ts: 1200,
+    }));
+    db.raw.prepare(`
+      UPDATE codex_daemon_lease
+         SET generation_id = 'generation-other', status = 'active'
+    `).run();
+    assert.throws(
+      () => db.recordCodexTurnStartPrepared({
+        checkpoint: preparedTurn(),
+        provider: codexProvider(),
+      }),
+      (error) => error.code === 'CODEX_CHECKPOINT_STALE_GENERATION',
+    );
+    assert.equal(db.getCodexAttempt('attempt-a'), undefined);
+    assert.equal(
+      db.getProviderSession('chat:topic', 'codex:app-server'),
+      undefined,
+    );
+  });
+
+  test('prepared Codex turn requires durable thread initialization proof', () => {
+    db.createCodexGeneration(generation({
+      thread_id: 'thread-a',
+    }));
+    acquire();
+
+    assert.throws(
+      () => db.recordCodexTurnStartPrepared({
+        checkpoint: preparedTurn(),
+        provider: codexProvider(),
+      }),
+      (error) => error.code === 'CODEX_CHECKPOINT_STALE_GENERATION',
+    );
+    assert.equal(db.getCodexAttempt('attempt-a'), undefined);
+    assert.equal(
+      db.getProviderSession('chat:topic', 'codex:app-server'),
+      undefined,
+    );
+  });
+
+  test('strict prepared turn preserves the exact claimed provider lineage', () => {
+    seedInitializedGeneration();
+    db.upsertProviderSession(codexProvider({ ts: 1095 }));
+    const claimed = db.getProviderSession(
+      'chat:topic',
+      'codex:app-server',
+    ).generation_id;
+
+    db.recordCodexTurnStartPrepared({
+      checkpoint: preparedTurn(),
+      provider: codexProvider(),
+      expectedProviderGenerationId: claimed,
+    });
+    assert.equal(
+      db.getProviderSession('chat:topic', 'codex:app-server').generation_id,
+      claimed,
+    );
+
+    db.raw.prepare(`
+      UPDATE agent_runtime_sessions
+         SET generation_id = ?
+       WHERE session_key = ? AND namespace = 'codex:app-server'
+    `).run('replaced-provider-lineage', 'chat:topic');
+    assert.throws(
+      () => db.recordCodexTurnStartPrepared({
+        checkpoint: preparedTurn({
+          attemptId: 'attempt-b',
+          source: 'telegram-message-b',
+          clientUserMessageId: 'client-message-b',
+          ts: 1120,
+        }),
+        provider: codexProvider({ ts: 1120 }),
+        expectedProviderGenerationId: claimed,
+      }),
+      (error) => error.code === 'CODEX_PROVIDER_LINEAGE_MISMATCH',
+    );
+    assert.equal(db.getCodexAttempt('attempt-b'), undefined);
+    assert.equal(
+      db.getProviderSession('chat:topic', 'codex:app-server').generation_id,
+      'replaced-provider-lineage',
+    );
+  });
 
   function seedStoppedTurn(terminalStatus = 'interrupted') {
     const base = {

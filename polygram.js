@@ -86,6 +86,9 @@ const {
   resolveCodexStartupRecovery,
 } = require('./lib/codex/runtime-controller');
 const {
+  authorizeCleanReplayDispatch,
+} = require('./lib/codex/clean-replay-dispatch');
+const {
   buildCodexSpawnContext,
 } = require('./lib/codex/spawn-context');
 const {
@@ -213,6 +216,12 @@ const {
   startCleanRestartRecovery,
   validateStrictResumeSpawn,
 } = require('./lib/ops/clean-resume');
+const {
+  createCleanReplaySessionCoordinator,
+} = require('./lib/ops/clean-replay-session-coordinator');
+const {
+  scheduleCleanCodexReplaySessions,
+} = require('./lib/ops/clean-codex-boot-replay');
 const { resolveReplayWindowMs } = require('./lib/db/replay-window');
 const { pruneEvents, resolveRetentionPolicy, validatePolicy } = require('./lib/db/events-retention');
 const { sweepSecrets, resolveSecretSweepConfig } = require('./lib/db/secret-sweep');
@@ -1222,7 +1231,7 @@ function parsePairCodeArgs(text) {
 
 // ─── Message handler ────────────────────────────────────────────────
 
-async function handleMessage(sessionKey, chatId, msg, bot) {
+async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = null) {
   const chatConfig = config.chats[chatId];
   if (!chatConfig) return;
   const text = msg.text || msg.caption || '';
@@ -2056,24 +2065,40 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   let acceptedAutosteerProvider = null;
   try {
     const current = pm.get(sessionKey);
-    const liveCodexGeneration = Boolean(
+    const cleanReplayDispatch = dispatchContext?.cleanReplay ?? null;
+    const currentCodexGeneration = Boolean(
       current
       && !current.closed
-      && current.inFlight
       && typeof current.generationId === 'string'
       && (
         current.runtime === 'codex'
         || current.backend === 'codex'
-      ),
+      )
+    );
+    const liveCodexGeneration = Boolean(
+      currentCodexGeneration
+      && current.inFlight
     );
     requireCodexDispatchEnabled({
       config,
       chatId,
       threadId: threadIdStr || null,
       selectedProvider: selectedInboundProvider,
-      liveCodexGeneration,
+      liveCodexGeneration: cleanReplayDispatch
+        ? currentCodexGeneration
+        : liveCodexGeneration,
     });
-    if (liveCodexGeneration) {
+    if (cleanReplayDispatch) {
+      codexDispatch = authorizeCleanReplayDispatch({
+        sessionKey,
+        currentProcess: current,
+        expectedProcess: cleanReplayDispatch.expectedProcess,
+        reservation: cleanReplayDispatch.reservation,
+        controller: codexRuntimeController,
+      });
+      codexDispatchDecision = 'queue';
+      acceptedAutosteerProvider = 'codex';
+    } else if (liveCodexGeneration) {
       if (!codexRuntimeController) {
         codexDispatchDecision = 'unavailable';
       } else {
@@ -2284,7 +2309,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
             // emitting — not the moment we wrote stdin.
             onFirstStream: () => reactor.setState('THINKING'),
             onTurnId: (id) => { dispatchedTurnId = id; },
-          }, { onDispatched: dispatched })
+          }, {
+            expectedProcess: cleanReplayDispatch?.expectedProcess ?? null,
+            onDispatched: () => {
+              dispatched();
+              try { dispatchContext?.onDispatched?.(); } catch {}
+            },
+          })
             .catch((e) => ({ __sendError: e }))
             .finally(dispatched);
         });
@@ -3571,6 +3602,8 @@ async function main() {
     mainPath: __filename,
     packageVersion: packageMetadata.version,
   });
+  const cleanReplaySessionCoordinator =
+    createCleanReplaySessionCoordinator();
   const cgroupOomObserver = createCgroupOomObserver();
   const invocationId = parseSystemdInvocationId();
   let abnormalProviderTermination = null;
@@ -4344,7 +4377,12 @@ async function main() {
   });
   const processFactory = (sessionKey, spawnContext) => {
     const proc = orchestraProcessFactory(sessionKey, spawnContext);
-    if (proc?.runtime === 'codex') codexRuntimeController.registerProcess(proc);
+    if (proc?.runtime === 'codex') {
+      codexRuntimeController.registerProcess(proc, {
+        expectedProviderGenerationId:
+          spawnContext.expectedProviderGenerationId ?? null,
+      });
+    }
     return proc;
   };
   // Route in-process approval prompts through the SAME canUseTool plumbing
@@ -4463,6 +4501,9 @@ async function main() {
   } = createDispatcher({
     config, db, dbWrite, tg, botName: BOT_NAME, logEvent,
     handleMessage, sendToProcess,
+    awaitSessionRecovery: (sessionKey, receipt) => (
+      cleanReplaySessionCoordinator.wait(sessionKey, receipt)
+    ),
     recoverCodex: (input) => {
       if (typeof recoverCodexRequest !== 'function') {
         const error = new Error('Exact Codex recovery path is unavailable');
@@ -5151,11 +5192,9 @@ async function main() {
         for (let index = 0; index < cleanRecovery.claims.length; index += 1) {
           const sessionKey = cleanRecovery.claims[index].session_key;
           const task = cleanRecovery.tasks[index];
-          const previous = cleanRecoveryTasksBySession.get(sessionKey);
-          cleanRecoveryTasksBySession.set(
-            sessionKey,
-            previous ? Promise.all([previous, task]) : task,
-          );
+          const tasks = cleanRecoveryTasksBySession.get(sessionKey) || [];
+          tasks.push(task);
+          cleanRecoveryTasksBySession.set(sessionKey, tasks);
         }
       } catch (err) {
         const fatal = new Error(
@@ -5215,20 +5254,26 @@ async function main() {
         return msg;
       };
 
+      const providerRecoveries = new Map();
+      const recoveryKey = (row) => `${row.chat_id}\u0000${row.msg_id}`;
       const getProviderRecovery = (row) => {
         const sessionKey = sourceSessionKey(row);
         if (!sessionKey) {
-          return {
+          const missing = {
             provider: 'unknown',
             reason: 'session-configuration-missing',
           };
+          providerRecoveries.set(recoveryKey(row), missing);
+          return missing;
         }
-        return db.getReplayProviderRecovery({
+        const evidence = db.getReplayProviderRecovery({
           sessionKey,
           botName: BOT_NAME,
           telegramChatId: String(row.chat_id),
           telegramMessageId: String(row.msg_id),
         });
+        providerRecoveries.set(recoveryKey(row), evidence);
+        return evidence;
       };
 
       const plan = classifyReplay({
@@ -5239,8 +5284,124 @@ async function main() {
         getProviderRecovery,
       });
 
+      let cleanCodexScheduled = 0;
+      let executionPlan = plan;
+      if (cleanShutdown && (plan.recoverCodex?.length || 0) > 0) {
+        const cleanReplaySchedule = scheduleCleanCodexReplaySessions({
+          candidates: plan.recoverCodex,
+          getSessionKey: sourceSessionKey,
+          getContinuationTasks: (sessionKey) => (
+            cleanRecoveryTasksBySession.get(sessionKey) || []
+          ),
+          coordinator: cleanReplaySessionCoordinator,
+          recover: async (row, { receipt: recoveryReceipt }) => {
+              const msg = reconstruct(row);
+              msg._requiredProvider = 'codex';
+              let resolveAdmission;
+              const admitted = new Promise((resolve) => {
+                resolveAdmission = resolve;
+              });
+              const redelivery = await redeliverAsFreshTurn({
+                chatId: row.chat_id,
+                msg,
+                source: 'boot-replay-codex-clean',
+                preMark: null,
+                onGateBlocked: () => db.setInboundHandlerStatus({
+                  chat_id: row.chat_id,
+                  msg_id: row.msg_id,
+                  status: 'replay-skipped',
+                }),
+                prepareDispatch: async () => {
+                  const expectedProcess = await pm.getOrSpawn(
+                    sessionKey,
+                    await buildSpawnContext(sessionKey),
+                  );
+                  if (
+                    !expectedProcess
+                    || expectedProcess.closed
+                    || pm.get(sessionKey) !== expectedProcess
+                    || (
+                      expectedProcess.runtime !== 'codex'
+                      && expectedProcess.backend !== 'codex'
+                    )
+                  ) {
+                    const error = new Error(
+                      'Clean Codex replay lost its exact process before rearm',
+                    );
+                    error.code = 'CODEX_CLEAN_REPLAY_PROCESS_CHANGED';
+                    throw error;
+                  }
+                  const replayReceipt = db.prepareCodexCleanReplay({
+                    source: {
+                      botName: BOT_NAME,
+                      telegramChatId: String(row.chat_id),
+                      telegramMessageId: String(row.msg_id),
+                    },
+                    sessionKey,
+                    currentGeneration: {
+                      generationId: expectedProcess.generationId,
+                    },
+                    expectedEvidence:
+                      providerRecoveries.get(recoveryKey(row)),
+                    owner: {
+                      stableHostId: expectedProcess.hostIdentity,
+                      bootSessionId: expectedProcess.bootSessionIdentity,
+                    },
+                    ts: Date.now(),
+                  });
+                  return Object.freeze({
+                    recoveryReceipt,
+                    cleanReplay: Object.freeze({
+                      expectedProcess,
+                      reservation: Object.freeze({
+                        reservationId: replayReceipt.reservationId,
+                        generationId: replayReceipt.generationId,
+                      }),
+                    }),
+                    onDispatched: () => resolveAdmission({
+                      status: 'dispatched',
+                    }),
+                  });
+                },
+              });
+              if (!redelivery.ok) {
+                return redelivery.terminal
+                  ? { status: 'gate-terminal' }
+                  : {
+                      status: 'failed',
+                      reason: redelivery.reason || 'redelivery-refused',
+                    };
+              }
+              const handlerSettled = Promise.resolve(redelivery.task).then(
+                () => ({
+                  status: 'failed',
+                  reason: 'handler-settled-before-admission',
+                }),
+                (error) => ({
+                  status: 'failed',
+                  reason: error?.code || 'handler-failed-before-admission',
+                }),
+              );
+              return Promise.race([admitted, handlerSettled]);
+          },
+          trackTask: trackHandlerTask,
+          onOutcome: ({ sessionKey, outcome }) => {
+            logEvent('codex-clean-replay-session', {
+              session_key: sessionKey,
+              status: outcome.status,
+              admitted_count: outcome.admitted,
+              terminal_count: outcome.terminal,
+              deferred_count: outcome.deferred,
+              reason: outcome.reason || undefined,
+            });
+          },
+        });
+        cleanCodexScheduled = cleanReplaySchedule.scheduled;
+        executionPlan = { ...plan, recoverCodex: [] };
+      }
+
       const result = await executeReplayPlan({
-        plan,
+        plan: executionPlan,
         deps: {
           // CRASH path — unchanged: through the unified redelivery tail (D5 gate
           // at tier 'redelivery', 'replay-attempted' one-shot pre-mark, ack).
@@ -5307,12 +5468,15 @@ async function main() {
       });
 
       if (candidates.length > 0) {
-        console.log(`[replay] ${cleanShutdown ? 'clean restart' : 'crash'} — recovered ${result.recovered}, skipped ${result.skipped}, noticed ${result.noticed}${result.noticeFailed ? `, notice-failed ${result.noticeFailed}` : ''}${result.deferred ? `, deferred ${result.deferred}` : ''}`);
+        console.log(`[replay] ${cleanShutdown ? 'clean restart' : 'crash'} — recovered ${result.recovered}, scheduled ${cleanCodexScheduled}, skipped ${result.skipped}, noticed ${result.noticed}${result.noticeFailed ? `, notice-failed ${result.noticeFailed}` : ''}${result.deferred ? `, deferred ${result.deferred}` : ''}`);
         logEvent('replay-on-boot', {
           bot: BOT_NAME, clean: cleanShutdown,
-          recovered: result.recovered, skipped: result.skipped,
-          noticed: result.noticed, notice_failed: result.noticeFailed,
-          deferred: result.deferred || 0,
+          recovered_count: result.recovered,
+          skipped_count: result.skipped,
+          codex_scheduled_count: cleanCodexScheduled,
+          noticed_count: result.noticed,
+          notice_failed_count: result.noticeFailed,
+          deferred_count: result.deferred || 0,
           total: candidates.length,
         });
       }
@@ -5421,12 +5585,16 @@ async function main() {
       }
     };
     for (const o of orphansLatest.values()) {
-      const recoveryTask = cleanRecoveryTasksBySession.get(o.session_key);
-      if (recoveryTask) {
+      const recoveryTasks = cleanRecoveryTasksBySession.get(o.session_key);
+      if (recoveryTasks?.length) {
         deferred += 1;
         trackHandlerTask(
-          Promise.resolve(recoveryTask)
-            .then(() => recoverCompact(o))
+          Promise.all(recoveryTasks)
+            .then((results) => (
+              results.every((result) => result?.status === 'replied')
+                ? recoverCompact(o)
+                : undefined
+            ))
             .catch((err) => {
               console.error(`[compact-replay] ${o.session_key}: deferred recovery failed: ${err.message}`);
             }),

@@ -47,6 +47,47 @@ describe('classifyReplay — provider-aware Codex recovery fence', () => {
     ...extra,
   });
 
+  const nestedCodex = ({
+    kind = 'selection-only',
+    reservation = null,
+    attempt = null,
+    linkedInput = null,
+    targetAttempt = null,
+    cancellationProof = null,
+  } = {}) => ({
+    provider: 'codex',
+    kind,
+    selection: {
+      provider: 'codex',
+      sessionKey: 'chat:topic',
+      selectedTs: 1000,
+    },
+    reservation,
+    attempt,
+    linkedInput,
+    targetAttempt,
+    cancellationProof,
+  });
+
+  const preparedAttempt = (overrides = {}) => ({
+    attemptId: 'attempt-a',
+    generationId: 'generation-a',
+    method: 'turn/start',
+    deliveryState: 'prepared',
+    recoveryState: 'prepared',
+    turnId: null,
+    terminalStatus: null,
+    ...overrides,
+  });
+
+  const safeReservation = (state = 'reserved') => ({
+    reservationId: 'reservation-a',
+    generationId: 'generation-a',
+    state,
+    steerAttemptId: null,
+    targetAttemptId: null,
+  });
+
   test('crash routes a prepared-only Codex request to the dedicated Codex recoverer', () => {
     const candidate = C('-100', 1, '37');
     const r = classifyReplay({
@@ -72,6 +113,141 @@ describe('classifyReplay — provider-aware Codex recovery fence', () => {
     assert.deepEqual(r.skip, [candidate]);
     assert.equal(r.notices.length, 1);
     assert.deepEqual(r.notices[0].items, [candidate]);
+  });
+
+  test('clean restart redispatches exact clean-safe Codex rows without a restart notice', () => {
+    const candidates = Array.from(
+      { length: 8 },
+      (_, index) => C('-100', index + 1, '37'),
+    );
+    const evidence = new Map([
+      [1, nestedCodex()],
+      [2, nestedCodex({
+        kind: 'dispatch-reservation',
+        reservation: safeReservation('reserved'),
+      })],
+      [3, nestedCodex({
+        kind: 'dispatch-reservation',
+        reservation: safeReservation('queue-authorized'),
+      })],
+      [4, nestedCodex({
+        kind: 'primary-turn',
+        attempt: preparedAttempt(),
+      })],
+      [5, nestedCodex({
+        kind: 'dispatch-reservation',
+        reservation: safeReservation('queue-authorized'),
+        attempt: preparedAttempt(),
+      })],
+      [6, nestedCodex({
+        kind: 'primary-turn',
+        attempt: preparedAttempt({ recoveryState: 'cancelled' }),
+        cancellationProof: {
+          kind: 'active-start-cancelled',
+          reason: 'clean-restart',
+        },
+      })],
+      [7, nestedCodex({
+        kind: 'queued-send',
+        attempt: preparedAttempt({
+          method: 'queued/send',
+          recoveryState: 'cancelled',
+        }),
+        cancellationProof: {
+          kind: 'queued-send-cancelled',
+          reason: 'clean-restart',
+        },
+      })],
+      [8, nestedCodex({
+        kind: 'dispatch-reservation',
+        reservation: safeReservation('queue-authorized'),
+        attempt: preparedAttempt({ recoveryState: 'cancelled' }),
+        cancellationProof: {
+          kind: 'active-start-cancelled',
+          reason: 'clean-restart',
+        },
+      })],
+    ]);
+
+    for (const value of evidence.values()) {
+      assert.equal(
+        classifyCodexRecoveryEvidence(value).cleanRestartSafe,
+        true,
+      );
+    }
+    const r = classifyReplay({
+      candidates,
+      cleanShutdown: true,
+      getProviderRecovery: (candidate) => evidence.get(candidate.msg_id),
+    });
+    assert.deepEqual(r.recover, []);
+    assert.deepEqual(r.recoverCodex, candidates);
+    assert.deepEqual(r.skip, []);
+    assert.deepEqual(r.notices, []);
+    assert.equal(r.defer, undefined);
+  });
+
+  test('clean restart skips user-owned cancellation and defers ambiguous nested evidence', () => {
+    const userCancelled = C('-100', 1, '37');
+    const timedOut = C('-100', 2, '37');
+    const ambiguousReservation = C('-100', 3, '37');
+    const linked = C('-100', 4, '37');
+    const conflict = C('-100', 5, '37');
+    const evidence = new Map([
+      [1, nestedCodex({
+        kind: 'primary-turn',
+        attempt: preparedAttempt({ recoveryState: 'cancelled' }),
+      })],
+      [2, nestedCodex({
+        kind: 'primary-turn',
+        attempt: preparedAttempt({ recoveryState: 'cancelled' }),
+        cancellationProof: {
+          kind: 'active-start-cancelled',
+          reason: 'timeout',
+        },
+      })],
+      [3, nestedCodex({
+        kind: 'dispatch-reservation',
+        reservation: safeReservation('reserved'),
+        attempt: preparedAttempt(),
+      })],
+      [4, nestedCodex({
+        kind: 'linked-input',
+        reservation: {
+          ...safeReservation('steer-accepted'),
+          steerAttemptId: 'steer-a',
+          targetAttemptId: 'target-a',
+        },
+        attempt: preparedAttempt({
+          attemptId: 'steer-a',
+          method: 'turn/steer',
+        }),
+        linkedInput: {
+          linkedInputId: 'reservation-a',
+          state: 'linked',
+          attemptId: 'steer-a',
+          targetAttemptId: 'target-a',
+        },
+        targetAttempt: preparedAttempt({ attemptId: 'target-a' }),
+      })],
+      [5, { provider: 'unknown', reason: 'codex-evidence-conflict' }],
+    ]);
+
+    const r = classifyReplay({
+      candidates: [
+        userCancelled,
+        timedOut,
+        ambiguousReservation,
+        linked,
+        conflict,
+      ],
+      cleanShutdown: true,
+      getProviderRecovery: (candidate) => evidence.get(candidate.msg_id),
+    });
+    assert.equal(r.recoverCodex, undefined);
+    assert.deepEqual(r.skip, [userCancelled, timedOut]);
+    assert.deepEqual(r.notices, []);
+    assert.deepEqual(r.defer, [ambiguousReservation, linked, conflict]);
   });
 
   test('prepared then explicitly cancelled work is skipped silently on crash or clean restart', () => {

@@ -264,4 +264,21 @@ describe('replay — getReplayCandidates edge cases', () => {
     assert.deepEqual(rows.map((r) => r.msg_id), [100, 101, 102],
       'replay must process oldest first to preserve user intent ordering');
   });
+
+  test('equal timestamps preserve durable inbound insertion order', () => {
+    const ts = Date.now() - 60 * 1000;
+    insertInbound(db, {
+      chat_id: '1', msg_id: 102, text: 'first inserted',
+      handler_status: 'dispatched', ts,
+    });
+    insertInbound(db, {
+      chat_id: '1', msg_id: 100, text: 'second inserted',
+      handler_status: 'dispatched', ts,
+    });
+
+    assert.deepEqual(
+      db.getReplayCandidates({ chatIds: ['1'] }).map((row) => row.msg_id),
+      [102, 100],
+    );
+  });
 });

@@ -172,7 +172,7 @@ describe('onInit — upserts session row with TOPIC-RESOLVED spawn identity', ()
         + "(pm:'tmux' aliases to 'cli' — factory.js Phase 4)");
   });
 
-  test('Codex persists its thread namespace without overwriting the dormant Claude session', () => {
+  test('Codex init does not persist incomplete provider identity or overwrite dormant Claude state', () => {
     const { db, dbPath } = freshDb('sdk-callbacks-codex-init');
     try {
       db.upsertSession({
@@ -200,19 +200,15 @@ describe('onInit — upserts session row with TOPIC-RESOLVED spawn identity', ()
         threadId: '24',
         label: 'Codex',
         cwd: '/codex/workspace',
-        model: 'gpt-5.6-sol',
-        effort: 'xhigh',
+        desiredSettings: Object.freeze({
+          model: 'gpt-5.6-sol',
+          effort: 'xhigh',
+        }),
+        spawnProfileId: 'a'.repeat(64),
       });
 
       const codex = db.getProviderSession('12345:24', 'codex:app-server');
-      assert.equal(codex.provider, 'codex');
-      assert.equal(codex.provider_session_id, 'thread-codex-a');
-      assert.equal(codex.app_server_session_id, null);
-      assert.equal(codex.agent, null);
-      assert.equal(codex.cwd, '/codex/workspace');
-      assert.equal(codex.model, 'gpt-5.6-sol');
-      assert.equal(codex.effort, 'xhigh');
-      assert.equal(codex.pm_backend, 'codex');
+      assert.equal(codex, undefined);
 
       const claude = db.getSession('12345:24');
       assert.equal(claude.claude_session_id, 'claude-session-a');

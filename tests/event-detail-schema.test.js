@@ -174,6 +174,15 @@ describe('enforceEventDetailSchema', () => {
         configured_scope_sha256: 'a'.repeat(64), session_key: '1:2',
         source_message_id: 4, restart_request_sha256: 'f'.repeat(64),
       },
+      'codex-clean-replay-session': {
+        session_key: '1:2', status: 'complete', admitted_count: 2,
+        terminal_count: 1, deferred_count: 0,
+      },
+      'replay-on-boot': {
+        bot: 'b', clean: true, recovered_count: 1, skipped_count: 2,
+        codex_scheduled_count: 3, noticed_count: 0,
+        notice_failed_count: 0, deferred_count: 1, total: 7,
+      },
       // Orchestra's own producers, under their real names.
       'cli-turn-resolved-by-stop': { turn_id: 't1', session_key: '1:2', backend: 'cli', reply_count: 2, final_len: 120 },
       'cli-hook-stream-stalled': { turn_id: 't1', last_hook_age_ms: 9000, session_key: '1:2' },

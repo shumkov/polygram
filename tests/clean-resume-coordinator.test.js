@@ -819,6 +819,33 @@ describe('clean resume boot coordinator', () => {
     await Promise.all(recovery.tasks);
   });
 
+  test('a tracked claim that throws after readiness resolves an explicit failed result', async () => {
+    const failure = new Error('continuation failed after admission opened');
+    const observed = [];
+    const recovery = await startCleanRestartRecovery({
+      db: {
+        claimCleanRestartRecovery: () => ({
+          clean: true,
+          claims: [claim],
+          stranded: [],
+        }),
+      },
+      botName: 'shumabit',
+      sessionKeyForSource: () => claim.session_key,
+      executeClaim: async (candidate, { onReady }) => {
+        onReady();
+        throw failure;
+      },
+      onTaskError: (error, candidate) => observed.push({ error, candidate }),
+    });
+
+    const result = await recovery.tasks[0];
+    assert.equal(result.status, 'failed');
+    assert.equal(typeof result.reason, 'string');
+    assert.ok(result.reason.length > 0);
+    assert.deepEqual(observed, [{ error: failure, candidate: claim }]);
+  });
+
   test('one boot claims both Claude and Codex recovery policies', async () => {
     const codexClaim = {
       ...claim,
