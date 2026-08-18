@@ -1986,6 +1986,149 @@ test('constructs a contained app-server client with the attested launcher receip
   );
 });
 
+test('hook-enabled clients are reattested and receive only the prepared manifest', async () => {
+  const hookManifest = Object.freeze({
+    ownedCwd: '/srv/workspace',
+    entries: Object.freeze([]),
+  });
+  const hookOptions = {
+    artifactRoot: '/opt/polygram/codex-hooks',
+    enabled: true,
+    operatorUid: 0,
+    runtimeId: 'node-24.4.0',
+    runtimeRoot: '/opt/polygram/runtime',
+    runtimeSha256: 'd'.repeat(64),
+    serviceUid: 1000,
+    version: '0.38.6',
+  };
+  const reattested = [];
+  let preparedInput;
+  const config = {
+    codex: {
+      home: '/srv/codex-home',
+      daemonSecretRoots: ['/srv/polygram'],
+      hooks: hookOptions,
+    },
+    defaults: { codexEnabled: true },
+    chats: {
+      '100': {
+        pm: 'codex',
+        cwd: '/srv/workspace',
+        codexModel: 'gpt-5.6-sol',
+        codexEffort: 'xhigh',
+      },
+    },
+  };
+  let rebuilt;
+  const runtimeProfileBuilder = {
+    async prepare(input) {
+      preparedInput = input;
+      return rebuilt.receipt.expectedStaticProfile;
+    },
+    reattest(profile) {
+      reattested.push(profile);
+    },
+  };
+  rebuilt = fixture({
+    configOverride: config,
+    staticProfileExtras: {
+      hookManifest,
+      hookArtifactsSha256: 'e'.repeat(64),
+    },
+    controllerOptions: { runtimeProfileBuilder },
+  });
+
+  await rebuilt.controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+  });
+  rebuilt.controller.clientFactory({
+    sessionKey: '100',
+    expectedStaticProfile: rebuilt.receipt.expectedStaticProfile,
+    onNotification() {},
+    onFault() {},
+  });
+
+  assert.deepEqual(preparedInput.hooks, hookOptions);
+  assert.equal(reattested.length, 2);
+  assert.equal(reattested[0], rebuilt.receipt.expectedStaticProfile);
+  assert.equal(
+    rebuilt.clientOptions[0].hookManifest,
+    rebuilt.receipt.expectedStaticProfile.hookManifest,
+  );
+});
+
+test('hook configuration changes during preflight invalidate the prepared profile', async () => {
+  const hookManifest = Object.freeze({
+    ownedCwd: '/srv/workspace',
+    entries: Object.freeze([]),
+  });
+  const hookOptions = {
+    artifactRoot: '/opt/polygram/codex-hooks',
+    enabled: true,
+    operatorUid: 0,
+    runtimeId: 'node-24.4.0',
+    runtimeRoot: '/opt/polygram/runtime',
+    runtimeSha256: 'd'.repeat(64),
+    serviceUid: 1000,
+    version: '0.38.6',
+  };
+  const config = {
+    codex: {
+      home: '/srv/codex-home',
+      daemonSecretRoots: ['/srv/polygram'],
+      hooks: hookOptions,
+    },
+    defaults: { codexEnabled: true },
+    chats: {
+      '100': {
+        pm: 'codex',
+        cwd: '/srv/workspace',
+        codexModel: 'gpt-5.6-sol',
+        codexEffort: 'xhigh',
+      },
+    },
+  };
+  let entered;
+  const prepareEntered = new Promise((resolve) => {
+    entered = resolve;
+  });
+  let release;
+  const blocked = new Promise((resolve) => {
+    release = resolve;
+  });
+  let rebuilt;
+  const runtimeProfileBuilder = {
+    async prepare() {
+      entered();
+      await blocked;
+      return rebuilt.receipt.expectedStaticProfile;
+    },
+    reattest() {},
+  };
+  rebuilt = fixture({
+    configOverride: config,
+    staticProfileExtras: {
+      hookManifest,
+      hookArtifactsSha256: 'e'.repeat(64),
+    },
+    controllerOptions: { runtimeProfileBuilder },
+  });
+
+  const preparing = rebuilt.controller.prepareSession({
+    sessionKey: '100',
+    chatId: '100',
+  });
+  await prepareEntered;
+  config.codex.hooks = { ...hookOptions, enabled: false };
+  release();
+
+  await assert.rejects(
+    preparing,
+    { code: 'CODEX_PREFLIGHT_PROFILE_MISMATCH' },
+  );
+});
+
 test('first prepared checkpoint atomically establishes durable generation ownership', async () => {
   const { calls, controller, receipt } = fixture();
   controller.initialize();
