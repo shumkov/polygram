@@ -570,10 +570,11 @@ personal-sensitivity guard.
 
 ### Assumptions and deferred questions
 
-- The exact process/auth boundary for invoking a cheap fixed router through an
-  existing Claude/Codex subscription is unresolved until U24. The plan must
-  not call it production-safe before the spike proves Claude and Codex turns,
-  exact runtime/model identity, and no commercial API key.
+- The exact process/auth boundary for the cheap fixed router is unresolved
+  until U24. Codex CLI 0.145 is an attested rejected candidate because it
+  cannot prevent built-in tool use; the accepted candidate must prove the
+  pinned Claude CLI, exact observed Haiku model, first-party subscription auth,
+  facts from both source-backend policies, and no commercial API key.
 - The effective embedding provider on the UMI VPS is unresolved. The corrected
   U16a gate must record the actual boundary or deliberately pre-stage and pin
   the upstream ONNX default before measuring; it must not infer live state from
@@ -749,9 +750,13 @@ are new prerequisites or gates and do not renumber existing units.
 - **Files:** new versioned spike harness and findings document; use synthetic
   fixtures and existing provider/runtime test helpers where possible.
 - **Approach:** Prefer one fixed cheap subscription-backed router for both
-  source backends; evaluate a fixed vendored Claude CLI/Haiku invocation
-  against a pinned Codex cheap-model invocation, and add active-backend
-  adapters only if the spike proves one fixed router infeasible. Feed only
+  source backends. The capability review rejected Codex CLI 0.145 as the
+  router because it exposes built-in tools and has no preventive equivalent
+  of Claude CLI's `--tools ""`; post-hoc tool-event rejection would be too late.
+  Use the fixed vendored Claude CLI/Haiku invocation for facts extracted from
+  either Claude or Codex sessions. Record the exact pinned Codex binary and
+  ChatGPT login as the rejected-candidate evidence, but do not send routing
+  facts to it. Feed only
   extracted facts on stdin and accept schema-only stdout: no tools, MCP, or
   filesystem access. Record the exact binary, model, auth source, process
   boundary, runtime identity, and proof that no commercial API key is used.
@@ -776,10 +781,12 @@ are new prerequisites or gates and do not renumber existing units.
 - **Corpus and repetitions:** Pre-register 26 extracted facts: 8 work,
   8 narrow-blacklist personal (including explicit-private instructions), 4 mixed, 2 semantic-uncertain, 2 key/value or
   known-shape secret cases, and 2 prose-form credential cases. Run five
-  repetitions through both Claude-CLI and Codex source
-  turns (260 route cases), plus four fault classes at five repetitions on both
-  backends (40 operational cases). Include exact source/runtime/model/auth
-  evidence in the findings. U24 tests routing/auth/schema behavior only;
+  repetitions through the one fixed Claude-CLI/Haiku router for both source
+  backend policies (130 route cases), plus four injected fault classes at five
+  repetitions through the same routing boundary (20 operational cases).
+  Include exact runtime, observed model, and first-party subscription-auth
+  evidence in the findings, plus the Codex no-tool-disable rejection evidence.
+  U24 tests routing/auth/schema behavior only;
   physical publication identity and idempotency belong to U16.
 - **Verification:** The bounded zero-leak gate must pass with zero
   private-to-general leaks on the fixture, 100% valid coverage and
@@ -796,18 +803,13 @@ are new prerequisites or gates and do not renumber existing units.
 
 ### U25. Durable SQLite/FTS secret boundary
 
-- **Local implementation status (2026-08-16; not shipped):** A reviewed
-  implementation exists in the isolated
-  `polygram.scoped-memory-durable-boundary` worktree, including the focused
-  pending-question boundary specified in
-  `docs/plans/2026-08-16-001-fix-pending-question-secret-answers-plan.md` in
-  that worktree.
-  It has not been committed, integrated into `main`, released, or deployed.
-  The final local verification ran 4,250 tests: 4,235 passed, 0 failed, and 15
-  were intentionally skipped; independent correctness, security/lifecycle,
-  and testing/operability reviewers reported no remaining must-fixes. Keep U25
-  open until that reviewed work is integrated and the downstream U26
-  historical-cleanup gate is performed.
+- **Implementation status (2026-08-18; shipped):** The reviewed implementation
+  landed as `27c8394` (`feat: enforce durable secret boundary`), is contained in
+  `main`, and shipped in Polygram 0.38.9. The final pre-merge verification ran
+  4,250 tests: 4,235 passed, 0 failed, and 15 were intentionally skipped;
+  independent correctness, security/lifecycle, and testing/operability reviews
+  reported no remaining must-fixes. U25 is complete. U26 remains a separate
+  pre-canary historical-cleanup and verification gate.
 - **Goal:** Inventory and protect every durable Polygram text sink reachable
   from inbound/provider content, while preserving the original live turn.
 - **Requirements:** R13-R16, R68.
@@ -1125,7 +1127,7 @@ shown as zero and excluded from remaining-work totals.
 | U16a-D | 1 | 2 | 4 | blocker: five-run Linux gate |
 | U23 | 10 | 14 | 24 | blocker; **remaining** effort (elapsed `T23` = 8/11/19); spent S0 + spec reviews are **unmetered** and excluded |
 | U24 | 3 | 5 | 8 | blocker |
-| U25 | 3 | 5 | 8 | reviewed local implementation exists; not integrated/shipped; retain envelope until landed |
+| U25 | 0 | 0 | 0 | spent; merged and shipped in Polygram 0.38.9 |
 | U27 | 1 | 2 | 4 | blocker |
 | U15 | 4 | 6 | 10 | remaining; raised from 3/5/8 — U15 now builds, installs and proves the deterministic closure of the real wrapper plus `stop.sh` inside U23's protected tree |
 | U16 | 8 | 13 | 20 | remaining; ledger and publisher |
@@ -1139,11 +1141,12 @@ shown as zero and excluded from remaining-work totals.
 - **U16a total work:** A+B+C+D = **4 / 8 / 14**; its elapsed recurrence is
   `max(A,B)+C+D = 3 / 6 / 11`.
 - **MVP engineering total:** U16a + U23 + U24 + U25 + U27 + U15 + U16 +
-  U14 + U17 + U18 + U26 + U19 = **42 / 69 / 114** engineer-days **remaining**
-  (was 32 / 56 / 91 at U23 = 1 / 2 / 3 and U15 = 3 / 5 / 8), plus registered
+  U14 + U17 + U18 + U26 + U19 = **39 / 64 / 106** engineer-days **remaining**
+  (before recording U25 as spent: 42 / 69 / 114), plus registered
   dark/soak and operator/calendar waits.
-- **Full parity total:** MVP + U20 = **48 / 79 / 129** remaining (was
-  38 / 66 / 106), plus staged soaks and operator/calendar waits.
+- **Full parity total:** MVP + U20 = **45 / 74 / 121** remaining (before
+  recording U25 as spent: 48 / 79 / 129), plus staged soaks and
+  operator/calendar waits.
 - **U23 re-derivation (not a delta).** U23 was re-estimated after its second
   spec review added an Orchestra verifier API with preflight/profile/factory/
   process plumbing, a per-`CODEX_HOME` provisioning state machine with crash
@@ -1165,7 +1168,7 @@ shown as zero and excluded from remaining-work totals.
   elapsed time: `T19` = **28 / 44 / 71** (was 20 / 34 / 53) and `T20` =
   **34 / 54 / 86** (was 26 / 44 / 68), using `T23` = 8 / 11 / 19 and
   U15 = 4 / 6 / 10.
-- **Spent:** U13, U21, and U22 contribute zero to all totals. U23's S0
+- **Spent:** U13, U21, U22, and U25 contribute zero to all totals. U23's S0
   characterization and its two spec-review rounds are likewise spent — and
   **were not time-tracked**, so they are **unmetered**: excluded from remaining,
   carrying no actual best/likely/worst, and **not summed into any published
