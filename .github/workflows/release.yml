@@ -42,6 +42,9 @@ jobs:
 
       - run: npm ci
 
+      - name: Prepare protected hook test root
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 /var/lib/polygram-hook-tests
+
       # Test gate. Stable tags (v0.X.Y) MUST pass. Pre-release tags
       # (v0.X.Y-rc.N) tolerate up to 8 known-flaky tests that pass in
       # isolation but fail under concurrent runner state contention —
@@ -51,6 +54,8 @@ jobs:
       # package.json (not the tag name); shell variables only — no user
       # event payloads — so no injection surface.
       - name: Run tests (strict for stable, tolerant for RC)
+        env:
+          POLYGRAM_HOOK_TEST_ROOT: /var/lib/polygram-hook-tests
         run: |
           PKG_VERSION="$(node -p "require('./package.json').version")"
           case "$PKG_VERSION" in
