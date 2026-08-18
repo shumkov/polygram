@@ -149,16 +149,20 @@ export function parseClaudeAuthStatus(stdout) {
   };
 }
 
-export function parseCodexLoginStatus(stdout) {
-  if (stdout.trim() !== 'Logged in using ChatGPT') throw new Error('ROUTER_AUTH_AMBIGUOUS');
+export function parseCodexLoginStatus(stdout, stderr = '') {
+  const statuses = [stdout, stderr].map((value) => value.trim()).filter(Boolean);
+  if (statuses.length !== 1 || statuses[0] !== 'Logged in using ChatGPT') {
+    throw new Error('ROUTER_AUTH_AMBIGUOUS');
+  }
   return { loggedIn: true, authMethod: 'chatgpt' };
 }
 
 async function authCommand(binary, argv, parser) {
   assertAbsolute(binary);
   let stdout;
+  let stderr;
   try {
-    ({ stdout } = await execFileAsync(binary, argv, {
+    ({ stdout, stderr } = await execFileAsync(binary, argv, {
       env: subscriptionOnlyEnv(),
       encoding: 'utf8',
       timeout: 10_000,
@@ -167,7 +171,7 @@ async function authCommand(binary, argv, parser) {
   } catch {
     throw Object.assign(new Error('ROUTER_AUTH_UNAVAILABLE'), { code: 'ROUTER_AUTH_UNAVAILABLE' });
   }
-  return parser(stdout);
+  return parser(stdout, stderr);
 }
 
 export function inspectClaudeAuth(binary) {

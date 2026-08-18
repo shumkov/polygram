@@ -742,6 +742,14 @@ are new prerequisites or gates and do not renumber existing units.
 
 ### U24. Narrow routing/auth boundary spike (blocker)
 
+- **Status (2026-08-18):** The reviewed Node 24 harness passes 127/127 with
+  adjacent secret/memory tests. The authorized VPS shape gate passed, but the
+  final full gate stopped with 109/110 successful real Haiku classifications,
+  one destination-free `ROUTER_MIXED_COVERAGE` error, zero mismatches, zero
+  private-to-work leaks, and 20/20 injected faults handled correctly. U24
+  remains blocked pending an aligned deterministic-retry gate (recommended)
+  or characterization of a stronger subscription-backed router; do not rerun
+  the unchanged stochastic gate until it happens to pass.
 - **Goal:** Decide whether the smallest successor to U22 is safe enough to
   implement: unchanged native extraction followed by a separate narrow
   personal-sensitivity routing/splitting pass.
@@ -764,23 +772,27 @@ are new prerequisites or gates and do not renumber existing units.
   routing. The publisher deterministically vetoes explicit-private
   instructions and every obvious narrow-blacklist cue before accepting a
   router result. A valid closed result is exactly one of `work`, `personal`,
-  `mixed`, or `semantic_uncertain`; only the last valid result invokes the
-  member-DM work/general default, which dual-writes to own-private and general.
+  or `mixed`. Meaning that is uncertain but has no personal-sensitive cue is
+  `work`, matching the member-DM default that dual-writes to own-private and
+  general; a separate uncertainty label would add nondeterminism without
+  changing a destination.
   Unknown fields, missing coverage, overlap, empty parts, invalid
   categories, malformed output, timeout, or process failure are operational
   errors that queue/retry and select no destination.
 - **Closed result schema:** stdout is exactly
   `{category, parts}` with no additional fields. `category` is the enum above;
   every part is exactly `{kind, text}`, where `kind` is `work` or `sensitive`
-  and `text` is non-empty. `work` has one work part, `personal` one sensitive
-  part, `mixed` exactly one of each with non-overlapping text, and
-  `semantic_uncertain` one work part that the publisher treats as work/general
-  for an authorized member DM and sends to both own-private and general. The
-  router returns no destination, scope, principal, confidence, identity, or
+  and `text` is non-empty. For `work` and `personal`, the model supplies the
+  category/kind only and the publisher retains the original sanitized source
+  fact rather than model-rewritten text. `mixed` has exactly one of each as
+  exact, non-overlapping source spans; the only permitted uncovered interior
+  connector is the closed corpus delimiter `because` or `after`. The router
+  returns no destination, scope, principal, confidence, identity, or
   secret value; the publisher derives all of those.
-- **Corpus and repetitions:** Pre-register 26 extracted facts: 8 work,
-  8 narrow-blacklist personal (including explicit-private instructions), 4 mixed, 2 semantic-uncertain, 2 key/value or
-  known-shape secret cases, and 2 prose-form credential cases. Run five
+- **Corpus and repetitions:** Pre-register 26 extracted facts: 8 ordinary work,
+  8 narrow-blacklist personal (including explicit-private instructions),
+  4 mixed, 2 uncertain-but-non-private work, 2 key/value or known-shape secret
+  cases, and 2 prose-form credential cases. Run five
   repetitions through the one fixed Claude-CLI/Haiku router for both source
   backend policies (130 route cases), plus four injected fault classes at five
   repetitions through the same routing boundary (20 operational cases).
@@ -792,8 +804,8 @@ are new prerequisites or gates and do not renumber existing units.
   private-to-general leaks on the fixture, 100% valid coverage and
   non-overlapping parts for accepted cases, 100% deterministic veto of
   explicit-private/obvious-blacklist categories, 100% suspected/unresolved
-  secret quarantine, 100% semantic-uncertain-to-member-DM-work/general
-  dual-write, and 100% operational errors queued without a destination. Any
+  secret quarantine, 100% uncertain-but-non-private work/general dual-write,
+  and 100% operational errors queued without a destination. Any
   unresolved process/auth boundary,
   model identity, or commercial-key ambiguity fails U24 and leaves memory
   feature enablement blocked; do not call an existing subscription invocation

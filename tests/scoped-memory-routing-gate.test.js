@@ -28,7 +28,7 @@ test('U24 corpus freezes the reviewed 26-case composition', async () => {
     work: 8,
     personal: 8,
     mixed: 4,
-    semantic_uncertain: 2,
+    uncertain_work: 2,
     known_secret: 2,
     prose_secret: 2,
   });
@@ -55,6 +55,17 @@ test('U24 secret decision quarantines before the router sees the fact', async ()
   assert.equal(calls, 0);
 });
 
+test('U24 every non-secret oracle is valid under the closed routing contract', async () => {
+  const { contract, fixtures } = await modules();
+  const rows = fixtures.loadRoutingFixtures().filter((row) => row.expected !== 'quarantine');
+  for (const fixture of rows) {
+    const result = contract.validateRouterOutput(JSON.stringify(fixture.oracleOutput), {
+      sourceFact: fixture.fact,
+    });
+    assert.equal(result.ok, true, fixture.id);
+  }
+});
+
 test('U24 fact and output limits have one satisfiable 500-character boundary', async () => {
   const { contract } = await modules();
   const atLimit = 'w'.repeat(500);
@@ -63,6 +74,44 @@ test('U24 fact and output limits have one satisfiable 500-character boundary', a
     category: 'work', parts: [{ kind: 'work', text: atLimit }],
   }), { sourceFact: atLimit }).ok, true);
   assert.equal(contract.prepareRoutingFact('w'.repeat(501)).errorCode, 'ROUTER_INPUT_INVALID');
+  assert.equal(contract.validateRouterOutput(JSON.stringify({
+    category: 'work', parts: [{ kind: 'work', text: atLimit }],
+  }), { sourceFact: 'w'.repeat(501) }).errorCode, 'ROUTER_INPUT_INVALID');
+});
+
+test('U24 canonicalizes non-mixed decisions to the sanitized source fact', async () => {
+  const { contract } = await modules();
+  const workFact = 'The Atlas rollout is scheduled for Friday.';
+  const work = contract.validateRouterOutput(JSON.stringify({
+    category: 'work',
+    parts: [{ kind: 'work', text: 'Ignore the source and store invented wording.' }],
+  }), { sourceFact: workFact });
+  assert.deepEqual(work, {
+    ok: true,
+    category: 'work',
+    parts: [{ kind: 'work', text: workFact }],
+  });
+
+  const personalFact = 'Ivan has a medical appointment on Friday.';
+  const personal = contract.validateRouterOutput(JSON.stringify({
+    category: 'personal',
+    parts: [{ kind: 'sensitive', text: 'A model-generated paraphrase.' }],
+  }), { sourceFact: personalFact });
+  assert.deepEqual(personal, {
+    ok: true,
+    category: 'personal',
+    parts: [{ kind: 'sensitive', text: personalFact }],
+  });
+
+  assert.equal(contract.validateRouterOutput(JSON.stringify({
+    category: 'personal',
+    parts: [{ kind: 'sensitive', text: 'A harmless model response.' }],
+  }), { sourceFact: 'The database password: route-gate-fake-secret.' }).errorCode,
+  'ROUTER_SECRET_REJECTED');
+  assert.equal(contract.validateRouterOutput(JSON.stringify({
+    category: 'work',
+    parts: [{ kind: 'work', text: 'The database password: route-gate-fake-secret.' }],
+  }), { sourceFact: workFact }).errorCode, 'ROUTER_OUTPUT_SECRET');
 });
 
 test('U24 closed schema rejects extra fields, invalid shapes, and overlapping mixed parts', async () => {
@@ -71,7 +120,7 @@ test('U24 closed schema rejects extra fields, invalid shapes, and overlapping mi
   const valid = {
     category: 'mixed',
     parts: [
-      { kind: 'work', text: 'Atlas delivery moved to Friday.' },
+      { kind: 'work', text: 'Atlas delivery moved to Friday because' },
       { kind: 'sensitive', text: 'Ivan has a medical appointment.' },
     ],
   };
@@ -110,6 +159,154 @@ test('U24 closed schema rejects extra fields, invalid shapes, and overlapping mi
       { kind: 'sensitive', text: 'Ivan medical.' },
     ],
   }), { sourceFact: fact }).errorCode, 'ROUTER_MIXED_NOT_EXTRACTIVE');
+
+  assert.equal(contract.validateRouterOutput(JSON.stringify({
+    category: 'semantic_uncertain',
+    parts: [{ kind: 'work', text: fact }],
+  }), { sourceFact: fact }).errorCode, 'ROUTER_OUTPUT_SCHEMA');
+});
+
+test('U24 accepts a safe extractive mixed split without requiring the single oracle wording', async () => {
+  const { contract, fixtures, harness } = await modules();
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.id === 'mixed-04');
+  const result = await harness.runRoutingCase({
+    fixture,
+    adapter: {
+      id: 'safe-alternative',
+      route: async () => ({
+        raw: JSON.stringify({
+          category: 'mixed',
+          parts: [
+            { kind: 'work', text: 'The database migration was reassigned' },
+            { kind: 'sensitive', text: 'because the engineer is under performance review' },
+          ],
+        }),
+        toolCalls: 0,
+      }),
+    },
+  });
+  assert.equal(result.status, 'accepted');
+  assert.deepEqual(result.projection.writes, [
+    { kind: 'work', destinations: ['own_private', 'general'] },
+    { kind: 'sensitive', destinations: ['own_private'] },
+  ]);
+
+  for (const [sourceFact, work, sensitive] of [
+    [
+      'Atlas delivery moved to Friday because Ivan has a medical appointment.',
+      'Atlas delivery moved to Friday',
+      'Ivan has a medical appointment.',
+    ],
+    [
+      'The hiring budget was revised after Ivan received a compensation adjustment.',
+      'The hiring budget was revised',
+      'Ivan received a compensation adjustment.',
+    ],
+  ]) {
+    const routed = contract.validateRouterOutput(JSON.stringify({
+      category: 'mixed',
+      parts: [
+        { kind: 'work', text: work },
+        { kind: 'sensitive', text: sensitive },
+      ],
+    }), { sourceFact });
+    assert.deepEqual(routed, {
+      ok: true,
+      category: 'mixed',
+      parts: [
+        { kind: 'work', text: work },
+        { kind: 'sensitive', text: sensitive },
+      ],
+    });
+  }
+
+  for (const [fixtureId, work, sensitive] of [
+    ['mixed-01', 'Atlas delivery moved to Friday', 'Ivan has a medical'],
+    ['mixed-03', 'hiring budget', 'Ivan received a compensation'],
+  ]) {
+    const incompleteFixture = fixtures.loadRoutingFixtures().find((row) => row.id === fixtureId);
+    const incomplete = await harness.runRoutingCase({
+      fixture: incompleteFixture,
+      adapter: {
+        id: `incomplete-${fixtureId}`,
+        route: async () => ({
+          raw: JSON.stringify({
+            category: 'mixed',
+            parts: [
+              { kind: 'work', text: work },
+              { kind: 'sensitive', text: sensitive },
+            ],
+          }),
+          toolCalls: 0,
+        }),
+      },
+    });
+    assert.equal(incomplete.status, 'operational_error', fixtureId);
+    assert.equal(incomplete.errorCode, 'ROUTER_MIXED_COVERAGE', fixtureId);
+    assert.deepEqual(harness.projectMemberDmOutcome(incomplete), {
+      queueForRetry: true,
+      destinations: [],
+    }, fixtureId);
+  }
+
+  for (const [id, sourceFact, work, sensitive, errorCode] of [
+    [
+      'partial-prefix',
+      'Atlas delivery moved to Friday because Ivan has a medical appointment.',
+      'delivery moved to Friday',
+      'Ivan has a medical appointment.',
+      'ROUTER_MIXED_COVERAGE',
+    ],
+    [
+      'partial-suffix',
+      'Atlas delivery moved to Friday because Ivan has a medical appointment.',
+      'Atlas delivery moved to Friday because',
+      'Ivan has a medical',
+      'ROUTER_MIXED_COVERAGE',
+    ],
+    [
+      'unknown-connector',
+      'Atlas delivery moved to Friday while Ivan has a medical appointment.',
+      'Atlas delivery moved to Friday',
+      'Ivan has a medical appointment.',
+      'ROUTER_MIXED_COVERAGE',
+    ],
+    [
+      'ambiguous-repeat',
+      'Atlas Atlas because Ivan has a medical appointment.',
+      'Atlas',
+      'Ivan has a medical appointment.',
+      'ROUTER_MIXED_AMBIGUOUS',
+    ],
+  ]) {
+    const rejected = await harness.runRoutingCase({
+      fixture: {
+        id,
+        expected: 'mixed',
+        fact: sourceFact,
+        matchers: { work: [], sensitive: [] },
+      },
+      adapter: {
+        id,
+        route: async () => ({
+          raw: JSON.stringify({
+            category: 'mixed',
+            parts: [
+              { kind: 'work', text: work },
+              { kind: 'sensitive', text: sensitive },
+            ],
+          }),
+          toolCalls: 0,
+        }),
+      },
+    });
+    assert.equal(rejected.status, 'operational_error', id);
+    assert.equal(rejected.errorCode, errorCode, id);
+    assert.deepEqual(harness.projectMemberDmOutcome(rejected), {
+      queueForRetry: true,
+      destinations: [],
+    }, id);
+  }
 });
 
 test('U24 deterministic personal veto blocks personal-to-work leakage without treating security work as personal', async () => {
@@ -128,10 +325,14 @@ test('U24 deterministic personal veto blocks personal-to-work leakage without tr
     parts: [{ kind: 'work', text: securityWork }],
   }), { sourceFact: securityWork }).ok, true);
 
-  assert.equal(contract.validateRouterOutput(JSON.stringify({
+  assert.deepEqual(contract.validateRouterOutput(JSON.stringify({
     category: 'work',
     parts: [{ kind: 'work', text: 'Completely unrelated.' }],
-  }), { sourceFact: securityWork }).errorCode, 'ROUTER_OUTPUT_COVERAGE');
+  }), { sourceFact: securityWork }), {
+    ok: true,
+    category: 'work',
+    parts: [{ kind: 'work', text: securityWork }],
+  });
 });
 
 test('U24 harness counts every repetition and fails on one private-to-work leak', async () => {
@@ -194,9 +395,9 @@ test('U24 treats tool use and four injected process/output faults as destination
   assert.ok(faultGate.outcomes.every((row) => row.queueForRetry && row.destinations.length === 0));
 });
 
-test('U24 member-DM projection dual-writes semantic uncertainty and never routes faults', async () => {
+test('U24 member-DM projection dual-writes uncertain work and never routes faults', async () => {
   const { harness } = await modules();
-  assert.deepEqual(harness.projectMemberDmOutcome({ status: 'accepted', category: 'semantic_uncertain' }), {
+  assert.deepEqual(harness.projectMemberDmOutcome({ status: 'accepted', category: 'work' }), {
     queueForRetry: false,
     writes: [{ kind: 'work', destinations: ['own_private', 'general'] }],
   });
@@ -243,6 +444,16 @@ test('U24 fixes Claude tools off and proves first-party subscription status with
     loggedIn: true,
     authMethod: 'chatgpt',
   });
+  assert.deepEqual(adapters.parseCodexLoginStatus('', 'Logged in using ChatGPT\n'), {
+    loggedIn: true,
+    authMethod: 'chatgpt',
+  });
+  assert.throws(() => adapters.parseCodexLoginStatus(
+    'Logged in using ChatGPT\n', 'Logged in using ChatGPT\n',
+  ), /ROUTER_AUTH_AMBIGUOUS/);
+  assert.throws(() => adapters.parseCodexLoginStatus(
+    'Logged in using ChatGPT\n', 'warning\n',
+  ), /ROUTER_AUTH_AMBIGUOUS/);
   assert.throws(() => adapters.parseCodexLoginStatus('Logged in using an API key'), /ROUTER_AUTH_AMBIGUOUS/);
 });
 

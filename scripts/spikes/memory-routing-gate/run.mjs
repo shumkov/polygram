@@ -39,7 +39,7 @@ const ALLOWED_FAILURE_CODES = new Set([
   'ROUTER_TIMEOUT',
 ]);
 const SHAPE_FAMILIES = new Set([
-  'work', 'personal', 'mixed', 'semantic_uncertain', 'known_secret', 'prose_secret',
+  'work', 'personal', 'mixed', 'uncertain_work', 'known_secret', 'prose_secret',
 ]);
 
 function usage() {

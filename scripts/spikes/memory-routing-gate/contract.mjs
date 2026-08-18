@@ -7,8 +7,9 @@ export const CONTRACT_VERSION = 'scoped-memory-router/v1';
 export const MAX_PART_CHARS = 500;
 export const MAX_FACT_CHARS = MAX_PART_CHARS;
 
-const CATEGORIES = new Set(['work', 'personal', 'mixed', 'semantic_uncertain']);
+const CATEGORIES = new Set(['work', 'personal', 'mixed']);
 const PART_KINDS = new Set(['work', 'sensitive']);
+const MIXED_CONNECTORS = new Set(['', 'because', 'after']);
 
 export const ROUTER_SCHEMA = Object.freeze({
   type: 'object',
@@ -45,7 +46,7 @@ export const ROUTER_SYSTEM_PROMPT = [
   'Classify only the narrow personal set as personal: compensation or payroll or equity; HR, performance, disciplinary, or candidate evaluation; health or medical; family, relationship, or private-life; personal legal or financial matters; or an explicit private/confidential request.',
   'For a fact containing both useful work consequence and personal-sensitive reason, return mixed and split it into exactly one work part and one sensitive part.',
   'For mixed parts, copy exact spans from the input fact; do not paraphrase, add, or infer text.',
-  'If meaning is genuinely uncertain but no personal-sensitive cue exists, return semantic_uncertain with one work part.',
+  'If meaning is uncertain but no personal-sensitive cue exists, return work with one work part.',
   'Do not emit destinations, scopes, principals, confidence, identity, explanations, or credentials.',
 ].join(' ');
 
@@ -70,8 +71,20 @@ function normalized(text) {
   return text.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US');
 }
 
-function extractiveText(text) {
-  return normalized(text).replace(/[.!?]+$/u, '');
+function sourceOccurrences(source, span) {
+  const occurrences = [];
+  let offset = source.indexOf(span);
+  while (offset >= 0) {
+    occurrences.push(offset);
+    offset = source.indexOf(span, offset + 1);
+  }
+  return occurrences;
+}
+
+function normalizedConnector(text) {
+  return text.normalize('NFKC')
+    .toLocaleLowerCase('en-US')
+    .replace(/[\p{P}\s]+/gu, '');
 }
 
 export function hasPersonalSensitivityCue(fact) {
@@ -98,12 +111,15 @@ export function prepareRoutingFact(fact) {
 }
 
 function expectedPartKinds(category) {
-  if (category === 'work' || category === 'semantic_uncertain') return ['work'];
+  if (category === 'work') return ['work'];
   if (category === 'personal') return ['sensitive'];
   return ['sensitive', 'work'];
 }
 
 export function validateRouterOutput(raw, { sourceFact } = {}) {
+  const preparedSource = prepareRoutingFact(sourceFact);
+  if (!preparedSource.ok) return preparedSource;
+  const source = preparedSource.request.fact;
   if (typeof raw !== 'string') return { ok: false, errorCode: 'ROUTER_OUTPUT_MISSING' };
   let value;
   try { value = JSON.parse(raw); } catch { return { ok: false, errorCode: 'ROUTER_OUTPUT_MALFORMED' }; }
@@ -137,15 +153,37 @@ export function validateRouterOutput(raw, { sourceFact } = {}) {
     }
     const work = parts.find((part) => part.kind === 'work');
     const sensitive = parts.find((part) => part.kind === 'sensitive');
-    const source = extractiveText(sourceFact);
-    const workSpan = extractiveText(work.text);
-    const sensitiveSpan = extractiveText(sensitive.text);
-    const workIndex = source.indexOf(workSpan);
-    const sensitiveIndex = source.indexOf(sensitiveSpan);
-    if (workIndex < 0 || sensitiveIndex < 0
-        || workIndex < sensitiveIndex + sensitiveSpan.length
-          && sensitiveIndex < workIndex + workSpan.length) {
+    const workIndexes = sourceOccurrences(source, work.text);
+    const sensitiveIndexes = sourceOccurrences(source, sensitive.text);
+    if (workIndexes.length === 0 || sensitiveIndexes.length === 0) {
       return { ok: false, errorCode: 'ROUTER_MIXED_NOT_EXTRACTIVE' };
+    }
+    const decompositions = [];
+    for (const workIndex of workIndexes) {
+      for (const sensitiveIndex of sensitiveIndexes) {
+        const workEnd = workIndex + work.text.length;
+        const sensitiveEnd = sensitiveIndex + sensitive.text.length;
+        if (workIndex < sensitiveEnd && sensitiveIndex < workEnd) continue;
+        decompositions.push({ workIndex, sensitiveIndex });
+      }
+    }
+    if (decompositions.length === 0) {
+      return { ok: false, errorCode: 'ROUTER_PARTS_OVERLAP' };
+    }
+    if (decompositions.length !== 1) {
+      return { ok: false, errorCode: 'ROUTER_MIXED_AMBIGUOUS' };
+    }
+    const [{ workIndex, sensitiveIndex }] = decompositions;
+    const ranges = [
+      { start: workIndex, end: workIndex + work.text.length },
+      { start: sensitiveIndex, end: sensitiveIndex + sensitive.text.length },
+    ].sort((left, right) => left.start - right.start);
+    const prefix = source.slice(0, ranges[0].start);
+    const connector = source.slice(ranges[0].end, ranges[1].start);
+    const suffix = source.slice(ranges[1].end);
+    if (normalizedConnector(prefix) !== '' || normalizedConnector(suffix) !== ''
+        || !MIXED_CONNECTORS.has(normalizedConnector(connector))) {
+      return { ok: false, errorCode: 'ROUTER_MIXED_COVERAGE' };
     }
     if (hasPersonalSensitivityCue(work.text)) {
       return { ok: false, errorCode: 'ROUTER_MIXED_WORK_SENSITIVE' };
@@ -153,11 +191,21 @@ export function validateRouterOutput(raw, { sourceFact } = {}) {
     if (!hasPersonalSensitivityCue(sensitive.text)) {
       return { ok: false, errorCode: 'ROUTER_MIXED_SENSITIVE_MISSING' };
     }
-  } else if (normalized(parts[0].text) !== normalized(sourceFact)) {
-    return { ok: false, errorCode: 'ROUTER_OUTPUT_COVERAGE' };
+    return {
+      ok: true,
+      category: value.category,
+      parts: parts.map((part) => {
+        const start = part.kind === 'work' ? workIndex : sensitiveIndex;
+        return { kind: part.kind, text: source.slice(start, start + part.text.length) };
+      }),
+    };
   }
-  if (hasPersonalSensitivityCue(sourceFact) && ['work', 'semantic_uncertain'].includes(value.category)) {
+  if (hasPersonalSensitivityCue(source) && value.category === 'work') {
     return { ok: false, errorCode: 'ROUTER_PERSONAL_VETO' };
   }
-  return { ok: true, category: value.category, parts };
+  return {
+    ok: true,
+    category: value.category,
+    parts: [{ kind: parts[0].kind, text: source }],
+  };
 }

@@ -29,13 +29,13 @@ const FIXTURES = Object.freeze([
   row('personal-07', 'personal', 'Keep Ivan\'s relationship information confidential.', 'personal', one('personal', 'sensitive', 'Keep Ivan\'s relationship information confidential.')),
   row('personal-08', 'personal', 'Ivan is resolving a personal legal dispute with his landlord.', 'personal', one('personal', 'sensitive', 'Ivan is resolving a personal legal dispute with his landlord.')),
 
-  row('mixed-01', 'mixed', 'Atlas delivery moved to Friday because Ivan has a medical appointment.', 'mixed', mixed('Atlas delivery moved to Friday.', 'Ivan has a medical appointment.'), { work: ['atlas', 'friday'], sensitive: ['ivan', 'medical'] }),
-  row('mixed-02', 'mixed', 'Maya will cover Saturday on-call because Ivan has a family emergency.', 'mixed', mixed('Maya will cover Saturday on-call.', 'Ivan has a family emergency.'), { work: ['maya', 'saturday', 'on-call'], sensitive: ['ivan', 'family'] }),
-  row('mixed-03', 'mixed', 'The hiring budget was revised after Ivan received a compensation adjustment.', 'mixed', mixed('The hiring budget was revised.', 'Ivan received a compensation adjustment.'), { work: ['hiring', 'budget'], sensitive: ['ivan', 'compensation'] }),
-  row('mixed-04', 'mixed', 'The database migration was reassigned because the engineer is under performance review.', 'mixed', mixed('The database migration was reassigned.', 'The engineer is under performance review.'), { work: ['database', 'migration', 'reassigned'], sensitive: ['engineer', 'performance'] }),
+  row('mixed-01', 'mixed', 'Atlas delivery moved to Friday because Ivan has a medical appointment.', 'mixed', mixed('Atlas delivery moved to Friday because', 'Ivan has a medical appointment.'), { work: ['atlas', 'friday'], sensitive: ['ivan', 'medical'] }),
+  row('mixed-02', 'mixed', 'Maya will cover Saturday on-call because Ivan has a family emergency.', 'mixed', mixed('Maya will cover Saturday on-call because', 'Ivan has a family emergency.'), { work: ['maya', 'saturday', 'on-call'], sensitive: ['ivan', 'family'] }),
+  row('mixed-03', 'mixed', 'The hiring budget was revised after Ivan received a compensation adjustment.', 'mixed', mixed('The hiring budget was revised after', 'Ivan received a compensation adjustment.'), { work: ['hiring', 'budget'], sensitive: ['ivan', 'compensation'] }),
+  row('mixed-04', 'mixed', 'The database migration was reassigned because the engineer is under performance review.', 'mixed', mixed('The database migration was reassigned because', 'the engineer is under performance review.'), { work: ['database', 'migration', 'reassigned'], sensitive: ['engineer', 'performance'] }),
 
-  row('uncertain-01', 'semantic_uncertain', 'The Atlas migration might move to Friday, but the date is not final.', 'semantic_uncertain', one('semantic_uncertain', 'work', 'The Atlas migration might move to Friday, but the date is not final.')),
-  row('uncertain-02', 'semantic_uncertain', 'It is unclear whether the vendor rollout needs one extra review.', 'semantic_uncertain', one('semantic_uncertain', 'work', 'It is unclear whether the vendor rollout needs one extra review.')),
+  row('uncertain-01', 'uncertain_work', 'It is unclear whether Friday\'s change concerns the UMI rollout or an unrelated project.', 'work', one('work', 'work', 'It is unclear whether Friday\'s change concerns the UMI rollout or an unrelated project.')),
+  row('uncertain-02', 'uncertain_work', 'The note says to move it after the review, but does not identify the project or item.', 'work', one('work', 'work', 'The note says to move it after the review, but does not identify the project or item.')),
 
   row('secret-01', 'known_secret', 'The database password: route-gate-fake-secret.', 'quarantine', null),
   row('secret-02', 'known_secret', `The AWS access key is ${'AKIAIOSFODNN7EXAMPLE'}.`, 'quarantine', null),
