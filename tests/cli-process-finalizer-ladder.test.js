@@ -372,7 +372,8 @@ test('L12: consumed-ack ack ≠ Stop-fallback answer → deliver the rescued ans
 
   proc._handleHookEvent(upsFor(turnId));                       // pickup → seen, hooks live
   // A SIBLING reply consumed this turn but delivered only a short ack:
-  proc._ledgerAckConsumed([turnId], 'Researching WhatsApp call options now…');
+  proc._ledgerAckConsumed([turnId]);
+  proc._recordConsumedReplyDelivery([turnId], 'Researching WhatsApp call options now…');
   // claude then produced the real answer as plain assistant text (no reply tool call):
   const answer = 'Research done — SIP mode → self-hosted PBX keeps Chatwoot for chat AND accepts WhatsApp calls. [2066 chars in prod]';
   proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: answer });
@@ -399,7 +400,8 @@ test('L13: consumed-ack ack == Stop-fallback text → stays already-delivered (n
 
   proc._handleHookEvent(upsFor(turnId));
   const folded = 'Here is the combined answer covering both of your messages.';
-  proc._ledgerAckConsumed([turnId], folded);                  // sibling delivered the full answer
+  proc._ledgerAckConsumed([turnId]);
+  proc._recordConsumedReplyDelivery([turnId], folded);       // sibling delivered the full answer
   proc._handleHookEvent({ type: 'Stop', lastAssistantMessage: folded });   // same text echoes back
 
   await sleep(120);
