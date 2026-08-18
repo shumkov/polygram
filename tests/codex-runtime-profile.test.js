@@ -44,6 +44,7 @@ const TARGET_PIN = resolveCodexTargetPin();
 const OPPOSITE_TARGET = TARGET_PIN.target === 'x86_64-unknown-linux-musl'
   ? 'aarch64-apple-darwin'
   : 'x86_64-unknown-linux-musl';
+const HOOK_TEST_ROOT = process.env.POLYGRAM_HOOK_TEST_ROOT ?? os.homedir();
 
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
@@ -62,7 +63,7 @@ function digest(value) {
 }
 
 function fixture(t) {
-  const root = realpathSync(mkdtempSync(path.join(os.homedir(), '.polygram-profile-')));
+  const root = realpathSync(mkdtempSync(path.join(HOOK_TEST_ROOT, '.polygram-profile-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const workspace = path.join(root, 'workspace');
   const daemonSecretRoot = path.join(root, 'daemon-secrets');

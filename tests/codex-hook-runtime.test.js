@@ -30,6 +30,7 @@ const {
 
 const BASE_CONFIG = Object.freeze({ marker: 'base' });
 const BASE_RAW = 'marker = "base"\n';
+const HOOK_TEST_ROOT = process.env.POLYGRAM_HOOK_TEST_ROOT ?? os.homedir();
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -37,7 +38,7 @@ function sha256(value) {
 
 function fixture(t) {
   const root = realpathSync(mkdtempSync(
-    path.join(os.homedir(), '.polygram-hook-runtime-'),
+    path.join(HOOK_TEST_ROOT, '.polygram-hook-runtime-'),
   ));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   chmodSync(root, 0o755);

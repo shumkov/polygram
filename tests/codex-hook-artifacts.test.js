@@ -51,13 +51,14 @@ const execFileAsync = promisify(execFile);
 const OPERATOR_UID = process.getuid();
 const SERVICE_UID = OPERATOR_UID + 1;
 const RUNTIME_ID = 'node-24.4.0';
+const HOOK_TEST_ROOT = process.env.POLYGRAM_HOOK_TEST_ROOT ?? os.homedir();
 
 function sha256(contents) {
   return createHash('sha256').update(contents).digest('hex');
 }
 
 function fixture(t) {
-  const base = realpathSync(mkdtempSync(path.join(os.homedir(), '.polygram-hook-artifacts-')));
+  const base = realpathSync(mkdtempSync(path.join(HOOK_TEST_ROOT, '.polygram-hook-artifacts-')));
   t.after(() => {
     try {
       chmodSync(base, 0o755);

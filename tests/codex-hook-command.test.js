@@ -29,11 +29,12 @@ const OPERATOR_UID = process.getuid();
 const SERVICE_UID = OPERATOR_UID + 1;
 const RUNTIME_ID = 'node-24.4.0';
 const VERSION = '1.0.0';
+const HOOK_TEST_ROOT = process.env.POLYGRAM_HOOK_TEST_ROOT ?? os.homedir();
 
 // Descriptors are rendered from a live attestation, never from a shape a test
 // or a caller can write by hand.
 function attested(t) {
-  const base = realpathSync(mkdtempSync(path.join(os.homedir(), '.polygram-hook-command-')));
+  const base = realpathSync(mkdtempSync(path.join(HOOK_TEST_ROOT, '.polygram-hook-command-')));
   t.after(() => rmSync(base, { recursive: true, force: true }));
   chmodSync(base, 0o755);
   const artifactRoot = path.join(base, 'codex-hooks');

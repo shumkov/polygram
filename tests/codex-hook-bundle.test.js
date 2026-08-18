@@ -30,9 +30,10 @@ const {
 } = require('../lib/codex/hook-bundle');
 
 const execFileAsync = promisify(execFile);
+const HOOK_TEST_ROOT = process.env.POLYGRAM_HOOK_TEST_ROOT ?? os.homedir();
 
 function scratch(t) {
-  const root = realpathSync(mkdtempSync(path.join(os.homedir(), '.polygram-hook-bundle-')));
+  const root = realpathSync(mkdtempSync(path.join(HOOK_TEST_ROOT, '.polygram-hook-bundle-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   return root;
 }
