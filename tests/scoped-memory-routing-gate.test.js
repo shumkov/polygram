@@ -347,6 +347,11 @@ test('U24 harness counts every repetition and fails on one private-to-work leak'
   assert.equal(green.adapters[0].routeCaseCount, 130);
   assert.equal(green.adapters[0].acceptedCaseCount, 110);
   assert.equal(green.adapters[0].quarantinedCaseCount, 20);
+  assert.equal(green.adapters[0].zeroAttemptCaseCount, 20);
+  assert.equal(green.adapters[0].firstAttemptCaseCount, 110);
+  assert.equal(green.adapters[0].retriedCaseCount, 0);
+  assert.equal(green.adapters[0].adapterAttemptCount, 110);
+  assert.equal(green.adapters[0].arithmeticPassed, true);
   assert.equal(green.adapters[0].privateToWorkLeaks, 0);
   assert.doesNotMatch(JSON.stringify(green), /compensation|password|medical appointment/i);
 
@@ -387,12 +392,531 @@ test('U24 treats tool use and four injected process/output faults as destination
     adapterIds: ['claude'],
     fixture,
     repetitions: 5,
-    runCase: async (input) => { routedCases += 1; return harness.runRoutingCase(input); },
+    runCase: async (input) => { routedCases += 1; return harness.runRoutingCaseWithRetry(input); },
   });
   assert.equal(faultGate.passed, true);
   assert.equal(faultGate.caseCount, 20);
   assert.equal(routedCases, 20);
   assert.ok(faultGate.outcomes.every((row) => row.queueForRetry && row.destinations.length === 0));
+});
+
+test('U24 retries one mixed-coverage failure without projecting it, then accepts once', async () => {
+  const { fixtures, harness } = await modules();
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.id === 'mixed-01');
+  let calls = 0;
+  const adapter = {
+    id: 'claude:haiku',
+    requireModelEvidence: true,
+    expectedObservedModel: 'claude-haiku-exact',
+    async route() {
+      calls += 1;
+      return {
+        raw: JSON.stringify(calls === 1 ? {
+          category: 'mixed',
+          parts: [
+            { kind: 'work', text: 'Atlas delivery moved to Friday' },
+            { kind: 'sensitive', text: 'Ivan has a medical' },
+          ],
+        } : fixture.oracleOutput),
+        toolCalls: 0,
+        observedModels: ['claude-haiku-exact'],
+      };
+    },
+  };
+
+  const result = await harness.runRoutingCaseWithRetry({ fixture, adapter });
+  assert.equal(calls, 2);
+  assert.equal(result.status, 'accepted');
+  assert.equal(result.attemptCount, 2);
+  assert.deepEqual(result.firstAttempt, {
+    errorCode: 'ROUTER_MIXED_COVERAGE',
+    privateToWorkLeak: false,
+    observedModels: ['claude-haiku-exact'],
+  });
+  assert.deepEqual(result.projection.writes, [
+    { kind: 'work', destinations: ['own_private', 'general'] },
+    { kind: 'sensitive', destinations: ['own_private'] },
+  ]);
+  assert.equal(JSON.stringify(result).includes(fixture.fact), false);
+});
+
+test('U24 exhausts one retry into one queue projection and never makes a third attempt', async () => {
+  const { fixtures, harness } = await modules();
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
+  let calls = 0;
+  const result = await harness.runRoutingCaseWithRetry({
+    fixture,
+    adapter: {
+      id: 'malformed-twice',
+      async route() {
+        calls += 1;
+        return { raw: '{bad', toolCalls: 0 };
+      },
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.status, 'operational_error');
+  assert.equal(result.errorCode, 'ROUTER_OUTPUT_MALFORMED');
+  assert.equal(result.attemptCount, 2);
+  assert.deepEqual(result.projection, {
+    queueForRetry: true,
+    destinations: [],
+  });
+  assert.equal(Object.hasOwn(result.firstAttempt, 'projection'), false);
+});
+
+test('U24 checks parsed model identity before retrying a missing Claude output', async () => {
+  const { adapters, fixtures, harness } = await modules();
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
+  const envelope = (model) => JSON.stringify({
+    is_error: false,
+    modelUsage: { [model]: { inputTokens: 1 } },
+  });
+
+  let wrongCalls = 0;
+  const wrong = await harness.runRoutingCaseWithRetry({
+    fixture,
+    adapter: {
+      id: 'wrong-model-missing-output',
+      requireModelEvidence: true,
+      expectedObservedModel: 'claude-haiku-exact',
+      async route() {
+        wrongCalls += 1;
+        return adapters.parseClaudeResult(envelope('claude-sonnet-wrong'));
+      },
+    },
+  });
+  assert.equal(wrongCalls, 1);
+  assert.equal(wrong.errorCode, 'ROUTER_MODEL_IDENTITY');
+  assert.equal(wrong.attemptCount, 1);
+
+  let correctCalls = 0;
+  const correct = await harness.runRoutingCaseWithRetry({
+    fixture,
+    adapter: {
+      id: 'correct-model-missing-output',
+      requireModelEvidence: true,
+      expectedObservedModel: 'claude-haiku-exact',
+      async route() {
+        correctCalls += 1;
+        return adapters.parseClaudeResult(envelope('claude-haiku-exact'));
+      },
+    },
+  });
+  assert.equal(correctCalls, 2);
+  assert.equal(correct.errorCode, 'ROUTER_OUTPUT_MISSING');
+  assert.equal(correct.attemptCount, 2);
+  assert.deepEqual(correct.firstAttempt.observedModels, ['claude-haiku-exact']);
+  assert.deepEqual(correct.observedModels, ['claude-haiku-exact']);
+  assert.deepEqual(correct.projection, { queueForRetry: true, destinations: [] });
+});
+
+test('U24 retry eligibility is closed and process retries require confirmed cleanup', async () => {
+  const { fixtures, harness } = await modules();
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
+  const retryable = [
+    'ROUTER_TIMEOUT',
+    'ROUTER_PROCESS_EXIT',
+    'ROUTER_OUTPUT_TOO_LARGE',
+    'ROUTER_STDERR_TOO_LARGE',
+    'ROUTER_OUTPUT_MALFORMED',
+    'ROUTER_OUTPUT_MISSING',
+    'ROUTER_OUTPUT_SCHEMA',
+    'ROUTER_PARTS_OVERLAP',
+    'ROUTER_MIXED_AMBIGUOUS',
+    'ROUTER_MIXED_COVERAGE',
+    'ROUTER_MIXED_SENSITIVE_MISSING',
+  ];
+  const terminal = [
+    'ROUTER_INPUT_INVALID',
+    'ROUTER_SECRET_REJECTED',
+    'ROUTER_TOOL_USE',
+    'ROUTER_OUTPUT_SECRET',
+    'ROUTER_PERSONAL_VETO',
+    'ROUTER_MIXED_WORK_SENSITIVE',
+    'ROUTER_MIXED_NOT_EXTRACTIVE',
+    'ROUTER_AUTH_UNAVAILABLE',
+    'ROUTER_MODEL_IDENTITY',
+    'ROUTER_GATE_FAILURE',
+  ];
+  const accepted = {
+    fixtureId: fixture.id,
+    expected: fixture.expected,
+    status: 'accepted',
+    category: 'work',
+    partKinds: ['work'],
+    projection: {
+      queueForRetry: false,
+      writes: [{ kind: 'work', destinations: ['own_private', 'general'] }],
+    },
+  };
+
+  for (const errorCode of retryable) {
+    let calls = 0;
+    const result = await harness.runRoutingCaseWithRetry({
+      fixture,
+      adapter: { id: errorCode, route: async () => { throw new Error('must not run'); } },
+      runCase: async () => {
+        calls += 1;
+        if (calls === 2) return accepted;
+        return {
+          fixtureId: fixture.id,
+          expected: fixture.expected,
+          status: 'operational_error',
+          errorCode,
+          ...(['ROUTER_TIMEOUT', 'ROUTER_PROCESS_EXIT', 'ROUTER_OUTPUT_TOO_LARGE', 'ROUTER_STDERR_TOO_LARGE']
+            .includes(errorCode) ? { diagnostics: { cleanupConfirmed: true } } : {}),
+        };
+      },
+    });
+    assert.equal(calls, 2, errorCode);
+    assert.equal(result.status, 'accepted', errorCode);
+  }
+
+  for (const errorCode of terminal) {
+    let calls = 0;
+    const result = await harness.runRoutingCaseWithRetry({
+      fixture,
+      adapter: { id: errorCode, route: async () => { throw new Error('must not run'); } },
+      runCase: async () => {
+        calls += 1;
+        return {
+          fixtureId: fixture.id,
+          expected: fixture.expected,
+          status: 'operational_error',
+          errorCode,
+        };
+      },
+    });
+    assert.equal(calls, 1, errorCode);
+    assert.equal(result.attemptCount,
+      ['ROUTER_INPUT_INVALID', 'ROUTER_SECRET_REJECTED'].includes(errorCode) ? 0 : 1,
+      errorCode);
+  }
+
+  for (const errorCode of ['ROUTER_TIMEOUT', 'ROUTER_PROCESS_EXIT', 'ROUTER_OUTPUT_TOO_LARGE', 'ROUTER_STDERR_TOO_LARGE']) {
+    let calls = 0;
+    const result = await harness.runRoutingCaseWithRetry({
+      fixture,
+      adapter: { id: errorCode, route: async () => { throw new Error('must not run'); } },
+      runCase: async () => {
+        calls += 1;
+        return {
+          fixtureId: fixture.id,
+          expected: fixture.expected,
+          status: 'operational_error',
+          errorCode,
+          diagnostics: { cleanupConfirmed: false },
+        };
+      },
+    });
+    assert.equal(calls, 1, `${errorCode} without cleanup`);
+    assert.equal(result.attemptCount, 1, errorCode);
+  }
+});
+
+test('U24 stops routing evaluation after an unconfirmed process cleanup', async () => {
+  const { fixtures, harness } = await modules();
+  const rows = fixtures.loadRoutingFixtures().filter((row) => row.family === 'work').slice(0, 2);
+  let calls = 0;
+  let laterAdapterCalls = 0;
+  const result = await harness.runRoutingEvaluation({
+    fixtures: rows,
+    adapters: [
+      {
+        id: 'unsafe-cleanup',
+        async route() {
+          calls += 1;
+          throw Object.assign(new Error('process failed'), {
+            code: 'ROUTER_PROCESS_EXIT',
+            diagnostics: { cleanupConfirmed: false },
+          });
+        },
+      },
+      {
+        id: 'must-not-run',
+        async route() {
+          laterAdapterCalls += 1;
+          return { raw: JSON.stringify(rows[0].oracleOutput), toolCalls: 0 };
+        },
+      },
+    ],
+    repetitions: 1,
+  });
+  assert.equal(calls, 1);
+  assert.equal(laterAdapterCalls, 0);
+  assert.equal(result.passed, false);
+  assert.equal(result.adapters[0].routeCaseCount, 1);
+  assert.equal(result.adapters[0].adapterAttemptCount, 1);
+  assert.equal(result.adapters[0].operationalErrors, 1);
+  assert.equal(result.adapters[0].queueRequestCount, 1);
+  assert.equal(result.adapters[0].destinationFreeQueueRequestCount, 1);
+  assert.equal(result.adapters[0].projectionPassed, true);
+  assert.deepEqual(result.adapters[0].outcomes[0].projection, {
+    queueForRetry: true,
+    destinations: [],
+  });
+});
+
+test('U24 sanitizes first-attempt diagnostics with a closed signal enum', async () => {
+  const { fixtures, harness } = await modules();
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
+  let calls = 0;
+  const result = await harness.runRoutingCaseWithRetry({
+    fixture,
+    adapter: { id: 'sanitized-retry', route: async () => { throw new Error('must not run'); } },
+    runCase: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          fixtureId: fixture.id,
+          expected: fixture.expected,
+          status: 'operational_error',
+          errorCode: 'ROUTER_TIMEOUT',
+          diagnostics: {
+            exitCode: 9,
+            signal: 'PASSWORD=hunter2',
+            stderrBytes: 42,
+            cleanupConfirmed: true,
+            secret: 'must not survive',
+          },
+        };
+      }
+      return {
+        fixtureId: fixture.id,
+        expected: fixture.expected,
+        status: 'accepted',
+        category: 'work',
+        partKinds: ['work'],
+      };
+    },
+  });
+  assert.deepEqual(result.firstAttempt.diagnostics, {
+    exitCode: 9,
+    signal: null,
+    stderrBytes: 42,
+    cleanupConfirmed: true,
+  });
+  assert.equal(JSON.stringify(result).includes('hunter2'), false);
+  assert.equal(JSON.stringify(result).includes('must not survive'), false);
+});
+
+test('U24 counts preflight rejections as zero attempts but adapter-thrown lookalikes as one', async () => {
+  const { fixtures, harness } = await modules();
+  const quarantined = fixtures.loadRoutingFixtures().find((row) => row.expected === 'quarantine');
+  let preflightCalls = 0;
+  const preflight = await harness.runRoutingCaseWithRetry({
+    fixture: quarantined,
+    adapter: { id: 'preflight', route: async () => { preflightCalls += 1; } },
+  });
+  assert.equal(preflightCalls, 0);
+  assert.equal(preflight.errorCode, 'ROUTER_SECRET_REJECTED');
+  assert.equal(preflight.attemptCount, 0);
+
+  const work = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
+  for (const errorCode of ['ROUTER_INPUT_INVALID', 'ROUTER_SECRET_REJECTED']) {
+    let adapterCalls = 0;
+    const result = await harness.runRoutingCaseWithRetry({
+      fixture: work,
+      adapter: {
+        id: `adapter-${errorCode}`,
+        async route() {
+          adapterCalls += 1;
+          throw Object.assign(new Error('adapter failure'), { code: errorCode });
+        },
+      },
+    });
+    assert.equal(adapterCalls, 1, errorCode);
+    assert.equal(result.errorCode, 'ROUTER_GATE_FAILURE', errorCode);
+    assert.equal(result.attemptCount, 1, errorCode);
+    assert.deepEqual(result.projection, { queueForRetry: true, destinations: [] }, errorCode);
+  }
+});
+
+test('U24 normalizes arbitrary thrown codes and makes auth, model, mismatch, and success terminal', async () => {
+  const { fixtures, harness } = await modules();
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
+  let unknownCalls = 0;
+  const unknown = await harness.runRoutingCaseWithRetry({
+    fixture,
+    adapter: {
+      id: 'unknown',
+      async route() {
+        unknownCalls += 1;
+        throw Object.assign(new Error('private failure text'), { code: 'SECRET_VALUE_IN_CODE' });
+      },
+    },
+  });
+  assert.equal(unknownCalls, 1);
+  assert.equal(unknown.errorCode, 'ROUTER_GATE_FAILURE');
+  assert.equal(JSON.stringify(unknown).includes('SECRET_VALUE_IN_CODE'), false);
+
+  for (const scenario of [
+    {
+      id: 'accepted',
+      response: { raw: JSON.stringify(fixture.oracleOutput), toolCalls: 0 },
+      status: 'accepted',
+    },
+    {
+      id: 'auth',
+      error: Object.assign(new Error('auth'), { code: 'ROUTER_AUTH_UNAVAILABLE' }),
+      status: 'operational_error',
+    },
+    {
+      id: 'model',
+      requireModelEvidence: true,
+      expectedObservedModel: 'claude-haiku-exact',
+      response: {
+        raw: JSON.stringify(fixture.oracleOutput), toolCalls: 0, observedModels: ['claude-sonnet-wrong'],
+      },
+      status: 'operational_error',
+    },
+    {
+      id: 'mismatch',
+      response: {
+        raw: JSON.stringify({ category: 'personal', parts: [{ kind: 'sensitive', text: fixture.fact }] }),
+        toolCalls: 0,
+      },
+      status: 'mismatch',
+    },
+  ]) {
+    let calls = 0;
+    const result = await harness.runRoutingCaseWithRetry({
+      fixture,
+      adapter: {
+        id: scenario.id,
+        requireModelEvidence: scenario.requireModelEvidence,
+        expectedObservedModel: scenario.expectedObservedModel,
+        async route() {
+          calls += 1;
+          if (scenario.error) throw scenario.error;
+          return scenario.response;
+        },
+      },
+    });
+    assert.equal(calls, 1, scenario.id);
+    assert.equal(result.status, scenario.status, scenario.id);
+    assert.equal(result.attemptCount, 1, scenario.id);
+  }
+});
+
+test('U24 routing summaries retain bounded retry evidence and exact arithmetic', async () => {
+  const { fixtures, harness } = await modules();
+  const rows = fixtures.loadRoutingFixtures();
+  const attempts = new Map();
+  const adapter = {
+    id: 'claude:haiku',
+    requireModelEvidence: true,
+    expectedObservedModel: 'claude-haiku-exact',
+    async route({ fixture }) {
+      const count = (attempts.get(fixture.id) || 0) + 1;
+      attempts.set(fixture.id, count);
+      const firstMixed = fixture.id === 'mixed-01' && count === 1;
+      return {
+        raw: JSON.stringify(firstMixed ? {
+          category: 'mixed',
+          parts: [
+            { kind: 'work', text: 'Atlas delivery moved to Friday' },
+            { kind: 'sensitive', text: 'Ivan has a medical' },
+          ],
+        } : fixture.oracleOutput),
+        toolCalls: 0,
+        observedModels: ['claude-haiku-exact'],
+      };
+    },
+  };
+  const result = await harness.runRoutingEvaluation({ fixtures: rows, adapters: [adapter], repetitions: 1 });
+  const summary = result.adapters[0];
+  assert.equal(summary.routeCaseCount, 26);
+  assert.equal(summary.zeroAttemptCaseCount, 4);
+  assert.equal(summary.firstAttemptCaseCount, 22);
+  assert.equal(summary.retriedCaseCount, 1);
+  assert.equal(summary.recoveredRetryCount, 1);
+  assert.equal(summary.exhaustedRetryCount, 0);
+  assert.equal(summary.adapterAttemptCount, 23);
+  assert.equal(summary.adapterAttemptCount,
+    summary.firstAttemptCaseCount + summary.retriedCaseCount);
+  assert.equal(summary.attemptsWithoutModelEvidence, 0);
+  assert.equal(summary.modelEvidenceAttemptCount, 23);
+  assert.deepEqual(summary.observedModels, ['claude-haiku-exact']);
+  assert.equal(summary.arithmeticPassed, true);
+  assert.equal(summary.passed, true);
+  assert.equal(summary.outcomes.find((row) => row.fixtureId === 'mixed-01').attemptCount, 2);
+  assert.equal(JSON.stringify(summary).includes('medical appointment'), false);
+});
+
+test('U24 rejects an observed Haiku model change between retry attempts', async () => {
+  const { fixtures, harness } = await modules();
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.id === 'mixed-01');
+  let calls = 0;
+  const result = await harness.runRoutingCaseWithRetry({
+    fixture,
+    adapter: {
+      id: 'claude:haiku',
+      requireModelEvidence: true,
+      async route() {
+        calls += 1;
+        return {
+          raw: JSON.stringify(calls === 1 ? {
+            category: 'mixed',
+            parts: [
+              { kind: 'work', text: 'Atlas delivery moved to Friday' },
+              { kind: 'sensitive', text: 'Ivan has a medical' },
+            ],
+          } : fixture.oracleOutput),
+          toolCalls: 0,
+          observedModels: [`claude-haiku-exact-${calls}`],
+        };
+      },
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.status, 'operational_error');
+  assert.equal(result.errorCode, 'ROUTER_MODEL_IDENTITY');
+  assert.equal(result.attemptCount, 2);
+  assert.deepEqual(harness.projectMemberDmOutcome(result), {
+    queueForRetry: true,
+    destinations: [],
+  });
+});
+
+test('U24 fault evaluation proves two bounded attempts per logical fault', async () => {
+  const { fixtures, harness } = await modules();
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
+  const result = await harness.runFaultEvaluation({
+    adapterIds: ['claude'],
+    fixture,
+    repetitions: 5,
+  });
+  assert.equal(result.passed, true);
+  assert.equal(result.caseCount, 20);
+  assert.equal(result.adapterAttemptCount, 40);
+  assert.equal(result.exhaustedRetryCount, 20);
+  assert.equal(result.queueRequestCount, 20);
+  assert.ok(result.outcomes.every((row) => row.attemptCount === 2));
+});
+
+test('U24 shape and full modes enforce their separate natural-recovery budgets', async () => {
+  const { runner } = await modules();
+  const routing = (recoveredRetryCount, exhaustedRetryCount = 0) => ({
+    adapters: [{ recoveredRetryCount, exhaustedRetryCount }],
+  });
+  assert.deepEqual(runner.evaluateRetryBudget('shape', routing(0)), {
+    limit: 0,
+    recoveredRetryCount: 0,
+    exhaustedRetryCount: 0,
+    passed: true,
+  });
+  assert.equal(runner.evaluateRetryBudget('shape', routing(1)).passed, false);
+  assert.equal(runner.evaluateRetryBudget('full', routing(1)).passed, true);
+  assert.equal(runner.evaluateRetryBudget('full', routing(2)).passed, false);
+  assert.equal(runner.evaluateRetryBudget('full', routing(0, 1)).passed, false);
+  assert.throws(() => runner.evaluateRetryBudget('quick', routing(0)), /shape or full/);
+  await assert.rejects(runner.runGate({
+    codexBin: '/does/not/exist/codex',
+    claudeBin: '/does/not/exist/claude',
+    mode: 'quick',
+  }), /shape or full/);
 });
 
 test('U24 member-DM projection dual-writes uncertain work and never routes faults', async () => {

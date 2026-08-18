@@ -16,7 +16,11 @@ import {
   subscriptionOnlyEnv,
 } from './adapters.mjs';
 import { loadRoutingFixtures, fixtureManifestHash } from './fixtures.mjs';
-import { runFaultEvaluation, runRoutingEvaluation } from './harness.mjs';
+import {
+  runFaultEvaluation,
+  runRoutingEvaluation,
+  sanitizeProcessDiagnostics,
+} from './harness.mjs';
 
 const require = createRequire(import.meta.url);
 const { resolvePinnedCodexBinary } = require('../../../lib/codex/binary.js');
@@ -30,6 +34,7 @@ const ALLOWED_FAILURE_CODES = new Set([
   'ROUTER_CLAUDE_RUNTIME_MISMATCH',
   'ROUTER_CODEX_RUNTIME_MISMATCH',
   'ROUTER_GATE_FAILURE',
+  'ROUTER_MODEL_IDENTITY',
   'ROUTER_OUTPUT_MALFORMED',
   'ROUTER_OUTPUT_MISSING',
   'ROUTER_OUTPUT_SCHEMA',
@@ -41,6 +46,15 @@ const ALLOWED_FAILURE_CODES = new Set([
 const SHAPE_FAMILIES = new Set([
   'work', 'personal', 'mixed', 'uncertain_work', 'known_secret', 'prose_secret',
 ]);
+const MODE_CONFIG = Object.freeze({
+  shape: Object.freeze({ fullCorpus: false, repetitions: 1, recoveredRetryLimit: 0 }),
+  full: Object.freeze({ fullCorpus: true, repetitions: 5, recoveredRetryLimit: 1 }),
+});
+
+function modeConfig(mode) {
+  if (!Object.hasOwn(MODE_CONFIG, mode)) throw new TypeError('--mode must be shape or full');
+  return MODE_CONFIG[mode];
+}
 
 function usage() {
   return [
@@ -66,7 +80,7 @@ export function parseArgs(argv) {
   for (const key of ['codex-bin', 'claude-bin', 'output', 'mode']) {
     if (!values[key]) throw new TypeError(`missing --${key}`);
   }
-  if (!['shape', 'full'].includes(values.mode)) throw new TypeError('--mode must be shape or full');
+  modeConfig(values.mode);
   if (values.mode === 'full' && !values['expected-model']) {
     throw new TypeError('--expected-model from the shape receipt is required for full mode');
   }
@@ -139,18 +153,31 @@ function failureCode(error) {
 }
 
 export function buildStopReceipt(error) {
-  const diagnostics = error?.diagnostics || {};
+  const diagnostics = sanitizeProcessDiagnostics(error?.diagnostics);
   return {
     schemaVersion: 'polygram-memory-routing-gate/v1',
     generatedAt: new Date().toISOString(),
     gate: 'STOP',
     failure: {
       code: failureCode(error),
-      exitCode: Number.isInteger(diagnostics.exitCode) ? diagnostics.exitCode : null,
-      signal: typeof diagnostics.signal === 'string' ? diagnostics.signal : null,
-      stderrBytes: Number.isInteger(diagnostics.stderrBytes) ? diagnostics.stderrBytes : 0,
-      cleanupConfirmed: diagnostics.cleanupConfirmed === true,
+      ...diagnostics,
     },
+  };
+}
+
+export function evaluateRetryBudget(mode, routing) {
+  const { recoveredRetryLimit: limit } = modeConfig(mode);
+  const recoveredRetryCount = routing.adapters.reduce((sum, adapter) => (
+    sum + adapter.recoveredRetryCount
+  ), 0);
+  const exhaustedRetryCount = routing.adapters.reduce((sum, adapter) => (
+    sum + adapter.exhaustedRetryCount
+  ), 0);
+  return {
+    limit,
+    recoveredRetryCount,
+    exhaustedRetryCount,
+    passed: exhaustedRetryCount === 0 && recoveredRetryCount <= limit,
   };
 }
 
@@ -175,6 +202,7 @@ async function attestClaude(binary) {
 }
 
 export async function runGate({ codexBin, claudeBin, mode, expectedModel }) {
+  const config = modeConfig(mode);
   const [codexRuntime, claudeRuntime] = await Promise.all([
     attestCodex(codexBin),
     attestClaude(claudeBin),
@@ -184,19 +212,20 @@ export async function runGate({ codexBin, claudeBin, mode, expectedModel }) {
     inspectClaudeAuth(claudeRuntime.canonicalPath),
   ]);
   const allFixtures = loadRoutingFixtures();
-  const fixtures = mode === 'full' ? allFixtures : shapeFixtures(allFixtures);
-  const repetitions = mode === 'full' ? 5 : 1;
+  const fixtures = config.fullCorpus ? allFixtures : shapeFixtures(allFixtures);
+  const { repetitions } = config;
   const adapter = createClaudeAdapter({
     binary: claudeRuntime.canonicalPath,
     model: CLAUDE_MODEL,
     expectedObservedModel: expectedModel,
   });
   const routing = await runRoutingEvaluation({ fixtures, adapters: [adapter], repetitions });
+  const retryBudget = evaluateRetryBudget(mode, routing);
   const faultFixture = allFixtures.find((fixture) => fixture.family === 'work');
   const faults = await runFaultEvaluation({
     adapterIds: [adapter.id],
     fixture: faultFixture,
-    repetitions: mode === 'full' ? 5 : 1,
+    repetitions: 5,
   });
   return {
     schemaVersion: 'polygram-memory-routing-gate/v1',
@@ -235,8 +264,9 @@ export async function runGate({ codexBin, claudeBin, mode, expectedModel }) {
       providerCustomizationsDisabled: true,
     },
     routing,
+    retryBudget,
     faults,
-    gate: routing.passed && faults.passed ? 'CONTINUE' : 'STOP',
+    gate: routing.passed && retryBudget.passed && faults.passed ? 'CONTINUE' : 'STOP',
   };
 }
 

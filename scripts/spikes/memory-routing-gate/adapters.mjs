@@ -187,8 +187,12 @@ export function parseClaudeResult(stdout) {
   try { envelope = JSON.parse(stdout); } catch {
     throw Object.assign(new Error('ROUTER_OUTPUT_MALFORMED'), { code: 'ROUTER_OUTPUT_MALFORMED' });
   }
+  const observedModels = envelope?.modelUsage && typeof envelope.modelUsage === 'object'
+    ? Object.keys(envelope.modelUsage).sort()
+    : [];
+  const envelopeError = (code) => Object.assign(new Error(code), { code, observedModels });
   if (envelope?.is_error === true || envelope?.terminal_reason === 'api_error') {
-    throw Object.assign(new Error('ROUTER_AUTH_UNAVAILABLE'), { code: 'ROUTER_AUTH_UNAVAILABLE' });
+    throw envelopeError('ROUTER_AUTH_UNAVAILABLE');
   }
   let raw;
   if (envelope && typeof envelope.structured_output === 'object' && envelope.structured_output) {
@@ -196,11 +200,8 @@ export function parseClaudeResult(stdout) {
   } else if (typeof envelope?.result === 'string') {
     raw = envelope.result;
   } else {
-    throw Object.assign(new Error('ROUTER_OUTPUT_MISSING'), { code: 'ROUTER_OUTPUT_MISSING' });
+    throw envelopeError('ROUTER_OUTPUT_MISSING');
   }
-  const observedModels = envelope?.modelUsage && typeof envelope.modelUsage === 'object'
-    ? Object.keys(envelope.modelUsage).sort()
-    : [];
   return { raw, observedModels };
 }
 

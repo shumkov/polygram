@@ -2,7 +2,7 @@
 title: Provider-Neutral Scoped Memory for Shumabit - Plan
 type: feat
 date: 2026-07-31
-revised: 2026-08-14
+revised: 2026-08-18
 topic: shumabit-scoped-memory
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
@@ -742,14 +742,20 @@ are new prerequisites or gates and do not renumber existing units.
 
 ### U24. Narrow routing/auth boundary spike (blocker)
 
-- **Status (2026-08-18):** The reviewed Node 24 harness passes 127/127 with
-  adjacent secret/memory tests. The authorized VPS shape gate passed, but the
-  final full gate stopped with 109/110 successful real Haiku classifications,
-  one destination-free `ROUTER_MIXED_COVERAGE` error, zero mismatches, zero
-  private-to-work leaks, and 20/20 injected faults handled correctly. U24
-  remains blocked pending an aligned deterministic-retry gate (recommended)
-  or characterization of a stronger subscription-backed router; do not rerun
-  the unchanged stochastic gate until it happens to pass.
+- **Status (2026-08-18):** Before the retry amendment, the reviewed Node 24
+  harness and adjacent secret/memory tests passed 127/127. After the amendment,
+  the focused suite passed 28/28 and the adjacent six-file suite passed 92/92.
+  The deterministic single-retry amendment is implemented, red-to-green
+  tested, and independently reviewed. The corrected
+  native-executable VPS shape gate passed. The one authorized full gate
+  stopped with 108 accepted, 20 pre-model quarantined, two destination-free
+  terminal operational errors, zero mismatches, zero privacy flags, two
+  recovered retries, and two confirmed-cleanup timeout retries exhausted.
+  Exact model identity, projection/arithmetic checks, and 20/20 injected fault
+  outcomes passed. U24 remains blocked by operational timeout/process-boundary
+  reliability, not a privacy or model-identity failure. Do not rerun the
+  unchanged gate in hope of a stochastic pass; the next decision is a separate
+  narrow characterization of the timeout/process boundary and router choice.
 - **Goal:** Decide whether the smallest successor to U22 is safe enough to
   implement: unchanged native extraction followed by a separate narrow
   personal-sensitivity routing/splitting pass.
@@ -778,7 +784,11 @@ are new prerequisites or gates and do not renumber existing units.
   changing a destination.
   Unknown fields, missing coverage, overlap, empty parts, invalid
   categories, malformed output, timeout, or process failure are operational
-  errors that queue/retry and select no destination.
+  errors that select no destination. The reviewed gate retries a closed set of
+  eligible errors exactly once, only after confirmed process cleanup where a
+  process is involved; it projects only the terminal result and emits one
+  destination-free queue-request intent if the retry exhausts. This gate
+  receipt is not a durable production queue; U15/U16 own that implementation.
 - **Closed result schema:** stdout is exactly
   `{category, parts}` with no additional fields. `category` is the enum above;
   every part is exactly `{kind, text}`, where `kind` is `work` or `sensitive`
@@ -805,7 +815,8 @@ are new prerequisites or gates and do not renumber existing units.
   non-overlapping parts for accepted cases, 100% deterministic veto of
   explicit-private/obvious-blacklist categories, 100% suspected/unresolved
   secret quarantine, 100% uncertain-but-non-private work/general dual-write,
-  and 100% operational errors queued without a destination. Any
+  and 100% terminal operational errors represented by a destination-free
+  queue-request intent in the gate receipt. This is not a durable queue. Any
   unresolved process/auth boundary,
   model identity, or commercial-key ambiguity fails U24 and leaves memory
   feature enablement blocked; do not call an existing subscription invocation
@@ -1276,7 +1287,10 @@ no duplicate estimate. No estimate assumes a managed-provider alternative.
   stdin-only facts, schema-only stdout, exact runtime/model/auth/process
   evidence, no commercial API key, zero private-to-general leaks on the
   fixture, mixed split, secret rejection, and malformed/timeout/retry queue
-  behavior.
+  behavior. The corrected shape gate passed. The single full run retained zero
+  privacy/model-identity/projection failures but stopped on two exhausted
+  confirmed-cleanup timeouts and exceeded the natural-retry budget, so this
+  gate remains open and must not be rerun unchanged.
 - U16a: host/provider confirmation and model staging, process-writer overlap,
   same-scope cross-process storage, then five production-class Linux runs with
   owner/busy/cleanup attestations. The existing same-process 5/5 failure and
