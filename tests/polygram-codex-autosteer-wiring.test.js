@@ -108,7 +108,7 @@ describe('Codex main-loop steering wiring', () => {
     );
   });
 
-  test('claims before async steering and finalizes before the accepted reaction', () => {
+  test('Claude settles accepted ownership while Codex keeps deferred settlement', () => {
     const claim = steering.indexOf(
       'codexRuntimeController.claimDispatchReservation(',
     );
@@ -119,10 +119,44 @@ describe('Codex main-loop steering wiring', () => {
     const reaction = steering.indexOf("reactor.setState('AUTOSTEERED')");
     assert.ok(claim >= 0 && claim < steer);
     assert.ok(steer < finalize && finalize < reaction);
-    assert.doesNotMatch(
-      steering.slice(reaction),
-      /markReplied\(\);/,
-      'accepted steering must inherit the target turn settlement',
+    const claudeInject = steering.indexOf('autosteer.tryAutosteer({');
+    const claudeSettlement = steering.indexOf(
+      'steered = settleAcceptedAutosteerOwnership({',
+    );
+    assert.ok(
+      claudeInject < claudeSettlement && claudeSettlement < reaction,
+      'accepted Claude injection must become terminal before its success reaction',
+    );
+    assert.match(
+      steering.slice(claudeSettlement, reaction),
+      /selectedProvider: acceptedAutosteerProvider/,
+      'ownership must follow the branch that accepted the steer, not a changed route',
+    );
+  });
+
+  test('Claude settlement ambiguity cannot fall through to a primary resend', () => {
+    const settlement = steering.indexOf(
+      'steered = settleAcceptedAutosteerOwnership({',
+    );
+    const ambiguityBranch = steering.indexOf(
+      "steered.outcome === 'accepted-persistence-ambiguous'",
+    );
+    const primaryGuard = steering.indexOf(
+      'if (shouldDispatchPrimaryAfterAutosteer({',
+    );
+    const primarySend = steering.indexOf('sendToProcess(sessionKey, prompt,');
+    const reaction = steering.indexOf("reactor.setState('AUTOSTEERED')");
+    assert.ok(
+      settlement >= 0
+        && primaryGuard > settlement
+        && primaryGuard < primarySend
+        && ambiguityBranch > primarySend
+        && ambiguityBranch < reaction,
+      'accepted-but-ambiguous input must be excluded from primary send and exit before success reaction',
+    );
+    assert.match(
+      steering.slice(ambiguityBranch, reaction),
+      /may have been incorporated/,
     );
   });
 

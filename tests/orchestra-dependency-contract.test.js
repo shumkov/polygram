@@ -8,7 +8,7 @@ const lockfile = require('../package-lock.json');
 const orchestra = require('@shumkov/orchestra');
 const orchestraPackage = require('@shumkov/orchestra/package.json');
 
-const REQUIRED_ORCHESTRA_VERSION = '0.10.14';
+const REQUIRED_ORCHESTRA_VERSION = '0.10.21';
 
 test('installed Orchestra exactly matches the reviewed Codex contract', () => {
   assert.equal(
@@ -58,9 +58,33 @@ test('installed Orchestra exactly matches the reviewed Codex contract', () => {
     },
   );
   assert.equal(typeof orchestra.codexProtocolSchema, 'object');
+  assert.deepEqual(
+    orchestra.codexProtocolSchema.clientRequests['hooks/list'],
+    {
+      required: ['cwds'],
+      optional: [],
+      internal: true,
+      stateChanging: false,
+    },
+  );
+  for (const method of ['hook/started', 'hook/completed']) {
+    assert.equal(
+      orchestra.codexProtocolSchema.droppedServerNotifications.includes(method),
+      true,
+      method,
+    );
+  }
+  assert.equal(
+    typeof orchestra.CodexAppServerClient.prototype.verifyHooks,
+    'function',
+  );
   assert.equal(typeof orchestra.ProcessManager.prototype.replaceRuntime, 'function');
   assert.equal(typeof orchestra.ProcessManager.prototype.steerTurn, 'function');
   assert.equal(typeof orchestra.ProcessManager.prototype.interrupt, 'function');
+  assert.equal(
+    typeof orchestra.ProcessManager.prototype.inspectCleanRestartQualification,
+    'function',
+  );
   assert.equal(typeof orchestra.ProcessManager.prototype.retireForCleanRestart, 'function');
   assert.equal(typeof orchestra.ProcessManager.prototype.retireExpectedProcess, 'function');
   assert.equal(
@@ -68,4 +92,48 @@ test('installed Orchestra exactly matches the reviewed Codex contract', () => {
     true,
   );
   assert.equal(orchestra.processGuard.CODEX_SUPERVISOR_GRACE_MS, 2_000);
+});
+
+test('installed Orchestra sends clean replay only to the expected live process', async () => {
+  const manager = new orchestra.ProcessManager({
+    processFactory: () => { throw new Error('unexpected spawn'); },
+  });
+  const calls = [];
+  const process = {
+    closed: false,
+    async send(prompt, options) {
+      calls.push({ prompt, options });
+      return { ok: true };
+    },
+  };
+  manager.procs.set('chat:topic', process);
+
+  assert.deepEqual(
+    await manager.send('chat:topic', 'continue', {
+      expectedProcess: process,
+      replay: true,
+    }),
+    { ok: true },
+  );
+  assert.deepEqual(calls, [{
+    prompt: 'continue',
+    options: { replay: true },
+  }]);
+
+  await assert.rejects(
+    manager.send('chat:topic', 'wrong generation', {
+      expectedProcess: {},
+      replay: true,
+    }),
+    (error) => error?.code === 'PROCESS_PRECONDITION_FAILED',
+  );
+  process.closed = true;
+  await assert.rejects(
+    manager.send('chat:topic', 'closed generation', {
+      expectedProcess: process,
+      replay: true,
+    }),
+    (error) => error?.code === 'PROCESS_PRECONDITION_FAILED',
+  );
+  assert.equal(calls.length, 1);
 });

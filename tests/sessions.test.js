@@ -185,7 +185,9 @@ describe('migrateJsonToDb — malformed JSON does not crash boot', () => {
     const ev = db.raw.prepare("SELECT * FROM events WHERE kind='sessions-json-malformed'").get();
     assert.ok(ev, 'sessions-json-malformed event should be logged');
     const detail = JSON.parse(ev.detail_json);
-    assert.ok(detail.quarantined_to.includes('.malformed-'));
+    // The quarantine is recorded as a fact, not as a filesystem path.
+    assert.equal(detail.quarantined, true);
+    assert.equal(detail.path, undefined);
   });
 
   test('works even when db lacks logEvent (no crash)', () => {

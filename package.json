@@ -1,13 +1,15 @@
 {
   "name": "polygram",
-  "version": "0.37.1",
+  "version": "0.38.9",
   "description": "Telegram daemon for Claude Code that preserves the OpenClaw per-chat session model. Migration path for OpenClaw users moving to Claude Code.",
   "main": "lib/ipc/client.js",
   "bin": {
     "polygram": "polygram.js",
     "polygram-split-db": "scripts/split-db.js",
     "polygram-ipc": "scripts/ipc-smoke.js",
-    "polygram-doctor": "scripts/doctor.js"
+    "polygram-doctor": "scripts/doctor.js",
+    "polygram-codex-hook-artifacts": "scripts/codex-hook-artifacts.js",
+    "polygram-build-codex-hook-bundle": "scripts/build-codex-hook-bundle.js"
   },
   "files": [
     "polygram.js",
@@ -16,11 +18,14 @@
     "scripts/split-db.js",
     "scripts/ipc-smoke.js",
     "scripts/doctor.js",
+    "scripts/build-codex-hook-bundle.js",
+    "scripts/codex-hook-artifacts.js",
     "skills/",
     "commands/",
     ".claude-plugin/",
     "ops/polygram.plist.example",
     "ops/README.md",
+    "docs/2026-08-16-003-codex-protected-hook-artifact-runbook.md",
     "config.example.json"
   ],
   "scripts": {
@@ -63,7 +68,8 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.2.123",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@shumkov/orchestra": "0.10.14",
+    "@shumkov/orchestra": "0.10.21",
+    "acorn": "8.18.0",
     "better-sqlite3": "^12.9.0",
     "grammy": "^1.42.0",
     "markdown-it": "^14.1.1",

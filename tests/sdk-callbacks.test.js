@@ -172,7 +172,7 @@ describe('onInit — upserts session row with TOPIC-RESOLVED spawn identity', ()
         + "(pm:'tmux' aliases to 'cli' — factory.js Phase 4)");
   });
 
-  test('Codex persists its thread namespace without overwriting the dormant Claude session', () => {
+  test('Codex init does not persist incomplete provider identity or overwrite dormant Claude state', () => {
     const { db, dbPath } = freshDb('sdk-callbacks-codex-init');
     try {
       db.upsertSession({
@@ -200,19 +200,15 @@ describe('onInit — upserts session row with TOPIC-RESOLVED spawn identity', ()
         threadId: '24',
         label: 'Codex',
         cwd: '/codex/workspace',
-        model: 'gpt-5.6-sol',
-        effort: 'xhigh',
+        desiredSettings: Object.freeze({
+          model: 'gpt-5.6-sol',
+          effort: 'xhigh',
+        }),
+        spawnProfileId: 'a'.repeat(64),
       });
 
       const codex = db.getProviderSession('12345:24', 'codex:app-server');
-      assert.equal(codex.provider, 'codex');
-      assert.equal(codex.provider_session_id, 'thread-codex-a');
-      assert.equal(codex.app_server_session_id, null);
-      assert.equal(codex.agent, null);
-      assert.equal(codex.cwd, '/codex/workspace');
-      assert.equal(codex.model, 'gpt-5.6-sol');
-      assert.equal(codex.effort, 'xhigh');
-      assert.equal(codex.pm_backend, 'codex');
+      assert.equal(codex, undefined);
 
       const claude = db.getSession('12345:24');
       assert.equal(claude.claude_session_id, 'claude-session-a');
@@ -1024,7 +1020,10 @@ describe('R8 — onInjectFail surfaces a failed autosteer paste promptly', () =>
     const ev = h.events.find((e) => e.kind === 'inject-fail');
     assert.ok(ev, 'inject-fail must be logged so a failed paste is diagnosable');
     assert.equal(ev.detail.msg_id, 658);
-    assert.match(ev.detail.error, /no server running/);
+    // The paste error text can quote whatever was being pasted, so the event
+    // carries its size; the message itself stays in the process log.
+    assert.equal(ev.detail.error_len, 'tmux paste-buffer: no server running'.length);
+    assert.equal(ev.detail.error, undefined);
 
     // The ✍ reaction (applied by autosteeredRefs.add when the message
     // was classified as an autosteer) must be cleared — otherwise it

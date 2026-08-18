@@ -12,6 +12,9 @@ const os = require('os');
 const ipcServer = require('../lib/ipc/server');
 const ipcClient = require('../lib/ipc/client');
 const { createIpcHandlers } = require('../lib/ipc/handlers');
+const {
+  requireRestartRequestId,
+} = require('../lib/ipc/restart-request-id');
 
 const silentLogger = { log: () => {}, error: () => {} };
 
@@ -33,6 +36,16 @@ function removeFixture(dir) {
 async function startServer(handlers) {
   sockPath = uniquePath();
   server = await ipcServer.start({ path: sockPath, handlers, logger: silentLogger });
+}
+
+async function startServerWithSecret(handlers, secret) {
+  sockPath = uniquePath();
+  server = await ipcServer.start({
+    path: sockPath,
+    handlers,
+    secret,
+    logger: silentLogger,
+  });
 }
 
 async function stopServer() {
@@ -115,6 +128,42 @@ describe('ipc round-trip', () => {
     assert.equal(res.bot, 'shumabit');
   });
 
+  test('identity op returns only content-free daemon readiness fields', async () => {
+    const daemonIdentity = Object.freeze({
+      pid: 4242,
+      daemon_instance_id: 'e565dbae-44cf-4fc0-b7df-91ee3305e588',
+      package_version: '0.38.1',
+      main_realpath_sha256: 'a'.repeat(64),
+    });
+    await startServer(createIpcHandlers({
+      botName: 'shumabit',
+      daemonIdentity,
+      getInFlightHandlers: () => new Map(),
+      handleSendOverIpc: async () => ({}),
+    }));
+
+    const res = await ipcClient.call({ path: sockPath, op: 'identity' });
+
+    assert.deepEqual(res, {
+      id: null,
+      ok: true,
+      bot: 'shumabit',
+      ...daemonIdentity,
+    });
+    assert.deepEqual(
+      Object.keys(res).sort(),
+      [
+        'bot',
+        'daemon_instance_id',
+        'id',
+        'main_realpath_sha256',
+        'ok',
+        'package_version',
+        'pid',
+      ],
+    );
+  });
+
   test('deploy restart op directly invokes the daemon restart request', async () => {
     const calls = [];
     await startServer(createIpcHandlers({
@@ -122,20 +171,227 @@ describe('ipc round-trip', () => {
       getInFlightHandlers: () => new Map(),
       handleSendOverIpc: async () => ({}),
       requestDeployRestart: (req) => {
-        calls.push(req.op);
+        calls.push({ op: req.op, id: req.id });
         return { accepted: true, old_pid: 4242 };
       },
     }));
 
-    const res = await ipcClient.call({ path: sockPath, op: 'deploy_restart' });
+    const res = await ipcClient.call({
+      path: sockPath,
+      op: 'deploy_restart',
+      id: 'restart-request-42',
+    });
 
-    assert.deepEqual(calls, ['deploy_restart']);
+    assert.deepEqual(calls, [{
+      op: 'deploy_restart',
+      id: 'restart-request-42',
+    }]);
     assert.deepEqual(res, {
-      id: null,
+      id: 'restart-request-42',
       ok: true,
       accepted: true,
       old_pid: 4242,
     });
+  });
+
+  test('foreground canary target op directly invokes the daemon target authorizer', async () => {
+    const calls = [];
+    await startServerWithSecret(createIpcHandlers({
+      botName: 'shumorobot',
+      getInFlightHandlers: () => new Map(),
+      handleSendOverIpc: async () => ({}),
+      requestForegroundCanaryTarget: (req) => {
+        calls.push(req);
+        return {
+          outcome: 'rejected',
+          rejection_code: 'daemon-busy',
+        };
+      },
+    }), 'secret');
+
+    const request = {
+      path: sockPath,
+      op: 'foreground_canary_target',
+      id: 'restart-request-42',
+      secret: 'secret',
+      payload: {
+        provider: 'claude',
+        configured_scope_sha256: 'a'.repeat(64),
+      },
+    };
+    const response = await ipcClient.call(request);
+
+    assert.deepEqual(calls, [{
+      op: request.op,
+      id: request.id,
+      secret: request.secret,
+      provider: request.payload.provider,
+      configured_scope_sha256: request.payload.configured_scope_sha256,
+    }]);
+    assert.deepEqual(response, {
+      id: 'restart-request-42',
+      ok: true,
+      outcome: 'rejected',
+      rejection_code: 'daemon-busy',
+    });
+  });
+
+  test('clean restart qualification is authenticated, selector-free, and content-free', async () => {
+    const calls = [];
+    const daemonIdentity = Object.freeze({
+      pid: 4242,
+      daemon_instance_id: 'instance-qualification-42',
+      package_version: '0.38.1',
+      main_realpath_sha256: 'a'.repeat(64),
+    });
+    await startServerWithSecret(createIpcHandlers({
+      botName: 'shumorobot',
+      daemonIdentity,
+      getInFlightHandlers: () => new Map(),
+      handleSendOverIpc: async () => ({}),
+      inspectCleanRestartQualification: async (...args) => {
+        calls.push(args);
+        return {
+          outcome: 'qualified',
+          reason: 'eligible',
+          generationDigest: 'b'.repeat(64),
+          activityEpoch: 7,
+          processState: 'Idle',
+          activeTurnCount: 0,
+          pendingDeliveryCount: 0,
+          backgroundOwnerCount: 0,
+          backgroundTerminalCount: 0,
+          backgroundTerminalRegistryComplete: true,
+          observedAtMs: 1_786_000_000_000,
+        };
+      },
+    }), 's3cret');
+
+    const unauthenticated = await ipcClient.call({
+      path: sockPath,
+      op: 'clean_restart_qualification',
+    });
+    assert.deepEqual(
+      { ok: unauthenticated.ok, error: unauthenticated.error },
+      { ok: false, error: 'auth' },
+    );
+
+    const response = await ipcClient.call({
+      path: sockPath,
+      op: 'clean_restart_qualification',
+      secret: 's3cret',
+    });
+    assert.deepEqual(calls, [[]]);
+    assert.deepEqual(response, {
+      id: null,
+      ok: true,
+      bot: 'shumorobot',
+      daemon_instance_id: 'instance-qualification-42',
+      package_version: '0.38.1',
+      observed_at_ms: 1_786_000_000_000,
+      generation_digest: 'b'.repeat(64),
+      activity_epoch: 7,
+      process_state: 'Idle',
+      active_turn_count: 0,
+      pending_delivery_count: 0,
+      background_owner_count: 0,
+      background_terminal_count: 0,
+      background_terminal_registry_complete: true,
+      outcome_code: 'eligible',
+    });
+    assert.doesNotMatch(JSON.stringify(response), /session|thread|provider|body|message/i);
+  });
+
+  test('clean restart qualification rejects every selector or unknown payload field', async () => {
+    let calls = 0;
+    await startServer(createIpcHandlers({
+      botName: 'shumorobot',
+      daemonIdentity: {
+        daemon_instance_id: 'instance-qualification-42',
+        package_version: '0.38.1',
+      },
+      getInFlightHandlers: () => new Map(),
+      handleSendOverIpc: async () => ({}),
+      inspectCleanRestartQualification: async () => {
+        calls += 1;
+        return {};
+      },
+    }));
+
+    for (const payload of [
+      { session_key: '100:3' },
+      { provider_session_id: 'thread-secret' },
+      { selector: {} },
+      { unexpected: true },
+    ]) {
+      const response = await ipcClient.call({
+        path: sockPath,
+        op: 'clean_restart_qualification',
+        payload,
+      });
+      assert.equal(response.ok, false);
+      assert.match(response.error, /unknown fields/);
+    }
+    assert.equal(calls, 0);
+  });
+
+  test('clean restart qualification bounds inspector failure without leaking its error', async () => {
+    await startServer(createIpcHandlers({
+      botName: 'shumorobot',
+      daemonIdentity: {
+        daemon_instance_id: 'instance-qualification-42',
+        package_version: '0.38.1',
+      },
+      getInFlightHandlers: () => new Map(),
+      handleSendOverIpc: async () => ({}),
+      inspectCleanRestartQualification: async () => {
+        throw new Error('provider thread secret must not cross IPC');
+      },
+    }));
+
+    const response = await ipcClient.call({
+      path: sockPath,
+      op: 'clean_restart_qualification',
+    });
+    assert.deepEqual(Object.keys(response), [
+      'id',
+      'ok',
+      'bot',
+      'daemon_instance_id',
+      'package_version',
+      'observed_at_ms',
+      'generation_digest',
+      'activity_epoch',
+      'process_state',
+      'active_turn_count',
+      'pending_delivery_count',
+      'background_owner_count',
+      'background_terminal_count',
+      'background_terminal_registry_complete',
+      'outcome_code',
+    ]);
+    assert.deepEqual(
+      { ...response, observed_at_ms: 0 },
+      {
+        id: null,
+        ok: true,
+        bot: 'shumorobot',
+        daemon_instance_id: 'instance-qualification-42',
+        package_version: '0.38.1',
+        observed_at_ms: 0,
+        generation_digest: null,
+        activity_epoch: null,
+        process_state: 'unknown',
+        active_turn_count: 0,
+        pending_delivery_count: 0,
+        background_owner_count: 0,
+        background_terminal_count: 0,
+        background_terminal_registry_complete: false,
+        outcome_code: 'inspection-failed',
+      },
+    );
+    assert.equal(Number.isSafeInteger(response.observed_at_ms), true);
+    assert.doesNotMatch(JSON.stringify(response), /provider|thread|secret|error/i);
   });
 
   test('id is echoed back in reply', async () => {
@@ -198,6 +454,22 @@ describe('ipc round-trip', () => {
       }),
       /call timeout/,
     );
+  });
+});
+
+describe('deploy restart request IDs', () => {
+  test('accepts a bounded opaque correlation ID', () => {
+    const value = 'r'.repeat(128);
+    assert.equal(requireRestartRequestId(value), value);
+  });
+
+  test('rejects missing, oversized, control-bearing, and non-string IDs', () => {
+    for (const value of [undefined, '', 'r'.repeat(129), 'bad\nvalue', 42]) {
+      assert.throws(
+        () => requireRestartRequestId(value),
+        (error) => error?.code === 'INVALID_DEPLOY_RESTART_REQUEST_ID',
+      );
+    }
   });
 });
 
@@ -485,5 +757,46 @@ describe('ipc auth (rc.69)', () => {
     });
     assert.equal(res.ok, true);
     assert.deepEqual(res.result, { ok: 1 });
+  });
+
+  test('daemon identity requires the current secret while ping stays public', async () => {
+    const daemonIdentity = Object.freeze({
+      pid: 4242,
+      daemon_instance_id: 'e565dbae-44cf-4fc0-b7df-91ee3305e588',
+      package_version: '0.38.1',
+      main_realpath_sha256: 'a'.repeat(64),
+    });
+    await startWithSecret(createIpcHandlers({
+      botName: 'shumabit',
+      daemonIdentity,
+      getInFlightHandlers: () => new Map(),
+      handleSendOverIpc: async () => ({}),
+    }), 's3cret');
+
+    const missing = await ipcClient.call({ path: sockPath, op: 'identity' });
+    const bad = await ipcClient.call({
+      path: sockPath,
+      op: 'identity',
+      secret: 'wrong',
+    });
+    const ping = await ipcClient.call({ path: sockPath, op: 'ping' });
+    const identity = await ipcClient.call({
+      path: sockPath,
+      op: 'identity',
+      secret: 's3cret',
+    });
+
+    assert.deepEqual({ ok: missing.ok, error: missing.error }, { ok: false, error: 'auth' });
+    assert.deepEqual({ ok: bad.ok, error: bad.error }, { ok: false, error: 'auth' });
+    assert.deepEqual(
+      { ok: ping.ok, pong: ping.pong, bot: ping.bot },
+      { ok: true, pong: true, bot: 'shumabit' },
+    );
+    assert.deepEqual(identity, {
+      id: null,
+      ok: true,
+      bot: 'shumabit',
+      ...daemonIdentity,
+    });
   });
 });

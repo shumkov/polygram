@@ -31,11 +31,20 @@ const {
   preflightCodexRuntime,
   resolveCodexTargetPin,
 } = require('@shumkov/orchestra');
+const {
+  HOOK_RUNTIME_RELATIVE_PATH,
+  installHookArtifactVersion,
+} = require('../lib/codex/hook-artifacts');
+const {
+  CAPTURE_DIRECTORY,
+  HOOK_EVENTS,
+} = require('../lib/codex/hook-runtime');
 
 const TARGET_PIN = resolveCodexTargetPin();
 const OPPOSITE_TARGET = TARGET_PIN.target === 'x86_64-unknown-linux-musl'
   ? 'aarch64-apple-darwin'
   : 'x86_64-unknown-linux-musl';
+const HOOK_TEST_ROOT = process.env.POLYGRAM_HOOK_TEST_ROOT ?? os.homedir();
 
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
@@ -54,7 +63,7 @@ function digest(value) {
 }
 
 function fixture(t) {
-  const root = realpathSync(mkdtempSync(path.join(os.homedir(), '.polygram-profile-')));
+  const root = realpathSync(mkdtempSync(path.join(HOOK_TEST_ROOT, '.polygram-profile-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const workspace = path.join(root, 'workspace');
   const daemonSecretRoot = path.join(root, 'daemon-secrets');
@@ -237,6 +246,16 @@ class FakeClient {
     return this.results[method];
   }
 
+  async verifyHooks({ phase }) {
+    this.calls.push({ method: 'verifyHooks', params: { phase } });
+    return this.options.hookManifest.entries.map((entry) => ({
+      ordinal: entry.ordinal,
+      currentHash: `sha256:${String(entry.ordinal + 1).repeat(64)}`,
+      trustStatus: phase === 'discovery' ? 'untrusted' : 'trusted',
+      enabled: true,
+    }));
+  }
+
   async close() {
     this.closed += 1;
   }
@@ -289,6 +308,69 @@ function prepareOptions(f, overrides = {}) {
     effort: 'xhigh',
     processEnv: f.processEnv,
     ...overrides,
+  };
+}
+
+function hookDeployment(f) {
+  chmodSync(f.root, 0o755);
+  const artifactRoot = path.join(f.root, 'hook-artifacts');
+  const runtimeRoot = path.join(f.root, 'hook-runtimes');
+  const runtimeId = 'node-24.4.0';
+  const runtimeDirectory = path.join(runtimeRoot, runtimeId, 'bin');
+  mkdirSync(artifactRoot, { mode: 0o755 });
+  mkdirSync(runtimeDirectory, { recursive: true, mode: 0o755 });
+  for (const directory of [
+    runtimeRoot,
+    path.join(runtimeRoot, runtimeId),
+    runtimeDirectory,
+  ]) chmodSync(directory, 0o755);
+  const runtimePath = path.join(
+    runtimeRoot,
+    runtimeId,
+    HOOK_RUNTIME_RELATIVE_PATH,
+  );
+  writeFileSync(runtimePath, '#!/bin/sh\nexit 0\n');
+  chmodSync(runtimePath, 0o755);
+  const runtimeSha256 = createHash('sha256')
+    .update(readFileSync(runtimePath))
+    .digest('hex');
+  const operatorUid = process.getuid();
+  const serviceUid = operatorUid + 1;
+  const version = '1.0.0';
+  installHookArtifactVersion({
+    artifactRoot,
+    version,
+    runtimeRoot,
+    runtimeId,
+    operatorUid,
+    serviceUid,
+    expectedRuntimeSha256: runtimeSha256,
+  });
+  return {
+    artifactRoot,
+    enabled: true,
+    operatorUid,
+    runtimeId,
+    runtimeRoot,
+    runtimeSha256,
+    serviceUid,
+    version,
+  };
+}
+
+function ownedConfigWithHooks(f) {
+  const hooksPath = path.join(f.codexHome, 'hooks.json');
+  return {
+    ...ownedConfig(f),
+    hooks: {
+      state: Object.fromEntries(HOOK_EVENTS.map(({ event }, ordinal) => [
+        `${hooksPath}:${event.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)}:0:0`,
+        {
+          enabled: true,
+          trusted_hash: `sha256:${String(ordinal + 1).repeat(64)}`,
+        },
+      ])),
+    },
   };
 }
 
@@ -442,6 +524,57 @@ describe('owned Codex native-beta runtime profile', () => {
       }],
     );
     assert.equal(clients[0].closed, 1);
+  });
+
+  test('hook-aware profile discovers once, verifies trusted state, and reattests before reuse', async (t) => {
+    const f = fixture(t);
+    const hooks = hookDeployment(f);
+    const trustedConfig = ownedConfigWithHooks(f);
+    const results = projectedResults(f, {
+      layers: [{
+        type: 'system',
+        version: 'system-v1',
+        disabled: false,
+        configSha256: digest({}),
+      }, {
+        type: 'user',
+        version: 'user-v1',
+        disabled: false,
+        configSha256: digest(trustedConfig),
+      }],
+    });
+    const { builder, clients } = createBuilder(f, results);
+
+    const profile = await builder.prepare(prepareOptions(f, { hooks }));
+
+    assert.equal(clients.length, 2);
+    assert.deepEqual(clients[0].calls, [{
+      method: 'verifyHooks',
+      params: { phase: 'discovery' },
+    }]);
+    assert.equal(clients[0].closed, 1);
+    assert.deepEqual(clients[1].calls[0], {
+      method: 'verifyHooks',
+      params: { phase: 'trusted' },
+    });
+    assert.equal(profile.hookManifest.ownedCwd, f.workspace);
+    assert.equal(profile.hookManifest.entries.length, 3);
+    assert.match(profile.hookArtifactsSha256, /^[a-f0-9]{64}$/);
+    assert.equal(Object.isFrozen(profile.hookManifest), true);
+    assert.equal(
+      statSync(path.join(f.workspace, CAPTURE_DIRECTORY)).mode & 0o777,
+      0o700,
+    );
+    assert.doesNotThrow(() => builder.reattest(profile));
+
+    const hooksPath = path.join(f.codexHome, 'hooks.json');
+    writeFileSync(hooksPath, `${readFileSync(hooksPath, 'utf8')} `, {
+      mode: 0o600,
+    });
+    assert.throws(
+      () => builder.reattest(profile),
+      { code: 'CODEX_OWNED_HOOKS_DRIFT' },
+    );
   });
 
   test('VPS Codex 0.145.0 disabled empty project layer is accepted', async (t) => {

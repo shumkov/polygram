@@ -117,7 +117,7 @@ describe('clean restart resume intents', () => {
     assert.equal(new Set(generations).size, generations.length);
   });
 
-  test('migration 019 upgrades an existing v18 production database', (t) => {
+  test('current migrations upgrade an existing v18 production database', (t) => {
     const legacyPath = `${dbPath}-v18`;
     let migrated = null;
     t.after(() => cleanupDb(legacyPath, migrated));
@@ -129,14 +129,28 @@ describe('clean restart resume intents', () => {
       legacy.exec(fs.readFileSync(path.join(migrationsDir, file), 'utf8'));
       legacy.pragma(`user_version = ${version}`);
     }
+    // A historical audit row from before the fingerprint was removed. Opening
+    // the database must take the stored digest with it, not leave it behind.
+    legacy.prepare(`INSERT INTO secret_redactions
+      (chat_id, msg_id, rule, tier, length, sha256, action, ts)
+      VALUES (?,?,?,?,?,?,?,?)`)
+      .run('-100', 1, 'aws-akia', 'high', 20, 'a'.repeat(64), 'redacted', 1);
     legacy.close();
 
     migrated = open(legacyPath);
 
     assert.equal(
       migrated.raw.pragma('user_version', { simple: true }),
-      19,
+      21,
     );
+    const auditColumns = migrated.raw
+      .prepare('PRAGMA table_info(secret_redactions)')
+      .all()
+      .map((column) => column.name);
+    assert.ok(!auditColumns.includes('sha256'), 'historical fingerprints are dropped');
+    const audit = migrated.raw.prepare('SELECT * FROM secret_redactions').all();
+    assert.equal(audit.length, 1, 'the audit row itself survives');
+    assert.ok(!JSON.stringify(audit[0]).includes('a'.repeat(64)));
     const providerColumns = migrated.raw
       .prepare('PRAGMA table_info(agent_runtime_sessions)')
       .all()

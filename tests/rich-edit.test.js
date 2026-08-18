@@ -131,7 +131,7 @@ describe('richEditMessageText — capability error → latch + plain fallback', 
       'wentRich:false signals the caller must NOT treat this as a successful rich edit — see streamer.js currentRichJson handling');
   });
 
-  test('logs rich-capability-latched with the redacted error and api_root', async () => {
+  test('logs rich-capability-latched with an error code and api_root, never the message', async () => {
     const m = makeDeps({
       tgError: new Error('Bad Request: bot123456:AAFakeTokenValue method not found'),
       isRichCapabilityError: () => true,
@@ -142,7 +142,9 @@ describe('richEditMessageText — capability error → latch + plain fallback', 
     const ev = m.events.find((e) => e.kind === 'rich-capability-latched');
     assert.ok(ev);
     assert.equal(ev.detail.api_root, 'http://localhost:8082');
-    assert.doesNotMatch(ev.detail.error, /AAFakeTokenValue/, 'bot token must be redacted before logging');
+    assert.equal(ev.detail.error, undefined, 'the message body is not a telemetry field');
+    assert.ok(!JSON.stringify(ev.detail).includes('AAFakeTokenValue'),
+      'a bot token in the message can no longer reach the event');
   });
 
   test('api_root falls back to "cloud" label when unset', async () => {

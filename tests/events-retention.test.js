@@ -274,6 +274,10 @@ describe('events-retention: resolveRetentionPolicy', () => {
     const p = resolveRetentionPolicy(undefined);
     assert.equal(p.defaultDays, DEFAULT_POLICY.defaultDays);
     assert.equal(p.enabled, true);
+    assert.ok(
+      p.keepForeverKinds.includes('clean-restart-qualification-observed'),
+      'release-qualification evidence must survive the default time tier',
+    );
   });
 });
 

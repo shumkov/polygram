@@ -30,7 +30,13 @@ function createFixture() {
   return { elsewhere, runtimeDir };
 }
 
-async function startProductionServer({ bot, runtimeDir, inFlightHandlers }) {
+async function startProductionServer({
+  bot,
+  runtimeDir,
+  inFlightHandlers,
+  requestDeployRestart,
+  daemonIdentity,
+}) {
   const options = {
     cwd: path.dirname(runtimeDir),
     env: { POLYGRAM_IPC_DIR: runtimeDir },
@@ -40,8 +46,10 @@ async function startProductionServer({ bot, runtimeDir, inFlightHandlers }) {
     path: ipcServer.socketPathFor(bot, options),
     handlers: createIpcHandlers({
       botName: bot,
+      daemonIdentity,
       getInFlightHandlers: () => inFlightHandlers,
       handleSendOverIpc: async () => ({}),
+      requestDeployRestart,
     }),
     logger: silentLogger,
     secret,
@@ -111,5 +119,88 @@ describe('polygram-ipc operator CLI', () => {
         '',
       ].join('\n'),
     );
+  });
+
+  test('identity prints one bounded content-free readiness object', async () => {
+    const bot = 'ops';
+    const { elsewhere, runtimeDir } = createFixture();
+    const daemonIdentity = Object.freeze({
+      pid: 4242,
+      daemon_instance_id: 'e565dbae-44cf-4fc0-b7df-91ee3305e588',
+      package_version: '0.38.1',
+      main_realpath_sha256: 'a'.repeat(64),
+    });
+    await startProductionServer({
+      bot,
+      runtimeDir,
+      daemonIdentity,
+      inFlightHandlers: new Map(),
+    });
+
+    const { stdout, stderr } = await runCli([bot, 'identity'], {
+      cwd: elsewhere,
+      runtimeDir,
+    });
+
+    assert.equal(stderr, '');
+    assert.equal(stdout, `${JSON.stringify({ bot, ...daemonIdentity })}\n`);
+    assert.doesNotMatch(stdout, /socket|session|message/i);
+    assert.doesNotMatch(stdout, new RegExp(runtimeDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.doesNotMatch(stdout, new RegExp(elsewhere.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.ok(Buffer.byteLength(stdout) < 512);
+  });
+
+  test('restart generates one opaque request ID and proves the echoed response', async () => {
+    const bot = 'ops';
+    const { elsewhere, runtimeDir } = createFixture();
+    let receivedRequestId = null;
+    await startProductionServer({
+      bot,
+      runtimeDir,
+      inFlightHandlers: new Map(),
+      requestDeployRestart: (req) => {
+        receivedRequestId = req.id;
+        return { accepted: true, old_pid: 4242 };
+      },
+    });
+
+    const { stdout, stderr } = await runCli([bot, 'restart'], {
+      cwd: elsewhere,
+      runtimeDir,
+    });
+    const result = JSON.parse(stdout);
+
+    assert.equal(stderr, '');
+    assert.equal(result.bot, bot);
+    assert.equal(result.accepted, true);
+    assert.equal(result.old_pid, 4242);
+    assert.match(result.restart_request_id, /^[0-9a-f-]{36}$/);
+    assert.equal(receivedRequestId, result.restart_request_id);
+  });
+
+  test('restart uses the deploy helper request ID so response-cut proof stays correlated', async () => {
+    const bot = 'ops';
+    const { elsewhere, runtimeDir } = createFixture();
+    const expectedRequestId = '5e1ec1ed-68c4-4678-8042-e2d9f1c5037a';
+    let receivedRequestId = null;
+    await startProductionServer({
+      bot,
+      runtimeDir,
+      inFlightHandlers: new Map(),
+      requestDeployRestart: (req) => {
+        receivedRequestId = req.id;
+        return { accepted: true, old_pid: 4242 };
+      },
+    });
+
+    const { stdout, stderr } = await runCli(
+      [bot, 'restart', expectedRequestId],
+      { cwd: elsewhere, runtimeDir },
+    );
+    const result = JSON.parse(stdout);
+
+    assert.equal(stderr, '');
+    assert.equal(receivedRequestId, expectedRequestId);
+    assert.equal(result.restart_request_id, expectedRequestId);
   });
 });

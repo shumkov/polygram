@@ -301,7 +301,10 @@ describe('D4 redeliverAsFreshTurn — the ONE redelivery tail', () => {
     const calls = { dispatched: [], reacted: [], marks: [], events: [], gated: [] };
     const redeliver = createRedeliver({
       gateInbound: over.gateInbound ?? (async (msg, opts) => { calls.gated.push(opts); return { action: 'pass' }; }),
-      dispatchHandleMessage: (sk, cid, msg) => calls.dispatched.push({ sk, cid, msg }),
+      dispatchHandleMessage: (sk, cid, msg, bot, dispatchContext) => {
+        calls.dispatched.push({ sk, cid, msg, bot, dispatchContext });
+        return Promise.resolve('handler-settled');
+      },
       getSessionKey: (cid, tid) => (tid ? `${cid}:${tid}` : cid),
       config: { chats: { '100': { name: 'X' } } },
       db: {},
@@ -355,5 +358,51 @@ describe('D4 redeliverAsFreshTurn — the ONE redelivery tail', () => {
     assert.equal(res.ok, true);
     assert.equal(calls.dispatched.length, 1);
     assert.equal(calls.reacted.length, 0, 'silent retry stays silent');
+  });
+
+  test('clean replay prepares after the gate and passes private dispatch context', async () => {
+    const order = [];
+    const receipt = Object.freeze({});
+    const dispatchContext = { recoveryReceipt: receipt, cleanReplay: { id: 1 } };
+    const { redeliver, calls } = makeRedeliver({
+      gateInbound: async () => {
+        order.push('gate');
+        return { action: 'pass' };
+      },
+    });
+
+    const result = await redeliver({
+      chatId: '100',
+      msg: dmMsg({ message_id: 94 }),
+      source: 'boot-replay-codex',
+      prepareDispatch: async ({ sessionKey }) => {
+        order.push(`prepare:${sessionKey}`);
+        return dispatchContext;
+      },
+    });
+
+    assert.deepEqual(order, ['gate', 'prepare:100']);
+    assert.equal(calls.dispatched[0].dispatchContext, dispatchContext);
+    assert.equal(await result.task, 'handler-settled');
+  });
+
+  test('clean replay can terminalize gate-blocked content without preparing it', async () => {
+    const calls = [];
+    const { redeliver } = makeRedeliver({
+      gateInbound: async () => ({ action: 'blocked', stage: 'admin' }),
+    });
+
+    const result = await redeliver({
+      chatId: '100',
+      msg: dmMsg({ message_id: 95, text: '/model' }),
+      source: 'boot-replay-codex',
+      prepareDispatch: async () => {
+        calls.push('prepare');
+      },
+      onGateBlocked: async ({ stage }) => calls.push(`blocked:${stage}`),
+    });
+
+    assert.deepEqual(calls, ['blocked:admin']);
+    assert.deepEqual(result, { ok: false, reason: 'admin', terminal: true });
   });
 });

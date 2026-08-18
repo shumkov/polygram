@@ -20,10 +20,14 @@ jobs:
           node-version: '24'
           cache: 'npm'
       - run: npm ci
+      - name: Prepare protected hook test root
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 /var/lib/polygram-hook-tests
       # Native test coverage (stable in Node 22+; CI runs 24, prod bots
       # run 25). Two reporters: spec for human-readable PR output, lcov
       # for the Codecov upload below.
       - name: Test with coverage
+        env:
+          POLYGRAM_HOOK_TEST_ROOT: /var/lib/polygram-hook-tests
         run: |
           mkdir -p coverage
           node --test --experimental-test-coverage \

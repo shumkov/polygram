@@ -115,7 +115,7 @@ describe('polygram production factory wiring', () => {
     }
     assert.match(
       src,
-      /if \(proc\?\.runtime === 'codex'\) codexRuntimeController\.registerProcess\(proc\)/,
+      /if \(proc\?\.runtime === 'codex'\) \{[\s\S]*?codexRuntimeController\.registerProcess\(proc, \{[\s\S]*?expectedProviderGenerationId:\s*spawnContext\.expectedProviderGenerationId \?\? null/,
     );
   });
 });

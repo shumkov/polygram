@@ -34,6 +34,74 @@ describe('replay — getReplayCandidates + dedupe', () => {
     assert.deepEqual(rows.map((r) => r.msg_id).sort(), [100, 101, 102]);
   });
 
+  test("v0.37.1 false deploy notice: an accepted Claude follow-up is no longer replayable", () => {
+    insertInbound(db, {
+      chat_id: '1',
+      msg_id: 105,
+      text: 'accepted follow-up',
+      handler_status: 'dispatched',
+    });
+
+    assert.deepEqual(
+      db.getReplayCandidates({ chatIds: ['1'] }).map((row) => row.msg_id),
+      [105],
+      'production precondition: the stale dispatched row becomes notice-eligible',
+    );
+
+    const settled = db.completeAcceptedClaudeAutosteer({
+      chat_id: '1',
+      msg_id: 105,
+    });
+
+    assert.equal(settled.changes, 1);
+    assert.equal(
+      db.raw.prepare(
+        `SELECT handler_status FROM messages
+          WHERE chat_id = '1' AND msg_id = 105 AND direction = 'in'`,
+      ).get().handler_status,
+      'replied',
+    );
+    assert.equal(db.getReplayCandidates({ chatIds: ['1'] }).length, 0);
+  });
+
+  test('accepted Claude follow-up settlement fails loud when ownership is not unique', () => {
+    insertInbound(db, {
+      chat_id: '1',
+      msg_id: 106,
+      text: 'already terminal',
+      handler_status: 'replied',
+    });
+
+    assert.throws(
+      () => db.completeAcceptedClaudeAutosteer({
+        chat_id: '1',
+        msg_id: 106,
+      }),
+      (error) => error?.code === 'CLAUDE_AUTOSTEER_STATUS_CONFLICT',
+    );
+  });
+
+  test('accepted Claude follow-up settlement wraps SQLite failures as typed errors', () => {
+    insertInbound(db, {
+      chat_id: '1',
+      msg_id: 107,
+      text: 'accepted before persistence failure',
+      handler_status: 'dispatched',
+    });
+    db.raw.close();
+
+    assert.throws(
+      () => db.completeAcceptedClaudeAutosteer({
+        chat_id: '1',
+        msg_id: 107,
+      }),
+      (error) => (
+        error?.code === 'CLAUDE_AUTOSTEER_STATUS_PERSIST_FAILED'
+        && error.cause instanceof Error
+      ),
+    );
+  });
+
   test('ignores rows outside the chatIds filter', () => {
     insertInbound(db, { chat_id: '1', msg_id: 100, text: 'ours', handler_status: 'dispatched' });
     insertInbound(db, { chat_id: '2', msg_id: 101, text: 'other bot', handler_status: 'dispatched' });
@@ -195,5 +263,22 @@ describe('replay — getReplayCandidates edge cases', () => {
     const rows = db.getReplayCandidates({ chatIds: ['1'] });
     assert.deepEqual(rows.map((r) => r.msg_id), [100, 101, 102],
       'replay must process oldest first to preserve user intent ordering');
+  });
+
+  test('equal timestamps preserve durable inbound insertion order', () => {
+    const ts = Date.now() - 60 * 1000;
+    insertInbound(db, {
+      chat_id: '1', msg_id: 102, text: 'first inserted',
+      handler_status: 'dispatched', ts,
+    });
+    insertInbound(db, {
+      chat_id: '1', msg_id: 100, text: 'second inserted',
+      handler_status: 'dispatched', ts,
+    });
+
+    assert.deepEqual(
+      db.getReplayCandidates({ chatIds: ['1'] }).map((row) => row.msg_id),
+      [102, 100],
+    );
   });
 });

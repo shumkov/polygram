@@ -45,8 +45,8 @@ function fixture(overrides = {}) {
   };
 
   let handleResolver;
-  const handleMessage = overrides.handleMessage || ((sessionKey, chatId, msg, bot) => {
-    calls.handle.push({ sessionKey, chatId, msg, bot });
+  const handleMessage = overrides.handleMessage || ((sessionKey, chatId, msg, bot, dispatchContext) => {
+    calls.handle.push({ sessionKey, chatId, msg, bot, dispatchContext });
     return new Promise((resolve, reject) => {
       handleResolver = { resolve, reject };
     });
@@ -78,6 +78,7 @@ function fixture(overrides = {}) {
     botName: 'testbot',
     logEvent: (kind, detail) => calls.events.push({ kind, detail }),
     handleMessage,
+    awaitSessionRecovery: overrides.awaitSessionRecovery,
     sendToProcess: overrides.sendToProcess || (async (sk, prompt, ctx) => {
       calls.sendToProcess.push({ sessionKey: sk, prompt, ctx });
       return overrides.sendToProcessResult || { text: 'auto-resume reply text' };
@@ -125,6 +126,70 @@ function fixture(overrides = {}) {
 const baseMsg = { message_id: 1, chat: { id: 100 } };
 
 describe('createDispatcher — in-flight counter', () => {
+  test('same-session recovery barrier blocks ordinary ingress and passes only the owner receipt', async () => {
+    let release;
+    const barrier = new Promise((resolve) => { release = resolve; });
+    const owner = Object.freeze({});
+    const waits = [];
+    const handled = [];
+    const { dispatcher } = fixture({
+      awaitSessionRecovery: (sessionKey, receipt) => {
+        waits.push({ sessionKey, receipt });
+        return receipt === owner ? Promise.resolve() : barrier;
+      },
+      handleMessage: async (...args) => { handled.push(args); },
+    });
+
+    const ordinary = dispatcher.dispatchHandleMessage(
+      '100:5', 100, baseMsg, {},
+    );
+    const recoveryContext = { recoveryReceipt: owner, cleanReplay: { id: 1 } };
+    const recovery = dispatcher.dispatchHandleMessage(
+      '100:5', 100, { ...baseMsg, message_id: 2 }, {}, recoveryContext,
+    );
+    await nextTick();
+
+    assert.equal(handled.length, 1);
+    assert.equal(handled[0][2].message_id, 2);
+    assert.equal(handled[0][4], recoveryContext);
+    assert.deepEqual(waits, [
+      { sessionKey: '100:5', receipt: null },
+      { sessionKey: '100:5', receipt: owner },
+    ]);
+
+    release();
+    await Promise.all([ordinary, recovery]);
+    assert.equal(handled.length, 2);
+    assert.equal(handled[1][2].message_id, 1);
+  });
+
+  test('exposes exact active source metadata without retaining the message body', async () => {
+    const { dispatcher, getResolver } = fixture();
+    const msg = {
+      ...baseMsg,
+      message_thread_id: 5,
+      text: 'must not enter the target snapshot',
+    };
+
+    dispatcher.dispatchHandleMessage('100:5', 100, msg, {});
+    await nextTick();
+
+    assert.deepEqual(dispatcher.getActiveHandlerTargets(), [{
+      sessionKey: '100:5',
+      chatId: '100',
+      threadId: '5',
+      telegramMessageId: '1',
+    }]);
+    assert.doesNotMatch(
+      JSON.stringify(dispatcher.getActiveHandlerTargets()),
+      /must not enter/,
+    );
+
+    getResolver().resolve();
+    await nextTick(); await nextTick();
+    assert.deepEqual(dispatcher.getActiveHandlerTargets(), []);
+  });
+
   test('increments + decrements around handleMessage', async () => {
     const { dispatcher, getResolver } = fixture();
     dispatcher.dispatchHandleMessage('sk1', 100, baseMsg, {});
@@ -152,6 +217,25 @@ describe('createDispatcher — in-flight counter', () => {
 });
 
 describe('createDispatcher — settlement ownership', () => {
+  test('counts dispatcher-owned work without exact message target metadata', async () => {
+    const fx = fixture();
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+
+    let finishTrackedTask;
+    fx.dispatcher.trackTask(new Promise((resolve) => {
+      finishTrackedTask = resolve;
+    }));
+
+    assert.equal(fx.dispatcher.getActiveHandlerTargets().length, 1);
+    assert.equal(fx.dispatcher.getActiveHandlerCount(), 2);
+
+    finishTrackedTask();
+    fx.getResolver().resolve();
+    await fx.dispatcher.awaitSettlement({ timeoutMs: 1000 });
+    assert.equal(fx.dispatcher.getActiveHandlerCount(), 0);
+  });
+
   test('awaitSettlement waits for an ordinary handler to finish', async () => {
     const fx = fixture();
     fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
@@ -265,7 +349,16 @@ describe('createDispatcher — queue-depth-warning telemetry', () => {
 describe('createDispatcher — error → terminal status mapping', () => {
   async function runAndFail(err, overrides = {}) {
     const fx = fixture(overrides);
-    const p = new Promise((res) => { fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {}); setImmediate(res); });
+    const p = new Promise((res) => {
+      fx.dispatcher.dispatchHandleMessage(
+        'sk',
+        100,
+        overrides.msg || baseMsg,
+        {},
+        overrides.dispatchContext || null,
+      );
+      setImmediate(res);
+    });
     await p;
     fx.getResolver().reject(err);
     await nextTick(); await nextTick(); await nextTick();
@@ -356,7 +449,27 @@ describe('createDispatcher — error → terminal status mapping', () => {
     assert.match(calls.tg[0].params.text, /error: boom/);
   });
 
-  test('tmux spawn telemetry retains error codes and the stderr tail', async () => {
+  test('clean replay process drift preserves the consumed guard without a reply', async () => {
+    const error = Object.assign(new Error('replacement process won the race'), {
+      code: 'CODEX_CLEAN_REPLAY_PROCESS_CHANGED',
+    });
+    const { calls } = await runAndFail(error, {
+      msg: { ...baseMsg, _isReplay: true },
+      dispatchContext: {
+        recoveryReceipt: Object.freeze({}),
+        cleanReplay: Object.freeze({ expectedProcess: {} }),
+      },
+    });
+
+    assert.deepEqual(calls.setInboundStatus, []);
+    assert.deepEqual(calls.tg, []);
+    assert.ok(calls.events.some((event) => (
+      event.kind === 'handler-error'
+      && event.detail.code === 'CODEX_CLEAN_REPLAY_PROCESS_CHANGED'
+    )));
+  });
+
+  test('tmux spawn telemetry retains error codes and the stderr SIZE', async () => {
     const stderr = `${'x'.repeat(600)}duplicate session: opaque`;
     const error = Object.assign(new Error('tmux spawn failed'), {
       code: 'TMUX_SPAWN_FAILED',
@@ -368,7 +481,11 @@ describe('createDispatcher — error → terminal status mapping', () => {
 
     assert.equal(event.detail.code, 'TMUX_SPAWN_FAILED');
     assert.equal(event.detail.cause_code, 1);
-    assert.equal(event.detail.stderr_tail, stderr.slice(-500));
+    // The child's stderr is process output, not a telemetry field: its size
+    // still separates "tmux refused" from "tmux said nothing", without
+    // persisting whatever the process printed.
+    assert.equal(event.detail.stderr_len, stderr.length);
+    assert.equal(event.detail.stderr_tail, undefined);
   });
 
   test('SESSION_PROCESS_LOST clears the saved session before guidance and never auto-resumes', async () => {

@@ -37,7 +37,17 @@ const {
   createAutosteerHandlers,
 } = require('../lib/handlers/autosteer');
 const {
+  buildResumeIntents,
+} = require('../lib/ops/clean-shutdown');
+const {
+  scheduleCleanCodexReplaySessions,
+} = require('../lib/ops/clean-codex-boot-replay');
+const {
+  createCleanReplaySessionCoordinator,
+} = require('../lib/ops/clean-replay-session-coordinator');
+const {
   classifyReplay,
+  classifyCodexRecoveryEvidence,
 } = require('../lib/handlers/replay-disposition');
 const { createSdkCallbacks } = require('../lib/sdk/callbacks');
 const {
@@ -517,6 +527,7 @@ function createRuntime({
   fixture,
   integrationOrchestra,
   controllerOptions = {},
+  checkpointSinkDecorator = null,
 }) {
   const processEnv = {
     HOME: fixture.serviceHome,
@@ -560,12 +571,15 @@ function createRuntime({
     ...controllerOptions,
   });
   const boot = controller.initialize();
+  const checkpointSink = checkpointSinkDecorator == null
+    ? controller.checkpointSink
+    : checkpointSinkDecorator(controller.checkpointSink);
   const baseFactory = orchestra.createProcessFactory({
     config,
     logger: QUIET,
     pmDefault: 'sdk',
     codexClientFactory: controller.clientFactory,
-    codexCheckpointSink: controller.checkpointSink,
+    codexCheckpointSink: checkpointSink,
     codexExpectedStaticProfile: controller.resolveReceipt,
     codexHostIdentity: boot.managerOptions.codexHostIdentity,
     codexBootSessionIdentity:
@@ -573,7 +587,12 @@ function createRuntime({
   });
   const processFactory = (sessionKey, spawnContext) => {
     const proc = baseFactory(sessionKey, spawnContext);
-    if (proc.runtime === 'codex') controller.registerProcess(proc);
+    if (proc.runtime === 'codex') {
+      controller.registerProcess(proc, {
+        expectedProviderGenerationId:
+          spawnContext.expectedProviderGenerationId ?? null,
+      });
+    }
     return proc;
   };
   const manager = new orchestra.ProcessManager({
@@ -619,10 +638,97 @@ async function spawnCodex(runtime, db, config, {
   return { proc, resumed: resolved.existingSessionId };
 }
 
+async function spawnStrictResumedCodex(t) {
+  const fixture = makeFixture(t);
+  const interruptedTurnId = 'turn-interrupted-before-deploy';
+  const resumedThread = threadResult(fixture.workspace);
+  resumedThread.thread.turns = [{
+    id: interruptedTurnId,
+    status: 'interrupted',
+    items: [],
+    error: null,
+  }];
+  writeScenario(fixture, {
+    methods: {
+      'thread/resume': { result: resumedThread },
+      'thread/backgroundTerminals/list': {
+        result: { data: [], count: 0, nextCursor: null },
+      },
+    },
+  });
+  const db = dbClient.open(fixture.dbPath);
+  const config = integrationConfig(fixture);
+  const runtime = createRuntime({
+    db,
+    config,
+    fixture,
+    integrationOrchestra: createIntegrationOrchestra(),
+  });
+  t.after(async () => {
+    try { await runtime.manager.get('1')?.client?.close(); } catch {}
+    try { await runtime.manager.kill('1', 'test-cleanup'); } catch {}
+    try { db.raw.close(); } catch {}
+  });
+  const prepared = await runtime.controller.prepareSession({
+    sessionKey: '1',
+    chatId: '1',
+    threadId: null,
+  });
+  db.upsertProviderSession({
+    session_key: '1',
+    namespace: 'codex:app-server',
+    provider: 'codex',
+    provider_session_id: 'codex-thread-1',
+    app_server_session_id: 'diagnostic-only',
+    cwd: fixture.workspace,
+    model: 'gpt-5.6-sol',
+    effort: 'medium',
+    pm_backend: 'codex',
+    spawn_profile_id: prepared.runtimeConfig.spawnProfileId,
+  });
+  const claimed = db.getProviderSession(
+    '1',
+    'codex:app-server',
+  ).generation_id;
+  const spawnContext = await buildCodexSpawnContext({
+    sessionKey: '1',
+    chatId: '1',
+    threadId: null,
+    chatConfig: config.chats['1'],
+    db,
+    pm: runtime.manager,
+    runtimeController: runtime.controller,
+    getSessionLabel: () => 'Codex integration',
+    logEvent() {},
+    strictResume: {
+      expectedGenerationId: claimed,
+      expectedSessionId: 'codex-thread-1',
+      expectedInterruptedTurnId: interruptedTurnId,
+      expectedSpawnProfileId: prepared.runtimeConfig.spawnProfileId,
+    },
+  });
+  assert.equal(spawnContext.expectedProviderGenerationId, claimed);
+  const proc = await runtime.manager.getOrSpawn('1', spawnContext);
+  assert.equal(
+    db.getProviderSession('1', 'codex:app-server').generation_id,
+    claimed,
+    'strict spawn attestation must not mutate provider ownership',
+  );
+  return { claimed, db, fixture, proc, runtime };
+}
+
 test('warm model settings reuse preflight, generation, and thread for the next turn', {
   timeout: 30_000,
 }, async (t) => {
   const fixture = makeFixture(t);
+  writeScenario(fixture, {
+    methods: {
+      'turn/start': [
+        completingTurnDescriptor('turn-warm-settings-1', 'Medium effort'),
+        completingTurnDescriptor('turn-warm-settings-2', 'Xhigh effort'),
+      ],
+    },
+  });
   const db = dbClient.open(fixture.dbPath);
   const config = integrationConfig(fixture);
   const integrationOrchestra = createIntegrationOrchestra();
@@ -645,6 +751,15 @@ test('warm model settings reuse preflight, generation, and thread for the next t
   assert.equal(spawned.env.CODEX_HOME, fixture.codexHome);
   const generationId = first.proc.generationId;
   const threadId = first.proc.providerSessionId;
+  assert.equal(
+    db.getProviderSession('1', 'codex:app-server'),
+    undefined,
+    'thread initialization alone has no admitted turn settings to persist',
+  );
+  const initialResult = await runtime.manager.send('1', 'Use medium effort');
+  await runtime.controller.settleTelegramDelivery('1', initialResult);
+  const initialProvider = db.getProviderSession('1', 'codex:app-server');
+  assert.equal(initialProvider.effort, 'medium');
   const requestLog = path.join(
     fixture.workspace,
     'fake-codex-requests.jsonl',
@@ -691,14 +806,157 @@ test('warm model settings reuse preflight, generation, and thread for the next t
   const starts = requests.filter(
     (message) => message.method === 'turn/start',
   );
-  assert.equal(starts.length, 1);
-  assert.equal(starts[0].params.model, 'gpt-5.6-sol');
-  assert.equal(starts[0].params.effort, 'xhigh');
+  assert.equal(starts.length, 2);
+  assert.equal(starts.at(-1).params.model, 'gpt-5.6-sol');
+  assert.equal(starts.at(-1).params.effort, 'xhigh');
+  const advancedProvider = db.getProviderSession(
+    '1',
+    'codex:app-server',
+  );
+  assert.equal(advancedProvider.effort, 'xhigh');
+  assert.notEqual(
+    advancedProvider.generation_id,
+    initialProvider.generation_id,
+  );
   assert.equal(
     requests.filter((message) => message.method === 'thread/resume').length,
     0,
   );
   assert.equal(await runtime.manager.kill('1', 'integration-done'), true);
+});
+
+test('turn identity persistence failure sends no Codex request and fences the process', {
+  timeout: 30_000,
+}, async (t) => {
+  const fixture = makeFixture(t);
+  const db = dbClient.open(fixture.dbPath);
+  const config = integrationConfig(fixture);
+  const runtime = createRuntime({
+    db,
+    config,
+    fixture,
+    integrationOrchestra: createIntegrationOrchestra(),
+  });
+  t.after(async () => {
+    try { await runtime.manager.kill('1', 'test-cleanup'); } catch {}
+    try { db.raw.close(); } catch {}
+  });
+  const { proc } = await spawnCodex(runtime, db, config);
+  t.after(async () => {
+    try { await proc.client?.close(); } catch {}
+  });
+  const requestLog = path.join(
+    fixture.workspace,
+    'fake-codex-requests.jsonl',
+  );
+  const countTurnStarts = () => readFileSync(requestLog, 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((message) => message.method === 'turn/start').length;
+  const beforeTurnStarts = countTurnStarts();
+  const persistenceError = Object.assign(
+    new Error('injected provider identity failure'),
+    { code: 'SQLITE_IOERR' },
+  );
+  db.recordCodexTurnStartPrepared = () => {
+    throw persistenceError;
+  };
+
+  await assert.rejects(
+    runtime.manager.send('1', 'must remain definitely not sent'),
+    (error) => {
+      let cause = error;
+      let preserved = false;
+      for (let depth = 0; cause && depth < 8; depth += 1) {
+        if (cause === persistenceError) preserved = true;
+        cause = cause.cause;
+      }
+      return error.code === 'CODEX_DURABILITY_FAILED' && preserved;
+    },
+  );
+  assert.equal(proc.state, 'DurabilityBlocked');
+  assert.equal(countTurnStarts(), beforeTurnStarts);
+  assert.equal(
+    db.getProviderSession('1', 'codex:app-server'),
+    undefined,
+  );
+});
+
+test('strict continue preserves the claimed provider lineage before transport', {
+  timeout: 30_000,
+}, async (t) => {
+  const { claimed, db, proc, runtime } = await spawnStrictResumedCodex(t);
+
+  const result = await runtime.manager.send('1', 'continue', {
+    context: { sourceMsgId: '41' },
+  });
+  await runtime.controller.settleTelegramDelivery('1', result);
+  assert.equal(result.providerSessionId, 'codex-thread-1');
+  assert.equal(
+    db.getProviderSession('1', 'codex:app-server').generation_id,
+    claimed,
+  );
+  assert.equal(proc.state, 'Idle');
+  assert.equal(await runtime.manager.kill('1', 'integration-done'), true);
+});
+
+test('strict continue rejects a provider lineage replaced after attestation', {
+  timeout: 30_000,
+}, async (t) => {
+  const { claimed, db, fixture, proc, runtime } =
+    await spawnStrictResumedCodex(t);
+  const replacement = 'replaced-provider-lineage-after-attestation';
+  const requestLog = path.join(
+    fixture.workspace,
+    'fake-codex-requests.jsonl',
+  );
+  const countTurnStarts = () => readFileSync(requestLog, 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((message) => message.method === 'turn/start').length;
+  const countAttempts = () => db.raw.prepare(`
+    SELECT COUNT(*) AS count
+      FROM codex_turn_attempts
+     WHERE generation_id = ?
+  `).get(proc.generationId).count;
+  const beforeTurnStarts = countTurnStarts();
+  const beforeAttempts = countAttempts();
+  assert.notEqual(replacement, claimed);
+  db.raw.prepare(`
+    UPDATE agent_runtime_sessions
+       SET generation_id = ?
+     WHERE session_key = ?
+       AND namespace = ?
+  `).run(replacement, '1', 'codex:app-server');
+
+  await assert.rejects(
+    runtime.manager.send('1', 'continue', {
+      context: { sourceMsgId: '42' },
+    }),
+    (error) => {
+      let cause = error;
+      let preserved = false;
+      for (let depth = 0; cause && depth < 8; depth += 1) {
+        if (cause.code === 'CODEX_PROVIDER_LINEAGE_MISMATCH') {
+          preserved = true;
+        }
+        cause = cause.cause;
+      }
+      return error.code === 'CODEX_DURABILITY_FAILED' && preserved;
+    },
+  );
+  assert.equal(proc.state, 'DurabilityBlocked');
+  assert.equal(countTurnStarts(), beforeTurnStarts);
+  assert.equal(countAttempts(), beforeAttempts);
+  assert.equal(
+    db.getProviderSession('1', 'codex:app-server').generation_id,
+    replacement,
+    'failed preparation must not rewrite the replaced lineage',
+  );
 });
 
 test('catalog drift retires once and resumes the persisted thread before the next turn', {
@@ -738,6 +996,15 @@ test('catalog drift retires once and resumes the persisted thread before the nex
   const first = await runtime.manager.getOrSpawn('1', await buildContext());
   const threadId = first.providerSessionId;
   const generationId = first.generationId;
+  const initialResult = await runtime.manager.send(
+    '1',
+    'establish provider identity before catalog refresh',
+  );
+  await runtime.controller.settleTelegramDelivery('1', initialResult);
+  assert.equal(
+    db.getProviderSession('1', 'codex:app-server').provider_session_id,
+    threadId,
+  );
   writeScenario(fixture, {
     methods: {
       'model/list': {
@@ -922,6 +1189,180 @@ function completingTurnDescriptor(turnId, text) {
     lateDelayMs: 100,
     lateMessages: completedTurnMessages(turnId, text),
   };
+}
+
+async function exerciseCleanRetirementDeliveryRace(t, {
+  notificationFirst,
+}) {
+  const turnId = notificationFirst
+    ? 'turn-deploy-notification-first'
+    : 'turn-deploy-response-first';
+  const releaseFile = notificationFirst
+    ? 'release-interrupt-response'
+    : 'release-stop-clean';
+  const harness = await createHarness(t, {
+    methods: {
+      'turn/start': activeTurnDescriptor(turnId),
+      'turn/interrupt': notificationFirst
+        ? {
+            result: {},
+            beforeResponseMessages: [interruptedTurnMessage(turnId)],
+            waitForResponseFile: releaseFile,
+          }
+        : {
+            result: {},
+            lateDelayMs: 5,
+            lateMessages: [interruptedTurnMessage(turnId)],
+          },
+      ...(!notificationFirst ? {
+        'thread/backgroundTerminals/clean': {
+          result: {},
+          waitForResponseFile: releaseFile,
+        },
+      } : {}),
+    },
+  });
+  const {
+    db,
+    fixture,
+    proc,
+    runtime,
+  } = harness;
+  const sourceMessageId = insertInbound(db, {
+    chat_id: '1',
+    msg_id: 41,
+    bot_name: 'testbot',
+    handler_status: 'processing',
+    ts: 1000,
+  });
+  const active = runtime.manager.send('1', 'Interrupted by authorized deploy', {
+    context: { sourceMsgId: '41' },
+  });
+  await waitFor(
+    () => proc.activeTurnId === turnId && proc.state === 'Active',
+    'the active deploy target',
+  );
+
+  let retirementResolved = false;
+  const retirement = runtime.manager.retireForCleanRestart({
+    continuationAuthorized: true,
+    getDeliveryEvidence: () => ({
+      outputAttempted: false,
+      pending: 0,
+      fenced: true,
+    }),
+  }).then((snapshots) => {
+    retirementResolved = true;
+    return snapshots;
+  });
+  let result;
+  let markerCount;
+  let stateBeforeRelease;
+  let preReleaseError = null;
+  try {
+    result = await active;
+    assert.equal(result.error, 'interrupted');
+    await waitFor(
+      () => readRequests(fixture).some(
+        (message) => message.method === 'turn/interrupt',
+      ),
+      'the authorized deploy interrupt write',
+    );
+    if (!notificationFirst) {
+      await waitFor(
+        () => db.raw.prepare(`
+          SELECT 1 FROM codex_attempt_checkpoints
+           WHERE generation_id = ?
+             AND kind = 'stop-terminal-reconciled'
+        `).get(proc.generationId) != null,
+        'stop-terminal reconciliation before delivery',
+      );
+    }
+    markerCount = db.listCodexAttemptCheckpoints(result.attemptId)
+      .filter((row) => row.kind === 'clean-retirement-requested').length;
+
+    await runtime.controller.settleTelegramDelivery(
+      '1',
+      result,
+      { disposition: 'failed' },
+    );
+    stateBeforeRelease = db.getCodexAttempt(result.attemptId).recovery_state;
+    assert.equal(retirementResolved, false);
+  } catch (error) {
+    preReleaseError = error;
+  } finally {
+    writeFileSync(path.join(fixture.workspace, releaseFile), '', { mode: 0o600 });
+  }
+  const retirementResult = await Promise.allSettled([retirement]);
+  if (preReleaseError) throw preReleaseError;
+  if (retirementResult[0].status === 'rejected') {
+    throw retirementResult[0].reason;
+  }
+  const snapshots = retirementResult[0].value;
+
+  assert.equal(markerCount, 1, 'deploy ownership must remain durable');
+  assert.equal(
+    stateBeforeRelease,
+    notificationFirst ? 'terminal-pending' : 'clean-pending',
+  );
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual(
+    {
+      eligible: snapshots[0].eligible,
+      sessionKey: snapshots[0].sessionKey,
+      providerSessionId: snapshots[0].providerSessionId,
+      providerTurnId: snapshots[0].providerTurnId,
+      sourceMsgId: snapshots[0].sourceMsgId,
+    },
+    {
+      eligible: true,
+      sessionKey: '1',
+      providerSessionId: result.providerSessionId,
+      providerTurnId: result.providerTurnId,
+      sourceMsgId: '41',
+    },
+  );
+  assert.equal(db.getCodexAttempt(result.attemptId).recovery_state, 'cancelled');
+  assert.equal(db.getCodexLease().status, 'clear');
+  assert.equal(
+    db.listCodexAttemptCheckpoints(result.attemptId)
+      .filter((row) => row.kind === 'telegram-delivery-failed').length,
+    1,
+  );
+
+  const projected = buildResumeIntents({
+    snapshots,
+    policyVersion: 2,
+    resolveSourceMessageId: (snapshot) => (
+      snapshot.sourceMsgId === '41' ? sourceMessageId : null
+    ),
+  });
+  assert.equal(projected.resumeIntents.length, 1);
+  assert.deepEqual(db.recordCleanShutdown({
+    botName: 'testbot',
+    now: 2000,
+    continuationAuthorized: true,
+    resumeIntents: projected.resumeIntents,
+  }), {
+    replayMarked: 1,
+    intentsRecorded: 1,
+  });
+  assert.equal(
+    db.raw.prepare(`
+      SELECT COUNT(*) AS count
+        FROM clean_restart_resume_intents
+       WHERE bot_name = 'testbot'
+    `).get().count,
+    1,
+  );
+  assert.equal(
+    db.raw.prepare(`
+      SELECT clean_shutdown_at
+        FROM polling_state
+       WHERE bot_name = 'testbot'
+    `).get().clean_shutdown_at,
+    2000,
+  );
 }
 
 async function waitFor(predicate, label, timeoutMs = 5_000) {
@@ -1415,6 +1856,340 @@ test('fake app-server ambiguous steer is never queued or crash-replayed', {
       .length,
     1,
     'ambiguous steering must not create a fallback turn',
+  );
+});
+
+test('authorized deploy keeps Codex continuation ownership when interrupt response arrives first', {
+  timeout: 30_000,
+}, async (t) => {
+  await exerciseCleanRetirementDeliveryRace(t, {
+    notificationFirst: false,
+  });
+});
+
+test('authorized deploy keeps Codex continuation ownership when terminal notification arrives first', {
+  timeout: 30_000,
+}, async (t) => {
+  await exerciseCleanRetirementDeliveryRace(t, {
+    notificationFirst: true,
+  });
+});
+
+test('prepared pre-write deploy cancellation remains exact clean-restart recovery evidence', {
+  timeout: 30_000,
+}, async (t) => {
+  const preparationCommitted = Promise.withResolvers();
+  const releasePreparation = Promise.withResolvers();
+  let holdPreparation = true;
+  const fixture = makeFixture(t);
+  const db = dbClient.open(fixture.dbPath);
+  const config = integrationConfig(fixture);
+  const integrationOrchestra = createIntegrationOrchestra();
+  const runtime = createRuntime({
+    db,
+    config,
+    fixture,
+    integrationOrchestra,
+    checkpointSinkDecorator: (checkpointSink) => async (checkpoint) => {
+      await checkpointSink(checkpoint);
+      if (
+        holdPreparation
+        && checkpoint.kind === 'request-prepared'
+        && checkpoint.method === 'turn/start'
+      ) {
+        holdPreparation = false;
+        preparationCommitted.resolve();
+        await releasePreparation.promise;
+      }
+    },
+  });
+  t.after(async () => {
+    try { await runtime.manager.kill('1', 'integration-cleanup'); } catch {}
+    try { db.raw.close(); } catch {}
+  });
+  const { proc } = await spawnCodex(runtime, db, config);
+  insertInbound(db, {
+    chat_id: '1',
+    msg_id: 41,
+    bot_name: 'testbot',
+    handler_status: 'processing',
+    ts: Date.now(),
+  });
+  db.recordInboundRuntimeSelection({
+    session_key: '1',
+    bot_name: 'testbot',
+    telegram_chat_id: '1',
+    telegram_message_id: '41',
+    provider: 'codex',
+    ts: Date.now(),
+  });
+  const send = runtime.manager.send('1', 'Cancel after durable preparation', {
+    context: { sourceMsgId: '41' },
+  });
+  const sendRejected = assert.rejects(
+    send,
+    (error) => error.code === 'INTERRUPTED',
+  );
+  await preparationCommitted.promise;
+
+  const stop = proc.interrupt('clean-restart');
+  releasePreparation.resolve();
+  assert.equal(await stop, true);
+  await sendRejected;
+
+  const evidence = db.getReplayProviderRecovery({
+    sessionKey: '1',
+    botName: 'testbot',
+    telegramChatId: '1',
+    telegramMessageId: '41',
+  });
+  assert.ok(evidence.attempt, JSON.stringify(evidence));
+  assert.equal(evidence.attempt.method, 'turn/start');
+  assert.equal(evidence.attempt.deliveryState, 'prepared');
+  assert.equal(evidence.attempt.recoveryState, 'cancelled');
+  assert.equal(evidence.attempt.turnId, null);
+  assert.equal(evidence.attempt.terminalStatus, null);
+  assert.deepEqual(evidence.cancellationProof, {
+    kind: 'active-start-cancelled',
+    reason: 'clean-restart',
+  });
+  assert.deepEqual(classifyCodexRecoveryEvidence(evidence), {
+    action: 'recover',
+    reason: 'clean-restart-request-cancelled-before-acceptance',
+    cleanRestartSafe: true,
+  });
+  assert.equal(
+    readRequests(fixture)
+      .some((message) => message.method === 'turn/start'),
+    false,
+    'the cancelled start must never reach Codex transport',
+  );
+});
+
+test('authorized deploy continues the active Codex turn before atomically rearming its queued follower', {
+  timeout: 30_000,
+}, async (t) => {
+  const turnId = 'turn-deploy-with-follower';
+  const harness = await createHarness(t, {
+    methods: {
+      'turn/start': activeTurnDescriptor(turnId),
+      'turn/interrupt': {
+        result: {},
+        lateDelayMs: 5,
+        lateMessages: [interruptedTurnMessage(turnId)],
+      },
+    },
+  });
+  const {
+    config,
+    db,
+    fixture,
+    integrationOrchestra,
+    proc,
+    runtime,
+  } = harness;
+  const sourceMessageId = insertInbound(db, {
+    chat_id: '1',
+    msg_id: 41,
+    bot_name: 'testbot',
+    handler_status: 'processing',
+    ts: Date.now(),
+  });
+  const active = runtime.manager.send('1', 'Active deploy turn', {
+    context: { sourceMsgId: '41' },
+  });
+  await waitFor(
+    () => proc.activeTurnId === turnId && proc.state === 'Active',
+    'the active deploy turn with a queued follower',
+  );
+
+  const followerClaim = claimFollowup({
+    db,
+    runtime,
+    proc,
+    messageId: 42,
+    text: 'Run after deploy continuation',
+  });
+  runtime.controller.markDispatchDisposition({
+    sessionKey: '1',
+    generationId: proc.generationId,
+    reservationId: followerClaim.reservationId,
+    disposition: 'queue-authorized',
+  });
+  const queuedOutcome = runtime.manager.send(
+    '1',
+    'Run after deploy continuation',
+    { context: { sourceMsgId: '42' } },
+  ).then(
+    () => null,
+    (error) => error,
+  );
+  await waitFor(
+    () => proc.pendingQueue.length === 2,
+    'the deploy-owned queued follower',
+  );
+
+  const retirement = runtime.manager.retireForCleanRestart({
+    continuationAuthorized: true,
+    getDeliveryEvidence: () => ({
+      outputAttempted: false,
+      pending: 0,
+      fenced: true,
+    }),
+  }).then((value) => ({ value }), (error) => ({ error }));
+  const activeResult = await active;
+  assert.equal(activeResult.error, 'interrupted');
+  await runtime.controller.settleTelegramDelivery(
+    '1',
+    activeResult,
+    { disposition: 'failed' },
+  );
+  const retirementOutcome = await retirement;
+  if (retirementOutcome.error) throw retirementOutcome.error;
+  const snapshots = retirementOutcome.value;
+  assert.equal((await queuedOutcome)?.code, 'INTERRUPTED');
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0].eligible, true);
+
+  const projected = buildResumeIntents({
+    snapshots,
+    policyVersion: 2,
+    resolveSourceMessageId: () => sourceMessageId,
+  });
+  assert.equal(projected.resumeIntents.length, 1);
+  assert.deepEqual(db.recordCleanShutdown({
+    botName: 'testbot',
+    now: Date.now(),
+    continuationAuthorized: true,
+    resumeIntents: projected.resumeIntents,
+  }), {
+    replayMarked: 2,
+    intentsRecorded: 1,
+  });
+  const recovery = db.claimCleanRestartRecovery({
+    botName: 'testbot',
+    now: Date.now(),
+    maxAgeMs: 60_000,
+    supportedPolicyVersions: [2],
+  });
+  assert.equal(recovery.clean, true);
+  assert.equal(recovery.claims.length, 1);
+  assert.equal(recovery.claims[0].executable, true);
+
+  const [follower] = db.getReplayCandidates({ chatIds: ['1'] });
+  assert.equal(follower.msg_id, 42);
+  const replayEvidence = db.getReplayProviderRecovery({
+    sessionKey: '1',
+    botName: 'testbot',
+    telegramChatId: '1',
+    telegramMessageId: '42',
+  });
+  const plan = classifyReplay({
+    candidates: [follower],
+    cleanShutdown: true,
+    getProviderRecovery: () => replayEvidence,
+  });
+  assert.deepEqual(plan.recoverCodex, [follower]);
+  assert.deepEqual(plan.notices, []);
+
+  writeScenario(fixture, {
+    methods: {
+      'turn/start': completingTurnDescriptor(
+        'turn-after-deploy',
+        'Continued after deploy',
+      ),
+    },
+  });
+  const replayRuntime = createRuntime({
+    db,
+    config,
+    fixture,
+    integrationOrchestra,
+    controllerOptions: {
+      resolveHostIdentity: () => Object.freeze({
+        stableHostId: 'host:integration',
+        bootSessionId: 'boot:replay',
+      }),
+      startupRecovery: Object.freeze({
+        exclusive_daemon_ownership: true,
+        supervisor_grace_elapsed: true,
+      }),
+    },
+  });
+  const { proc: replayProc } = await spawnCodex(
+    replayRuntime,
+    db,
+    config,
+  );
+  t.after(async () => {
+    try { await replayRuntime.manager.kill('1', 'integration-cleanup'); } catch {}
+  });
+
+  const order = [];
+  const tracked = [];
+  const outcomes = [];
+  const continuationTask = Promise.resolve().then(async () => {
+    order.push('continue');
+    const result = await replayRuntime.manager.send('1', 'continue', {
+      context: { sourceMsgId: '41' },
+    });
+    await replayRuntime.controller.settleTelegramDelivery('1', result);
+    return { status: 'replied' };
+  });
+  const scheduled = scheduleCleanCodexReplaySessions({
+    candidates: plan.recoverCodex,
+    getSessionKey: () => '1',
+    getContinuationTasks: () => [continuationTask],
+    coordinator: createCleanReplaySessionCoordinator(),
+    recover: async (row) => {
+      order.push(`follower:${row.msg_id}`);
+      db.prepareCodexCleanReplay({
+        source: {
+          botName: 'testbot',
+          telegramChatId: '1',
+          telegramMessageId: '42',
+        },
+        sessionKey: '1',
+        currentGeneration: {
+          generationId: replayProc.generationId,
+        },
+        expectedEvidence: replayEvidence,
+        owner: {
+          stableHostId: replayProc.hostIdentity,
+          bootSessionId: replayProc.bootSessionIdentity,
+        },
+        ts: Date.now(),
+      });
+      return { status: 'dispatched' };
+    },
+    trackTask: (task) => tracked.push(task),
+    onOutcome: (outcome) => outcomes.push(outcome),
+  });
+  assert.deepEqual(scheduled, { scheduled: 1, sessions: 1 });
+  await Promise.all(tracked);
+
+  assert.deepEqual(order, ['continue', 'follower:42']);
+  assert.equal(outcomes[0].outcome.status, 'complete');
+  assert.equal(outcomes[0].outcome.admitted, 1);
+  assert.equal(
+    db.raw.prepare(`
+      SELECT handler_status FROM messages
+       WHERE chat_id = '1' AND msg_id = 42
+    `).get().handler_status,
+    'replay-attempted',
+  );
+  assert.deepEqual(
+    db.raw.prepare(`
+      SELECT generation_id, state, steer_attempt_id, target_attempt_id
+        FROM codex_dispatch_reservations
+       WHERE reservation_id = ?
+    `).get(followerClaim.reservationId),
+    {
+      generation_id: replayProc.generationId,
+      state: 'reserved',
+      steer_attempt_id: null,
+      target_attempt_id: null,
+    },
   );
 });
 

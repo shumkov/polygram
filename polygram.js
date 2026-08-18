@@ -31,11 +31,22 @@ const {
 const { buildPrompt, resolvePromptBackend } = require('./lib/prompt');
 const { countInFlight } = require('./lib/queue-utils');
 const { createIpcHandlers } = require('./lib/ipc/handlers');
+const {
+  buildQualificationEvent,
+} = require('./lib/ops/clean-restart-qualification');
+const {
+  createForegroundCanaryAuthorizer,
+} = require('./lib/ops/foreground-canary-target');
+const {
+  createDeployRestartHandler,
+} = require('./lib/ops/deploy-restart-handler');
 const { classifyOrphanSweep } = require('./lib/ops/tmux-preflight');
 const {
   parseSystemdInvocationId,
   lifecycleDetail,
 } = require('./lib/ops/systemd-invocation');
+const { createDaemonIdentity } = require('./lib/ops/daemon-identity');
+const packageMetadata = require('./package.json');
 const { filterAttachments, resolveFileCaps, resolveMaxFileOverride, MAX_TOTAL_BYTES } = require('./lib/attachments');
 // 0.9.0: SDK ProcessManager is the only pm. CLI pm
 // (lib/process-manager.js) deleted in commit 6.
@@ -75,6 +86,9 @@ const {
   resolveCodexStartupRecovery,
 } = require('./lib/codex/runtime-controller');
 const {
+  authorizeCleanReplayDispatch,
+} = require('./lib/codex/clean-replay-dispatch');
+const {
   buildCodexSpawnContext,
 } = require('./lib/codex/spawn-context');
 const {
@@ -98,6 +112,10 @@ const { createDownloadAttachments } = require('./lib/handlers/download');
 const { createHandleConfigCallback } = require('./lib/handlers/config-callback');
 const { createHandleAbort } = require('./lib/handlers/abort');
 const { createAutosteerHandlers } = require('./lib/handlers/autosteer');
+const {
+  settleAcceptedAutosteerOwnership,
+  shouldDispatchPrimaryAfterAutosteer,
+} = require('./lib/handlers/claude-autosteer-ownership');
 const { createEditCorrectionInjector } = require('./lib/handlers/edit-correction');
 const { createEditRedelivery } = require('./lib/handlers/edit-redelivery');
 const { createGateInbound, ADMIN_CMD_RE, PAIR_CLAIM_RE } = require('./lib/handlers/gate-inbound');
@@ -106,7 +124,7 @@ const { createRedeliver } = require('./lib/handlers/redeliver');
 const { classifyReplay, executeReplayPlan } = require('./lib/handlers/replay-disposition');
 const { createDropRedeliverer } = require('./lib/handlers/drop-redeliver');
 const { createSessionFeedback } = require('./lib/feedback/session-feedback');
-const { createSlashCommands } = require('./lib/handlers/slash-commands');
+const { createSlashCommands, normalizeCompactCommand } = require('./lib/handlers/slash-commands');
 const {
   buildCodexReconciliationView,
   createHandleCodexReconciliationCallback,
@@ -187,6 +205,7 @@ const { createCgroupOomObserver } = require('./lib/ops/cgroup-oom-observer');
 const { persistShutdownDisposition } = require('./lib/ops/shutdown-disposition');
 const {
   prepareCleanRetirement,
+  settleCrashShutdown,
   buildResumeIntents,
 } = require('./lib/ops/clean-shutdown');
 const {
@@ -197,6 +216,12 @@ const {
   startCleanRestartRecovery,
   validateStrictResumeSpawn,
 } = require('./lib/ops/clean-resume');
+const {
+  createCleanReplaySessionCoordinator,
+} = require('./lib/ops/clean-replay-session-coordinator');
+const {
+  scheduleCleanCodexReplaySessions,
+} = require('./lib/ops/clean-codex-boot-replay');
 const { resolveReplayWindowMs } = require('./lib/db/replay-window');
 const { pruneEvents, resolveRetentionPolicy, validatePolicy } = require('./lib/db/events-retention');
 const { sweepSecrets, resolveSecretSweepConfig } = require('./lib/db/secret-sweep');
@@ -475,6 +500,13 @@ let richEditMessageText;
 // classification, but it never throws: its caller holds the only copy of the
 // reply and owns the plain fallback.
 let richSendMessage;
+// The rich half of the reply-tool delivery chain, hoisted so the interactive
+// turn path can reuse the same instance rather than configure a second one.
+// Two instances would be two capability latches, two styling verdicts and two
+// sets of ceilings to keep in step; one is the only way they cannot drift.
+// Null until main() wires it — callers fall back to plain, which is what a
+// chat without rich gets anyway.
+let makeRichDeliverText = null;
 let richMediaFileIdCache;
 
 // 0.15 secret redaction (agent-flagged path): the agent marks a secret it saw
@@ -1054,6 +1086,8 @@ let attemptAutoResume = null;
 let errorReplyText = null;
 let queueWarnThreshold = null;
 let inFlightHandlers = null;
+let getActiveHandlerCount = null;
+let getActiveHandlerTargets = null;
 let awaitHandlerSettlement = null;
 let trackHandlerTask = null;
 let recoverCodexRequest = null;
@@ -1197,7 +1231,7 @@ function parsePairCodeArgs(text) {
 
 // ─── Message handler ────────────────────────────────────────────────
 
-async function handleMessage(sessionKey, chatId, msg, bot) {
+async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = null) {
   const chatConfig = config.chats[chatId];
   if (!chatConfig) return;
   const text = msg.text || msg.caption || '';
@@ -1373,7 +1407,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // /pair-code /pairings /unpair /pair. Returns true when handled;
   // caller short-circuits.
   if (await dispatchSlashCommand({
-    text, sessionKey, chatId, threadIdStr, chatConfig,
+    text, msgId: msg.message_id, sessionKey, chatId, threadIdStr, chatConfig,
     cmdUser, cmdUserId, label, sendReply,
   })) return;
 
@@ -1486,7 +1520,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       console.error(`[${label}] failed to notify user of skipped attachments: ${err.message}`);
       logEvent('attachment-skip-notice-failed', {
         chat_id: chatId, msg_id: msg.message_id,
-        error: err.message?.slice(0, 200),
+        error_class: err.name || 'Error',
         rejected_count: rejected.length,
       });
     }
@@ -1547,12 +1581,15 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   // path — same contract for "not opted in", "capability known
   // unsupported", and "content doesn't need it" (needsRichRendering
   // inside toTelegramRichBlocks handles the last one).
-  // Rich delivery is limited to this interactive streamer instance.
-  // A reply that never crosses minChars (stays idle → delivered via
-  // deliverReplies) and any non-streaming send path — autonomous-wakeup/
+  // This callback covers the streamed bubble only. A turn that ends with
+  // text instead of streaming it renders rich too, through the reply tool's
+  // own factory reused at the non-streamed branch below — one gate, one
+  // sender, one latch, so the same markdown cannot format two ways
+  // depending on how the answer arrived.
+  // Still plain: the non-streaming send paths — autonomous-wakeup/
   // auto-resume/autosteer via lib/telegram/process-agent-reply.js, cron/
-  // IPC sends — never render rich even when richText is on and the
-  // content qualifies. Those delivery paths intentionally remain plain.
+  // IPC sends. Those render plain even when richText is on and the content
+  // qualifies.
   // Re-read both controls for every flush so a config change or a
   // capability result applies to the turn already in progress.
   // Typed media resolution for rich replies. Same
@@ -1765,7 +1802,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
           // Network errors can embed the request URL, which carries the
           // bot token — redact before persisting, matching rich-edit.js
           // and api.js's handling of the same error class.
-          api_error: redactBotToken(err.message)?.slice(0, 200),
+          api_error_code: err.code || err.name || 'error',
+          error_len: err.message?.length ?? 0,
           bot: BOT_NAME,
         });
         throw err;
@@ -2024,26 +2062,43 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
   let sendPromise = null;
   let codexDispatch = null;
   let codexDispatchDecision = null;
+  let acceptedAutosteerProvider = null;
   try {
     const current = pm.get(sessionKey);
-    const liveCodexGeneration = Boolean(
+    const cleanReplayDispatch = dispatchContext?.cleanReplay ?? null;
+    const currentCodexGeneration = Boolean(
       current
       && !current.closed
-      && current.inFlight
       && typeof current.generationId === 'string'
       && (
         current.runtime === 'codex'
         || current.backend === 'codex'
-      ),
+      )
+    );
+    const liveCodexGeneration = Boolean(
+      currentCodexGeneration
+      && current.inFlight
     );
     requireCodexDispatchEnabled({
       config,
       chatId,
       threadId: threadIdStr || null,
       selectedProvider: selectedInboundProvider,
-      liveCodexGeneration,
+      liveCodexGeneration: cleanReplayDispatch
+        ? currentCodexGeneration
+        : liveCodexGeneration,
     });
-    if (liveCodexGeneration) {
+    if (cleanReplayDispatch) {
+      codexDispatch = authorizeCleanReplayDispatch({
+        sessionKey,
+        currentProcess: current,
+        expectedProcess: cleanReplayDispatch.expectedProcess,
+        reservation: cleanReplayDispatch.reservation,
+        controller: codexRuntimeController,
+      });
+      codexDispatchDecision = 'queue';
+      acceptedAutosteerProvider = 'codex';
+    } else if (liveCodexGeneration) {
       if (!codexRuntimeController) {
         codexDispatchDecision = 'unavailable';
       } else {
@@ -2070,6 +2125,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
               msg,
               prompt,
             });
+            acceptedAutosteerProvider = 'codex';
             if (steered.outcome === 'accepted') {
               try {
                 codexRuntimeController.finalizeAcceptedSteer({
@@ -2196,12 +2252,23 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         msg,
         prompt,
       });
+      acceptedAutosteerProvider = 'claude';
     }
-    if (
-      !steered.autosteered
-      && !['duplicate', 'ambiguous', 'unavailable']
-        .includes(codexDispatchDecision)
-    ) {
+    steered = settleAcceptedAutosteerOwnership({
+      selectedProvider: acceptedAutosteerProvider,
+      steered,
+      db,
+      chatId,
+      msgId: msg.message_id,
+      sessionKey,
+      logLabel: label,
+      logEvent,
+      logger: console,
+    });
+    if (shouldDispatchPrimaryAfterAutosteer({
+      steered,
+      codexDispatchDecision,
+    })) {
       if (codexDispatchDecision === 'queue') {
         reactor.setState('THINKING');
       }
@@ -2242,7 +2309,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
             // emitting — not the moment we wrote stdin.
             onFirstStream: () => reactor.setState('THINKING'),
             onTurnId: (id) => { dispatchedTurnId = id; },
-          }, { onDispatched: dispatched })
+          }, {
+            expectedProcess: cleanReplayDispatch?.expectedProcess ?? null,
+            onDispatched: () => {
+              dispatched();
+              try { dispatchContext?.onDispatched?.(); } catch {}
+            },
+          })
             .catch((e) => ({ __sendError: e }))
             .finally(dispatched);
         });
@@ -2277,6 +2350,31 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         status: terminalDuplicateStatus,
       }), 'restore duplicate Codex handler status');
     }
+    return;
+  }
+  if (steered.outcome === 'accepted-persistence-ambiguous') {
+    stopTyping();
+    await finishStreamer();
+    await reactor.clear().catch(() => {});
+    reactor.stop();
+    await tg(bot, 'sendMessage', {
+      chat_id: chatId,
+      text: 'This follow-up may have been incorporated. Please wait for the current turn to finish before retrying it.',
+      ...replyOpts(threadId),
+    }, {
+      source: 'claude-autosteer-notice',
+      botName: BOT_NAME,
+    }).catch((error) => {
+      console.error(
+        `[${label}] failed to send Claude autosteer ambiguity notice: ${error.message}`,
+      );
+      logEvent('autosteer-ambiguity-notice-failed', {
+        chat_id: chatId,
+        msg_id: msg.message_id,
+        session_key: sessionKey,
+        code: error?.code || error?.name || 'unknown',
+      });
+    });
     return;
   }
   if (['ambiguous', 'unavailable'].includes(codexDispatchDecision)) {
@@ -2387,7 +2485,9 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       logEvent('wedged-session-detected', {
         chat_id: chatId, session_key: sessionKey,
         kind: wedge.kind,
-        text_preview: result.text.slice(0, 200),
+        // The wrapper's classification is the forensic signal; the wrapped
+        // payload is provider content and stays out of the row.
+        text_len: result.text.length,
       });
       // Promote the wrapped error to result.error so the existing
       // auto-recover + thrown-error machinery handles it uniformly.
@@ -2408,6 +2508,13 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
       // to type /new.
       const cls = classifyError(result.error);
       if (cls.autoRecover === 'reset_session') {
+        // The process that owns any open question is going away with the
+        // session. Retirement closes the row and drops what is held exactly
+        // for it — that part runs synchronously, so starting it here is enough
+        // to have happened before the reset. Only the card edit it leaves
+        // behind is awaited, and the reset must not wait on Telegram.
+        questionHandlers?.retireSession(sessionKey)
+          ?.catch((err) => console.error(`[${label}] question retire failed: ${err.message}`));
         pm.resetSession(sessionKey, { reason: cls.kind })
           .catch((err) => console.error(`[${label}] auto-reset failed: ${err.message}`));
         logEvent('auto-recover', {
@@ -2582,7 +2689,7 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         reactor.setState('ERROR');
         logEvent('telegram-empty-response-fallback-failed', {
           chat_id: chatId, msg_id: msg.message_id, bot: BOT_NAME,
-          error: err.message?.slice(0, 200),
+          error_class: err.name || 'Error',
         });
         throw new Error(`empty-response fallback send failed: ${err.message}`);
       }
@@ -2671,7 +2778,8 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         logEvent('canned-reply-suppressed', {
           chat_id: chatId,
           msg_id: msg.message_id,
-          original: sanitized.original,
+          // The suppressed reply is provider content; its size is the signal.
+          original_len: sanitized.original?.length ?? 0,
           backend: result?.backend || null,
         });
         parsed.text = sanitized.text;
@@ -2862,27 +2970,78 @@ async function handleMessage(sessionKey, chatId, msg, bot) {
         console.error(`[${label}] sendSticker failed: ${err.message}`);
       });
     } else if (parsed.text) {
-      // 0.7.0: use markdown-aware chunker + deliverReplies primitive.
-      // The old chunkText was newline/byte-only; chunkMarkdownText also
-      // respects code-fence boundaries (closes + reopens across chunks).
-      // Short replies never went live-rich, so image markdown from a
-      // rich-enabled chat degrades to caption text here too — never a
-      // raw local path in the bubble.
-      const shortText = resolveRichTextEnabled(config, chatId, threadId)
-        ? stripMediaMarkdown(parsed.text)
-        : parsed.text;
-      const chunks = chunkMarkdownText(shortText, TG_CHUNK_BUDGET);
-      const deliveryResult = await deliverReplies({
-        bot,
-        send: (b, method, params, m) => tg(b, method, params, m),
-        chatId,
-        threadId,
-        chunks,
-        replyToMessageId: msg.message_id,
-        meta: outMeta,
-        logger: { error: (m) => console.error(`[${label}] ${m}`) },
-      });
-      mediaContext.recordTextFailures(deliveryResult.failed.length);
+      // A turn that ends with text instead of calling the reply tool lands
+      // here. It is the same agent writing the same markdown as the reply
+      // tool, so it renders through the same gate and the same sender —
+      // otherwise a table is a table or a wall of pipes depending only on
+      // which way the answer happened to arrive, which is not a distinction
+      // the reader can see or act on.
+      //
+      // Text-only by construction: no allowedRoots, so media stays degraded
+      // to caption text exactly as it was here before, and this path opens no
+      // upload surface of its own.
+      // Wrapped even though the factory is contracted not to throw: that
+      // contract is convention, and its styling-retry ladder evaluates
+      // blocksAreStyled/flattenStyledBlocks outside any try. A throw escaping
+      // here would skip the plain arm and cost the whole reply, so this catch
+      // is the difference between a flat answer and no answer.
+      let richOut = null;
+      try {
+        richOut = makeRichDeliverText
+          ? await makeRichDeliverText({ chatId, threadId })({
+            text: parsed.text,
+            replyToMessageId: msg.message_id,
+            // Its own source, because rich-message-sent carries none and the
+            // streamed rich open reports as bot-reply-stream-open-rich.
+            // Without a distinct tag nothing downstream can tell this branch
+            // from the other sites writing the bare streamer tag.
+            meta: { ...outMeta, source: 'bot-reply-final-rich' },
+          })
+          : null;
+      } catch (richErr) {
+        // Named apart from the turn's own `err` on purpose: this is the
+        // rich attempt failing, not the turn, and the completion tail is
+        // located in tests by scanning for the turn handler's catch.
+        console.error(`[${label}] rich delivery threw, falling back to plain: ${richErr.message}`);
+        richOut = null;
+      }
+      if (richOut?.handled) {
+        // One bubble, no chunks, nothing failed — but still report, because
+        // this is the same incomplete-delivery gate the plain arm feeds and
+        // it must hear from whichever arm ran.
+        mediaContext.recordTextFailures(richOut.failed.length);
+      } else {
+        // 0.7.0: use markdown-aware chunker + deliverReplies primitive.
+        // The old chunkText was newline/byte-only; chunkMarkdownText also
+        // respects code-fence boundaries (closes + reopens across chunks).
+        // Image markdown from a rich-enabled chat degrades to caption text
+        // here too — never a raw local path in the bubble.
+        //
+        // The `??` arm is load-bearing: a chat with rich off declines with
+        // no body at all, and chunking `undefined` would drop the reply
+        // entirely for most of the fleet. Both arms strip through the same
+        // call, so the delivered text is byte-identical either way.
+        const shortText = richOut?.text ?? (resolveRichTextEnabled(config, chatId, threadId)
+          ? stripMediaMarkdown(parsed.text)
+          : parsed.text);
+        const chunks = chunkMarkdownText(shortText, TG_CHUNK_BUDGET);
+        const deliveryResult = await deliverReplies({
+          bot,
+          send: (b, method, params, m) => tg(b, method, params, m),
+          chatId,
+          threadId,
+          chunks,
+          replyToMessageId: msg.message_id,
+          // Tagged like its rich sibling. Five call sites write the bare
+          // 'bot-reply-stream' tag and three of them deliver reply bodies,
+          // so a row carrying it says nothing about which one produced it.
+          // Naming both arms makes this branch identifiable from the
+          // messages table whichever way the reply went out.
+          meta: { ...outMeta, source: 'bot-reply-final' },
+          logger: { error: (m) => console.error(`[${label}] ${m}`) },
+        });
+        mediaContext.recordTextFailures(deliveryResult.failed.length);
+      }
     }
 
     // A turn whose final output was a solo sticker/reaction skips the
@@ -3418,7 +3577,7 @@ function createBot(token) {
       bot: BOT_NAME,
       update_id: updateId,
       msg_id: msgId,
-      error: err.message?.slice(0, 300),
+      error_class: err.name || 'Error',
     });
   });
 
@@ -3433,10 +3592,18 @@ function createBot(token) {
 // ─── Manual polling — extracted to lib/handlers/poll.js ────────────
 let pollBot = null;
 let startPollWatchdog = null;
+let stopPolling = null;
+let awaitPollSettlement = null;
 
 // ─── Main ───────────────────────────────────────────────────────────
 
 async function main() {
+  const daemonIdentity = createDaemonIdentity({
+    mainPath: __filename,
+    packageVersion: packageMetadata.version,
+  });
+  const cleanReplaySessionCoordinator =
+    createCleanReplaySessionCoordinator();
   const cgroupOomObserver = createCgroupOomObserver();
   const invocationId = parseSystemdInvocationId();
   let abnormalProviderTermination = null;
@@ -3681,7 +3848,7 @@ async function main() {
     db.logEvent('polygram-start', lifecycleDetail({
       migration: migration.reason,
       imported: migration.imported,
-    }, invocationId));
+    }, invocationId, daemonIdentity));
     if (cgroupOomObserver.startup.status === 'unavailable') {
       console.warn(`[oom-observer] unavailable (${cgroupOomObserver.startup.reason}); handled shutdown signals will retain clean-restart behavior`);
       db.logEvent('oom-observer-unavailable', { reason: cgroupOomObserver.startup.reason });
@@ -3752,7 +3919,7 @@ async function main() {
       }
     } catch (err) {
       console.error(`[secret-sweep] FAILED (${trigger}): ${err.message}`);
-      try { db.logEvent('secret-sweep-failed', { trigger, error: err.message }); } catch {}
+      try { db.logEvent('secret-sweep-failed', { trigger, error_class: err.name || 'Error' }); } catch {}
     }
   };
   if (secretSweepCfg.enabled) {
@@ -3923,6 +4090,20 @@ async function main() {
     answerQuestion: (sk, tc, result) => pm.answerQuestion(sk, tc, result),
     logger: console,
   });
+  // A question whose answer was held in memory cannot be completed by this
+  // process: the exact value went with the one that died. Cancel those rows
+  // here — before replay, redelivery, provider recovery, polling or any other
+  // path can act on them — so none is ever answered from a marker.
+  // A failure here is fatal on purpose. Rows this could not cancel would meet
+  // replay and inbound traffic with an answer no live process can complete, so
+  // startup stops instead of admitting messages behind an open fence.
+  try {
+    await questionHandlers.reconcileMarkedQuestionsAtBoot(questionStore.listOpen(BOT_NAME));
+  } catch (e) {
+    console.error(`[${BOT_NAME}] question boot reconciliation failed; refusing to admit traffic: ${e.message}`);
+    throw e;
+  }
+
   // Resolve expired questions with {timedout} so claude never hangs on an ignored ask.
   setInterval(() => {
     try {
@@ -3936,7 +4117,10 @@ async function main() {
   // the copy-only transcript-fork executor (P2/P3: fork → repoint the session → kill → delete
   // orphaned bot messages). channels/cli only; the fork mechanism was proven in P0.6.
   // See docs/0.13-rewind-design.md.
-  const executeRewind = createRewindExecutor({ db, pm, tg, bot, botName: BOT_NAME, logEvent, logger: console });
+  const executeRewind = createRewindExecutor({
+    db, pm, tg, bot, botName: BOT_NAME, logEvent, logger: console,
+    retireQuestionSession: (sessionKey) => questionHandlers?.retireSession(sessionKey),
+  });
   rewindHandler = createRewindHandler({
     pm, tg, bot, botName: BOT_NAME, logEvent, logger: console, executeRewind,
   });
@@ -4017,6 +4201,38 @@ async function main() {
   //
   // Neither feature may switch the other off, which a single strategy slot
   // could not express.
+  // Built before the chain rather than inline in it, because the interactive
+  // turn path reuses this exact instance for its non-streamed replies. See
+  // the makeRichDeliverText declaration for why it must be one instance.
+  // Injected rather than imported by the dispatcher: rich-media.js requires
+  // the dispatcher module, so the reverse direction would be a require cycle.
+  makeRichDeliverText = createRichDeliveryFactory({
+    bot,
+    sendRich: (args) => richSendMessage(args),
+    isRichTextEnabled: (chatId, threadId) => resolveRichTextEnabled(config, chatId, threadId),
+    getRichKnownUnsupported: () => richSendKnownUnsupported,
+    // No config knob: the automatic flatten-and-retry below IS the control,
+    // and it needs no operator to notice anything. A knob would add a state
+    // where styling is off while the server accepts it, which nothing in
+    // the system can detect or correct.
+    isInlineStylingEnabled: () => !richInlineStylingUnsupported,
+    onStylingRejected: () => richStylingLatch?.recordStylingRejection(),
+    onStylingAccepted: () => richStylingLatch?.recordHealthyOutcome(),
+    redactError: redactBotToken,
+    // Media for one reply. The envelope itself (no URL media, the `files:`
+    // fan-out ceiling, the shared stat) lives in rich-media.js so it is
+    // pinned by behavior rather than by this literal — nothing executes
+    // this file. `allowedRoots` arrives per call from the dispatcher, which
+    // computed it once and validates `files:` against that very array, so a
+    // path the reply tool may upload is exactly a path image syntax may
+    // upload. The interactive path passes none, so it renders text-only.
+    makeMediaWiring: makeReplyMediaWiring({
+      config,
+      fileIdCache: richMediaFileIdCache,
+      logEvent,
+      botName: BOT_NAME,
+    }),
+  });
   const makeDeliverText = composeDeliverTextFactories([
     createDeliverTextFactory({
       registry: streamerRegistry,
@@ -4034,35 +4250,7 @@ async function main() {
         resolveRichTextEnabled(config, chatId, threadId) ? stripMediaMarkdown(text) : text
       ),
     }),
-    // Injected rather than imported by the dispatcher: rich-media.js requires
-    // the dispatcher module, so the reverse direction would be a require cycle.
-    createRichDeliveryFactory({
-      bot,
-      sendRich: (args) => richSendMessage(args),
-      isRichTextEnabled: (chatId, threadId) => resolveRichTextEnabled(config, chatId, threadId),
-      getRichKnownUnsupported: () => richSendKnownUnsupported,
-      // No config knob: the automatic flatten-and-retry below IS the control,
-      // and it needs no operator to notice anything. A knob would add a state
-      // where styling is off while the server accepts it, which nothing in
-      // the system can detect or correct.
-      isInlineStylingEnabled: () => !richInlineStylingUnsupported,
-      onStylingRejected: () => richStylingLatch?.recordStylingRejection(),
-      onStylingAccepted: () => richStylingLatch?.recordHealthyOutcome(),
-      redactError: redactBotToken,
-      // Media for one reply. The envelope itself (no URL media, the `files:`
-      // fan-out ceiling, the shared stat) lives in rich-media.js so it is
-      // pinned by behavior rather than by this literal — nothing executes
-      // this file. `allowedRoots` arrives per call from the dispatcher, which
-      // computed it once and validates `files:` against that very array, so a
-      // path the reply tool may upload is exactly a path image syntax may
-      // upload.
-      makeMediaWiring: makeReplyMediaWiring({
-        config,
-        fileIdCache: richMediaFileIdCache,
-        logEvent,
-        botName: BOT_NAME,
-      }),
-    }),
+    makeRichDeliverText,
   ]);
 
   // The edit tool's counterpart to the reply chain above. An agent that posts
@@ -4189,7 +4377,12 @@ async function main() {
   });
   const processFactory = (sessionKey, spawnContext) => {
     const proc = orchestraProcessFactory(sessionKey, spawnContext);
-    if (proc?.runtime === 'codex') codexRuntimeController.registerProcess(proc);
+    if (proc?.runtime === 'codex') {
+      codexRuntimeController.registerProcess(proc, {
+        expectedProviderGenerationId:
+          spawnContext.expectedProviderGenerationId ?? null,
+      });
+    }
     return proc;
   };
   // Route in-process approval prompts through the SAME canUseTool plumbing
@@ -4280,6 +4473,7 @@ async function main() {
   handleAbortIfRequested = createHandleAbort({
     pm, bot, tg, logEvent, isAbortRequest,
     markSessionAborted, clearAutosteeredReactions, getSessionKey,
+    retireQuestionSession: (sessionKey) => questionHandlers?.retireSession(sessionKey),
     botName: BOT_NAME, logger: console,
   });
   autosteer = createAutosteerHandlers({
@@ -4300,11 +4494,16 @@ async function main() {
     errorReplyText,
     queueWarnThreshold,
     inFlightHandlers,
+    getActiveHandlerCount,
+    getActiveHandlerTargets,
     awaitSettlement: awaitHandlerSettlement,
     trackTask: trackHandlerTask,
   } = createDispatcher({
     config, db, dbWrite, tg, botName: BOT_NAME, logEvent,
     handleMessage, sendToProcess,
+    awaitSessionRecovery: (sessionKey, receipt) => (
+      cleanReplaySessionCoordinator.wait(sessionKey, receipt)
+    ),
     recoverCodex: (input) => {
       if (typeof recoverCodexRequest !== 'function') {
         const error = new Error('Exact Codex recovery path is unavailable');
@@ -4373,7 +4572,7 @@ async function main() {
   dropRedeliverer = createDropRedeliverer({
     db, redeliver: redeliverAsFreshTurn, logEvent, logger: console,
   });
-  ({ pollBot, startPollWatchdog } = createPollLoop({
+  ({ pollBot, startPollWatchdog, stopPolling, awaitPollSettlement } = createPollLoop({
     db, dbWrite, config, botName: BOT_NAME,
     isWellFormedMessage, getTopicName,
     logger: console,
@@ -4385,6 +4584,7 @@ async function main() {
     modelVersionsDesc: MODEL_VERSIONS_DESC, saveConfig,
     resolveRuntimeView: resolveSessionRuntimeView,
     botName: BOT_NAME, logEvent, logger: console,
+    retireQuestionSession: (sessionKey) => questionHandlers?.retireSession(sessionKey),
   });
   console.log('[polygram] using SDK ProcessManager');
 
@@ -4419,7 +4619,12 @@ async function main() {
   // replay picks it up. Prevents "Sorry, I couldn't process that message"
   // from showing on every restart.
   const SHUTDOWN_DRAIN_MS = 30_000;
-  const shutdown = async ({ continuationAuthorized = false, trigger = 'signal' } = {}) => {
+  const shutdown = async ({
+    continuationAuthorized = false,
+    trigger = 'signal',
+    restartRequestId = null,
+    qualificationExpectation,
+  } = {}) => {
     if (isShuttingDown) return;
     const shutdownObservation = cgroupOomObserver.sample();
     // Sample in-flight work at SIGNAL time, alongside the OOM observation and
@@ -4431,28 +4636,41 @@ async function main() {
     isShuttingDown = true;
     console.log(`\nShutting down (${trigger})...`);
     // 1. Stop accepting new inbound first so nothing new queues behind the drain.
-    if (bot && bot._stop) bot._stop();
+    stopPolling();
+    const awaitIngressSettlement = ({ timeoutMs } = {}) => (
+      awaitPollSettlement({ timeoutMs })
+    );
 
-    // 1.5 (0.13 D1): expire open interactive questions {cancelled} BEFORE the
-    // drain. With D1 the asking turn stays in flight for the whole wait, so a
-    // deploy during a question would otherwise eat the entire 30s drain and
-    // mark the inbound replay-pending mid-ask. Cancelling unblocks claude's
-    // ask so the cycle can end inside the drain; the boot-replay re-ask is the
-    // documented recovery path (design §3 D1 ask-wait semantics).
+    // Resolve open questions before provider settlement. Authorized deploys
+    // register the card edit and cancel the row without answering the retiring
+    // provider; ordinary stops keep the existing answer-and-await behavior.
     try {
       const openQuestions = questionStore.listOpen?.(BOT_NAME) || [];
+      const shutdownNotice = 'Bot is restarting — this question was cancelled. It may be re-asked in a moment.';
+      // Each row is disposed on its own: one that throws must not take the
+      // rows after it, nor the drop of everything held in memory, with it.
       for (const row of openQuestions) {
-        // eslint-disable-next-line no-await-in-loop
-        await questionHandlers.expireQuestion(row, {
-          status: 'cancelled',
-          message: 'Bot is restarting — this question was cancelled. It may be re-asked in a moment.',
-        }).catch(() => {});
+        try {
+          if (continuationAuthorized) {
+            questionHandlers.beginShutdownDisposition(row, { message: shutdownNotice });
+          } else {
+            // eslint-disable-next-line no-await-in-loop
+            await questionHandlers.expireQuestion(row, { status: 'cancelled', message: shutdownNotice });
+          }
+        } catch (err) {
+          console.error(`[shutdown] question ${row.id} disposition failed: ${err.message}`);
+        }
       }
       if (openQuestions.length) {
         logEvent('shutdown-questions-cancelled', { count: openQuestions.length });
       }
     } catch (err) {
       console.error(`[shutdown] question expiry failed: ${err.message}`);
+    } finally {
+      // Nothing exact survives the process on purpose, whatever any single row
+      // did on the way out.
+      try { questionHandlers.discardAll(); }
+      catch (err) { console.error(`[shutdown] question context drop failed: ${err.message}`); }
     }
 
     // 1.6 Album siblings still buffered (arrived <flushMs before shutdown,
@@ -4505,13 +4723,15 @@ async function main() {
     // 2. Drain in-flight handlers. Wait for inFlightHandlers to empty or
     //    SHUTDOWN_DRAIN_MS to elapse. pm handlers resolve naturally when
     //    result events arrive; the dispatcher's .finally decrements.
-    const drainStart = Date.now();
-    while (inFlightHandlers.size > 0) {
-      if (Date.now() - drainStart >= SHUTDOWN_DRAIN_MS) break;
-      await new Promise((r) => setTimeout(r, 100));
+    let drainElapsed = 0;
+    if (!continuationAuthorized) {
+      const drainStart = Date.now();
+      while (inFlightHandlers.size > 0) {
+        if (Date.now() - drainStart >= SHUTDOWN_DRAIN_MS) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      drainElapsed = Date.now() - drainStart;
     }
-    const drainElapsed = Date.now() - drainStart;
-    const remaining = countInFlight(inFlightHandlers);
 
     // 3. A clean stop closes both output boundaries before persisting any
     //    recovery intent. The ProcessManager receipt is the only authority for
@@ -4522,14 +4742,39 @@ async function main() {
       ? 'provider-process-terminated'
       : null;
     let resumeIntents = [];
-    if (shutdownObservation?.detected !== true) {
+    if (shutdownObservation?.detected === true) {
+      try {
+        await settleCrashShutdown({
+          pm,
+          deliveryBarrier,
+          awaitIngressSettlement,
+          awaitHandlerSettlement,
+          settlementTimeoutMs: SHUTDOWN_DRAIN_MS,
+        });
+      } catch (err) {
+        console.error(`[shutdown] crash settlement failed: ${err.message}`);
+      }
+      pmRetired = true;
+    } else {
       try {
         const retirement = await prepareCleanRetirement({
           pm,
           deliveryBarrier,
+          awaitIngressSettlement,
           awaitHandlerSettlement,
           settlementTimeoutMs: SHUTDOWN_DRAIN_MS,
+          continuationAuthorized,
+          qualificationExpectation,
         });
+        if (qualificationExpectation !== undefined) {
+          logEvent('clean-restart-qualification-observed', buildQualificationEvent({
+            botName: BOT_NAME,
+            daemonIdentity,
+            restartRequestId,
+            expectation: qualificationExpectation,
+            observation: retirement.qualification,
+          }));
+        }
         pmRetired = true;
         const projected = continuationAuthorized ? buildResumeIntents({
           snapshots: retirement.snapshots,
@@ -4572,12 +4817,16 @@ async function main() {
           });
         }
       } catch (err) {
-        forceCrashReason = 'clean-retirement-failed';
+        forceCrashReason = err?.code === 'POLL_OFFSET_PERSISTENCE_FAILED'
+          ? 'poll-offset-persistence-failed'
+          : err?.code === 'POLL_SETTLEMENT_TIMEOUT'
+            ? 'poll-settlement-timeout'
+            : 'clean-retirement-failed';
         console.error(`[shutdown] clean retirement failed: ${err.message}`);
-        if (pm) await pm.shutdown().catch(() => {});
         pmRetired = true;
       }
     }
+    const remaining = countInFlight(inFlightHandlers);
 
     // 4. Persist only after the old delivery/process boundary is closed and
     //    every dispatcher-owned continuation has settled. Any uncertainty is
@@ -4611,8 +4860,14 @@ async function main() {
           elapsed_ms: drainElapsed,
           clean: res.clean,
           shutdown_reason: res.shutdownReason,
+          restart_trigger: trigger,
+          continuation_authorized: continuationAuthorized === true,
+          resume_intents_recorded: res.intentsRecorded ?? 0,
+          restart_request_id: trigger === 'deploy-ipc'
+            ? restartRequestId
+            : null,
           ...(res.oomKillDelta != null ? { oom_kill_delta: res.oomKillDelta } : {}),
-        }, invocationId));
+        }, invocationId, daemonIdentity));
         console.log(`[shutdown] ${res.clean ? 'clean' : 'crash-like'} shutdown recorded (${res.shutdownReason}); ${inFlightAtSignal} in-flight at signal, drained ${drainElapsed}ms, ${remaining} still in-flight, ${res.replayMarked} marked replay-pending`);
       } catch (err) {
         console.error(`[shutdown] persistence failed: ${err.message}`);
@@ -4621,7 +4876,7 @@ async function main() {
           logEvent('shutdown-persistence-fallback', {
             bot: BOT_NAME,
             replay_marked: fallback.replayMarked,
-            error: err.message?.slice(0, 200),
+            error_class: err.name || 'Error',
           });
         } catch (fallbackErr) {
           console.error(
@@ -4646,7 +4901,7 @@ async function main() {
     if (pm && !pmRetired) await pm.shutdown().catch(() => {});
     if (db) {
       try {
-        db.logEvent('polygram-stop', lifecycleDetail({}, invocationId));
+        db.logEvent('polygram-stop', lifecycleDetail({}, invocationId, daemonIdentity));
         db.raw.close();
       } catch {}
     }
@@ -4677,28 +4932,42 @@ async function main() {
     // scripts, hook); also exported to spawned Claude processes via env.
     const ipcSecret = ipcServer.writeSecret(BOT_NAME);
     process.env.POLYGRAM_IPC_SECRET = ipcSecret;
+    const foregroundCanaryAuthorizer = createForegroundCanaryAuthorizer({
+      botName: BOT_NAME,
+      daemonIdentity,
+      config,
+      tokenSecret: ipcSecret,
+      getActiveHandlerCount: () => getActiveHandlerCount(),
+      getActiveHandlerTargets: () => getActiveHandlerTargets(),
+      getForegroundCanaryTarget: (input) => (
+        db.getForegroundCanaryTarget(input)
+      ),
+    });
+    const requestDeployRestart = createDeployRestartHandler({
+      getIsShuttingDown: () => isShuttingDown,
+      getPid: () => process.pid,
+      foregroundCanaryAuthorizer,
+      persistForegroundCanaryAuthorization: (detail) => (
+        db.logEvent('foreground-canary-target-authorized', detail)
+      ),
+      shutdown,
+      logger: console,
+    });
     ipcCloser = await ipcServer.start({
       path: ipcServer.socketPathFor(BOT_NAME),
       secret: ipcSecret,
       handlers: createIpcHandlers({
         botName: BOT_NAME,
+        daemonIdentity,
         getInFlightHandlers: () => inFlightHandlers,
         handleSendOverIpc: (req) => handleSendOverIpc(req),
-        requestDeployRestart: () => {
-          if (isShuttingDown) {
-            const error = new Error('shutdown already in progress');
-            error.code = 'SHUTDOWN_IN_PROGRESS';
-            throw error;
-          }
-          const oldPid = process.pid;
-          shutdown({
-            continuationAuthorized: true,
-            trigger: 'deploy-ipc',
-          }).catch((error) => {
-            console.error(`[shutdown] deploy restart failed: ${error.message}`);
-          });
-          return { accepted: true, old_pid: oldPid };
-        },
+        requestForegroundCanaryTarget: (req) => (
+          foregroundCanaryAuthorizer.probe(req)
+        ),
+        inspectCleanRestartQualification: () => (
+          pm.inspectCleanRestartQualification(undefined)
+        ),
+        requestDeployRestart,
       }),
       logger: console,
     });
@@ -4923,11 +5192,9 @@ async function main() {
         for (let index = 0; index < cleanRecovery.claims.length; index += 1) {
           const sessionKey = cleanRecovery.claims[index].session_key;
           const task = cleanRecovery.tasks[index];
-          const previous = cleanRecoveryTasksBySession.get(sessionKey);
-          cleanRecoveryTasksBySession.set(
-            sessionKey,
-            previous ? Promise.all([previous, task]) : task,
-          );
+          const tasks = cleanRecoveryTasksBySession.get(sessionKey) || [];
+          tasks.push(task);
+          cleanRecoveryTasksBySession.set(sessionKey, tasks);
         }
       } catch (err) {
         const fatal = new Error(
@@ -4987,20 +5254,26 @@ async function main() {
         return msg;
       };
 
+      const providerRecoveries = new Map();
+      const recoveryKey = (row) => `${row.chat_id}\u0000${row.msg_id}`;
       const getProviderRecovery = (row) => {
         const sessionKey = sourceSessionKey(row);
         if (!sessionKey) {
-          return {
+          const missing = {
             provider: 'unknown',
             reason: 'session-configuration-missing',
           };
+          providerRecoveries.set(recoveryKey(row), missing);
+          return missing;
         }
-        return db.getReplayProviderRecovery({
+        const evidence = db.getReplayProviderRecovery({
           sessionKey,
           botName: BOT_NAME,
           telegramChatId: String(row.chat_id),
           telegramMessageId: String(row.msg_id),
         });
+        providerRecoveries.set(recoveryKey(row), evidence);
+        return evidence;
       };
 
       const plan = classifyReplay({
@@ -5011,8 +5284,124 @@ async function main() {
         getProviderRecovery,
       });
 
+      let cleanCodexScheduled = 0;
+      let executionPlan = plan;
+      if (cleanShutdown && (plan.recoverCodex?.length || 0) > 0) {
+        const cleanReplaySchedule = scheduleCleanCodexReplaySessions({
+          candidates: plan.recoverCodex,
+          getSessionKey: sourceSessionKey,
+          getContinuationTasks: (sessionKey) => (
+            cleanRecoveryTasksBySession.get(sessionKey) || []
+          ),
+          coordinator: cleanReplaySessionCoordinator,
+          recover: async (row, { receipt: recoveryReceipt }) => {
+              const msg = reconstruct(row);
+              msg._requiredProvider = 'codex';
+              let resolveAdmission;
+              const admitted = new Promise((resolve) => {
+                resolveAdmission = resolve;
+              });
+              const redelivery = await redeliverAsFreshTurn({
+                chatId: row.chat_id,
+                msg,
+                source: 'boot-replay-codex-clean',
+                preMark: null,
+                onGateBlocked: () => db.setInboundHandlerStatus({
+                  chat_id: row.chat_id,
+                  msg_id: row.msg_id,
+                  status: 'replay-skipped',
+                }),
+                prepareDispatch: async () => {
+                  const expectedProcess = await pm.getOrSpawn(
+                    sessionKey,
+                    await buildSpawnContext(sessionKey),
+                  );
+                  if (
+                    !expectedProcess
+                    || expectedProcess.closed
+                    || pm.get(sessionKey) !== expectedProcess
+                    || (
+                      expectedProcess.runtime !== 'codex'
+                      && expectedProcess.backend !== 'codex'
+                    )
+                  ) {
+                    const error = new Error(
+                      'Clean Codex replay lost its exact process before rearm',
+                    );
+                    error.code = 'CODEX_CLEAN_REPLAY_PROCESS_CHANGED';
+                    throw error;
+                  }
+                  const replayReceipt = db.prepareCodexCleanReplay({
+                    source: {
+                      botName: BOT_NAME,
+                      telegramChatId: String(row.chat_id),
+                      telegramMessageId: String(row.msg_id),
+                    },
+                    sessionKey,
+                    currentGeneration: {
+                      generationId: expectedProcess.generationId,
+                    },
+                    expectedEvidence:
+                      providerRecoveries.get(recoveryKey(row)),
+                    owner: {
+                      stableHostId: expectedProcess.hostIdentity,
+                      bootSessionId: expectedProcess.bootSessionIdentity,
+                    },
+                    ts: Date.now(),
+                  });
+                  return Object.freeze({
+                    recoveryReceipt,
+                    cleanReplay: Object.freeze({
+                      expectedProcess,
+                      reservation: Object.freeze({
+                        reservationId: replayReceipt.reservationId,
+                        generationId: replayReceipt.generationId,
+                      }),
+                    }),
+                    onDispatched: () => resolveAdmission({
+                      status: 'dispatched',
+                    }),
+                  });
+                },
+              });
+              if (!redelivery.ok) {
+                return redelivery.terminal
+                  ? { status: 'gate-terminal' }
+                  : {
+                      status: 'failed',
+                      reason: redelivery.reason || 'redelivery-refused',
+                    };
+              }
+              const handlerSettled = Promise.resolve(redelivery.task).then(
+                () => ({
+                  status: 'failed',
+                  reason: 'handler-settled-before-admission',
+                }),
+                (error) => ({
+                  status: 'failed',
+                  reason: error?.code || 'handler-failed-before-admission',
+                }),
+              );
+              return Promise.race([admitted, handlerSettled]);
+          },
+          trackTask: trackHandlerTask,
+          onOutcome: ({ sessionKey, outcome }) => {
+            logEvent('codex-clean-replay-session', {
+              session_key: sessionKey,
+              status: outcome.status,
+              admitted_count: outcome.admitted,
+              terminal_count: outcome.terminal,
+              deferred_count: outcome.deferred,
+              reason: outcome.reason || undefined,
+            });
+          },
+        });
+        cleanCodexScheduled = cleanReplaySchedule.scheduled;
+        executionPlan = { ...plan, recoverCodex: [] };
+      }
+
       const result = await executeReplayPlan({
-        plan,
+        plan: executionPlan,
         deps: {
           // CRASH path — unchanged: through the unified redelivery tail (D5 gate
           // at tier 'redelivery', 'replay-attempted' one-shot pre-mark, ack).
@@ -5079,12 +5468,15 @@ async function main() {
       });
 
       if (candidates.length > 0) {
-        console.log(`[replay] ${cleanShutdown ? 'clean restart' : 'crash'} — recovered ${result.recovered}, skipped ${result.skipped}, noticed ${result.noticed}${result.noticeFailed ? `, notice-failed ${result.noticeFailed}` : ''}${result.deferred ? `, deferred ${result.deferred}` : ''}`);
+        console.log(`[replay] ${cleanShutdown ? 'clean restart' : 'crash'} — recovered ${result.recovered}, scheduled ${cleanCodexScheduled}, skipped ${result.skipped}, noticed ${result.noticed}${result.noticeFailed ? `, notice-failed ${result.noticeFailed}` : ''}${result.deferred ? `, deferred ${result.deferred}` : ''}`);
         logEvent('replay-on-boot', {
           bot: BOT_NAME, clean: cleanShutdown,
-          recovered: result.recovered, skipped: result.skipped,
-          noticed: result.noticed, notice_failed: result.noticeFailed,
-          deferred: result.deferred || 0,
+          recovered_count: result.recovered,
+          skipped_count: result.skipped,
+          codex_scheduled_count: cleanCodexScheduled,
+          noticed_count: result.noticed,
+          notice_failed_count: result.noticeFailed,
+          deferred_count: result.deferred || 0,
           total: candidates.length,
         });
       }
@@ -5094,18 +5486,17 @@ async function main() {
     console.error(`[replay] boot replay failed: ${err.message}`);
   }
 
-  // rc.61 + rc.65: handle compact-command events that were never
-  // paired with a compact-boundary (deploy / crash interrupted them
-  // before the SDK processed). rc.65 changes behaviour from
-  // "post a 'please retry' message and ask the user" to
-  // "silently retry by re-pushing the same /compact text to a
-  // freshly-spawned (resumed) Query." Same pattern as boot-replay
-  // for inbound messages — recovery should be invisible.
+  // Handle compact-command events that were never paired with a
+  // compact-boundary (a deploy or crash interrupted them before the SDK
+  // processed them). Recovery re-pushes the same /compact line into a
+  // freshly-spawned (resumed) session, invisibly — the same pattern as
+  // boot-replay for inbound messages.
   //
   // Requirements for a silent retry:
-  //   1. The compact-command event was logged with full `text`
-  //      (rc.65+ does this; pre-rc.65 events have only text_len —
-  //      we fall back to the old "please retry" message for those).
+  //   1. The command line is recoverable — from the inbound message row the
+  //      event points at, or from an older event that still stored it — and
+  //      it normalizes to a real /compact command. Otherwise the user gets
+  //      the "please retry" message instead.
   //   2. The chat is still configured (config.chats[chat_id] exists).
   //   3. The session has a saved claude_session_id we can resume.
   //
@@ -5133,9 +5524,13 @@ async function main() {
       const threadId = o.thread_id ? Number(o.thread_id) : null;
       const savedSessionId = getClaudeSessionId(db, o.session_key);
 
-      // Silent retry path: only when we have BOTH the original text
-      // (rc.65+) AND a session_id to resume into.
-      if (o.text && savedSessionId) {
+      // Silent retry path: only when the stored line is provably a compact
+      // command AND there is a session_id to resume into. The line comes back
+      // from storage, so it is normalized and validated before it is fired at
+      // a live session — a mention-suffixed command is accepted in its
+      // normalized form, anything else is refused and surfaced instead.
+      const replayCommand = normalizeCompactCommand(o.text);
+      if (replayCommand && savedSessionId) {
         try {
           const entry = await pm.getOrSpawn(
             o.session_key,
@@ -5147,7 +5542,7 @@ async function main() {
           if (!entry || typeof entry.fireUserMessage !== 'function') {
             throw new Error('Process.fireUserMessage not available');
           }
-          const ok = entry.fireUserMessage(o.text);
+          const ok = entry.fireUserMessage(replayCommand);
           if (!ok) {
             throw new Error('fireUserMessage refused (closed or empty content)');
           }
@@ -5156,8 +5551,7 @@ async function main() {
             thread_id: o.thread_id,
             session_key: o.session_key,
             original_ts: o.ts,
-            text_len: o.text.length,
-            user: o.user,
+            text_len: replayCommand.length,
             user_id: o.user_id,
           });
           replayed += 1;
@@ -5168,9 +5562,9 @@ async function main() {
         }
       }
 
-      // Fallback: surface the legacy "please retry" message. Only
-      // happens for pre-rc.65 events (no `text` field) or when
-      // the silent-retry spawn failed.
+      // Fallback: surface the "please retry" message. Happens when the hint
+      // could not be recovered, when the stored line is not a compact
+      // command, or when the silent retry failed.
       try {
         await tg(bot, 'sendMessage', {
           chat_id: o.chat_id,
@@ -5182,9 +5576,8 @@ async function main() {
           thread_id: o.thread_id,
           session_key: o.session_key,
           original_ts: o.ts,
-          user: o.user,
           user_id: o.user_id,
-          reason: o.text ? 'spawn-failed' : 'pre-rc65-event-no-text',
+          reason: replayCommand ? 'spawn-failed' : (o.text ? 'not-a-compact-command' : 'no-recoverable-text'),
         });
         surfacedFallback += 1;
       } catch (err) {
@@ -5192,12 +5585,16 @@ async function main() {
       }
     };
     for (const o of orphansLatest.values()) {
-      const recoveryTask = cleanRecoveryTasksBySession.get(o.session_key);
-      if (recoveryTask) {
+      const recoveryTasks = cleanRecoveryTasksBySession.get(o.session_key);
+      if (recoveryTasks?.length) {
         deferred += 1;
         trackHandlerTask(
-          Promise.resolve(recoveryTask)
-            .then(() => recoverCompact(o))
+          Promise.all(recoveryTasks)
+            .then((results) => (
+              results.every((result) => result?.status === 'replied')
+                ? recoverCompact(o)
+                : undefined
+            ))
             .catch((err) => {
               console.error(`[compact-replay] ${o.session_key}: deferred recovery failed: ${err.message}`);
             }),
@@ -5215,7 +5612,7 @@ async function main() {
 
   logEvent('polygram-admission-open', lifecycleDetail({
     bot: BOT_NAME,
-  }, invocationId));
+  }, invocationId, daemonIdentity));
   console.log(`[${BOT_NAME}] Starting...`);
   const pollPromise = pollBot(bot).catch(err => {
     console.error(`[${BOT_NAME}] Fatal:`, err.message);

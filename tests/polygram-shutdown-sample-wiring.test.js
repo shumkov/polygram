@@ -16,6 +16,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const src = fs.readFileSync(path.join(__dirname, '..', 'polygram.js'), 'utf8');
+const deployRestartSrc = fs.readFileSync(
+  path.join(__dirname, '..', 'lib', 'ops', 'deploy-restart-handler.js'),
+  'utf8',
+);
 
 // Body of the SIGTERM/SIGINT/SIGHUP handler.
 function shutdownBody() {
@@ -40,7 +44,7 @@ describe('shutdown signal-time sampling', () => {
     // giving in-flight handlers a chance to settle or fail first.
     const mustComeAfter = {
       'the isShuttingDown latch': 'isShuttingDown = true',
-      'refusing new inbound (bot._stop)': 'bot._stop()',
+      'refusing new inbound (stable polling controller)': 'stopPolling()',
       'cancelling open questions': 'expireQuestion',
       'the drain loop': 'const drainStart',
     };
@@ -60,15 +64,23 @@ describe('shutdown signal-time sampling', () => {
     // actually cost versus how much the drain managed to finish.
     assert.match(body, /logEvent\('shutdown-drain', lifecycleDetail\(\{[\s\S]*?in_flight: remaining,/);
     assert.match(body, /logEvent\('shutdown-drain', lifecycleDetail\(\{[\s\S]*?in_flight_at_signal: inFlightAtSignal,/);
-    assert.match(body, /\}, invocationId\)\)/);
+    assert.match(body, /\}, invocationId, daemonIdentity\)\)/);
+  });
+
+  test('reports restart authorization and committed intent count in lifecycle evidence', () => {
+    const body = shutdownBody();
+    assert.match(body, /restart_trigger: trigger/);
+    assert.match(body, /continuation_authorized: continuationAuthorized === true/);
+    assert.match(body, /resume_intents_recorded: res\.intentsRecorded \?\? 0/);
+    assert.match(body, /restart_request_id: trigger === 'deploy-ipc'[\s\S]*?restartRequestId[\s\S]*?: null/);
   });
 
   test('the post-drain count is measured after the drain, not reused', () => {
     const body = shutdownBody();
-    const drain = body.indexOf('const drainStart');
+    const retire = body.indexOf('await prepareCleanRetirement({');
     const remaining = body.indexOf('const remaining = countInFlight(inFlightHandlers)');
     assert.notEqual(remaining, -1, 'post-drain in-flight count is missing');
-    assert.ok(remaining > drain, 'post-drain count must be taken after the drain loop');
+    assert.ok(remaining > retire, 'final in-flight count must be taken after clean retirement and handler settlement');
   });
 });
 
@@ -123,8 +135,8 @@ describe('clean restart lifecycle ordering', () => {
       'ordinary handled signals must not reach continuation-intent projection',
     );
     assert.match(
-      src,
-      /requestDeployRestart: \(\) => \{[\s\S]{0,500}?shutdown\(\{[\s\S]{0,180}?continuationAuthorized: true,[\s\S]{0,180}?trigger: 'deploy-ipc'/,
+      deployRestartSrc,
+      /return function requestDeployRestart\(request\)[\s\S]*?requireRestartRequestId\(request\?\.id\)[\s\S]*?shutdown\(\{[\s\S]{0,220}?continuationAuthorized: true,[\s\S]{0,220}?trigger: 'deploy-ipc',[\s\S]{0,220}?restartRequestId/,
       'the authenticated IPC handler must directly begin the authorized shutdown',
     );
     for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
@@ -136,9 +148,67 @@ describe('clean restart lifecycle ordering', () => {
     }
   });
 
+  test('qualified deploy forwards one closed fence while routine deploy remains unchanged', () => {
+    const body = shutdownBody();
+    assert.match(
+      deployRestartSrc,
+      /const qualificationExpectation = normalizeDeployQualificationExpectation\(request\)/,
+      'the authenticated deploy request must be reduced to the closed qualification fence',
+    );
+    assert.match(
+      body,
+      /const shutdown = async \(\{[\s\S]{0,180}?qualificationExpectation,[\s\S]*?prepareCleanRetirement\(\{[\s\S]{0,500}?continuationAuthorized,[\s\S]{0,220}?qualificationExpectation,/,
+      'the shutdown must forward deploy authorization and the normalized fence into clean retirement',
+    );
+  });
+
+  test('logs exactly one bounded qualification result before any retirement snapshot', () => {
+    const body = shutdownBody();
+    const retirement = body.indexOf('const retirement = await prepareCleanRetirement({');
+    const qualificationEvent = body.indexOf("logEvent('clean-restart-qualification-observed'", retirement);
+    const snapshots = body.indexOf("logEvent('clean-retirement-snapshot'", retirement);
+    assert.notEqual(retirement, -1, 'clean retirement call is missing');
+    assert.notEqual(qualificationEvent, -1, 'qualification event is missing');
+    assert.notEqual(snapshots, -1, 'retirement snapshot event is missing');
+    assert.ok(retirement < qualificationEvent && qualificationEvent < snapshots);
+    assert.equal(
+      body.match(/logEvent\('clean-restart-qualification-observed'/g)?.length,
+      1,
+      'shutdown must have one qualification event call site',
+    );
+    assert.match(
+      body.slice(retirement, snapshots),
+      /if \(qualificationExpectation !== undefined\) \{[\s\S]*?buildQualificationEvent\(/,
+      'routine deploys must not emit a qualification result',
+    );
+  });
+
+  test('authorized deploy starts retirement without the legacy natural drain', () => {
+    const body = shutdownBody();
+    assert.match(
+      body,
+      /if \(!continuationAuthorized\) \{[\s\S]*?while \(inFlightHandlers\.size > 0\)[\s\S]*?\}/,
+      'only non-authorizing shutdowns may run the legacy natural-handler drain',
+    );
+    assert.match(
+      body,
+      /let drainElapsed = 0;[\s\S]*?if \(!continuationAuthorized\) \{[\s\S]*?drainElapsed = Date\.now\(\) - drainStart/,
+      'authorized shutdown must report zero legacy drain time',
+    );
+  });
+
+  test('authorized question cleanup never answers the retiring provider while signals retain normal expiry', () => {
+    const body = shutdownBody();
+    assert.match(
+      body,
+      /if \(continuationAuthorized\) \{[\s\S]*?beginShutdownDisposition[\s\S]*?\} else \{[\s\S]*?expireQuestion/,
+      'deploy-only question disposition must remain separate from ordinary signal expiry',
+    );
+  });
+
   test('fences inbound admission before delivery/process retirement and clean persistence', () => {
     const body = shutdownBody();
-    const stopInbound = body.indexOf('bot._stop()');
+    const stopInbound = body.indexOf('stopPolling()');
     const retire = body.indexOf('await prepareCleanRetirement({');
     const persist = body.indexOf('persistShutdownDisposition({');
     assert.notEqual(stopInbound, -1, 'Telegram intake fence is missing');
@@ -150,8 +220,27 @@ describe('clean restart lifecycle ordering', () => {
     );
     assert.match(
       body,
-      /prepareCleanRetirement\(\{[\s\S]{0,250}?deliveryBarrier,[\s\S]{0,250}?awaitHandlerSettlement,/,
-      'the retirement barrier must include reply delivery and handler settlement',
+      /prepareCleanRetirement\(\{[\s\S]{0,350}?deliveryBarrier,[\s\S]{0,350}?awaitIngressSettlement,[\s\S]{0,350}?awaitHandlerSettlement,/,
+      'the retirement barrier must include reply delivery, admitted ingress, and handler settlement',
+    );
+  });
+
+  test('constructs and uses a stable polling fence before pollBot can start', () => {
+    assert.match(
+      src,
+      /\(\{ pollBot, startPollWatchdog, stopPolling, awaitPollSettlement \} = createPollLoop\(/,
+      'poll admission and settlement controls must exist before pollBot starts',
+    );
+    const body = shutdownBody();
+    assert.match(
+      body,
+      /stopPolling\(\);[\s\S]{0,250}?const awaitIngressSettlement = \(\{ timeoutMs \} = \{\}\) => \([\s\S]{0,120}?awaitPollSettlement\(\{ timeoutMs \}\)/,
+      'shutdown must close the stable controller and preserve its settlement timeout',
+    );
+    assert.match(
+      body,
+      /err\?\.code === 'POLL_SETTLEMENT_TIMEOUT'[\s\S]{0,100}?poll-settlement-timeout/,
+      'uncertain ingress settlement must force an explicit crash-like disposition',
     );
   });
 
@@ -164,12 +253,24 @@ describe('clean restart lifecycle ordering', () => {
     assert.ok(retire < persist, 'clean retirement must finish before persistence');
     assert.match(
       body,
-      /prepareCleanRetirement\(\{[\s\S]{0,250}?awaitHandlerSettlement,/,
+      /prepareCleanRetirement\(\{[\s\S]{0,450}?awaitIngressSettlement,[\s\S]{0,250}?awaitHandlerSettlement,/,
     );
     assert.match(
       body,
       /if \(pm && !pmRetired\) await pm\.shutdown\(\)/,
       'a retired ProcessManager must not be shut down a second time',
+    );
+  });
+
+  test('OOM shutdown joins delivery, poll ingress, process teardown, and handlers before persistence', () => {
+    const body = shutdownBody();
+    const settle = body.indexOf('await settleCrashShutdown({');
+    const persist = body.indexOf('persistShutdownDisposition({');
+    assert.notEqual(settle, -1, 'crash/OOM settlement helper is missing');
+    assert.ok(settle < persist, 'crash/OOM branches must settle before persistence');
+    assert.match(
+      body,
+      /settleCrashShutdown\(\{[\s\S]{0,450}?deliveryBarrier,[\s\S]{0,450}?awaitIngressSettlement,[\s\S]{0,450}?awaitHandlerSettlement/,
     );
   });
 
@@ -202,11 +303,42 @@ describe('clean restart lifecycle ordering', () => {
   test('same-session compact replay waits for the tracked continuation without delaying polling', () => {
     assert.match(
       src,
-      /cleanRecoveryTasksBySession\.get\(o\.session_key\)[\s\S]{0,500}trackHandlerTask\([\s\S]{0,500}\.then\(\(\) => recoverCompact\(o\)\)/,
+      /cleanRecoveryTasksBySession\.get\(o\.session_key\)[\s\S]{0,500}trackHandlerTask\([\s\S]{0,500}results\.every\(\(result\) => result\?\.status === 'replied'\)[\s\S]{0,200}recoverCompact\(o\)/,
     );
     const deferredCompact = src.indexOf('cleanRecoveryTasksBySession.get(o.session_key)');
     const polling = src.indexOf('const pollPromise = pollBot(bot)', deferredCompact);
     assert.notEqual(polling, -1);
+  });
+
+  test('clean-safe Codex followers use a session barrier and atomic replay rearm', () => {
+    const schedule = src.indexOf('scheduleCleanCodexReplaySessions({');
+    const execute = src.indexOf('const result = await executeReplayPlan({', schedule);
+    const poll = src.indexOf('const pollPromise = pollBot(bot)', schedule);
+    assert.notEqual(schedule, -1);
+    assert.ok(schedule < execute && execute < poll);
+    assert.match(
+      src.slice(schedule, execute),
+      /getContinuationTasks:[\s\S]*?cleanRecoveryTasksBySession\.get\(sessionKey\)[\s\S]*?coordinator: cleanReplaySessionCoordinator,[\s\S]*?db\.prepareCodexCleanReplay\(\{[\s\S]*?expectedEvidence:[\s\S]*?recoveryReceipt,[\s\S]*?expectedProcess,[\s\S]*?onDispatched/,
+    );
+    assert.match(
+      src,
+      /awaitSessionRecovery: \(sessionKey, receipt\) => \([\s\S]*?cleanReplaySessionCoordinator\.wait\(sessionKey, receipt\)/,
+    );
+    assert.match(
+      src,
+      /authorizeCleanReplayDispatch\(\{[\s\S]*?expectedProcess: cleanReplayDispatch\.expectedProcess,[\s\S]*?expectedProcess: cleanReplayDispatch\?\.expectedProcess \?\? null/,
+      'the handler must preserve the exact process fence through pm.send',
+    );
+    assert.doesNotMatch(
+      src,
+      /result\.recovered \+= cleanCodexScheduled/,
+      'scheduled work is not recovered until its later session outcome admits it',
+    );
+    assert.match(
+      src,
+      /logEvent\('codex-clean-replay-session',[\s\S]*?admitted_count: outcome\.admitted,[\s\S]*?terminal_count: outcome\.terminal,[\s\S]*?deferred_count: outcome\.deferred/,
+    );
+    assert.match(src, /codex_scheduled_count: cleanCodexScheduled/);
   });
 
   test('strict recovery spawn requires the expected existing session and attestation', () => {
@@ -231,6 +363,16 @@ describe('clean restart lifecycle ordering', () => {
       /if \(strictResume\) \{[\s\S]{0,500}?validateStrictResumeSpawn\(\{/,
       'a Codex backend switch must pass through the tested strict-resume validator',
     );
+    assert.match(
+      codexSpawnContext,
+      /expectedProviderGenerationId: strictResume\.expectedGenerationId/,
+      'the validated clean-resume claim must reach turn preparation unchanged',
+    );
+    assert.match(
+      src,
+      /registerProcess\(proc, \{[\s\S]{0,200}?spawnContext\.expectedProviderGenerationId/,
+      'the production process factory must bind strict lineage to its controller record',
+    );
   });
 });
 
@@ -240,6 +382,66 @@ describe('ipc handler wiring', () => {
     // would silently stop covering what a running daemon actually answers.
     assert.match(src, /handlers: createIpcHandlers\(\{/);
     assert.match(src, /getInFlightHandlers: \(\) => inFlightHandlers/);
+    assert.match(src, /createForegroundCanaryAuthorizer\(\{[\s\S]{0,500}?getActiveHandlerCount:/);
+    assert.match(src, /createForegroundCanaryAuthorizer\(\{[\s\S]{0,700}?getActiveHandlerTargets:/);
+    assert.match(src, /requestForegroundCanaryTarget:/);
+    assert.match(src, /const requestDeployRestart = createDeployRestartHandler\(\{/);
+    assert.match(
+      src,
+      /persistForegroundCanaryAuthorization: \(detail\) =>[\s\S]{0,150}?db\.logEvent\([\s\S]{0,100}?'foreground-canary-target-authorized'/,
+    );
+    assert.match(src, /requestDeployRestart,/);
+  });
+
+  test('foreground restart authorization is rechecked and persisted before shutdown starts', () => {
+    const restartHandler = deployRestartSrc.indexOf(
+      'return function requestDeployRestart(request)',
+    );
+    const handlerBody = deployRestartSrc.slice(restartHandler);
+    const authorize = handlerBody.indexOf('authorizeRestart({');
+    const event = handlerBody.indexOf('persistForegroundCanaryAuthorization(');
+    const shutdown = handlerBody.indexOf('shutdown({');
+
+    assert.ok(restartHandler >= 0);
+    assert.ok(authorize >= 0, 'foreground target must be rechecked in the restart handler');
+    assert.ok(event > authorize, 'authorization event must follow the exact recheck');
+    assert.ok(shutdown > event, 'shutdown must begin only after the authorization event');
+    assert.match(handlerBody, /restart_request_id: restartRequestId/);
+  });
+
+  test('one per-boot identity is created before DB or IPC and reaches every lifecycle witness', () => {
+    const createIdentity = src.indexOf('const daemonIdentity = createDaemonIdentity({');
+    const openDb = src.indexOf('db = dbClient.open(DB_PATH)');
+    const startIpc = src.indexOf('ipcCloser = await ipcServer.start({');
+    assert.ok(createIdentity >= 0, 'daemon identity is not created during boot');
+    assert.ok(createIdentity < openDb, 'daemon identity must exist before the DB opens');
+    assert.ok(createIdentity < startIpc, 'daemon identity must exist before IPC starts');
+    assert.match(
+      src.slice(createIdentity, createIdentity + 300),
+      /mainPath: __filename,[\s\S]*?packageVersion: packageMetadata\.version,/,
+      'daemon identity must describe the real production entrypoint and installed package',
+    );
+
+    for (const kind of [
+      'polygram-start',
+      'shutdown-drain',
+      'polygram-stop',
+      'polygram-admission-open',
+    ]) {
+      const event = src.indexOf(`'${kind}'`);
+      assert.notEqual(event, -1, `${kind} event is missing`);
+      assert.match(
+        src.slice(event, event + 1_200),
+        /\}, invocationId, daemonIdentity\)\)/,
+        `${kind} must include the per-boot identity and PID`,
+      );
+    }
+
+    assert.match(
+      src.slice(startIpc, startIpc + 1_500),
+      /createIpcHandlers\(\{[\s\S]*?daemonIdentity,/,
+      'authenticated IPC readiness must use the same per-boot identity',
+    );
   });
 });
 

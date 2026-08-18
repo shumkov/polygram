@@ -681,6 +681,28 @@ are new prerequisites or gates and do not renumber existing units.
 
 ### U23. Orchestra hook-notification release prerequisite (blocker)
 
+- **Amendment plan (governing):**
+  `docs/plans/2026-08-16-002-feat-codex-hook-trust-discovery-plan.md` in the
+  `polygram.scoped-memory-u23-consumption` worktree. **Both multi-agent spec
+  review rounds are complete and it is `implementation-ready`**, with its
+  decision history recorded in its frontmatter. It **governs U23's Approach,
+  Files, Test scenarios, and Verification** — wherever it and the text below
+  differ, it wins.
+- **S0 characterization: COMPLETE, `CONTINUE` (2026-08-17) —
+  `aarch64-apple-darwin` only, and characterization only.** It ran against the
+  pinned Codex binary with a loopback provider on a spike-owned home;
+  **neither released-production live gate has run on either target.**
+  Findings: `docs/2026-08-17-001-u23-hook-trust-characterization-findings.md`
+  in that same worktree. Load-bearing results: the user-layer digest risk is
+  cleared; the `hooks/list` params form is frozen to `{cwds: [ownedCwd]}`;
+  `[features] hooks = true` is not required; the `key` derivation is confirmed
+  for all three events; **the manifest a session executes is fixed at
+  `thread/start`, so verification before `thread/start` does not close that
+  race**; the hook-before-checkpoint race is live and **owned by U15**; and the
+  earlier "10-100 ms" durable-budget figure is **withdrawn** as a measurement
+  artefact. Unmeasured: the `x86_64-unknown-linux-musl` runtime receipt; whether
+  `thread/resume` snapshots as `thread/start` does; and whether a post-
+  `thread/start` `hooks/list` reflects the bound snapshot.
 - **Goal:** Make Codex hooks survivable under the exact pinned Orchestra path.
 - **Requirements:** R45, R59, R62, AE10.
 - **Dependencies:** U21.
@@ -696,6 +718,19 @@ are new prerequisites or gates and do not renumber existing units.
   already enforced by `lib/codex/binary.js`; the wrapper must pass that path,
   never resolve `codex` from PATH. Mint/lookup receipts by the app-server
   `turn/started` id and require equality with hook stdin `turn_id`.
+  **Superseded in four respects by the amendment plan and S0:** (a) rendering
+  trusted hashes additionally requires a reviewed Orchestra internal,
+  manifest-bound hook verifier, because no allowed surface reports a hook's
+  `currentHash`; (b) U23 proves `turn/started.id === hook.turn_id` and the
+  observed ordering from **existing** checkpoint evidence and builds **no**
+  receipt mint/lookup machinery — that stays U15's; (c) hook commands are
+  rendered from typed descriptors with attested runtime/artifact paths rather
+  than shell text; (d) **production executed inputs must satisfy the
+  R18a-grounded artifact boundary** — a root/operator-owned immutable versioned
+  tree with a digest manifest, service-unwritable ancestors, versioned command
+  paths, and every transitive executed input attested (including `stop.sh`
+  before U15 may exec it). Enablement fails closed where that boundary cannot
+  be installed.
 - **Test scenarios:** A credential-free app-server turn with trusted hooks
   produces no Orchestra protocol fault; the control without hooks remains
   unchanged; changing a hook changes its trusted hash/config digest; a wrapper
@@ -841,10 +876,17 @@ are new prerequisites or gates and do not renumber existing units.
   `migrations/` next available schema version, and focused tests.
 - **Approach:** Parse the root-owned projection, implement pure role/operation/
   sender/audience policy, add the memory/tool digest to Claude and Codex session
-  identity, and persist only the external receipt reference. Use the U23-proven
-  hook wrapper/receipt path; receipt minting is per turn, outside the provider,
-  and best-effort. Retire sessions and queued work on binding/audience/tool
-  drift. Do not let ordinary chat configuration enable or widen memory.
+  identity, and persist only the external receipt reference. Build the wrapper
+  and its receipt semantics **here**, on the trust, descriptor and artifact
+  plumbing U23 proves — U23 builds no receipt mint/lookup path, so U15 must not
+  be written as though one exists; U27 owns end-to-end handoff. Receipt minting
+  is per turn, outside the provider, and best-effort, and must not assume the
+  `turn-accepted` checkpoint is durably readable when `UserPromptSubmit` fires
+  (S0 measured that race as live); fail closed with a content-free counter.
+  The wrapper and every transitive input it executes, including `stop.sh`, must
+  live inside the R18a artifact boundary U23 specifies. Retire sessions and
+  queued work on binding/audience/tool drift. Do not let ordinary chat
+  configuration enable or widen memory.
 - **Test scenarios:** For MVP, run the member-DM, unmapped, and unauthorized
   rows and every allowed/forbidden read, write, tool, and staging cell in
   `tests/fixtures/scoped-memory-role-context-matrix.v1.json`, plus audience
@@ -1081,11 +1123,11 @@ shown as zero and excluded from remaining-work totals.
 | U16a-B | 1 | 2 | 3 | blocker: process-writer correction |
 | U16a-C | 1 | 2 | 4 | blocker: cross-process storage check |
 | U16a-D | 1 | 2 | 4 | blocker: five-run Linux gate |
-| U23 | 1 | 2 | 3 | blocker; Orchestra release owner |
+| U23 | 10 | 14 | 24 | blocker; **remaining** effort (elapsed `T23` = 8/11/19); spent S0 + spec reviews are **unmetered** and excluded |
 | U24 | 3 | 5 | 8 | blocker |
 | U25 | 3 | 5 | 8 | reviewed local implementation exists; not integrated/shipped; retain envelope until landed |
 | U27 | 1 | 2 | 4 | blocker |
-| U15 | 3 | 5 | 8 | remaining |
+| U15 | 4 | 6 | 10 | remaining; raised from 3/5/8 — U15 now builds, installs and proves the deterministic closure of the real wrapper plus `stop.sh` inside U23's protected tree |
 | U16 | 8 | 13 | 20 | remaining; ledger and publisher |
 | U14 | 4 | 7 | 12 | blocker: mechanism/release/pin/proof |
 | U17 | 1 | 2 | 3 | remaining |
@@ -1097,11 +1139,39 @@ shown as zero and excluded from remaining-work totals.
 - **U16a total work:** A+B+C+D = **4 / 8 / 14**; its elapsed recurrence is
   `max(A,B)+C+D = 3 / 6 / 11`.
 - **MVP engineering total:** U16a + U23 + U24 + U25 + U27 + U15 + U16 +
-  U14 + U17 + U18 + U26 + U19 = **32 / 56 / 91** engineer-days, plus
-  registered dark/soak and operator/calendar waits.
-- **Full parity total:** MVP + U20 = **38 / 66 / 106** engineer-days, plus
-  staged soaks and operator/calendar waits.
-- **Spent:** U13, U21, and U22 contribute zero to all totals.
+  U14 + U17 + U18 + U26 + U19 = **42 / 69 / 114** engineer-days **remaining**
+  (was 32 / 56 / 91 at U23 = 1 / 2 / 3 and U15 = 3 / 5 / 8), plus registered
+  dark/soak and operator/calendar waits.
+- **Full parity total:** MVP + U20 = **48 / 79 / 129** remaining (was
+  38 / 66 / 106), plus staged soaks and operator/calendar waits.
+- **U23 re-derivation (not a delta).** U23 was re-estimated after its second
+  spec review added an Orchestra verifier API with preflight/profile/factory/
+  process plumbing, a per-`CODEX_HOME` provisioning state machine with crash
+  recovery and direction-from-configuration, a locked rollback/admission
+  procedure, cross-target gates, and — the largest addition — a **required
+  production artifact-body boundary** delivered as a deterministic self-contained
+  hook bundle with a generated digest manifest inside a root-owned immutable
+  versioned tree. Components: Orchestra API/tests/release `O` = 2 / 3 / 5;
+  Polygram renderer/state machine/attestation `P` = 3 / 4 / 7; U23 bundle +
+  protected installer/manifest/version retention/runbook `H` = 2 / 3 / 5;
+  landing the S0 harness + both-target gates/receipts/rollback `G` = 2 / 3 / 5;
+  implementation code review and fold `R` = 1 / 1 / 2 → **10 / 14 / 24
+  remaining effort**. Elapsed is smaller because `H` overlaps `O`+`P`:
+  `T23 = max(O+P, H, W_host) + R + G` = **8 / 11 / 19** at `W_host` = 0.
+  `W_host` is an unquantified operator/calendar wait for root-owned installation
+  on the Mac and the VPS — registered, not converted to engineer-days. The
+  earlier 2 / 4 / 6 predates all of this and is not carried forward.
+- **Critical path uses remaining elapsed only**, since spent work adds no
+  elapsed time: `T19` = **28 / 44 / 71** (was 20 / 34 / 53) and `T20` =
+  **34 / 54 / 86** (was 26 / 44 / 68), using `T23` = 8 / 11 / 19 and
+  U15 = 4 / 6 / 10.
+- **Spent:** U13, U21, and U22 contribute zero to all totals. U23's S0
+  characterization and its two spec-review rounds are likewise spent — and
+  **were not time-tracked**, so they are **unmetered**: excluded from remaining,
+  carrying no actual best/likely/worst, and **not summed into any published
+  "from zero" total**. A historical pre-S0 planning envelope of 2 / 3 / 4 exists
+  for U23's characterization but is a forecast never reconciled against
+  actuals, and is labelled as such wherever it appears.
 
 The dependency graph is:
 
@@ -1120,7 +1190,7 @@ days and let `A/B/C/D` be U16a's four pieces:
 
 ```text
 T16a = max(A,B) + C + D
-T23  = U23
+T23  = max(O + P, H, W_host) + R + G     (U23 internals; W_host = registered wait)
 T24  = T23 + U24
 T14  = T23 + U14
 T27  = T23 + U27
@@ -1134,9 +1204,15 @@ T19  = max(T18, T26, T16a, T27, T17) + U19
 T20  = T19 + U20
 ```
 
-Evaluated independently, the critical path to the MVP canary is `T19` =
-**20 / 34 / 53** elapsed engineer-days; full parity is `T20` = **26 / 44 /
-68**. U25 can start from U13 in parallel. U14 starts only after the exact
+Evaluated independently on **remaining** work, the critical path to the MVP
+canary is `T19` = **28 / 44 / 71** elapsed engineer-days; full parity is `T20` =
+**34 / 54 / 86** (both raised by U23's re-derivation and U15's rise to
+4 / 6 / 10; they read 20 / 34 / 53 and 26 / 44 / 68 at U23 = 1 / 2 / 3).
+`T23` = `max(O+P, H, W_host) + R + G` = 8 / 11 / 19 at `W_host` = 0, so U23's
+elapsed contribution is smaller than its 10 / 14 / 24 of effort; `W_host`, the
+root-owned installation wait on both hosts, is registered separately and is not
+counted as engineer-days. U23's spent S0 and spec reviews are unmetered and
+excluded from elapsed time. U25 can start from U13 in parallel. U14 starts only after the exact
 reviewed Orchestra release/consumer pin prerequisite, and U17/U19 cannot
 start from the checked-in dynamic-tools finding alone. The Orchestra
 release owner owns schema review, release, and its artifact; the Polygram
@@ -1174,7 +1250,13 @@ no duplicate estimate. No estimate assumes a managed-provider alternative.
 
 - U23: credential-free hook-enabled Codex turn under the released Orchestra
   pin, with trusted hook hashes rendered in owned config and exact absolute
-  binary path; `turn/started.id` equals hook `turn_id`.
+  binary path; `turn/started.id` equals hook `turn_id`; and every executed hook
+  input sits inside the R18a artifact boundary. **Both targets are U23
+  completion criteria** — `aarch64-apple-darwin` and
+  `x86_64-unknown-linux-musl`, same checked-in gate command with per-target
+  runtime/artifact-root/receipt. S0's characterization passed on Darwin only;
+  **no released-production gate has run on either target**, and the Linux
+  runtime receipt is unmeasured.
 - U24: one fixed-router evaluation across Claude-CLI and Codex source turns,
   stdin-only facts, schema-only stdout, exact runtime/model/auth/process
   evidence, no commercial API key, zero private-to-general leaks on the

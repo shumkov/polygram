@@ -48,6 +48,20 @@ describe('pending_questions store', () => {
     assert.deepEqual(JSON.parse(row.questions_json)[0].header, 'H');
   });
 
+  test('a secret-bearing question body is sanitized in BOTH durable copies', () => {
+    // `questions_json` is the audit copy and `state_json.questions` is the
+    // replay copy of the same array. Masking one and not the other leaves the
+    // provider's exact question in the row.
+    const row = store.issue({
+      bot_name: 'b', session_key: 's:secret', chat_id: '100', tool_call_id: 'tc-secret',
+      questions: [{ header: 'H', question: 'use password: hunter2-fake-value?', options: [{ label: 'ok' }] }],
+      state: { questions: [{ header: 'H', question: 'use password: hunter2-fake-value?', options: [{ label: 'ok' }] }], qIndex: 0, answers: [] },
+    });
+    assert.ok(!row.questions_json.includes('hunter2-fake-value'), row.questions_json);
+    assert.ok(!row.state_json.includes('hunter2-fake-value'), row.state_json);
+    assert.equal(JSON.parse(row.state_json).questions[0].header, 'H', 'shape survives');
+  });
+
   test('getOpenForSession returns the single open question (one per session)', () => {
     const r = store.getOpenForSession('s:1');
     assert.ok(r && r.tool_call_id === 'tc1');

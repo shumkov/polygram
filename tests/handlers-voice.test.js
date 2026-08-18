@@ -160,7 +160,11 @@ describe('voice handler — failure paths', () => {
     assert.equal(res.ackEmitted, true);
     const failEvt = m.events.find((e) => e.kind === 'voice-transcribe-failed');
     assert.ok(failEvt);
-    assert.match(failEvt.detail.error, /whisper down/);
+    // The failure is recorded by class; the message can quote provider output
+    // and the filename is user-controlled, so neither is persisted.
+    assert.equal(failEvt.detail.error_class, 'Error');
+    assert.equal(failEvt.detail.error, undefined);
+    assert.equal(failEvt.detail.name, undefined);
   });
 
   test('null botApi means no ack reaction (ackEmitted=false)', async () => {
