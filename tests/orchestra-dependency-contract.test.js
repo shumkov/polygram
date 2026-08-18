@@ -58,6 +58,26 @@ test('installed Orchestra exactly matches the reviewed Codex contract', () => {
     },
   );
   assert.equal(typeof orchestra.codexProtocolSchema, 'object');
+  assert.deepEqual(
+    orchestra.codexProtocolSchema.clientRequests['hooks/list'],
+    {
+      required: ['cwds'],
+      optional: [],
+      internal: true,
+      stateChanging: false,
+    },
+  );
+  for (const method of ['hook/started', 'hook/completed']) {
+    assert.equal(
+      orchestra.codexProtocolSchema.droppedServerNotifications.includes(method),
+      true,
+      method,
+    );
+  }
+  assert.equal(
+    typeof orchestra.CodexAppServerClient.prototype.verifyHooks,
+    'function',
+  );
   assert.equal(typeof orchestra.ProcessManager.prototype.replaceRuntime, 'function');
   assert.equal(typeof orchestra.ProcessManager.prototype.steerTurn, 'function');
   assert.equal(typeof orchestra.ProcessManager.prototype.interrupt, 'function');
