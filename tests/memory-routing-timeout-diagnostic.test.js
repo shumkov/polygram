@@ -418,7 +418,7 @@ test('U24 real systemd launcher builds an executable transient-service command',
     'ActiveState=active',
     'ControlGroup=/user.slice/u24.service',
     'KillMode=control-group',
-    'RuntimeMaxUSec=4h 9min 0s',
+    'RuntimeMaxUSec=4h 9min',
     'TimeoutStopUSec=10s',
     'SendSIGKILL=yes',
     'RemainAfterExit=yes',
@@ -454,7 +454,7 @@ test('U24 real systemd launcher builds an executable transient-service command',
     throw new Error('unexpected command');
   };
   const launcher = diagnostic.createSystemdUserLauncher({
-    execFileCommand, platform: 'linux', monotonicNowMs: () => 1,
+    execFileCommand, platform: 'linux', monotonicNowMs: () => 1, delay: async () => {},
   });
   const scratchPath = '/private/polygram-u24-timeout-scratch';
   const properties = diagnostic.transientServiceProperties(scratchPath);
@@ -488,6 +488,31 @@ test('U24 real systemd launcher builds an executable transient-service command',
   }
   assert.ok(systemdCall[1].includes('/usr/bin/node'));
   assert.ok(systemdCall[1].some((value) => value.startsWith('--unit=polygram-u24-timeout-')));
+
+  for (const invalidDuration of ['', '4hours 9min']) {
+    const invalidLauncher = diagnostic.createSystemdUserLauncher({
+      platform: 'linux',
+      monotonicNowMs: () => 1,
+      delay: async () => {},
+      execFileCommand: async (binary, argv) => {
+        if (binary === '/usr/bin/systemctl' && argv.includes('--property=LoadState')) {
+          return { stdout: 'LoadState=not-found\n' };
+        }
+        if (binary === '/usr/bin/systemd-run') return { stdout: '' };
+        if (binary === '/usr/bin/systemctl' && argv.includes('--property=ControlGroup')) {
+          return {
+            stdout: show.replace('RuntimeMaxUSec=4h 9min', `RuntimeMaxUSec=${invalidDuration}`),
+          };
+        }
+        throw new Error('unexpected command');
+      },
+    });
+    await assert.rejects(invalidLauncher.runService(request), (error) => {
+      assert.equal(error.message, 'transient service did not become verifiably active');
+      assert.equal(error.cause?.message, 'invalid systemd duration');
+      return true;
+    });
+  }
 });
 
 test('U24 shared Claude attestation binds canonical path, version, digest, and file identity', async () => {

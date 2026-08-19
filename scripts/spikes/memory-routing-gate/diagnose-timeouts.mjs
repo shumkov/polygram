@@ -1076,11 +1076,12 @@ function parseKeyValueLines(stdout) {
 }
 
 function parseSystemdDuration(value) {
-  if (/^\d+s$/.test(value)) return Number(value.slice(0, -1)) * 1_000;
-  const match = /^(?:(\d+)h )?(?:(\d+)min )?(\d+)s$/.exec(value);
-  if (!match) throw new Error('invalid systemd duration');
+  const match = /^(?:(\d+)h(?: |$))?(?:(\d+)min(?: |$))?(?:(\d+)s)?$/.exec(value);
+  if (!match || value.length === 0 || value.endsWith(' ')) {
+    throw new Error('invalid systemd duration');
+  }
   return ((Number(match[1] || 0) * 3_600) + (Number(match[2] || 0) * 60)
-    + Number(match[3])) * 1_000;
+    + Number(match[3] || 0)) * 1_000;
 }
 
 function parseActiveUnitEvidence(stdout, expectedProperties) {
