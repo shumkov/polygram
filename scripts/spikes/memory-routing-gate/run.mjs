@@ -1,9 +1,7 @@
 #!/usr/bin/env node
 
-import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { constants as fsConstants, createReadStream } from 'node:fs';
-import { access, realpath, stat, writeFile } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { promisify } from 'node:util';
@@ -21,10 +19,10 @@ import {
   runRoutingEvaluation,
   sanitizeProcessDiagnostics,
 } from './harness.mjs';
+import { attestClaudeRuntime } from './runtime-attestation.mjs';
 
 const require = createRequire(import.meta.url);
 const { resolvePinnedCodexBinary } = require('../../../lib/codex/binary.js');
-const { CLAUDE_CLI_PINNED_VERSION } = require('@shumkov/orchestra/lib/claude-bin');
 const execFileAsync = promisify(execFile);
 const CLAUDE_MODEL = 'haiku';
 const OBSERVED_HAIKU_RE = /^claude-haiku-[a-z0-9-]+$/;
@@ -99,40 +97,6 @@ export function parseArgs(argv) {
   };
 }
 
-async function sha256File(file) {
-  const hash = crypto.createHash('sha256');
-  await new Promise((resolve, reject) => {
-    const stream = createReadStream(file);
-    stream.on('data', (chunk) => hash.update(chunk));
-    stream.on('error', reject);
-    stream.on('end', resolve);
-  });
-  return hash.digest('hex');
-}
-
-async function claudeRuntimeReceipt(binary) {
-  const canonicalPath = await realpath(binary);
-  await access(canonicalPath, fsConstants.X_OK);
-  const info = await stat(canonicalPath);
-  if (!info.isFile()) throw new TypeError('router binary must be a regular file');
-  const { stdout } = await execFileAsync(canonicalPath, ['--version'], {
-    env: subscriptionOnlyEnv(),
-    encoding: 'utf8',
-    timeout: 10_000,
-    maxBuffer: 16_384,
-  });
-  const version = stdout.trim();
-  const expectedVersion = `${CLAUDE_CLI_PINNED_VERSION} (Claude Code)`;
-  if (version !== expectedVersion) {
-    throw Object.assign(new Error('ROUTER_RUNTIME_MISMATCH'), { code: 'ROUTER_RUNTIME_MISMATCH' });
-  }
-  return {
-    canonicalPath,
-    sha256: await sha256File(canonicalPath),
-    version,
-  };
-}
-
 function shapeFixtures(fixtures) {
   const selected = [];
   for (const family of SHAPE_FAMILIES) {
@@ -193,7 +157,7 @@ async function attestCodex(binary) {
 
 async function attestClaude(binary) {
   try {
-    return await claudeRuntimeReceipt(binary);
+    return await attestClaudeRuntime(binary);
   } catch {
     throw Object.assign(new Error('ROUTER_CLAUDE_RUNTIME_MISMATCH'), {
       code: 'ROUTER_CLAUDE_RUNTIME_MISMATCH',
@@ -244,7 +208,12 @@ export async function runGate({ codexBin, claudeBin, mode, expectedModel }) {
       codex: codexAuth,
     },
     runtimes: {
-      claude: { ...claudeRuntime, requestedModel: CLAUDE_MODEL },
+      claude: {
+        canonicalPath: claudeRuntime.canonicalPath,
+        sha256: claudeRuntime.sha256,
+        version: claudeRuntime.version,
+        requestedModel: CLAUDE_MODEL,
+      },
       codex: {
         canonicalPath: codexRuntime.path,
         target: codexRuntime.target,

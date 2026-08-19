@@ -2,7 +2,9 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { mkdtemp, readFile, realpath, rm, writeFile, readdir } = require('node:fs/promises');
+const {
+  mkdtemp, readFile, realpath, rm, writeFile, readdir, mkdir, stat, access,
+} = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 
