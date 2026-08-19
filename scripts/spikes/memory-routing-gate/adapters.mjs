@@ -7,6 +7,11 @@ import { promisify } from 'node:util';
 import { ROUTER_SCHEMA, ROUTER_SYSTEM_PROMPT } from './contract.mjs';
 
 const execFileAsync = promisify(execFile);
+const MAX_ATTEMPT_OFFSET_MS = 180_000;
+const MAX_CLAUDE_DURATION_MS = 120_000;
+const MAX_STDOUT_BYTES = 1_000_000;
+const MAX_STDERR_BYTES = 256_000;
+const OVER_LIMIT = 'over_limit';
 const SAFE_ENV_KEYS = new Set([
   'HOME', 'USER', 'LOGNAME', 'PATH', 'SHELL',
   'TMPDIR', 'TMP', 'TEMP', 'LANG',
@@ -37,16 +42,74 @@ export function buildClaudeInvocation({ binary, model, schema }) {
   };
 }
 
-function processError(code, diagnostics = {}) {
+function processError(code, diagnostics = {}, attemptEvidence, stdout) {
   const error = new Error(code);
   error.code = code;
   error.diagnostics = {
     exitCode: Number.isInteger(diagnostics.exitCode) ? diagnostics.exitCode : null,
     signal: typeof diagnostics.signal === 'string' ? diagnostics.signal : null,
-    stderrBytes: Number.isInteger(diagnostics.stderrBytes) ? diagnostics.stderrBytes : 0,
+    stderrBytes: diagnostics.stderrBytes === OVER_LIMIT || Number.isInteger(diagnostics.stderrBytes)
+      ? diagnostics.stderrBytes
+      : 0,
     cleanupConfirmed: diagnostics.cleanupConfirmed === true,
   };
+  error.attemptEvidence = attemptEvidence;
+  if (typeof stdout === 'string') {
+    Object.defineProperty(error, 'stdout', { value: stdout });
+  }
   return error;
+}
+
+function elapsedMs(startedAt) {
+  const elapsed = Number((process.hrtime.bigint() - startedAt) / 1_000_000n);
+  return elapsed <= MAX_ATTEMPT_OFFSET_MS ? elapsed : null;
+}
+
+function jsonCandidateTracker(onComplete) {
+  let started = false;
+  let inString = false;
+  let escaped = false;
+  let invalid = false;
+  let complete = false;
+  const stack = [];
+  return (chunk) => {
+    if (complete || invalid) return;
+    for (const byte of chunk) {
+      if (!started) {
+        if ([0x09, 0x0a, 0x0d, 0x20].includes(byte)) continue;
+        if (byte !== 0x7b && byte !== 0x5b) {
+          invalid = true;
+          return;
+        }
+        started = true;
+        stack.push(byte === 0x7b ? 0x7d : 0x5d);
+        continue;
+      }
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (byte === 0x5c) escaped = true;
+        else if (byte === 0x22) inString = false;
+        continue;
+      }
+      if (byte === 0x22) {
+        inString = true;
+      } else if (byte === 0x7b) {
+        stack.push(0x7d);
+      } else if (byte === 0x5b) {
+        stack.push(0x5d);
+      } else if (byte === 0x7d || byte === 0x5d) {
+        if (stack.pop() !== byte) {
+          invalid = true;
+          return;
+        }
+        if (stack.length === 0) {
+          complete = true;
+          onComplete();
+          return;
+        }
+      }
+    }
+  };
 }
 
 function killProcessGroup(child) {
@@ -63,6 +126,7 @@ function killProcessGroup(child) {
 
 export function runProcess({ binary, argv, cwd, input, timeoutMs, env }) {
   return new Promise((resolve, reject) => {
+    const startedAt = process.hrtime.bigint();
     const child = spawn(binary, argv, {
       cwd,
       env,
@@ -72,22 +136,57 @@ export function runProcess({ binary, argv, cwd, input, timeoutMs, env }) {
     const stdout = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
+    let stdoutOverLimit = false;
+    let stderrOverLimit = false;
     let failureCode = null;
     let settled = false;
     let killDeadline = null;
+    let phase = 'starting';
+    const offsets = {
+      stdin_flush_ms: null,
+      first_stdout_ms: null,
+      complete_json_candidate_ms: null,
+      stdout_end_ms: null,
+      close_ms: null,
+      total_elapsed_ms: null,
+    };
+    const advancePhase = (next) => {
+      const order = ['starting', 'awaiting_output', 'output_started', 'awaiting_close'];
+      if (order.indexOf(next) > order.indexOf(phase)) phase = next;
+    };
+    const recordOffset = (field) => {
+      if (offsets[field] === null) offsets[field] = elapsedMs(startedAt);
+    };
+    const evidence = () => ({
+      phase,
+      ...offsets,
+      stdout_bytes: stdoutOverLimit ? OVER_LIMIT : stdoutBytes,
+      stderr_bytes: stderrOverLimit ? OVER_LIMIT : stderrBytes,
+      payload_valid: false,
+      duration_ms: null,
+      duration_api_ms: null,
+      num_turns: null,
+    });
+    const trackJsonCandidate = jsonCandidateTracker(() => {
+      recordOffset('complete_json_candidate_ms');
+    });
 
     const diagnostics = (exitCode = null, signal = null, cleanupConfirmed = false) => ({
       exitCode,
       signal,
-      stderrBytes,
+      stderrBytes: stderrOverLimit ? OVER_LIMIT : stderrBytes,
       cleanupConfirmed,
     });
+    const bufferedStdout = () => (
+      stdoutOverLimit ? undefined : Buffer.concat(stdout).toString('utf8')
+    );
     const finishError = (code, details) => {
       if (settled) return;
       settled = true;
       clearTimeout(turnDeadline);
       if (killDeadline) clearTimeout(killDeadline);
-      reject(processError(code, details));
+      recordOffset('total_elapsed_ms');
+      reject(processError(code, details, evidence(), bufferedStdout()));
     };
     const terminate = (code) => {
       if (settled || failureCode) return;
@@ -100,16 +199,31 @@ export function runProcess({ binary, argv, cwd, input, timeoutMs, env }) {
     const turnDeadline = setTimeout(() => terminate('ROUTER_TIMEOUT'), timeoutMs);
 
     child.stdout.on('data', (chunk) => {
-      stdoutBytes += chunk.length;
-      if (stdoutBytes > 1_000_000) {
+      if (offsets.first_stdout_ms === null) {
+        recordOffset('first_stdout_ms');
+        advancePhase('output_started');
+      }
+      const remaining = Math.max(0, MAX_STDOUT_BYTES - stdoutBytes);
+      if (remaining > 0) trackJsonCandidate(chunk.subarray(0, remaining));
+      if (chunk.length > remaining) {
+        stdoutOverLimit = true;
         terminate('ROUTER_OUTPUT_TOO_LARGE');
         return;
       }
+      stdoutBytes += chunk.length;
       stdout.push(chunk);
     });
+    child.stdout.on('end', () => {
+      recordOffset('stdout_end_ms');
+      advancePhase('awaiting_close');
+    });
     child.stderr.on('data', (chunk) => {
+      if (chunk.length > Math.max(0, MAX_STDERR_BYTES - stderrBytes)) {
+        stderrOverLimit = true;
+        terminate('ROUTER_STDERR_TOO_LARGE');
+        return;
+      }
       stderrBytes += chunk.length;
-      if (stderrBytes > 256_000) terminate('ROUTER_STDERR_TOO_LARGE');
     });
     child.on('error', () => {
       if (!child.pid) {
@@ -123,15 +237,24 @@ export function runProcess({ binary, argv, cwd, input, timeoutMs, env }) {
       if (settled) return;
       clearTimeout(turnDeadline);
       if (killDeadline) clearTimeout(killDeadline);
+      recordOffset('close_ms');
+      recordOffset('total_elapsed_ms');
       if (failureCode || code !== 0 || signal) {
         finishError(failureCode || 'ROUTER_PROCESS_EXIT', diagnostics(code, signal, true));
         return;
       }
       settled = true;
-      resolve(Buffer.concat(stdout).toString('utf8'));
+      resolve({ stdout: bufferedStdout(), attemptEvidence: evidence() });
     });
     child.stdin.on('error', () => terminate('ROUTER_PROCESS_EXIT'));
-    child.stdin.end(input);
+    try {
+      child.stdin.end(input, () => {
+        recordOffset('stdin_flush_ms');
+        advancePhase('awaiting_output');
+      });
+    } catch {
+      terminate('ROUTER_PROCESS_EXIT');
+    }
   });
 }
 
@@ -182,6 +305,20 @@ export function inspectCodexAuth(binary) {
   return authCommand(binary, ['login', 'status'], parseCodexLoginStatus);
 }
 
+export function sanitizeClaudeMetrics(envelope = {}) {
+  const boundedDuration = (value) => (
+    Number.isInteger(value) && value >= 0 && value <= MAX_CLAUDE_DURATION_MS ? value : null
+  );
+  const durationMs = boundedDuration(envelope.duration_ms);
+  const durationApiMs = boundedDuration(envelope.duration_api_ms);
+  if (durationMs === null || durationApiMs === null || envelope.num_turns !== 1) return null;
+  return {
+    duration_ms: durationMs,
+    duration_api_ms: durationApiMs,
+    num_turns: 1,
+  };
+}
+
 export function parseClaudeResult(stdout) {
   let envelope;
   try { envelope = JSON.parse(stdout); } catch {
@@ -202,7 +339,11 @@ export function parseClaudeResult(stdout) {
   } else {
     throw envelopeError('ROUTER_OUTPUT_MISSING');
   }
-  return { raw, observedModels };
+  const claudeMetrics = sanitizeClaudeMetrics(envelope);
+  if (!claudeMetrics) throw envelopeError('ROUTER_OUTPUT_MALFORMED');
+  const result = { raw, observedModels };
+  Object.defineProperty(result, 'claudeMetrics', { value: claudeMetrics });
+  return result;
 }
 
 function inputFor(request) {
@@ -220,15 +361,41 @@ export function createClaudeAdapter({
   return {
     id: `claude:${model}`,
     requireModelEvidence: true,
+    requireAttemptEvidence: true,
     expectedObservedModel,
     async route({ request }) {
       const cwd = await mkdtemp(path.join(tempRoot, 'polygram-u24-claude-'));
       try {
         const invocation = buildClaudeInvocation({ binary, model, schema: ROUTER_SCHEMA });
-        const stdout = await runProcess({
-          ...invocation, cwd, input: inputFor(request), timeoutMs, env: subscriptionOnlyEnv(),
-        });
-        return { ...parseClaudeResult(stdout), toolCalls: 0 };
+        let processResult;
+        try {
+          processResult = await runProcess({
+            ...invocation, cwd, input: inputFor(request), timeoutMs, env: subscriptionOnlyEnv(),
+          });
+        } catch (error) {
+          if (typeof error?.stdout === 'string'
+              && Number.isInteger(error?.attemptEvidence?.stdout_end_ms)) {
+            try {
+              const parsed = parseClaudeResult(error.stdout);
+              error.attemptEvidence = { ...error.attemptEvidence, ...parsed.claudeMetrics };
+              Object.defineProperty(error, 'routeResponse', {
+                value: { ...parsed, toolCalls: 0 },
+              });
+            } catch { /* the process-boundary error remains primary */ }
+          }
+          throw error;
+        }
+        try {
+          const parsed = parseClaudeResult(processResult.stdout);
+          return {
+            ...parsed,
+            toolCalls: 0,
+            attemptEvidence: { ...processResult.attemptEvidence, ...parsed.claudeMetrics },
+          };
+        } catch (error) {
+          error.attemptEvidence = processResult.attemptEvidence;
+          throw error;
+        }
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }

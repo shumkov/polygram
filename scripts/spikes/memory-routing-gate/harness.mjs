@@ -31,6 +31,25 @@ const CLOSED_ERROR_CODES = new Set([
   'ROUTER_GATE_FAILURE',
 ]);
 const OBSERVED_MODEL_RE = /^claude-[a-z0-9-]+$/;
+const ATTEMPT_PHASES = new Set([
+  'starting',
+  'awaiting_output',
+  'output_started',
+  'awaiting_close',
+]);
+const ATTEMPT_OFFSET_FIELDS = Object.freeze([
+  'stdin_flush_ms',
+  'first_stdout_ms',
+  'complete_json_candidate_ms',
+  'stdout_end_ms',
+  'close_ms',
+  'total_elapsed_ms',
+]);
+const MAX_ATTEMPT_OFFSET_MS = 180_000;
+const MAX_CLAUDE_DURATION_MS = 120_000;
+const MAX_STDOUT_BYTES = 1_000_000;
+const MAX_STDERR_BYTES = 256_000;
+const OVER_LIMIT = 'over_limit';
 const SAFE_OS_SIGNALS = new Set([
   'SIGABRT', 'SIGALRM', 'SIGBUS', 'SIGCHLD', 'SIGCONT', 'SIGFPE', 'SIGHUP',
   'SIGILL', 'SIGINT', 'SIGIO', 'SIGKILL', 'SIGPIPE', 'SIGPOLL', 'SIGPROF',
@@ -108,12 +127,77 @@ function modelIdentityResolved(adapter, response, observedModels) {
 }
 
 export function sanitizeProcessDiagnostics(diagnostics = {}) {
+  const stderrBytes = diagnostics.stderrBytes === OVER_LIMIT
+    ? OVER_LIMIT
+    : Number.isInteger(diagnostics.stderrBytes)
+        && diagnostics.stderrBytes >= 0
+        && diagnostics.stderrBytes <= MAX_STDERR_BYTES
+      ? diagnostics.stderrBytes
+      : 0;
   return {
     exitCode: Number.isInteger(diagnostics.exitCode) ? diagnostics.exitCode : null,
     signal: SAFE_OS_SIGNALS.has(diagnostics.signal) ? diagnostics.signal : null,
-    stderrBytes: Number.isInteger(diagnostics.stderrBytes) ? diagnostics.stderrBytes : 0,
+    stderrBytes,
     cleanupConfirmed: diagnostics.cleanupConfirmed === true,
   };
+}
+
+export function sanitizeAttemptEvidence(evidence = {}, { payloadValid } = {}) {
+  const boundedInteger = (value, maximum) => (
+    Number.isInteger(value) && value >= 0 && value <= maximum ? value : null
+  );
+  const byteCount = (value, maximum) => (
+    value === OVER_LIMIT ? OVER_LIMIT : boundedInteger(value, maximum)
+  );
+  const sanitized = {
+    phase: ATTEMPT_PHASES.has(evidence.phase) ? evidence.phase : 'starting',
+    ...Object.fromEntries(ATTEMPT_OFFSET_FIELDS.map((field) => [
+      field,
+      boundedInteger(evidence[field], MAX_ATTEMPT_OFFSET_MS),
+    ])),
+    stdout_bytes: byteCount(evidence.stdout_bytes, MAX_STDOUT_BYTES),
+    stderr_bytes: byteCount(evidence.stderr_bytes, MAX_STDERR_BYTES),
+    payload_valid: false,
+    duration_ms: boundedInteger(evidence.duration_ms, MAX_CLAUDE_DURATION_MS),
+    duration_api_ms: boundedInteger(evidence.duration_api_ms, MAX_CLAUDE_DURATION_MS),
+    num_turns: evidence.num_turns === 1 ? 1 : null,
+  };
+  const offsets = ATTEMPT_OFFSET_FIELDS.map((field) => sanitized[field]);
+  const monotonicOffsets = offsets.every((value, index) => (
+    value !== null && (index === 0 || value >= offsets[index - 1])
+  ));
+  const completedEvidence = sanitized.phase === 'awaiting_close'
+    && monotonicOffsets
+    && Number.isInteger(sanitized.stdout_bytes)
+    && Number.isInteger(sanitized.stderr_bytes)
+    && sanitized.duration_ms !== null
+    && sanitized.duration_api_ms !== null
+    && sanitized.num_turns === 1;
+  const requestedPayloadValidity = payloadValid === undefined
+    ? evidence.payload_valid === true
+    : payloadValid === true;
+  sanitized.payload_valid = requestedPayloadValidity && completedEvidence;
+  return sanitized;
+}
+
+function attemptEvidence(response, payloadValid = false) {
+  if (!response?.attemptEvidence || typeof response.attemptEvidence !== 'object') return {};
+  return {
+    attemptEvidence: sanitizeAttemptEvidence(response.attemptEvidence, { payloadValid }),
+  };
+}
+
+function completedAttemptEvidenceValid(response) {
+  if (!response?.attemptEvidence || typeof response.attemptEvidence !== 'object') return false;
+  return sanitizeAttemptEvidence(response.attemptEvidence, { payloadValid: true }).payload_valid;
+}
+
+function payloadMatchesFixture(adapter, response, fixture) {
+  if (!response || (response.toolCalls || 0) !== 0) return false;
+  const observedModels = safeObservedModels(response);
+  if (!modelIdentityResolved(adapter, response, observedModels)) return false;
+  const routed = validateRouterOutput(response.raw, { sourceFact: fixture.fact });
+  return routed.ok && matchesFixture(fixture, routed);
 }
 
 export async function runRoutingCase({ fixture, adapter }) {
@@ -136,16 +220,22 @@ export async function runRoutingCase({ fixture, adapter }) {
       errorCode = 'ROUTER_GATE_FAILURE';
     }
     const evidence = responseEvidence(error);
+    const safeAttemptEvidence = attemptEvidence(
+      error,
+      payloadMatchesFixture(adapter, error?.routeResponse, fixture),
+    );
     if (Object.hasOwn(error || {}, 'observedModels')
         && !modelIdentityResolved(adapter, error, evidence.observedModels || [])) {
       return {
         ...compactResult(fixture, 'operational_error', 'ROUTER_MODEL_IDENTITY'),
         ...evidence,
+        ...safeAttemptEvidence,
       };
     }
     const result = {
       ...compactResult(fixture, 'operational_error', errorCode),
       ...evidence,
+      ...safeAttemptEvidence,
     };
     if (!error?.diagnostics) return result;
     return {
@@ -155,16 +245,27 @@ export async function runRoutingCase({ fixture, adapter }) {
   }
   const evidence = responseEvidence(response);
   const observedModels = evidence.observedModels || [];
+  const invalidRequiredAttemptEvidence = adapter.requireAttemptEvidence === true
+    && !completedAttemptEvidenceValid(response);
+  if (invalidRequiredAttemptEvidence) {
+    return {
+      ...compactResult(fixture, 'operational_error', 'ROUTER_GATE_FAILURE'),
+      ...evidence,
+      ...attemptEvidence(response, false),
+    };
+  }
   if (!modelIdentityResolved(adapter, response, observedModels)) {
     return {
       ...compactResult(fixture, 'operational_error', 'ROUTER_MODEL_IDENTITY'),
       ...evidence,
+      ...attemptEvidence(response, false),
     };
   }
   if ((response?.toolCalls || 0) !== 0) {
     return {
       ...compactResult(fixture, 'operational_error', 'ROUTER_TOOL_USE'),
       ...evidence,
+      ...attemptEvidence(response, false),
     };
   }
   const routed = validateRouterOutput(response?.raw, { sourceFact: fixture.fact });
@@ -176,6 +277,7 @@ export async function runRoutingCase({ fixture, adapter }) {
       ...compactResult(fixture, 'operational_error', routed.errorCode),
       ...(leaked ? { privateToWorkLeak: true } : {}),
       ...evidence,
+      ...attemptEvidence(response, false),
     };
   }
   if (!matchesFixture(fixture, routed)) {
@@ -183,6 +285,7 @@ export async function runRoutingCase({ fixture, adapter }) {
       ...compactResult(fixture, 'mismatch', 'ROUTER_EXPECTATION_MISMATCH', routed.category),
       ...(fixture.expected === 'personal' && routed.category !== 'personal' ? { privateToWorkLeak: true } : {}),
       ...evidence,
+      ...attemptEvidence(response, false),
     };
   }
   const result = {
@@ -193,6 +296,7 @@ export async function runRoutingCase({ fixture, adapter }) {
     ...result,
     projection: projectMemberDmOutcome(result),
     ...evidence,
+    ...attemptEvidence(response, true),
   };
 }
 
@@ -208,6 +312,7 @@ function normalizeOperationalResult(result) {
     ...result,
     errorCode: normalizeErrorCode(result.errorCode),
     ...(result.diagnostics ? { diagnostics: sanitizeProcessDiagnostics(result.diagnostics) } : {}),
+    ...(result.attemptEvidence ? attemptEvidence(result, result.attemptEvidence.payload_valid) : {}),
   };
 }
 
@@ -219,6 +324,7 @@ function firstAttemptEvidence(result) {
   return {
     errorCode: normalizeErrorCode(result.errorCode),
     ...(result.diagnostics ? { diagnostics: sanitizeProcessDiagnostics(result.diagnostics) } : {}),
+    ...(result.attemptEvidence ? { attemptEvidence: sanitizeAttemptEvidence(result.attemptEvidence) } : {}),
     privateToWorkLeak: result.privateToWorkLeak === true,
     ...responseEvidence(result),
   };
@@ -425,12 +531,14 @@ function summarizeAdapter(adapter, rows) {
       errorCode,
       category,
       diagnostics,
+      attemptEvidence: rowAttemptEvidence,
       attemptCount,
       firstAttempt,
       projection,
     }) => ({
       fixtureId, expected, status, errorCode: errorCode || null, category: category || null,
       ...(diagnostics ? { diagnostics } : {}),
+      ...(rowAttemptEvidence ? { attemptEvidence: rowAttemptEvidence } : {}),
       attemptCount,
       ...(firstAttempt ? { firstAttempt } : {}),
       projection,

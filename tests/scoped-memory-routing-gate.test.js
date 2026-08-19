@@ -19,6 +19,12 @@ async function modules() {
   return { contract, fixtures, harness, adapters, runner };
 }
 
+async function writeFakeClaude(root, name, source) {
+  const binary = path.join(root, name);
+  await writeFile(binary, `#!/usr/bin/env node\n${source}\n`, { mode: 0o700 });
+  return binary;
+}
+
 test('U24 corpus freezes the reviewed 26-case composition', async () => {
   const { fixtures } = await modules();
   const rows = fixtures.loadRoutingFixtures();
@@ -471,6 +477,9 @@ test('U24 checks parsed model identity before retrying a missing Claude output',
   const envelope = (model) => JSON.stringify({
     is_error: false,
     modelUsage: { [model]: { inputTokens: 1 } },
+    duration_ms: 1,
+    duration_api_ms: 1,
+    num_turns: 1,
   });
 
   let wrongCalls = 0;
@@ -987,6 +996,9 @@ test('U24 Claude envelope exposes one observed model and rejects API/auth errors
     is_error: false,
     structured_output: { category: 'work', parts: [{ kind: 'work', text: 'Fact.' }] },
     modelUsage: { 'claude-haiku-example': { inputTokens: 1 } },
+    duration_ms: 0,
+    duration_api_ms: 120_000,
+    num_turns: 1,
   }));
   assert.deepEqual(parsed, {
     raw: '{"category":"work","parts":[{"kind":"work","text":"Fact."}]}',
@@ -1080,6 +1092,285 @@ test('U24 exact observed Haiku model is required and routing errors keep only sa
   assert.equal(JSON.stringify(failed).includes('raw secret stderr'), false);
 });
 
+test('U24 accepts only closed attempt-evidence bounds and fails invalid required evidence closed', async () => {
+  const { fixtures, harness } = await modules();
+  const atBounds = {
+    phase: 'awaiting_close',
+    stdin_flush_ms: 0,
+    first_stdout_ms: 0,
+    complete_json_candidate_ms: 180_000,
+    stdout_end_ms: 180_000,
+    close_ms: 180_000,
+    total_elapsed_ms: 180_000,
+    stdout_bytes: 1_000_000,
+    stderr_bytes: 256_000,
+    payload_valid: true,
+    duration_ms: 0,
+    duration_api_ms: 120_000,
+    num_turns: 1,
+  };
+  assert.deepEqual(harness.sanitizeAttemptEvidence(atBounds), atBounds);
+
+  for (const [field, value] of [
+    ['stdin_flush_ms', -1],
+    ['first_stdout_ms', 180_001],
+    ['complete_json_candidate_ms', 0.5],
+    ['stdout_end_ms', '4'],
+    ['close_ms', Number.NaN],
+    ['total_elapsed_ms', Number.POSITIVE_INFINITY],
+    ['stdout_bytes', 1_000_001],
+    ['stderr_bytes', 256_001],
+    ['duration_ms', -1],
+    ['duration_api_ms', 120_001],
+    ['num_turns', 2],
+  ]) {
+    const sanitized = harness.sanitizeAttemptEvidence({ ...atBounds, [field]: value });
+    assert.equal(sanitized[field], null, field);
+    assert.equal(sanitized.payload_valid, false, field);
+  }
+  assert.equal(harness.sanitizeAttemptEvidence({
+    ...atBounds,
+    first_stdout_ms: 10,
+    complete_json_candidate_ms: 9,
+  }).payload_valid, false);
+
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
+  const failed = await harness.runRoutingCase({
+    fixture,
+    adapter: {
+      id: 'invalid-attempt-evidence',
+      requireModelEvidence: true,
+      requireAttemptEvidence: true,
+      expectedObservedModel: 'claude-haiku-exact',
+      async route() {
+        return {
+          raw: JSON.stringify(fixture.oracleOutput),
+          toolCalls: 0,
+          observedModels: ['claude-haiku-exact'],
+          attemptEvidence: { ...atBounds, duration_ms: 120_001 },
+        };
+      },
+    },
+  });
+  assert.equal(failed.status, 'operational_error');
+  assert.equal(failed.errorCode, 'ROUTER_GATE_FAILURE');
+  assert.equal(failed.attemptEvidence.payload_valid, false);
+});
+
+test('U24 records monotonic same-call phases and bounded successful Claude metrics without content', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const { adapters, fixtures, harness } = await modules();
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-evidence-test-'));
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
+  const maliciousStderr = 'malicious stderr must not survive';
+  try {
+    const output = JSON.stringify({
+      is_error: false,
+      structured_output: fixture.oracleOutput,
+      modelUsage: { 'claude-haiku-exact': {} },
+      duration_ms: 0,
+      duration_api_ms: 120_000,
+      num_turns: 1,
+    });
+    const binary = await writeFakeClaude(root, 'malicious-process-name', [
+      `process.stderr.write(${JSON.stringify(maliciousStderr)});`,
+      `process.stdout.write(${JSON.stringify(`\n${output}\t`)});`,
+    ].join('\n'));
+    const adapter = adapters.createClaudeAdapter({
+      binary,
+      expectedObservedModel: 'claude-haiku-exact',
+      timeoutMs: 5_000,
+      tempRoot: root,
+    });
+    const result = await harness.runRoutingCase({ fixture, adapter });
+    assert.equal(result.status, 'accepted');
+    assert.deepEqual(result.attemptEvidence, {
+      phase: 'awaiting_close',
+      stdin_flush_ms: result.attemptEvidence.stdin_flush_ms,
+      first_stdout_ms: result.attemptEvidence.first_stdout_ms,
+      complete_json_candidate_ms: result.attemptEvidence.complete_json_candidate_ms,
+      stdout_end_ms: result.attemptEvidence.stdout_end_ms,
+      close_ms: result.attemptEvidence.close_ms,
+      total_elapsed_ms: result.attemptEvidence.total_elapsed_ms,
+      stdout_bytes: Buffer.byteLength(`\n${output}\t`),
+      stderr_bytes: Buffer.byteLength(maliciousStderr),
+      payload_valid: true,
+      duration_ms: 0,
+      duration_api_ms: 120_000,
+      num_turns: 1,
+    });
+    const offsets = [
+      result.attemptEvidence.stdin_flush_ms,
+      result.attemptEvidence.first_stdout_ms,
+      result.attemptEvidence.complete_json_candidate_ms,
+      result.attemptEvidence.stdout_end_ms,
+      result.attemptEvidence.close_ms,
+      result.attemptEvidence.total_elapsed_ms,
+    ];
+    assert.ok(offsets.every((value) => Number.isInteger(value) && value >= 0 && value <= 180_000));
+    assert.deepEqual(offsets, [...offsets].sort((left, right) => left - right));
+    const serialized = JSON.stringify(result);
+    assert.equal(serialized.includes(maliciousStderr), false);
+    assert.equal(serialized.includes(fixture.fact), false);
+    assert.equal(serialized.includes(root), false);
+    assert.equal(serialized.includes('malicious-process-name'), false);
+    assert.equal(serialized.includes('sha256'), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('U24 keeps an incremental JSON candidate as phase evidence but rejects trailing payload', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const { adapters, fixtures, harness } = await modules();
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-framing-test-'));
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
+  try {
+    const output = JSON.stringify({
+      is_error: false,
+      structured_output: fixture.oracleOutput,
+      modelUsage: { 'claude-haiku-exact': {} },
+      duration_ms: 10,
+      duration_api_ms: 9,
+      num_turns: 1,
+    });
+    for (const [name, trailing] of [['second-value', '{}'], ['trailing-bytes', 'not-json']]) {
+      const binary = await writeFakeClaude(root, name, [
+        `process.stdout.write(${JSON.stringify(output)});`,
+        `process.stdout.write(${JSON.stringify(trailing)});`,
+      ].join('\n'));
+      const adapter = adapters.createClaudeAdapter({
+        binary,
+        expectedObservedModel: 'claude-haiku-exact',
+        timeoutMs: 5_000,
+        tempRoot: root,
+      });
+      const result = await harness.runRoutingCase({ fixture, adapter });
+      assert.equal(result.status, 'operational_error', name);
+      assert.equal(result.errorCode, 'ROUTER_OUTPUT_MALFORMED', name);
+      assert.equal(Number.isInteger(result.attemptEvidence.complete_json_candidate_ms), true, name);
+      assert.equal(Number.isInteger(result.attemptEvidence.stdout_end_ms), true, name);
+      assert.equal(result.attemptEvidence.payload_valid, false, name);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('U24 rejects invalid Claude success metrics at every required boundary shape', async () => {
+  const { adapters } = await modules();
+  assert.deepEqual(adapters.sanitizeClaudeMetrics({
+    duration_ms: 0,
+    duration_api_ms: 120_000,
+    num_turns: 1,
+  }), {
+    duration_ms: 0,
+    duration_api_ms: 120_000,
+    num_turns: 1,
+  });
+  for (const metrics of [
+    {},
+    { duration_ms: Number.NaN, duration_api_ms: 1, num_turns: 1 },
+    { duration_ms: Number.POSITIVE_INFINITY, duration_api_ms: 1, num_turns: 1 },
+    { duration_ms: 0.5, duration_api_ms: 1, num_turns: 1 },
+    { duration_ms: -1, duration_api_ms: 1, num_turns: 1 },
+    { duration_ms: 120_001, duration_api_ms: 1, num_turns: 1 },
+    { duration_ms: '1', duration_api_ms: 1, num_turns: 1 },
+    { duration_ms: 1, duration_api_ms: 120_001, num_turns: 1 },
+    { duration_ms: 1, duration_api_ms: 1, num_turns: 0 },
+  ]) {
+    assert.equal(adapters.sanitizeClaudeMetrics(metrics), null);
+  }
+  const output = {
+    is_error: false,
+    structured_output: { category: 'work', parts: [{ kind: 'work', text: 'Fact.' }] },
+    modelUsage: { 'claude-haiku-example': {} },
+    duration_ms: 1,
+    duration_api_ms: 1,
+    num_turns: 1,
+  };
+  for (const invalid of [
+    { duration_ms: undefined },
+    { duration_ms: 120_001 },
+    { duration_api_ms: -1 },
+    { num_turns: 2 },
+  ]) {
+    assert.throws(() => adapters.parseClaudeResult(JSON.stringify({ ...output, ...invalid })), {
+      code: 'ROUTER_OUTPUT_MALFORMED',
+    });
+  }
+});
+
+test('U24 marks stdout and stderr overflow with content-free sentinels after confirmed cleanup', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const { adapters } = await modules();
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-overflow-test-'));
+  try {
+    for (const [stream, size, errorCode] of [
+      ['stdout', 1_000_001, 'ROUTER_OUTPUT_TOO_LARGE'],
+      ['stderr', 256_001, 'ROUTER_STDERR_TOO_LARGE'],
+    ]) {
+      await assert.rejects(adapters.runProcess({
+        binary: process.execPath,
+        argv: ['-e', `process.${stream}.write(Buffer.alloc(${size}, 120))`],
+        cwd: root,
+        input: '',
+        timeoutMs: 5_000,
+        env: adapters.subscriptionOnlyEnv(),
+      }), (error) => {
+        assert.equal(error.code, errorCode);
+        assert.equal(error.diagnostics.cleanupConfirmed, true);
+        assert.equal(error.attemptEvidence[`${stream}_bytes`], 'over_limit');
+        assert.equal(JSON.stringify(error.attemptEvidence).includes('xxxxx'), false);
+        return true;
+      });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('U24 distinguishes a payload-valid same-call envelope from its later close failure', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const { adapters, fixtures, harness } = await modules();
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-close-test-'));
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
+  try {
+    const output = JSON.stringify({
+      is_error: false,
+      structured_output: fixture.oracleOutput,
+      modelUsage: { 'claude-haiku-exact': {} },
+      duration_ms: 100,
+      duration_api_ms: 90,
+      num_turns: 1,
+    });
+    const binary = await writeFakeClaude(root, 'close-failure', [
+      `process.stdout.write(${JSON.stringify(output)});`,
+      'process.exitCode = 7;',
+    ].join('\n'));
+    const adapter = adapters.createClaudeAdapter({
+      binary,
+      expectedObservedModel: 'claude-haiku-exact',
+      timeoutMs: 5_000,
+      tempRoot: root,
+    });
+    const result = await harness.runRoutingCase({ fixture, adapter });
+    assert.equal(result.status, 'operational_error');
+    assert.equal(result.errorCode, 'ROUTER_PROCESS_EXIT');
+    assert.equal(result.diagnostics.exitCode, 7);
+    assert.equal(result.diagnostics.cleanupConfirmed, true);
+    assert.equal(result.attemptEvidence.payload_valid, true);
+    assert.equal(Number.isInteger(result.attemptEvidence.stdout_end_ms), true);
+    assert.equal(Number.isInteger(result.attemptEvidence.close_ms), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('U24 timeout kills the process group and successful adapter cleanup removes its temp directory', {
   skip: process.platform === 'win32',
 }, async () => {
@@ -1111,6 +1402,9 @@ test('U24 timeout kills the process group and successful adapter cleanup removes
       is_error: false,
       structured_output: { category: 'work', parts: [{ kind: 'work', text: 'Synthetic.' }] },
       modelUsage: { 'claude-haiku-fixture': {} },
+      duration_ms: 1,
+      duration_api_ms: 1,
+      num_turns: 1,
     });
     await writeFile(fakeClaude, `#!/bin/sh\npwd > '${cwdReceipt}'\nprintf '%s' '${envelope}'\n`, { mode: 0o700 });
     const adapterRoot = path.join(root, 'adapter');
