@@ -1155,7 +1155,7 @@ async function showUnitCompletion(unitName, execFileCommand, timeoutMs) {
     throw new Error('invalid transient service completion evidence');
   }
   if (values.ActiveState === 'active' && values.SubState === 'exited'
-      && values.Result === 'success' && values.ExecMainCode === 'exited'
+      && values.Result === 'success' && values.ExecMainCode === '1'
       && values.ExecMainStatus === '0') return true;
   if (values.ActiveState === 'failed'
       || (values.ActiveState === 'inactive' && values.SubState === 'dead')) {

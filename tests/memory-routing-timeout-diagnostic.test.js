@@ -441,7 +441,7 @@ test('U24 real systemd launcher builds an executable transient-service command',
       return {
         stdout: [
           'ActiveState=active', 'SubState=exited', 'Result=success',
-          'ExecMainCode=exited', 'ExecMainStatus=0',
+          'ExecMainCode=1', 'ExecMainStatus=0',
         ].join('\n'),
       };
     }
@@ -454,7 +454,8 @@ test('U24 real systemd launcher builds an executable transient-service command',
     throw new Error('unexpected command');
   };
   const launcher = diagnostic.createSystemdUserLauncher({
-    execFileCommand, platform: 'linux', monotonicNowMs: () => 1, delay: async () => {},
+    execFileCommand, platform: 'linux', monotonicNowMs: () => 1,
+    completionPollAttempts: 1, delay: async () => {},
   });
   const scratchPath = '/private/polygram-u24-timeout-scratch';
   const properties = diagnostic.transientServiceProperties(scratchPath);
@@ -488,6 +489,38 @@ test('U24 real systemd launcher builds an executable transient-service command',
   }
   assert.ok(systemdCall[1].includes('/usr/bin/node'));
   assert.ok(systemdCall[1].some((value) => value.startsWith('--unit=polygram-u24-timeout-')));
+
+  for (const [completionEvidence, expectedError] of [
+    [
+      'ActiveState=active\nSubState=exited\nResult=success\nExecMainCode=2\nExecMainStatus=0',
+      /completion was not confirmed/,
+    ],
+    [
+      'ActiveState=failed\nSubState=failed\nResult=exit-code\nExecMainCode=1\nExecMainStatus=1',
+      /execution failed/,
+    ],
+  ]) {
+    const rejectedLauncher = diagnostic.createSystemdUserLauncher({
+      platform: 'linux',
+      monotonicNowMs: () => 1,
+      completionPollAttempts: 1,
+      delay: async () => {},
+      execFileCommand: async (binary, argv) => {
+        if (binary === '/usr/bin/systemctl' && argv.includes('--property=LoadState')) {
+          return { stdout: 'LoadState=not-found\n' };
+        }
+        if (binary === '/usr/bin/systemd-run') return { stdout: '' };
+        if (binary === '/usr/bin/systemctl' && argv.includes('--property=ControlGroup')) {
+          return { stdout: show };
+        }
+        if (binary === '/usr/bin/systemctl' && argv.includes('--property=SubState')) {
+          return { stdout: completionEvidence };
+        }
+        throw new Error('unexpected command');
+      },
+    });
+    await assert.rejects(rejectedLauncher.runService(request), expectedError);
+  }
 
   for (const invalidDuration of ['', '4hours 9min']) {
     const invalidLauncher = diagnostic.createSystemdUserLauncher({
@@ -1518,7 +1551,7 @@ test('U24 systemd inspection fails closed and only accepts cgroup ENOENT after i
     delay: async () => {},
     execFileCommand: async (binary, argv) => {
       if (binary === '/usr/bin/systemctl' && argv.includes('--property=SubState')) return {
-        stdout: 'ActiveState=active\nSubState=exited\nResult=success\nExecMainCode=exited\nExecMainStatus=0\n',
+        stdout: 'ActiveState=active\nSubState=exited\nResult=success\nExecMainCode=1\nExecMainStatus=0\n',
       };
       if (binary === '/usr/bin/systemctl' && argv.includes('--property=LoadState')) return phase === 'active'
         ? { stdout: 'LoadState=not-found\n' }
@@ -1552,7 +1585,7 @@ test('U24 systemd inspection fails closed and only accepts cgroup ENOENT after i
     delay: async () => {},
     execFileCommand: async (binary, argv) => {
       if (binary === '/usr/bin/systemctl' && argv.includes('--property=SubState')) return {
-        stdout: 'ActiveState=active\nSubState=exited\nResult=success\nExecMainCode=exited\nExecMainStatus=0\n',
+        stdout: 'ActiveState=active\nSubState=exited\nResult=success\nExecMainCode=1\nExecMainStatus=0\n',
       };
       if (binary === '/usr/bin/systemctl' && argv.includes('--property=LoadState')) {
         return phase === 'active'
@@ -1717,7 +1750,7 @@ test('U24 detached-child wait and final-state polling are explicitly bounded', a
       }
       if (argv.includes('--property=ControlGroup')) return { stdout: show };
       if (argv.includes('--property=SubState')) return {
-        stdout: 'ActiveState=active\nSubState=exited\nResult=success\nExecMainCode=exited\nExecMainStatus=0\n',
+        stdout: 'ActiveState=active\nSubState=exited\nResult=success\nExecMainCode=1\nExecMainStatus=0\n',
       };
       if (argv.includes('stop')) {
         phase = 'final';
@@ -1960,7 +1993,7 @@ async function assertAbsoluteCompletionDeadline() {
         completionTimeouts.push(options.timeout);
         now += options.timeout;
         return {
-          stdout: 'ActiveState=active\nSubState=running\nResult=success\nExecMainCode=exited\nExecMainStatus=0\n',
+          stdout: 'ActiveState=active\nSubState=running\nResult=success\nExecMainCode=1\nExecMainStatus=0\n',
         };
       }
       if (binary === '/usr/bin/systemctl' && argv.includes('stop')) {
