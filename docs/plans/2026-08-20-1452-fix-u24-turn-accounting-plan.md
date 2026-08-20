@@ -277,3 +277,26 @@ No gate may interpret `num_turns` as provider HTTP request count. No live result
 - `docs/sdk-query-lifecycle-research.md` records that `num_turns` is an agent-loop count and shows a valid two-turn result.
 - `node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts` from installed SDK 0.2.123 defines numeric `num_turns` on success and error terminal results and exposes `error_max_structured_output_retries`.
 - The exact Claude CLI 2.1.220 `--help` documents `--json-schema` but no public max-turn or structured-output retry option. Inspection of the attested pinned binary shows a private structured-output attempt limit, but its emitted `num_turns` comes from a separate counter; this plan intentionally does not equate them.
+
+---
+
+## Execution Outcome
+
+The reviewed implementation was signed as exact commit
+`6db437798fc461f340b96e4a29cadfc3c123d242`. Its exact seven-file archive had
+SHA-256 `3e2d9efa8ee6d9a3d04b8f21067872e7af08d3dd47fd6e8940622c8553111a2f`;
+the staged import and no-model transient-systemd capability gate passed. After
+fresh approval using the R9 accounting terms, the one authorized campaign
+stopped at outer invocation 53 with `router-quality-failure` on `personal-01`
+repetition 3. The reopened v2 receipt derived 53 exact outer invocations and
+106 exact observed internal agent-loop turns, with zero unknown or possible
+uncheckpointed work. Cleanup and evidence durability passed.
+
+The receipt SHA-256 is
+`0de407bba54dfd106769935211c4e9add94d05572b94c0c292e405d30e30ebc3`;
+the unit-witness SHA-256 is
+`44d8f58c715b6f20f8a67697e79b508e9b70485dc298a54b49d85083dc49f317`.
+No production application state changed. The receipt deliberately retains no
+raw output and no finer router subreason, so the reviewed next-decision table
+selects `revise-router-contract-or-prompt-in-reviewed-plan`. U24 remains
+blocked, and the unchanged campaign must not run again.

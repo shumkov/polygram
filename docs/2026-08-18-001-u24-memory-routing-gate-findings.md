@@ -6,9 +6,10 @@ the one authorized full VPS gate stopped on two exhausted process timeouts,
 the first timeout characterization stopped safely on its first call with an
 ambiguous invalid-envelope result, and the reviewed discriminator rerun stopped
 safely on its first call with `invalid-envelope-turn-count`. U24 remains
-blocked. The turn-count contract review and implementation are complete; the
-next gate is one changed campaign from a signed immutable commit after fresh
-approval using the reviewed outer-invocation accounting terms.
+blocked. The turn-count correction then completed, and its one approved changed
+campaign stopped cleanly at outer invocation 53 with
+`router-quality-failure` on `personal-01` repetition 3. The next gate is a
+reviewed router-contract or prompt revision; do not rerun the unchanged route.
 
 ## Decision
 
@@ -261,6 +262,56 @@ content-free receipt deliberately does not retain whether `num_turns` was
 missing, malformed, or a different integer. Do not rerun this unchanged
 implementation. That invariant has now been replaced by the reviewed positive
 safe-integer turn-evidence contract, with actual values retained in fresh v2
-receipts and aggregate accounting derived from reopened evidence. U24 and
-memory-feature enablement remain blocked until a signed immutable changed
-commit receives fresh approval and its one bounded VPS campaign is reviewed.
+receipts and aggregate accounting derived from reopened evidence. At that
+point, U24 and memory-feature enablement remained blocked until a signed
+immutable changed commit received fresh approval and its one bounded VPS
+campaign was reviewed. The next section records that campaign.
+
+### Turn-accounting campaign
+
+The false exact-one invariant was replaced by the reviewed positive-safe
+integer turn-evidence contract and committed as signed exact commit
+`6db437798fc461f340b96e4a29cadfc3c123d242`. The exact seven-file Git archive
+had SHA-256
+`3e2d9efa8ee6d9a3d04b8f21067872e7af08d3dd47fd6e8940622c8553111a2f`.
+Its commit-scoped staging import and no-model transient-systemd capability
+check passed. Ivan then approved at most 110 serial outer Claude CLI
+invocations, each limited to 120 seconds, while explicitly acknowledging that
+internal agent-loop turns and provider retries were not separately pre-capped
+or fully observable.
+
+The campaign stopped once at its first terminal disposition:
+
+```text
+primary outcome        router-quality-failure
+reason                 router-quality-failure
+next decision          revise-router-contract-or-prompt-in-reviewed-plan
+fixture / repetition   personal-01 / 3
+outer ordinal          53
+campaign elapsed       512,529 ms
+terminal elapsed       40,460 ms
+payload valid          false
+Claude duration        37,658 ms
+Claude API duration    38,680 ms
+observed num_turns     2
+slow-valid observed    false
+cleanup confirmed      true
+```
+
+The reopened v2 receipt derives exact accounting: 53 checkpointed outer
+invocations, no possible uncheckpointed outer invocation, 106 known internal
+agent-loop turns, zero unknown-turn rows, and an exact internal-turn total. The
+receipt reached sequence 54. Its 33,455 bytes hash to
+`0de407bba54dfd106769935211c4e9add94d05572b94c0c292e405d30e30ebc3`.
+The 221-byte unit witness hashes to
+`44d8f58c715b6f20f8a67697e79b508e9b70485dc298a54b49d85083dc49f317`
+and proves the transient service inactive, cgroup empty, detached child
+removed, and terminal receipt durably reopened. Scratch cleanup also passed.
+
+The content-free receipt intentionally retains neither the model output nor a
+finer router error code, so this run cannot distinguish a category mismatch
+from a schema or deterministic-guard rejection. It is nevertheless a terminal
+router-quality result under the reviewed table. Do not rerun this unchanged
+commit or route. U24 and memory-feature enablement remain blocked pending a
+reviewed router-contract or prompt revision. No Polygram service, package,
+configuration, database, Telegram, or production-memory state was changed.

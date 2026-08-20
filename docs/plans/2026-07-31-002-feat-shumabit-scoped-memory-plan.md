@@ -2,7 +2,7 @@
 title: Provider-Neutral Scoped Memory for Shumabit - Plan
 type: feat
 date: 2026-07-31
-revised: 2026-08-18
+revised: 2026-08-20
 topic: shumabit-scoped-memory
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
@@ -772,10 +772,19 @@ are new prerequisites or gates and do not renumber existing units.
   was missing, malformed, or a different integer. Do not rerun any unchanged
   gate or diagnostic. The pinned-CLI `num_turns` investigation, reviewed
   positive-safe-integer turn-evidence contract, v2 receipt implementation, and
-  local verification are complete. U24 remains blocked pending a signed
-  immutable changed commit, fresh approval using the reviewed outer-invocation
-  accounting terms, and one bounded VPS campaign whose evidence is folded back
-  into this plan.
+  local verification completed. At that point U24 remained blocked pending a
+  signed immutable changed commit, fresh approval using the reviewed
+  outer-invocation accounting terms, and one bounded VPS campaign whose
+  evidence is folded back into this plan. That campaign then ran once from
+  signed commit `6db4377` and
+  stopped cleanly at outer invocation 53 with
+  `router-quality-failure` on `personal-01` repetition 3. Exact reopened
+  accounting reported 53 outer invocations, 106 observed internal agent-loop
+  turns, and no unknown or possible uncheckpointed work. Unit inactivity,
+  empty cgroup, detached-child removal, durable evidence, and scratch cleanup
+  all passed. The content-free receipt does not retain the raw output or a
+  finer router subreason. Do not rerun the unchanged route. U24 remains blocked
+  pending a reviewed router-contract or prompt revision.
 - **Goal:** Decide whether the smallest successor to U22 is safe enough to
   implement: unchanged native extraction followed by a separate narrow
   personal-sensitivity routing/splitting pass.
@@ -1309,8 +1318,14 @@ no duplicate estimate. No estimate assumes a managed-provider alternative.
   fixture, mixed split, secret rejection, and malformed/timeout/retry queue
   behavior. The corrected shape gate passed. The single full run retained zero
   privacy/model-identity/projection failures but stopped on two exhausted
-  confirmed-cleanup timeouts and exceeded the natural-retry budget, so this
-  gate remains open and must not be rerun unchanged.
+  confirmed-cleanup timeouts and exceeded the natural-retry budget. The
+  `d37de69` and `dfd2fc2` diagnostics then stopped safely on ambiguous envelope
+  and exact-one turn assumptions. After the turn-accounting correction, the
+  one approved `6db4377` campaign stopped cleanly at outer invocation 53 with
+  `router-quality-failure` on `personal-01` repetition 3. The content-free
+  receipt proves exact outer/inner accounting and cleanup but retains no raw
+  output or finer router cause. This gate remains open pending a reviewed
+  router-contract or prompt revision and must not be rerun unchanged.
 - U16a: host/provider confirmation and model staging, process-writer overlap,
   same-scope cross-process storage, then five production-class Linux runs with
   owner/busy/cleanup attestations. The existing same-process 5/5 failure and
@@ -1430,6 +1445,9 @@ explicit sync item and remains gated by U24's bounded zero-leak evidence.
   `tests/handlers-record-inbound.test.js` — current behavior that U25 must
   preserve or intentionally extend.
 
-No production/VPS/Telegram state was contacted by this revision. No
-application code, configuration, migration, commit, push, deploy, or restart
-was performed.
+This revision created signed diagnostic commits, staged their immutable source
+and content-free evidence on the VPS, and ran only the separately approved
+transient-systemd campaigns described above. No Polygram application service,
+package, configuration, migration, database, Telegram, or production-memory
+state changed, and no release, deploy, application restart, push, or PR was
+performed.
