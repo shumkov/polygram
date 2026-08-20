@@ -963,6 +963,7 @@ test('U24 fixes Claude tools off and proves first-party subscription status with
     HOME: '/home/router', PATH: '/bin', LANG: 'en_US.UTF-8',
     OPENAI_API_KEY: 'remove', CODEX_API_KEY: 'remove', ANTHROPIC_API_KEY: 'remove',
     ANTHROPIC_AUTH_TOKEN: 'remove', CLAUDE_CODE_USE_BEDROCK: 'remove', AWS_ACCESS_KEY_ID: 'remove',
+    MAX_STRUCTURED_OUTPUT_RETRIES: 'remove',
   });
   assert.deepEqual(env, { HOME: '/home/router', PATH: '/bin', LANG: 'en_US.UTF-8' });
 
@@ -1000,11 +1001,16 @@ test('U24 Claude envelope exposes one observed model and rejects API/auth errors
     modelUsage: { 'claude-haiku-example': { inputTokens: 1 } },
     duration_ms: 0,
     duration_api_ms: 120_000,
-    num_turns: 1,
+    num_turns: 2,
   }));
   assert.deepEqual(parsed, {
     raw: '{"category":"work","parts":[{"kind":"work","text":"Fact."}]}',
     observedModels: ['claude-haiku-example'],
+  });
+  assert.deepEqual(parsed.claudeMetrics, {
+    duration_ms: 0,
+    duration_api_ms: 120_000,
+    num_turns: 2,
   });
   assert.throws(() => adapters.parseClaudeResult(JSON.stringify({
     is_error: true, result: 'Not logged in; secret diagnostic must not escape', modelUsage: {},
@@ -1019,7 +1025,7 @@ test('U24 classifies only five Claude envelope failure shapes without changing p
     modelUsage: { 'claude-haiku-example': {} },
     duration_ms: 1,
     duration_api_ms: 1,
-    num_turns: 1,
+    num_turns: 2,
   };
   const failureFor = (stdout) => {
     let failure;
@@ -1080,7 +1086,17 @@ test('U24 classifies only five Claude envelope failure shapes without changing p
     }
   }
 
-  for (const numTurns of [undefined, null, '1', 0, 1.5, 2]) {
+  for (const numTurns of [
+    undefined,
+    null,
+    '1',
+    0,
+    -1,
+    1.5,
+    Number.MAX_SAFE_INTEGER + 1,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+  ]) {
     assertFailure(
       JSON.stringify({ ...validEnvelope, num_turns: numTurns }),
       'ROUTER_OUTPUT_MALFORMED',
@@ -1090,12 +1106,20 @@ test('U24 classifies only five Claude envelope failure shapes without changing p
     );
   }
   assertFailure(
-    JSON.stringify({ ...validEnvelope, duration_ms: -1, num_turns: 2 }),
+    JSON.stringify({ ...validEnvelope, duration_ms: -1, num_turns: 0 }),
     'ROUTER_OUTPUT_MALFORMED',
     'duration-and-turn-count-invalid',
     ['claude-haiku-example'],
     'duration and turn count',
   );
+
+  for (const numTurns of [1, 2, 5, 6, Number.MAX_SAFE_INTEGER]) {
+    const acceptedTurns = adapters.parseClaudeResult(JSON.stringify({
+      ...validEnvelope,
+      num_turns: numTurns,
+    }));
+    assert.equal(acceptedTurns.claudeMetrics.num_turns, numTurns, String(numTurns));
+  }
 
   const emptyResult = adapters.parseClaudeResult(JSON.stringify({
     ...validEnvelope,
@@ -1138,8 +1162,9 @@ test('U24 carries only an allowlisted non-enumerable envelope failure through ru
     ['{bad', 'ROUTER_OUTPUT_MALFORMED', 'json-framing'],
     [JSON.stringify({ ...baseEnvelope, structured_output: null }), 'ROUTER_OUTPUT_MISSING', 'output-missing'],
     [JSON.stringify({ ...baseEnvelope, duration_ms: null }), 'ROUTER_OUTPUT_MALFORMED', 'duration-metrics-invalid'],
-    [JSON.stringify({ ...baseEnvelope, num_turns: 2 }), 'ROUTER_OUTPUT_MALFORMED', 'turn-count-invalid'],
-    [JSON.stringify({ ...baseEnvelope, duration_ms: -1, num_turns: 2 }), 'ROUTER_OUTPUT_MALFORMED', 'duration-and-turn-count-invalid'],
+    [JSON.stringify({ ...baseEnvelope, num_turns: 0 }), 'ROUTER_OUTPUT_MALFORMED', 'turn-count-invalid'],
+    [JSON.stringify({ ...baseEnvelope, duration_ms: -1, num_turns: 2 }), 'ROUTER_OUTPUT_MALFORMED', 'duration-metrics-invalid'],
+    [JSON.stringify({ ...baseEnvelope, duration_ms: -1, num_turns: 0 }), 'ROUTER_OUTPUT_MALFORMED', 'duration-and-turn-count-invalid'],
   ];
 
   for (const [stdout, errorCode, claudeEnvelopeFailure] of cases) {
@@ -1363,11 +1388,29 @@ test('U24 accepts only closed attempt-evidence bounds and fails invalid required
     ['stderr_bytes', 256_001],
     ['duration_ms', -1],
     ['duration_api_ms', 120_001],
-    ['num_turns', 2],
+    ['num_turns', 0],
   ]) {
     const sanitized = harness.sanitizeAttemptEvidence({ ...atBounds, [field]: value });
     assert.equal(sanitized[field], null, field);
     assert.equal(sanitized.payload_valid, false, field);
+  }
+  for (const numTurns of [1, 2, 5, 6, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(
+      harness.sanitizeAttemptEvidence({ ...atBounds, num_turns: numTurns }).num_turns,
+      numTurns,
+    );
+  }
+  for (const numTurns of [
+    null,
+    -1,
+    1.5,
+    Number.MAX_SAFE_INTEGER + 1,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+  ]) {
+    const sanitized = harness.sanitizeAttemptEvidence({ ...atBounds, num_turns: numTurns });
+    assert.equal(sanitized.num_turns, null, String(numTurns));
+    assert.equal(sanitized.payload_valid, false, String(numTurns));
   }
   assert.equal(harness.sanitizeAttemptEvidence({
     ...atBounds,
@@ -1412,7 +1455,7 @@ test('U24 records monotonic same-call phases and bounded successful Claude metri
       modelUsage: { 'claude-haiku-exact': {} },
       duration_ms: 0,
       duration_api_ms: 120_000,
-      num_turns: 1,
+      num_turns: 2,
     });
     const binary = await writeFakeClaude(root, 'malicious-process-name', [
       `process.stderr.write(${JSON.stringify(maliciousStderr)});`,
@@ -1439,7 +1482,7 @@ test('U24 records monotonic same-call phases and bounded successful Claude metri
       payload_valid: true,
       duration_ms: 0,
       duration_api_ms: 120_000,
-      num_turns: 1,
+      num_turns: 2,
     });
     const offsets = [
       result.attemptEvidence.stdin_flush_ms,
@@ -1506,17 +1549,21 @@ test('U24 keeps a process failure primary when recovery parsing finds a classifi
   const { adapters, fixtures, harness } = await modules();
   const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-envelope-precedence-test-'));
   const fixture = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
-  const output = JSON.stringify({
+  const processOutput = JSON.stringify({
     is_error: false,
     structured_output: fixture.oracleOutput,
     modelUsage: { 'claude-haiku-exact': {} },
-    duration_ms: -1,
+    duration_ms: 1,
     duration_api_ms: 1,
-    num_turns: 1,
+    num_turns: 2,
+  });
+  const durationFailureOutput = JSON.stringify({
+    ...JSON.parse(processOutput),
+    duration_ms: -1,
   });
   try {
     const processFailureBinary = await writeFakeClaude(root, 'process-failure', [
-      `process.stdout.write(${JSON.stringify(output)});`,
+      `process.stdout.write(${JSON.stringify(processOutput)});`,
       'process.exitCode = 7;',
     ].join('\n'));
     const processFailure = await harness.runRoutingCase({
@@ -1531,13 +1578,14 @@ test('U24 keeps a process failure primary when recovery parsing finds a classifi
     assert.equal(processFailure.errorCode, 'ROUTER_PROCESS_EXIT');
     assert.equal(processFailure.diagnostics.exitCode, 7);
     assert.equal(processFailure.diagnostics.cleanupConfirmed, true);
-    assert.equal(processFailure.attemptEvidence.payload_valid, false);
+    assert.equal(processFailure.attemptEvidence.payload_valid, true);
+    assert.equal(processFailure.attemptEvidence.num_turns, 2);
     assert.equal(Object.hasOwn(processFailure, 'claudeEnvelopeFailure'), false);
 
     const cleanCloseBinary = await writeFakeClaude(
       root,
       'clean-close',
-      `process.stdout.write(${JSON.stringify(output)});`,
+      `process.stdout.write(${JSON.stringify(durationFailureOutput)});`,
     );
     const cleanClose = await harness.runRoutingCase({
       fixture,
@@ -1552,6 +1600,7 @@ test('U24 keeps a process failure primary when recovery parsing finds a classifi
     assert.equal(cleanClose.claudeEnvelopeFailure, 'duration-metrics-invalid');
     assert.equal(Object.getOwnPropertyDescriptor(cleanClose, 'claudeEnvelopeFailure').enumerable, false);
     assert.equal(cleanClose.attemptEvidence.payload_valid, false);
+    assert.equal(cleanClose.attemptEvidence.num_turns, 2);
     assert.equal(Object.hasOwn(cleanClose.attemptEvidence, 'claudeEnvelopeFailure'), false);
     assert.equal(JSON.stringify(cleanClose).includes('claudeEnvelopeFailure'), false);
   } finally {
@@ -1561,15 +1610,17 @@ test('U24 keeps a process failure primary when recovery parsing finds a classifi
 
 test('U24 rejects invalid Claude success metrics at every required boundary shape', async () => {
   const { adapters } = await modules();
-  assert.deepEqual(adapters.sanitizeClaudeMetrics({
-    duration_ms: 0,
-    duration_api_ms: 120_000,
-    num_turns: 1,
-  }), {
-    duration_ms: 0,
-    duration_api_ms: 120_000,
-    num_turns: 1,
-  });
+  for (const numTurns of [1, 2, 5, 6, Number.MAX_SAFE_INTEGER]) {
+    assert.deepEqual(adapters.sanitizeClaudeMetrics({
+      duration_ms: 0,
+      duration_api_ms: 120_000,
+      num_turns: numTurns,
+    }), {
+      duration_ms: 0,
+      duration_api_ms: 120_000,
+      num_turns: numTurns,
+    });
+  }
   for (const metrics of [
     {},
     { duration_ms: Number.NaN, duration_api_ms: 1, num_turns: 1 },
@@ -1580,6 +1631,11 @@ test('U24 rejects invalid Claude success metrics at every required boundary shap
     { duration_ms: '1', duration_api_ms: 1, num_turns: 1 },
     { duration_ms: 1, duration_api_ms: 120_001, num_turns: 1 },
     { duration_ms: 1, duration_api_ms: 1, num_turns: 0 },
+    { duration_ms: 1, duration_api_ms: 1, num_turns: -1 },
+    { duration_ms: 1, duration_api_ms: 1, num_turns: 1.5 },
+    { duration_ms: 1, duration_api_ms: 1, num_turns: Number.MAX_SAFE_INTEGER + 1 },
+    { duration_ms: 1, duration_api_ms: 1, num_turns: Number.NaN },
+    { duration_ms: 1, duration_api_ms: 1, num_turns: Number.POSITIVE_INFINITY },
   ]) {
     assert.equal(adapters.sanitizeClaudeMetrics(metrics), null);
   }
@@ -1595,7 +1651,7 @@ test('U24 rejects invalid Claude success metrics at every required boundary shap
     { duration_ms: undefined },
     { duration_ms: 120_001 },
     { duration_api_ms: -1 },
-    { num_turns: 2 },
+    { num_turns: 0 },
   ]) {
     assert.throws(() => adapters.parseClaudeResult(JSON.stringify({ ...output, ...invalid })), {
       code: 'ROUTER_OUTPUT_MALFORMED',
@@ -1646,7 +1702,7 @@ test('U24 distinguishes a payload-valid same-call envelope from its later close 
       modelUsage: { 'claude-haiku-exact': {} },
       duration_ms: 100,
       duration_api_ms: 90,
-      num_turns: 1,
+      num_turns: 2,
     });
     const binary = await writeFakeClaude(root, 'close-failure', [
       `process.stdout.write(${JSON.stringify(output)});`,
@@ -1664,6 +1720,7 @@ test('U24 distinguishes a payload-valid same-call envelope from its later close 
     assert.equal(result.diagnostics.exitCode, 7);
     assert.equal(result.diagnostics.cleanupConfirmed, true);
     assert.equal(result.attemptEvidence.payload_valid, true);
+    assert.equal(result.attemptEvidence.num_turns, 2);
     assert.equal(Number.isInteger(result.attemptEvidence.stdout_end_ms), true);
     assert.equal(Number.isInteger(result.attemptEvidence.close_ms), true);
   } finally {

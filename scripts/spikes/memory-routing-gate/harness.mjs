@@ -1,5 +1,6 @@
 import { prepareRoutingFact, validateRouterOutput } from './contract.mjs';
 import { fixtureManifestHash } from './fixtures.mjs';
+import { isPositiveSafeTurnCount } from './adapters.mjs';
 
 const PROCESS_RETRY_CODES = new Set([
   'ROUTER_TIMEOUT',
@@ -178,7 +179,7 @@ export function sanitizeAttemptEvidence(evidence = {}, { payloadValid } = {}) {
     payload_valid: false,
     duration_ms: boundedInteger(evidence.duration_ms, MAX_CLAUDE_DURATION_MS),
     duration_api_ms: boundedInteger(evidence.duration_api_ms, MAX_CLAUDE_DURATION_MS),
-    num_turns: evidence.num_turns === 1 ? 1 : null,
+    num_turns: isPositiveSafeTurnCount(evidence.num_turns) ? evidence.num_turns : null,
   };
   const offsets = ATTEMPT_OFFSET_FIELDS.map((field) => sanitized[field]);
   const monotonicOffsets = offsets.every((value, index) => (
@@ -190,7 +191,7 @@ export function sanitizeAttemptEvidence(evidence = {}, { payloadValid } = {}) {
     && Number.isInteger(sanitized.stderr_bytes)
     && sanitized.duration_ms !== null
     && sanitized.duration_api_ms !== null
-    && sanitized.num_turns === 1;
+    && isPositiveSafeTurnCount(sanitized.num_turns);
   const requestedPayloadValidity = payloadValid === undefined
     ? evidence.payload_valid === true
     : payloadValid === true;

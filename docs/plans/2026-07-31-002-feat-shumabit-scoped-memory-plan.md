@@ -761,9 +761,21 @@ are new prerequisites or gates and do not renumber existing units.
   all confirmed. Its content-free receipt proves that one JSON candidate was
   observed, but cannot distinguish invalid/trailing JSON from a valid envelope
   whose required duration or turn-count fields failed the diagnostic contract.
-  Do not rerun either unchanged gate. U24 remains blocked while a reviewed
-  amendment adds a closed envelope-failure category and reruns only the changed
-  diagnostic.
+  A reviewed five-category discriminator was then committed as exact commit
+  `dfd2fc2` and staged from an immutable seven-file archive. After fresh
+  approval, its one changed VPS campaign stopped safely after the first
+  8.0-second call with
+  `diagnostic-failure / invalid-envelope-turn-count`; process close,
+  transient-unit inactivity, empty cgroup, durable checkpointing, and scratch
+  cleanup again passed. This rules out the other four discriminator classes as
+  the selected failure but intentionally does not retain whether `num_turns`
+  was missing, malformed, or a different integer. Do not rerun any unchanged
+  gate or diagnostic. The pinned-CLI `num_turns` investigation, reviewed
+  positive-safe-integer turn-evidence contract, v2 receipt implementation, and
+  local verification are complete. U24 remains blocked pending a signed
+  immutable changed commit, fresh approval using the reviewed outer-invocation
+  accounting terms, and one bounded VPS campaign whose evidence is folded back
+  into this plan.
 - **Goal:** Decide whether the smallest successor to U22 is safe enough to
   implement: unchanged native extraction followed by a separate narrow
   personal-sensitivity routing/splitting pass.

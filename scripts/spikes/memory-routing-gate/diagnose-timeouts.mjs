@@ -9,7 +9,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 import {
-  createClaudeAdapter, inspectClaudeAuth, subscriptionOnlyEnv,
+  createClaudeAdapter, inspectClaudeAuth, isPositiveSafeTurnCount, subscriptionOnlyEnv,
 } from './adapters.mjs';
 import { loadRoutingFixtures, fixtureManifestHash } from './fixtures.mjs';
 import { runRoutingCase } from './harness.mjs';
@@ -204,6 +204,27 @@ const OUT_OF_BAND_REASONS = new Set([
   'checkpoint-unconfirmed',
   'call-arithmetic-mismatch',
 ]);
+const EXACT_OUT_OF_BAND_OUTER_REASONS = new Set([
+  'production-became-busy',
+  'campaign-budget-exhausted',
+  'call-arithmetic-mismatch',
+]);
+const PRE_SPAWN_OUT_OF_BAND_REASONS = new Set([
+  'integrity-failure',
+  'production-became-busy',
+  'campaign-budget-exhausted',
+  'call-arithmetic-mismatch',
+]);
+const POST_LAUNCH_OUT_OF_BAND_REASONS = new Set([
+  'integrity-failure',
+  'invalid-evidence',
+  'unknown-evidence',
+  'checkpoint-unconfirmed',
+]);
+const LAUNCHER_PRIMARY_REASONS = new Set([
+  'integrity-failure',
+  'runner-nonterminal',
+]);
 
 export const STAGING_SOURCE_FILES = Object.freeze([
   'scripts/spikes/memory-routing-gate/diagnose-timeouts.mjs',
@@ -246,7 +267,11 @@ function classified(outcome, reason, slowValid = false) {
   };
 }
 
-function invalidNumericEvidence(evidence, { allowParsedRouterEnvelope = false } = {}) {
+function invalidNumericEvidence(evidence, {
+  allowParsedRouterEnvelope = false,
+  strictCloseGrammar = true,
+  turnCountValid = isPositiveSafeTurnCount,
+} = {}) {
   if (!hasExactKeys(evidence, RECEIPT_EVIDENCE_FIELDS)
       || !ATTEMPT_PHASES.has(evidence.phase)
       || typeof evidence.payload_valid !== 'boolean') return true;
@@ -259,11 +284,17 @@ function invalidNumericEvidence(evidence, { allowParsedRouterEnvelope = false } 
     if (value !== 'over_limit'
         && (!Number.isInteger(value) || value < 0 || value > maximum)) return true;
   }
+  const closeObserved = Number.isInteger(evidence.close_ms);
+  if (strictCloseGrammar && closeObserved && (evidence.total_elapsed_ms === null
+      || evidence.phase !== 'awaiting_close')) return true;
+  const streamOverLimitObserved = evidence.stdout_bytes === 'over_limit'
+    || evidence.stderr_bytes === 'over_limit';
+  if ((evidence.payload_valid || allowParsedRouterEnvelope) && streamOverLimitObserved) return true;
   for (const field of ['duration_ms', 'duration_api_ms']) {
     const value = evidence[field];
     if (value !== null && (!Number.isInteger(value) || value < 0 || value > 120_000)) return true;
   }
-  if (evidence.num_turns !== null && evidence.num_turns !== 1) return true;
+  if (evidence.num_turns !== null && !turnCountValid(evidence.num_turns)) return true;
   const observedOffsets = OFFSET_FIELDS
     .map((field) => evidence[field])
     .filter((value) => value !== null);
@@ -282,9 +313,13 @@ function invalidNumericEvidence(evidence, { allowParsedRouterEnvelope = false } 
     output_started: Number.isInteger(evidence.stdin_flush_ms)
       && Number.isInteger(evidence.first_stdout_ms)
       && evidence.stdout_end_ms === null,
-    awaiting_close: Number.isInteger(evidence.stdin_flush_ms)
-      && Number.isInteger(evidence.first_stdout_ms)
-      && Number.isInteger(evidence.stdout_end_ms),
+    awaiting_close: Number.isInteger(evidence.stdout_end_ms)
+      && (evidence.stdin_flush_ms === null || Number.isInteger(evidence.stdin_flush_ms))
+      && (evidence.first_stdout_ms === null
+        || (Number.isInteger(evidence.stdin_flush_ms)
+          && Number.isInteger(evidence.first_stdout_ms)))
+      && (evidence.complete_json_candidate_ms === null
+        || Number.isInteger(evidence.first_stdout_ms)),
   };
   if (!phaseShape[evidence.phase]) return true;
   if (evidence.payload_valid || allowParsedRouterEnvelope) {
@@ -292,14 +327,17 @@ function invalidNumericEvidence(evidence, { allowParsedRouterEnvelope = false } 
         || !Number.isInteger(evidence.complete_json_candidate_ms)
         || !Number.isInteger(evidence.duration_ms)
         || !Number.isInteger(evidence.duration_api_ms)
-        || evidence.num_turns !== 1) return true;
-  } else if (evidence.duration_ms !== null
-      || evidence.duration_api_ms !== null
-      || evidence.num_turns !== null) return true;
+        || !turnCountValid(evidence.num_turns)) return true;
+  } else if (evidence.num_turns !== null) {
+    if (evidence.phase !== 'awaiting_close'
+        || !Number.isInteger(evidence.complete_json_candidate_ms)
+        || evidence.duration_ms !== null
+        || evidence.duration_api_ms !== null) return true;
+  } else if (evidence.duration_ms !== null || evidence.duration_api_ms !== null) return true;
   return false;
 }
 
-function acceptedAttemptValid(evidence) {
+function acceptedAttemptValid(evidence, turnCountValid = isPositiveSafeTurnCount) {
   if (evidence?.payload_valid !== true || evidence.phase !== 'awaiting_close') return false;
   if (!OFFSET_FIELDS.every((field) => Number.isInteger(evidence[field]))) return false;
   for (let index = 1; index < OFFSET_FIELDS.length; index += 1) {
@@ -309,14 +347,20 @@ function acceptedAttemptValid(evidence) {
     && Number.isInteger(evidence.stderr_bytes)
     && Number.isInteger(evidence.duration_ms)
     && Number.isInteger(evidence.duration_api_ms)
-    && evidence.num_turns === 1;
+    && turnCountValid(evidence.num_turns);
 }
 
-function receiptAttemptEvidenceValid(evidence) {
+function receiptAttemptEvidenceValid(evidence, receiptSchema) {
+  const turnCountValid = turnCountValidator(receiptSchema);
+  const hasAnyMetrics = [evidence?.duration_ms, evidence?.duration_api_ms, evidence?.num_turns]
+    .some((value) => value !== null);
   return !invalidNumericEvidence(evidence, {
     allowParsedRouterEnvelope: evidence?.payload_valid === false
-      && [evidence.duration_ms, evidence.duration_api_ms, evidence.num_turns]
-        .some((value) => value !== null),
+      && (receiptSchema === RECEIPT_SCHEMA_V1
+        ? hasAnyMetrics
+        : evidence.duration_ms !== null && evidence.duration_api_ms !== null),
+    turnCountValid,
+    strictCloseGrammar: receiptSchema === RECEIPT_SCHEMA_V2,
   });
 }
 
@@ -467,23 +511,26 @@ export async function runDiagnosticCampaign({
   activatedAtMs,
   monotonicNowMs,
   checkBusy,
+  beforeInvocation = async () => {},
   routeOnce,
   checkpointAttempt,
   checkpointOutOfBand,
+  receiptSchema = RECEIPT_SCHEMA_V2,
 }) {
   if (!Array.isArray(fixtures) || fixtures.length !== DIAGNOSTIC_LIMITS.fixtureCount
       || fixtures.some((fixture) => fixture?.expected === 'quarantine')
       || fixtureManifestHash(fixtures) !== DIAGNOSTIC_MANIFEST_HASH) {
     throw new TypeError('diagnostic campaign requires the 22 non-secret fixtures');
   }
-  if (![monotonicNowMs, checkBusy, routeOnce, checkpointAttempt, checkpointOutOfBand]
+  if (![monotonicNowMs, checkBusy, beforeInvocation, routeOnce,
+    checkpointAttempt, checkpointOutOfBand]
     .every((candidate) => typeof candidate === 'function')) {
     throw new TypeError('diagnostic campaign seams are required');
   }
   const attempts = [];
-  const checkpointTerminal = async (decision) => {
+  const checkpointTerminal = async (decision, outerInvocationStarted) => {
     try {
-      await checkpointOutOfBand(decision);
+      await checkpointOutOfBand(decision, outerInvocationStarted);
     } catch {
       // The in-memory result remains diagnostic-failure when durable evidence cannot be confirmed.
     }
@@ -496,12 +543,12 @@ export async function runDiagnosticCampaign({
         productionBusy = await checkBusy({ nextCallOrdinal: callOrdinal + 1 });
       } catch {
         const decision = classifyDiagnosticEvent({ integrityFailure: true, priorAttempts: attempts });
-        await checkpointTerminal(decision);
+        await checkpointTerminal(decision, false);
         return campaignResult(decision, attempts);
       }
       if (productionBusy) {
         const decision = classifyDiagnosticEvent({ productionBusy: true, priorAttempts: attempts });
-        await checkpointTerminal(decision);
+        await checkpointTerminal(decision, false);
         return campaignResult(decision, attempts);
       }
       let fits;
@@ -509,12 +556,23 @@ export async function runDiagnosticCampaign({
         fits = reservationFits(activatedAtMs, monotonicNowMs());
       } catch {
         const decision = classifyDiagnosticEvent({ integrityFailure: true, priorAttempts: attempts });
-        await checkpointTerminal(decision);
+        await checkpointTerminal(decision, false);
         return campaignResult(decision, attempts);
       }
       if (!fits) {
         const decision = classifyDiagnosticEvent({ reservationFits: false, priorAttempts: attempts });
-        await checkpointTerminal(decision);
+        await checkpointTerminal(decision, false);
+        return campaignResult(decision, attempts);
+      }
+      try {
+        await beforeInvocation({
+          fixture,
+          repetition,
+          nextCallOrdinal: callOrdinal + 1,
+        });
+      } catch {
+        const decision = classifyDiagnosticEvent({ integrityFailure: true, priorAttempts: attempts });
+        await checkpointTerminal(decision, false);
         return campaignResult(decision, attempts);
       }
       callOrdinal += 1;
@@ -528,7 +586,7 @@ export async function runDiagnosticCampaign({
         });
       } catch {
         const decision = classifyDiagnosticEvent({ integrityFailure: true, priorAttempts: attempts });
-        await checkpointTerminal(decision);
+        await checkpointTerminal(decision, true);
         return campaignResult(decision, attempts);
       }
       const decision = classifyDiagnosticEvent({
@@ -536,12 +594,12 @@ export async function runDiagnosticCampaign({
         callOrdinal,
         priorAttempts: attempts,
       });
-      if (!result || !receiptAttemptEvidenceValid(result.attemptEvidence)) {
-        await checkpointTerminal(decision);
+      if (!result || !receiptAttemptEvidenceValid(result.attemptEvidence, receiptSchema)) {
+        await checkpointTerminal(decision, true);
         return campaignResult(decision, attempts);
       }
       if (decision.reason === 'invalid-evidence') {
-        await checkpointTerminal(decision);
+        await checkpointTerminal(decision, true);
         return campaignResult(decision, attempts);
       }
       const attempt = receiptAttempt({ fixture, repetition, ordinal: callOrdinal, result, decision });
@@ -549,7 +607,7 @@ export async function runDiagnosticCampaign({
         await checkpointAttempt(attempt, decision);
       } catch {
         const checkpointFailure = classified('diagnostic-failure', 'checkpoint-unconfirmed');
-        await checkpointTerminal(checkpointFailure);
+        await checkpointTerminal(checkpointFailure, true);
         return campaignResult(checkpointFailure, attempts);
       }
       attempts.push(attempt);
@@ -557,7 +615,7 @@ export async function runDiagnosticCampaign({
     }
   }
   const decision = classified('diagnostic-failure', 'call-arithmetic-mismatch');
-  await checkpointTerminal(decision);
+  await checkpointTerminal(decision, false);
   return campaignResult(decision, attempts);
 }
 
@@ -594,25 +652,27 @@ export async function runLiveDiagnosticCampaign({
   });
   return runDiagnosticCampaign({
     ...campaignOptions,
+    receiptSchema: RECEIPT_SCHEMA_V2,
     fixtures: DIAGNOSTIC_FIXTURES.map((fixture) => structuredClone(fixture)),
-    routeOnce: async ({ fixture }) => {
-      await assertRuntimeIdentityUnchanged(runtime);
-      return runCase({ fixture, adapter });
-    },
+    beforeInvocation: () => assertRuntimeIdentityUnchanged(runtime),
+    routeOnce: ({ fixture }) => runCase({ fixture, adapter }),
   });
 }
 
-const RECEIPT_SCHEMA = 'polygram-memory-routing-timeout-diagnostic/v1';
+const RECEIPT_SCHEMA_V1 = 'polygram-memory-routing-timeout-diagnostic/v1';
+const RECEIPT_SCHEMA_V2 = 'polygram-memory-routing-timeout-diagnostic/v2';
+const RECEIPT_SCHEMAS = new Set([RECEIPT_SCHEMA_V1, RECEIPT_SCHEMA_V2]);
 
 function baseReceipt() {
   return {
-    schema_version: RECEIPT_SCHEMA,
+    schema_version: RECEIPT_SCHEMA_V2,
     sequence: 0,
     preflight_complete: false,
     campaign_elapsed_ms: 0,
     attempts: [],
     terminal: null,
     out_of_band_terminal_count: 0,
+    out_of_band_outer_invocation_started: false,
   };
 }
 
@@ -681,8 +741,10 @@ async function writeAtomicJson(filePath, value) {
 }
 
 function validateReceipt(receipt) {
-  if (!receipt || receipt.schema_version !== RECEIPT_SCHEMA) throw new Error('invalid receipt schema');
-  if (!hasExactKeys(receipt, [
+  if (!receipt || !RECEIPT_SCHEMAS.has(receipt.schema_version)) {
+    throw new Error('invalid receipt schema');
+  }
+  const receiptFields = [
     'schema_version',
     'sequence',
     'preflight_complete',
@@ -690,7 +752,11 @@ function validateReceipt(receipt) {
     'attempts',
     'terminal',
     'out_of_band_terminal_count',
-  ])) throw new Error('invalid receipt fields');
+    ...(receipt.schema_version === RECEIPT_SCHEMA_V2
+      ? ['out_of_band_outer_invocation_started']
+      : []),
+  ];
+  if (!hasExactKeys(receipt, receiptFields)) throw new Error('invalid receipt fields');
   assertBoundedInteger(receipt.sequence, DIAGNOSTIC_LIMITS.maxSequence, 'receipt sequence');
   assertBoundedInteger(
     receipt.campaign_elapsed_ms,
@@ -700,7 +766,9 @@ function validateReceipt(receipt) {
   if (typeof receipt.preflight_complete !== 'boolean'
       || !Array.isArray(receipt.attempts)
       || receipt.attempts.length > DIAGNOSTIC_LIMITS.callCeiling
-      || ![0, 1].includes(receipt.out_of_band_terminal_count)) {
+      || ![0, 1].includes(receipt.out_of_band_terminal_count)
+      || (receipt.schema_version === RECEIPT_SCHEMA_V2
+        && typeof receipt.out_of_band_outer_invocation_started !== 'boolean')) {
     throw new Error('invalid receipt evidence');
   }
   if (receipt.terminal !== null
@@ -708,6 +776,8 @@ function validateReceipt(receipt) {
         || !DIAGNOSTIC_OUTCOMES.has(receipt.terminal?.outcome)
         || !CLOSED_REASONS.has(receipt.terminal?.reason)
         || !OUTCOME_REASONS[receipt.terminal?.outcome]?.has(receipt.terminal?.reason)
+        || (receipt.schema_version === RECEIPT_SCHEMA_V2
+          && receipt.terminal?.reason === LEGACY_INVALID_ENVELOPE_REASON)
         || receipt.terminal?.next_decision !== nextDecisionFor(receipt.terminal.outcome))) {
     throw new Error('invalid receipt terminal');
   }
@@ -716,7 +786,7 @@ function validateReceipt(receipt) {
     throw new Error('invalid receipt arithmetic');
   }
   for (let index = 0; index < receipt.attempts.length; index += 1) {
-    validateStoredAttempt(receipt.attempts[index], index + 1);
+    validateStoredAttempt(receipt.attempts[index], index + 1, receipt.schema_version);
   }
   const terminalAttempts = receipt.attempts.filter((attempt) => attempt.terminal_result !== null);
   if (!receipt.preflight_complete
@@ -734,6 +804,14 @@ function validateReceipt(receipt) {
     if (!OUT_OF_BAND_REASONS.has(receipt.terminal.reason)) {
       throw new Error('invalid receipt out-of-band terminal reason');
     }
+    if (receipt.schema_version === RECEIPT_SCHEMA_V2) {
+      const allowedReasons = receipt.out_of_band_outer_invocation_started
+        ? POST_LAUNCH_OUT_OF_BAND_REASONS
+        : PRE_SPAWN_OUT_OF_BAND_REASONS;
+      if (!allowedReasons.has(receipt.terminal.reason)) {
+        throw new Error('invalid receipt out-of-band outer invocation phase');
+      }
+    }
   } else if (receipt.terminal === null) {
     if (terminalAttempts.length !== 0) throw new Error('invalid receipt terminal projection');
   } else {
@@ -743,7 +821,16 @@ function validateReceipt(receipt) {
         || terminalAttempt.attempted_call_result !== receipt.terminal.outcome) {
       throw new Error('invalid receipt terminal projection');
     }
-    validateAttemptTerminalRelationship(terminalAttempt, receipt.terminal);
+    validateAttemptTerminalRelationship(
+      terminalAttempt,
+      receipt.terminal,
+      receipt.schema_version,
+    );
+  }
+  if (receipt.schema_version === RECEIPT_SCHEMA_V2
+      && receipt.out_of_band_terminal_count === 0
+      && receipt.out_of_band_outer_invocation_started !== false) {
+    throw new Error('invalid receipt out-of-band outer invocation state');
   }
   if (receipt.terminal?.reason === 'call-ceiling-with-slow-valid') {
     if (receipt.attempts.length !== DIAGNOSTIC_LIMITS.callCeiling
@@ -769,7 +856,18 @@ function sanitizedReceiptEvidence(evidence) {
   return Object.fromEntries(RECEIPT_EVIDENCE_FIELDS.map((field) => [field, evidence[field]]));
 }
 
-function parsedClosedEnvelopeEvidence(evidence) {
+function turnCountValidator(receiptSchema) {
+  switch (receiptSchema) {
+    case RECEIPT_SCHEMA_V1:
+      return (value) => value === 1;
+    case RECEIPT_SCHEMA_V2:
+      return isPositiveSafeTurnCount;
+    default:
+      throw new Error('invalid receipt schema');
+  }
+}
+
+function parsedClosedEnvelopeEvidence(evidence, receiptSchema) {
   return evidence.phase === 'awaiting_close'
     && OFFSET_FIELDS.every((field) => Number.isInteger(evidence[field]))
     && Number.isInteger(evidence.stdout_bytes)
@@ -777,7 +875,7 @@ function parsedClosedEnvelopeEvidence(evidence) {
     && Number.isInteger(evidence.complete_json_candidate_ms)
     && Number.isInteger(evidence.duration_ms)
     && Number.isInteger(evidence.duration_api_ms)
-    && evidence.num_turns === 1;
+    && turnCountValidator(receiptSchema)(evidence.num_turns);
 }
 
 function streamOverLimit(evidence) {
@@ -790,14 +888,23 @@ function successMetricsAbsent(evidence) {
     && evidence.num_turns === null;
 }
 
-function validateAttemptTerminalRelationship(attempt, terminal) {
+function validTurnOnlyEvidence(evidence, receiptSchema) {
+  return receiptSchema === RECEIPT_SCHEMA_V2
+    && evidence.duration_ms === null
+    && evidence.duration_api_ms === null
+    && isPositiveSafeTurnCount(evidence.num_turns);
+}
+
+function validateAttemptTerminalRelationship(attempt, terminal, receiptSchema) {
   const { evidence } = attempt;
   if (terminal.outcome === 'process-boundary-fault'
-      && (evidence.payload_valid !== true || !parsedClosedEnvelopeEvidence(evidence))) {
+      && (evidence.payload_valid !== true
+        || !parsedClosedEnvelopeEvidence(evidence, receiptSchema))) {
     throw new Error('invalid process-boundary terminal evidence');
   }
   if (terminal.outcome === 'router-quality-failure'
-      && (evidence.payload_valid !== false || !parsedClosedEnvelopeEvidence(evidence))) {
+      && (evidence.payload_valid !== false
+        || !parsedClosedEnvelopeEvidence(evidence, receiptSchema))) {
     throw new Error('invalid router-quality terminal evidence');
   }
   if (terminal.outcome === 'route-unsuitable-at-diagnostic-ceiling'
@@ -812,14 +919,22 @@ function validateAttemptTerminalRelationship(attempt, terminal) {
   if (['old-cap-false-rejection', 'inconclusive'].includes(terminal.outcome)
       && terminal.reason.startsWith('call-ceiling-')
       && (attempt.ordinal !== DIAGNOSTIC_LIMITS.callCeiling
-        || !acceptedAttemptValid(evidence))) {
+        || !acceptedAttemptValid(evidence, turnCountValidator(receiptSchema)))) {
     throw new Error('invalid call-ceiling terminal attempt');
   }
   if (terminal.outcome !== 'diagnostic-failure') return;
   const closeConfirmed = Number.isInteger(evidence.close_ms);
   if (ENVELOPE_REASONS.has(terminal.reason)) {
+    let validMetrics = successMetricsAbsent(evidence);
+    if (receiptSchema === RECEIPT_SCHEMA_V2
+        && terminal.reason === 'invalid-envelope-duration-metrics') {
+      validMetrics = validTurnOnlyEvidence(evidence, receiptSchema);
+    } else if (receiptSchema === RECEIPT_SCHEMA_V2
+        && terminal.reason === 'missing-envelope-payload') {
+      validMetrics ||= validTurnOnlyEvidence(evidence, receiptSchema);
+    }
     if (evidence.payload_valid !== false || !closeConfirmed
-        || streamOverLimit(evidence) || !successMetricsAbsent(evidence)) {
+        || streamOverLimit(evidence) || !validMetrics) {
       throw new Error('invalid envelope terminal evidence');
     }
     return;
@@ -829,7 +944,8 @@ function validateAttemptTerminalRelationship(attempt, terminal) {
       if (evidence.close_ms !== null
           || (evidence.payload_valid === false
             && !streamOverLimit(evidence)
-            && !successMetricsAbsent(evidence))) {
+            && !successMetricsAbsent(evidence)
+            && !validTurnOnlyEvidence(evidence, receiptSchema))) {
         throw new Error('invalid cleanup terminal evidence');
       }
       break;
@@ -839,7 +955,10 @@ function validateAttemptTerminalRelationship(attempt, terminal) {
       }
       break;
     case 'hard-timeout-before-input':
-      if (evidence.payload_valid !== false || evidence.phase !== 'starting'
+      if (evidence.payload_valid !== false
+          || evidence.phase !== (receiptSchema === RECEIPT_SCHEMA_V1
+            ? 'starting'
+            : 'awaiting_close')
           || evidence.stdin_flush_ms !== null || evidence.first_stdout_ms !== null
           || streamOverLimit(evidence)
           || !closeConfirmed
@@ -860,7 +979,7 @@ function validateAttemptTerminalRelationship(attempt, terminal) {
       }
       break;
     case 'success-after-hard-deadline':
-      if (!acceptedAttemptValid(evidence)
+      if (!acceptedAttemptValid(evidence, turnCountValidator(receiptSchema))
           || evidence.total_elapsed_ms <= DIAGNOSTIC_LIMITS.hardDeadlineMs) {
         throw new Error('invalid late-success terminal evidence');
       }
@@ -875,7 +994,7 @@ function validateAttemptTerminalRelationship(attempt, terminal) {
   }
 }
 
-function validateStoredAttempt(attempt, expectedOrdinal) {
+function validateStoredAttempt(attempt, expectedOrdinal, receiptSchema) {
   const expectedFixture = DIAGNOSTIC_FIXTURES[(expectedOrdinal - 1) % DIAGNOSTIC_FIXTURES.length];
   const expectedRepetition = Math.floor((expectedOrdinal - 1) / DIAGNOSTIC_FIXTURES.length) + 1;
   if (!hasExactKeys(attempt, [
@@ -891,7 +1010,7 @@ function validateStoredAttempt(attempt, expectedOrdinal) {
       || attempt.repetition !== expectedRepetition
       || attempt.ordinal !== expectedOrdinal
       || !hasExactKeys(attempt.evidence, RECEIPT_EVIDENCE_FIELDS)
-      || !receiptAttemptEvidenceValid(attempt.evidence)
+      || !receiptAttemptEvidenceValid(attempt.evidence, receiptSchema)
       || typeof attempt.slow_valid !== 'boolean'
       || !ATTEMPT_RESULTS.has(attempt.attempted_call_result)
       || (attempt.terminal_result !== null && !DIAGNOSTIC_OUTCOMES.has(attempt.terminal_result))
@@ -909,7 +1028,7 @@ function validateStoredAttempt(attempt, expectedOrdinal) {
     && attempt.evidence.total_elapsed_ms <= DIAGNOSTIC_LIMITS.hardDeadlineMs;
   if (attempt.slow_valid !== derivedSlow) throw new Error('invalid attempt slow evidence');
   if (attempt.attempted_call_result === 'valid'
-      && !acceptedAttemptValid(attempt.evidence)) {
+      && !acceptedAttemptValid(attempt.evidence, turnCountValidator(receiptSchema))) {
     throw new Error('valid attempt requires accepted evidence');
   }
   if (expectedOrdinal === DIAGNOSTIC_LIMITS.callCeiling
@@ -945,12 +1064,15 @@ function sanitizeCheckpointAttempt(attempt, expectedOrdinal) {
     attempted_call_result: attempt.attempted_call_result,
     terminal_result: attempt.terminal_result,
   };
-  validateStoredAttempt(sanitized, expectedOrdinal);
+  validateStoredAttempt(sanitized, expectedOrdinal, RECEIPT_SCHEMA_V2);
   return sanitized;
 }
 
 export async function checkpointDiagnosticReceipt(filePath, receipt, checkpoint) {
   validateReceipt(receipt);
+  if (receipt.schema_version !== RECEIPT_SCHEMA_V2) {
+    throw new Error('v1 receipt is read-only and cannot be appended');
+  }
   await assertCurrentReceipt(filePath, receipt);
   if (receipt.terminal || !checkpoint || typeof checkpoint !== 'object') {
     throw new Error('receipt is already terminal');
@@ -989,6 +1111,10 @@ export async function checkpointDiagnosticReceipt(filePath, receipt, checkpoint)
     };
   } else if (checkpoint.kind === 'out_of_band') {
     if (!receipt.preflight_complete || receipt.out_of_band_terminal_count !== 0
+        || !hasExactKeys(checkpoint, [
+          'kind', 'campaign_elapsed_ms', 'outcome', 'reason', 'outer_invocation_started',
+        ])
+        || typeof checkpoint.outer_invocation_started !== 'boolean'
         || !DIAGNOSTIC_OUTCOMES.has(checkpoint.outcome)
         || !CLOSED_REASONS.has(checkpoint.reason)
         || !OUT_OF_BAND_REASONS.has(checkpoint.reason)
@@ -1005,6 +1131,7 @@ export async function checkpointDiagnosticReceipt(filePath, receipt, checkpoint)
         next_decision: nextDecisionFor(checkpoint.outcome),
       },
       out_of_band_terminal_count: 1,
+      out_of_band_outer_invocation_started: checkpoint.outer_invocation_started,
     };
   } else {
     throw new Error('unknown receipt checkpoint');
@@ -1588,12 +1715,13 @@ export async function runInsideSystemdDiagnostic({
         reason: decision.reason,
       });
     },
-    checkpointOutOfBand: async (decision) => {
+    checkpointOutOfBand: async (decision, outerInvocationStarted) => {
       receipt = await checkpointDiagnosticReceipt(receiptPath, receipt, {
         kind: 'out_of_band',
         campaign_elapsed_ms: campaignElapsed(active.activated_at_ms),
         outcome: decision.outcome,
         reason: decision.reason,
+        outer_invocation_started: outerInvocationStarted,
       });
     },
   });
@@ -1682,6 +1810,7 @@ export async function runSystemdDiagnostic({
       reason: 'checkpoint-unconfirmed',
       next_decision: nextDecisionFor('diagnostic-failure'),
       cleanup_confirmed: false,
+      accounting: result.accounting,
       hashes: null,
       scratch_cleanup_confirmed: false,
     };
@@ -1746,11 +1875,64 @@ export async function runSystemdCapabilityCheck({
   };
 }
 
-export function interpretDiagnosticArtifacts(receipt, unitWitness) {
+function unavailableDiagnosticAccounting() {
+  return { available: false };
+}
+
+function deriveDiagnosticAccounting(receipt) {
+  let knownInternalTurns = 0;
+  let unknownInternalTurnInvocations = 0;
+  for (const attempt of receipt.attempts) {
+    if (attempt.evidence.num_turns === null) {
+      unknownInternalTurnInvocations += 1;
+      continue;
+    }
+    const nextTotal = knownInternalTurns + attempt.evidence.num_turns;
+    if (!Number.isSafeInteger(nextTotal)) {
+      throw new Error('internal turn aggregate exceeds the safe integer range');
+    }
+    knownInternalTurns = nextTotal;
+  }
+  const possibleUncheckpointedOuterInvocations = receipt.terminal === null
+    || (receipt.out_of_band_terminal_count === 1
+      && (receipt.schema_version === RECEIPT_SCHEMA_V2
+        ? receipt.out_of_band_outer_invocation_started
+        : !EXACT_OUT_OF_BAND_OUTER_REASONS.has(receipt.terminal.reason)))
+    ? 1
+    : 0;
+  const checkpointedOuterInvocations = receipt.attempts.length;
+  return {
+    available: true,
+    checkpointed_outer_invocations: checkpointedOuterInvocations,
+    outer_invocation_range: {
+      minimum: checkpointedOuterInvocations,
+      maximum: checkpointedOuterInvocations + possibleUncheckpointedOuterInvocations,
+    },
+    possible_uncheckpointed_outer_invocations: possibleUncheckpointedOuterInvocations,
+    known_internal_agent_loop_turns: knownInternalTurns,
+    unknown_internal_turn_invocations: unknownInternalTurnInvocations,
+    exact_internal_turn_total_available: unknownInternalTurnInvocations === 0
+      && possibleUncheckpointedOuterInvocations === 0,
+  };
+}
+
+export function interpretDiagnosticArtifacts(receipt, unitWitness, {
+  primaryReason = null,
+} = {}) {
   validateReceipt(receipt);
   validateUnitWitness(unitWitness);
+  if (primaryReason !== null && !LAUNCHER_PRIMARY_REASONS.has(primaryReason)) {
+    throw new Error('invalid primary diagnostic failure reason');
+  }
   const cleanupConfirmed = unitWitness.cleanup_confirmed;
   const slowObserved = receipt.attempts.some((attempt) => attempt.slow_valid === true);
+  let accounting;
+  try {
+    accounting = deriveDiagnosticAccounting(receipt);
+  } catch (error) {
+    if (cleanupConfirmed && primaryReason === null) throw error;
+    accounting = unavailableDiagnosticAccounting();
+  }
   if (!cleanupConfirmed) {
     return {
       outcome: 'diagnostic-failure',
@@ -1758,21 +1940,24 @@ export function interpretDiagnosticArtifacts(receipt, unitWitness) {
       next_decision: nextDecisionFor('diagnostic-failure'),
       slow_valid_observed: slowObserved,
       cleanup_confirmed: false,
+      accounting,
     };
   }
-  if (!receipt.terminal) {
+  if (primaryReason !== null || !receipt.terminal) {
     return {
       outcome: 'diagnostic-failure',
-      reason: 'runner-nonterminal',
+      reason: primaryReason || 'runner-nonterminal',
       next_decision: nextDecisionFor('diagnostic-failure'),
       slow_valid_observed: slowObserved,
       cleanup_confirmed: true,
+      accounting,
     };
   }
   return {
     ...receipt.terminal,
     slow_valid_observed: slowObserved,
     cleanup_confirmed: true,
+    accounting,
   };
 }
 
@@ -1858,52 +2043,44 @@ export async function runWithUnitLauncher({
       reason: 'checkpoint-unconfirmed',
       next_decision: nextDecisionFor('diagnostic-failure'),
       cleanup_confirmed: false,
+      accounting: unavailableDiagnosticAccounting(),
     };
   }
+  let beforeInterpretError;
   try {
     await beforeInterpret();
-  } catch {
-    const cleanupConfirmed = witness.inactive && witness.cgroup_empty
-      && witness.detached_child_removed && witness.receipt_checkpoint_confirmed;
-    return {
-      outcome: 'diagnostic-failure',
-      reason: cleanupConfirmed ? 'integrity-failure' : 'cleanup-unconfirmed',
-      next_decision: nextDecisionFor('diagnostic-failure'),
-      cleanup_confirmed: cleanupConfirmed,
-    };
+  } catch (error) {
+    beforeInterpretError = error;
   }
   let artifacts;
   try {
     artifacts = await readArtifacts();
   } catch {
+    const locallyConfirmedCleanup = witness.inactive
+      && witness.cgroup_empty
+      && witness.detached_child_removed
+      && witness.receipt_checkpoint_confirmed;
+    if (beforeInterpretError) {
+      return {
+        outcome: 'diagnostic-failure',
+        reason: locallyConfirmedCleanup ? 'integrity-failure' : 'cleanup-unconfirmed',
+        next_decision: nextDecisionFor('diagnostic-failure'),
+        cleanup_confirmed: locallyConfirmedCleanup,
+        accounting: unavailableDiagnosticAccounting(),
+      };
+    }
     return {
       outcome: 'diagnostic-failure',
       reason: 'checkpoint-unconfirmed',
       next_decision: nextDecisionFor('diagnostic-failure'),
       cleanup_confirmed: false,
+      accounting: unavailableDiagnosticAccounting(),
     };
   }
-  if (artifacts.unitWitness.cleanup_confirmed !== true) {
-    return {
-      outcome: 'diagnostic-failure',
-      reason: 'cleanup-unconfirmed',
-      next_decision: nextDecisionFor('diagnostic-failure'),
-      slow_valid_observed: artifacts.receipt.attempts
-        .some((attempt) => attempt.slow_valid === true),
-      cleanup_confirmed: false,
-    };
-  }
-  if (runError || stopError) {
-    return {
-      outcome: 'diagnostic-failure',
-      reason: 'runner-nonterminal',
-      next_decision: nextDecisionFor('diagnostic-failure'),
-      slow_valid_observed: artifacts.receipt.attempts
-        .some((attempt) => attempt.slow_valid === true),
-      cleanup_confirmed: artifacts.unitWitness.cleanup_confirmed,
-    };
-  }
-  return interpretDiagnosticArtifacts(artifacts.receipt, artifacts.unitWitness);
+  const primaryReason = beforeInterpretError
+    ? 'integrity-failure'
+    : (runError || stopError ? 'runner-nonterminal' : null);
+  return interpretDiagnosticArtifacts(artifacts.receipt, artifacts.unitWitness, { primaryReason });
 }
 
 const UNIT_WITNESS_SCHEMA = 'polygram-memory-routing-timeout-unit-witness/v1';

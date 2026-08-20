@@ -45,18 +45,24 @@ creation is exclusive so an earlier receipt is never silently overwritten.
 
 ## Timeout characterization runner
 
-`diagnose-timeouts.mjs` is the no-retry diagnostic core for the separately
-reviewed timeout characterization. It keeps the existing `shape` and `full`
-runner unchanged. The diagnostic wrapper uses the same Claude adapter and
-single-pass routing case, but fixes the corpus to the 22 non-secret fixtures in
-manifest order for five repetitions, with one call per case, a 60-second soft
-observation threshold, a 120-second hard call deadline, and a 110-call ceiling.
+`diagnose-timeouts.mjs` is the zero-Polygram-retry diagnostic core for the
+separately reviewed timeout characterization. It keeps the existing `shape`
+and `full` runner unchanged. The diagnostic wrapper uses the same Claude
+adapter and single-pass routing case, but fixes the corpus to the 22 non-secret
+fixtures in manifest order for five repetitions. The campaign ceiling is 110
+serial outer invocations, with a 60-second soft observation threshold and a
+120-second deadline for each outer invocation. Claude's reported `num_turns`
+is an observed internal agent-loop turn count, not an outer invocation,
+provider HTTP request, or billable API-call count. Internal agent-loop turns
+are not separately pre-capped, and provider retries remain opaque.
 
 The module includes an executable Linux `systemd --user` launcher plus an
-injected portable test seam. Before its first model call the real boundary
+injected portable test seam. Before its first model-backed outer invocation the real boundary
 attests the canonical pinned Claude path, version, SHA-256, device, inode,
 size, mode, ctime, and mtime. Before every spawn it performs only the cheap
-realpath plus opened-file identity check; after the service stops it recomputes
+realpath plus opened-file identity check after busy/reservation checks and
+before incrementing the outer ordinal or invoking the adapter. Runtime drift
+therefore records an exact pre-invocation out-of-band stop. After the service stops it recomputes
 the full SHA-256 once, before interpreting the receipt. It also proves Claude Code
 2.1.220, first-party
 `claude.ai` authentication, the exact observed Haiku identity, the unchanged
@@ -75,7 +81,7 @@ StandardError=null
 WorkingDirectory=<private scratch>
 ```
 
-Each call reserves 130 seconds: 120 for the hard call deadline, five for
+Each outer invocation reserves 130 seconds: 120 for its deadline, five for
 process cleanup, and a separate five for the durable checkpoint. The internal
 terminal-checkpoint deadline is 14,930 seconds; 110 reservations consume
 14,300 seconds and retain 630 seconds for preflight, busy checks, and campaign
@@ -94,7 +100,7 @@ model or require systemd. The bounded real-Linux capability preflight and the
 one authorized campaign belong to the later operational step.
 
 The in-service runner queries the authenticated production IPC endpoint for
-both fixed bot identities (`shumabit` and `umi-assistant`) before every call.
+both fixed bot identities (`shumabit` and `umi-assistant`) before every outer invocation.
 Only exact `{bot,in_flight}` responses are accepted; malformed or unavailable
 evidence fails closed. The launcher never executes an operator-supplied shell
 command.
@@ -108,9 +114,27 @@ only by the outside launcher after final unit inspection. Both artifacts are
 closed and content-free: they retain no prompts, result bodies, stderr, paths,
 unit names, PIDs, process names, or source-derived digests. The unit witness
 also records whether the outside launcher independently reopened and fsynced
-the terminal receipt. A nonterminal
+the terminal receipt. Each v2 out-of-band terminal also records the closed
+boolean `out_of_band_outer_invocation_started`: pre-spawn busy, reservation,
+budget, and arithmetic stops are `false`, while route, result-validation, and
+attempt-checkpoint failures after launch are `true`. Historical v1 receipts
+remain read-only and retain their legacy reason-based interpretation. A nonterminal
 receipt or any unconfirmed close/cgroup cleanup is interpreted as
 `diagnostic-failure` without rewriting the preserved receipt.
+If post-run runtime verification and artifact reopening both fail, the already
+established local unit witness preserves `integrity-failure` after confirmed
+cleanup or `cleanup-unconfirmed` otherwise; accounting remains unavailable.
+An artifact-read failure without runtime drift remains `checkpoint-unconfirmed`.
+
+The launcher derives accounting only after reopening and validating those
+artifacts. It reports checkpointed outer invocations, the exact sum of known
+internal agent-loop turns, rows whose turn evidence is unknown, whether an
+exact internal-turn total is available, and an exact or one-invocation-wide
+outer range. Unknown or possibly uncheckpointed internal work has no invented
+finite upper bound. These derived values are not stored back into either
+artifact. Aggregate turn overflow still fails closed during a clean
+interpretation, but it cannot mask cleanup-unconfirmed or an explicit launcher
+primary failure; those retain their reason with accounting unavailable.
 
 For the later authorized Linux step, stage only the reviewed source files from
 one immutable Git object. The global package dependency tree is fixed at
@@ -170,7 +194,13 @@ The capability command is bounded and does not contact a model:
   --scratch "/run/user/$UID/polygram-u24-timeout-capability-$source_commit"
 ```
 
-Only after that succeeds, launch the single authorized campaign. This command
+Only after that succeeds, launch the single authorized campaign. The earlier
+approval is consumed: obtain new approval that names the reviewed immutable
+40-hex commit, the ceiling of at most 110 serial outer invocations, the
+120-second deadline for each outer invocation, and acknowledges that internal
+agent-loop turns are observed but not separately pre-capped while provider
+retries are opaque and not separately pre-capped. Approval using an ambiguous
+term such as "calls" is insufficient. This command
 creates the scratch directory exclusively, runs the explicit `inside` command
 as the transient service process, and derives its answer only from the reopened
 receipt and unit witness:

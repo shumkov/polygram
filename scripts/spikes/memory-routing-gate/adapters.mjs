@@ -316,6 +316,10 @@ export function sanitizeClaudeMetrics(envelope = {}) {
   return claudeMetricValidation(envelope).claudeMetrics;
 }
 
+export function isPositiveSafeTurnCount(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
 function claudeMetricValidation(envelope = {}) {
   const boundedDuration = (value) => (
     Number.isInteger(value) && value >= 0 && value <= MAX_CLAUDE_DURATION_MS ? value : null
@@ -323,20 +327,31 @@ function claudeMetricValidation(envelope = {}) {
   const durationMs = boundedDuration(envelope.duration_ms);
   const durationApiMs = boundedDuration(envelope.duration_api_ms);
   const durationMetricsValid = durationMs !== null && durationApiMs !== null;
-  const turnCountValid = envelope.num_turns === 1;
+  const turnCountValid = isPositiveSafeTurnCount(envelope.num_turns);
+  const numTurns = turnCountValid ? envelope.num_turns : null;
   return {
     durationMetricsValid,
     turnCountValid,
+    numTurns,
     claudeMetrics: durationMetricsValid && turnCountValid ? {
       duration_ms: durationMs,
       duration_api_ms: durationApiMs,
-      num_turns: 1,
+      num_turns: numTurns,
     } : null,
   };
 }
 
 function withClaudeEnvelopeFailure(error, claudeEnvelopeFailure) {
   Object.defineProperty(error, 'claudeEnvelopeFailure', { value: claudeEnvelopeFailure });
+  return error;
+}
+
+function withClaudeTurnEvidence(error, envelope) {
+  if (isPositiveSafeTurnCount(envelope?.num_turns)) {
+    Object.defineProperty(error, 'claudeTurnEvidence', {
+      value: Object.freeze({ num_turns: envelope.num_turns }),
+    });
+  }
   return error;
 }
 
@@ -351,7 +366,10 @@ export function parseClaudeResult(stdout) {
   const observedModels = envelope?.modelUsage && typeof envelope.modelUsage === 'object'
     ? Object.keys(envelope.modelUsage).sort()
     : [];
-  const envelopeError = (code) => Object.assign(new Error(code), { code, observedModels });
+  const envelopeError = (code) => withClaudeTurnEvidence(
+    Object.assign(new Error(code), { code, observedModels }),
+    envelope,
+  );
   const envelopeFailure = (code, failure) => withClaudeEnvelopeFailure(
     envelopeError(code), failure,
   );
@@ -416,7 +434,13 @@ export function createClaudeAdapter({
               Object.defineProperty(error, 'routeResponse', {
                 value: { ...parsed, toolCalls: 0 },
               });
-            } catch { /* the process-boundary error remains primary */ }
+            } catch (parseError) {
+              const numTurns = parseError?.claudeTurnEvidence?.num_turns;
+              if (isPositiveSafeTurnCount(numTurns)) {
+                error.attemptEvidence = { ...error.attemptEvidence, num_turns: numTurns };
+              }
+              /* the process-boundary error remains primary */
+            }
           }
           throw error;
         }
@@ -428,7 +452,11 @@ export function createClaudeAdapter({
             attemptEvidence: { ...processResult.attemptEvidence, ...parsed.claudeMetrics },
           };
         } catch (error) {
-          error.attemptEvidence = processResult.attemptEvidence;
+          const numTurns = error?.claudeTurnEvidence?.num_turns;
+          error.attemptEvidence = {
+            ...processResult.attemptEvidence,
+            ...(isPositiveSafeTurnCount(numTurns) ? { num_turns: numTurns } : {}),
+          };
           throw error;
         }
       } finally {

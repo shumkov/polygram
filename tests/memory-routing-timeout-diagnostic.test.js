@@ -34,6 +34,8 @@ function diagnosticAttempt({
   cleanupConfirmed = true,
   stdoutBytes = 100,
   stderrBytes = 0,
+  numTurns = payloadValid ? 1 : null,
+  completeJsonCandidateMs = payloadValid ? 3 : null,
 } = {}) {
   return {
     status,
@@ -43,7 +45,7 @@ function diagnosticAttempt({
       phase,
       stdin_flush_ms: phase === 'starting' ? null : 1,
       first_stdout_ms: ['starting', 'awaiting_output'].includes(phase) ? null : 2,
-      complete_json_candidate_ms: payloadValid ? 3 : null,
+      complete_json_candidate_ms: completeJsonCandidateMs,
       stdout_end_ms: phase === 'awaiting_close' ? 4 : null,
       close_ms: cleanupConfirmed ? elapsedMs : null,
       total_elapsed_ms: elapsedMs,
@@ -52,10 +54,193 @@ function diagnosticAttempt({
       payload_valid: payloadValid,
       duration_ms: payloadValid ? Math.min(elapsedMs, 120_000) : null,
       duration_api_ms: payloadValid ? Math.min(elapsedMs, 120_000) : null,
-      num_turns: payloadValid ? 1 : null,
+      num_turns: numTurns,
     },
   };
 }
+
+function closedProcessAttempt({
+  afterInput = true,
+  outputStarted = false,
+  errorCode = 'ROUTER_TIMEOUT',
+  elapsedMs = 120_000,
+  stdoutBytes = 100,
+  stderrBytes = 0,
+} = {}) {
+  const result = diagnosticAttempt({
+    status: 'operational_error',
+    errorCode,
+    phase: 'awaiting_close',
+    elapsedMs,
+    payloadValid: false,
+    stdoutBytes,
+    stderrBytes,
+  });
+  Object.assign(result.attemptEvidence, {
+    stdin_flush_ms: afterInput ? 1 : null,
+    first_stdout_ms: outputStarted ? 2 : null,
+    complete_json_candidate_ms: null,
+    stdout_end_ms: 3,
+  });
+  return result;
+}
+
+function expectedAccounting({ rows, turns, unknown = 0, possible = 0 }) {
+  return {
+    available: true,
+    checkpointed_outer_invocations: rows,
+    outer_invocation_range: { minimum: rows, maximum: rows + possible },
+    possible_uncheckpointed_outer_invocations: possible,
+    known_internal_agent_loop_turns: turns,
+    unknown_internal_turn_invocations: unknown,
+    exact_internal_turn_total_available: unknown === 0 && possible === 0,
+  };
+}
+
+test('U24 accepts positive-safe Claude turns through parser, harness, classifier, and v2 receipt', async () => {
+  const [adapters, { loadRoutingFixtures }, { runRoutingCase }, diagnostic] = await Promise.all([
+    import(`${ROOT}/adapters.mjs`),
+    import(`${ROOT}/fixtures.mjs`),
+    import(`${ROOT}/harness.mjs`),
+    diagnosticModule(),
+  ]);
+  const fixture = loadRoutingFixtures().find((row) => row.id === 'work-01');
+  const envelope = {
+    is_error: false,
+    structured_output: fixture.oracleOutput,
+    modelUsage: { 'claude-haiku-exact': {} },
+    duration_ms: 10,
+    duration_api_ms: 9,
+    num_turns: 1,
+  };
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-turn-contract-'));
+  try {
+    for (const [index, numTurns] of [2, 1, 5, 6, Number.MAX_SAFE_INTEGER].entries()) {
+      assert.equal(adapters.isPositiveSafeTurnCount(numTurns), true, String(numTurns));
+      const parsed = adapters.parseClaudeResult(JSON.stringify({
+        ...envelope,
+        num_turns: numTurns,
+      }));
+      assert.deepEqual(parsed.claudeMetrics, {
+        duration_ms: 10,
+        duration_api_ms: 9,
+        num_turns: numTurns,
+      });
+      const result = await runRoutingCase({
+        fixture,
+        adapter: {
+          id: `positive-safe-${numTurns}`,
+          requireModelEvidence: true,
+          requireAttemptEvidence: true,
+          expectedObservedModel: 'claude-haiku-exact',
+          async route() {
+            return {
+              ...parsed,
+              toolCalls: 0,
+              attemptEvidence: {
+                ...diagnosticAttempt({ elapsedMs: 10, numTurns }).attemptEvidence,
+                ...parsed.claudeMetrics,
+              },
+            };
+          },
+        },
+      });
+      assert.equal(result.status, 'accepted', String(numTurns));
+      assert.equal(result.attemptEvidence.num_turns, numTurns, String(numTurns));
+
+      const decision = diagnostic.classifyDiagnosticEvent({ result, callOrdinal: 1 });
+      assert.deepEqual([decision.outcome, decision.reason], [null, 'fast-valid']);
+      const receiptPath = path.join(root, `receipt-${index}.json`);
+      let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
+      assert.equal(receipt.schema_version, 'polygram-memory-routing-timeout-diagnostic/v2');
+      receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+        kind: 'preflight', campaign_elapsed_ms: 0,
+      });
+      receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+        kind: 'attempt', campaign_elapsed_ms: 10,
+        attempt: {
+          fixture_id: fixture.id,
+          repetition: 1,
+          ordinal: 1,
+          evidence: result.attemptEvidence,
+          slow_valid: decision.slow_valid,
+          attempted_call_result: 'valid',
+          terminal_result: null,
+        },
+      });
+      assert.equal(receipt.attempts[0].evidence.num_turns, numTurns, String(numTurns));
+    }
+
+    const invalidTurns = [
+      undefined,
+      null,
+      0,
+      -1,
+      1.5,
+      '2',
+      Number.MAX_SAFE_INTEGER + 1,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+    ];
+    for (const numTurns of invalidTurns) {
+      assert.equal(adapters.isPositiveSafeTurnCount(numTurns), false, String(numTurns));
+      assert.throws(
+        () => adapters.parseClaudeResult(JSON.stringify({
+          ...envelope,
+          num_turns: numTurns,
+        })),
+        (error) => error?.code === 'ROUTER_OUTPUT_MALFORMED'
+          && error?.claudeEnvelopeFailure === 'turn-count-invalid',
+        `num_turns=${String(numTurns)}`,
+      );
+      const invalidResult = diagnosticAttempt({ elapsedMs: 10 });
+      invalidResult.attemptEvidence.num_turns = numTurns;
+      assert.equal(
+        diagnostic.classifyDiagnosticEvent({ result: invalidResult }).reason,
+        'invalid-evidence',
+        String(numTurns),
+      );
+    }
+
+    const missingTurnResult = diagnosticAttempt({ elapsedMs: 10 });
+    delete missingTurnResult.attemptEvidence.num_turns;
+    assert.equal(
+      diagnostic.classifyDiagnosticEvent({ result: missingTurnResult }).reason,
+      'invalid-evidence',
+    );
+
+    const invalidReceiptPath = path.join(root, 'receipt-invalid.json');
+    let invalidReceipt = await diagnostic.createDiagnosticReceipt(invalidReceiptPath);
+    invalidReceipt = await diagnostic.checkpointDiagnosticReceipt(
+      invalidReceiptPath,
+      invalidReceipt,
+      { kind: 'preflight', campaign_elapsed_ms: 0 },
+    );
+    for (const numTurns of [...invalidTurns, Symbol('missing')]) {
+      const invalidEvidence = diagnosticAttempt({ elapsedMs: 10 }).attemptEvidence;
+      if (typeof numTurns === 'symbol') delete invalidEvidence.num_turns;
+      else invalidEvidence.num_turns = numTurns;
+      await assert.rejects(diagnostic.checkpointDiagnosticReceipt(
+        invalidReceiptPath,
+        invalidReceipt,
+        {
+          kind: 'attempt', campaign_elapsed_ms: 10,
+          attempt: {
+            fixture_id: fixture.id,
+            repetition: 1,
+            ordinal: 1,
+            evidence: invalidEvidence,
+            slow_valid: false,
+            attempted_call_result: 'valid',
+            terminal_result: null,
+          },
+        },
+      ), /attempt evidence/, String(numTurns));
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 function validPreflight(expectedModel = 'claude-haiku-exact') {
   return {
@@ -91,7 +276,7 @@ function validWitness(overrides = {}) {
   };
 }
 
-function parsedRouterQualityAttempt({ elapsedMs = 10 } = {}) {
+function parsedRouterQualityAttempt({ elapsedMs = 10, numTurns = 1 } = {}) {
   const result = diagnosticAttempt({
     status: 'operational_error',
     errorCode: 'ROUTER_OUTPUT_SECRET',
@@ -102,7 +287,7 @@ function parsedRouterQualityAttempt({ elapsedMs = 10 } = {}) {
     complete_json_candidate_ms: 3,
     duration_ms: Math.min(elapsedMs, 120_000),
     duration_api_ms: Math.min(elapsedMs, 120_000),
-    num_turns: 1,
+    num_turns: numTurns,
   });
   return result;
 }
@@ -124,7 +309,60 @@ test('U24 diagnostic rejects nonmonotonic, phase-impossible, and nonboolean atte
   assert.equal(classifyDiagnosticEvent({ result: stringPayload }).reason, 'invalid-evidence');
 });
 
-test('U24 maps real Claude envelope failures through the classifier and v1 checkpoint', async () => {
+test('U24 rejects impossible close timing before an envelope terminal can be checkpointed', async () => {
+  const diagnostic = await diagnosticModule();
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-close-grammar-'));
+  const cases = [
+    {
+      name: 'close-without-total',
+      mutate(evidence) { evidence.total_elapsed_ms = null; },
+    },
+    {
+      name: 'close-before-awaiting-close',
+      mutate(evidence) {
+        evidence.phase = 'output_started';
+        evidence.stdout_end_ms = null;
+      },
+    },
+  ];
+  try {
+    for (const row of cases) {
+      const result = diagnosticAttempt({
+        status: 'operational_error', errorCode: 'ROUTER_OUTPUT_MALFORMED',
+        elapsedMs: 10, payloadValid: false,
+      });
+      row.mutate(result.attemptEvidence);
+      Object.defineProperty(result, 'claudeEnvelopeFailure', {
+        value: 'json-framing', enumerable: false,
+      });
+      assert.equal(
+        diagnostic.classifyDiagnosticEvent({ result }).reason,
+        'invalid-evidence',
+        row.name,
+      );
+
+      const receiptPath = path.join(root, `${row.name}.json`);
+      let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
+      receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+        kind: 'preflight', campaign_elapsed_ms: 0,
+      });
+      await assert.rejects(diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+        kind: 'attempt', campaign_elapsed_ms: 10, reason: 'invalid-envelope-framing',
+        attempt: {
+          fixture_id: 'work-01', repetition: 1, ordinal: 1,
+          evidence: result.attemptEvidence,
+          slow_valid: false,
+          attempted_call_result: 'diagnostic-failure',
+          terminal_result: 'diagnostic-failure',
+        },
+      }), /attempt evidence|close|terminal/, row.name);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('U24 maps real Claude envelope failures through the classifier and v2 checkpoint', async () => {
   const [{ parseClaudeResult }, { loadRoutingFixtures }, { runRoutingCase }, diagnostic] = await Promise.all([
     import(`${ROOT}/adapters.mjs`),
     import(`${ROOT}/fixtures.mjs`),
@@ -142,21 +380,25 @@ test('U24 maps real Claude envelope failures through the classifier and v1 check
     num_turns: 1,
   };
   const mappings = [
-    ['{bad', 'ROUTER_OUTPUT_MALFORMED', 'json-framing', 'invalid-envelope-framing'],
+    ['{bad', 'ROUTER_OUTPUT_MALFORMED', 'json-framing', 'invalid-envelope-framing', null],
     [JSON.stringify({ ...validEnvelope, structured_output: null }),
-      'ROUTER_OUTPUT_MISSING', 'output-missing', 'missing-envelope-payload'],
+      'ROUTER_OUTPUT_MISSING', 'output-missing', 'missing-envelope-payload', 1],
     [JSON.stringify({ ...validEnvelope, duration_ms: null }),
       'ROUTER_OUTPUT_MALFORMED', 'duration-metrics-invalid',
-      'invalid-envelope-duration-metrics'],
-    [JSON.stringify({ ...validEnvelope, num_turns: 2 }),
-      'ROUTER_OUTPUT_MALFORMED', 'turn-count-invalid', 'invalid-envelope-turn-count'],
+      'invalid-envelope-duration-metrics', 1],
+    [JSON.stringify({ ...validEnvelope, num_turns: 0 }),
+      'ROUTER_OUTPUT_MALFORMED', 'turn-count-invalid', 'invalid-envelope-turn-count', null],
     [JSON.stringify({ ...validEnvelope, duration_ms: null, num_turns: 2 }),
+      'ROUTER_OUTPUT_MALFORMED', 'duration-metrics-invalid',
+      'invalid-envelope-duration-metrics', 2],
+    [JSON.stringify({ ...validEnvelope, duration_ms: null, num_turns: 0 }),
       'ROUTER_OUTPUT_MALFORMED', 'duration-and-turn-count-invalid',
-      'invalid-envelope-duration-and-turn-count'],
+      'invalid-envelope-duration-and-turn-count', null],
   ];
   const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-envelope-round-trip-'));
   try {
-    for (const [stdout, errorCode, claudeEnvelopeFailure, reason] of mappings) {
+    for (const [index, mapping] of mappings.entries()) {
+      const [stdout, errorCode, claudeEnvelopeFailure, reason, expectedNumTurns] = mapping;
       const result = await runRoutingCase({
         fixture,
         adapter: {
@@ -168,6 +410,8 @@ test('U24 maps real Claude envelope failures through the classifier and v1 check
               Object.defineProperty(error, 'attemptEvidence', {
                 value: diagnosticAttempt({
                   status: 'operational_error', errorCode, elapsedMs: 10, payloadValid: false,
+                  numTurns: error.claudeTurnEvidence?.num_turns ?? null,
+                  completeJsonCandidateMs: error.claudeTurnEvidence ? 3 : null,
                 }).attemptEvidence,
               });
               throw error;
@@ -189,7 +433,7 @@ test('U24 maps real Claude envelope failures through the classifier and v1 check
         ['diagnostic-failure', reason],
         claudeEnvelopeFailure,
       );
-      const receiptPath = path.join(root, `${claudeEnvelopeFailure}.json`);
+      const receiptPath = path.join(root, `${index}-${claudeEnvelopeFailure}.json`);
       let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
       receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
         kind: 'preflight', campaign_elapsed_ms: 0,
@@ -213,11 +457,16 @@ test('U24 maps real Claude envelope failures through the classifier and v1 check
         },
       });
       assert.deepEqual([campaign.outcome, campaign.reason], ['diagnostic-failure', reason]);
-      assert.equal(receipt.schema_version, 'polygram-memory-routing-timeout-diagnostic/v1');
+      assert.equal(receipt.schema_version, 'polygram-memory-routing-timeout-diagnostic/v2');
+      assert.equal(
+        receipt.attempts[0].evidence.num_turns,
+        expectedNumTurns,
+      );
       assert.equal(receipt.sequence, 2);
       assert.deepEqual(Object.keys(receipt).sort(), [
         'attempts',
         'campaign_elapsed_ms',
+        'out_of_band_outer_invocation_started',
         'out_of_band_terminal_count',
         'preflight_complete',
         'schema_version',
@@ -301,18 +550,19 @@ test('U24 envelope carrier validation fails closed only at the envelope preceden
   const precedenceCases = [
     [carried({
       errorCode: 'ROUTER_TIMEOUT', cleanupConfirmed: false, elapsedMs: 120_000,
+      payloadValid: true, numTurns: 2,
     }, 'json-framing'), 'cleanup-unconfirmed'],
     [carried({
       errorCode: 'ROUTER_OUTPUT_TOO_LARGE', stdoutBytes: 'over_limit',
     }, 'json-framing'), 'stream-over-limit'],
-    [carried({ errorCode: 'ROUTER_PROCESS_EXIT', payloadValid: true }, 'json-framing'),
+    [carried({ errorCode: 'ROUTER_PROCESS_EXIT', payloadValid: true, numTurns: 2 }, 'json-framing'),
       'payload-valid-process-boundary'],
     [carried({ errorCode: 'ROUTER_PROCESS_EXIT' }, 'json-framing'), 'early-process-exit'],
     ...['ROUTER_AUTH_UNAVAILABLE', 'ROUTER_CLAUDE_RUNTIME_MISMATCH',
       'ROUTER_MODEL_IDENTITY', 'ROUTER_TOOL_USE'].map((errorCode) => [
-      carried({ errorCode }, 'json-framing'), 'integrity-failure',
+      carried({ errorCode, numTurns: 2 }, 'json-framing'), 'integrity-failure',
     ]),
-    [Object.defineProperty(parsedRouterQualityAttempt(), 'claudeEnvelopeFailure', {
+    [Object.defineProperty(parsedRouterQualityAttempt({ numTurns: 2 }), 'claudeEnvelopeFailure', {
       value: 'json-framing',
     }), 'router-quality-failure'],
   ];
@@ -323,6 +573,72 @@ test('U24 envelope carrier validation fails closed only at the envelope preceden
   const accepted = diagnosticAttempt();
   Object.defineProperty(accepted, 'claudeEnvelopeFailure', { value: 'json-framing' });
   assert.equal(classifyDiagnosticEvent({ result: accepted }).reason, 'fast-valid');
+});
+
+test('U24 checkpoints preserved turn evidence under cleanup, integrity, and early-exit precedence', async () => {
+  const diagnostic = await diagnosticModule();
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-turn-precedence-'));
+  const cases = [
+    {
+      name: 'integrity',
+      result: diagnosticAttempt({
+        status: 'operational_error', errorCode: 'ROUTER_MODEL_IDENTITY', elapsedMs: 10,
+        payloadValid: false, numTurns: 2, completeJsonCandidateMs: 3,
+      }),
+      outcome: 'diagnostic-failure',
+      reason: 'integrity-failure',
+    },
+    {
+      name: 'early-exit',
+      result: diagnosticAttempt({
+        status: 'operational_error', errorCode: 'ROUTER_PROCESS_EXIT', elapsedMs: 10,
+        payloadValid: false, numTurns: 2, completeJsonCandidateMs: 3,
+      }),
+      outcome: 'diagnostic-failure',
+      reason: 'early-process-exit',
+    },
+    {
+      name: 'cleanup',
+      result: diagnosticAttempt({
+        status: 'operational_error', errorCode: 'ROUTER_PROCESS_EXIT', elapsedMs: 10,
+        payloadValid: false, cleanupConfirmed: false, numTurns: 2,
+        completeJsonCandidateMs: 3,
+      }),
+      outcome: 'diagnostic-failure',
+      reason: 'cleanup-unconfirmed',
+    },
+  ];
+  try {
+    for (const row of cases) {
+      assert.equal(row.result.attemptEvidence.duration_ms, null, row.name);
+      assert.equal(row.result.attemptEvidence.duration_api_ms, null, row.name);
+      assert.equal(row.result.attemptEvidence.num_turns, 2, row.name);
+      const decision = diagnostic.classifyDiagnosticEvent({ result: row.result, callOrdinal: 1 });
+      assert.deepEqual([decision.outcome, decision.reason], [row.outcome, row.reason], row.name);
+
+      const receiptPath = path.join(root, `${row.name}.json`);
+      let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
+      receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+        kind: 'preflight', campaign_elapsed_ms: 0,
+      });
+      receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+        kind: 'attempt', campaign_elapsed_ms: 10, reason: decision.reason,
+        attempt: {
+          fixture_id: 'work-01', repetition: 1, ordinal: 1,
+          evidence: row.result.attemptEvidence,
+          slow_valid: decision.slow_valid,
+          attempted_call_result: decision.outcome,
+          terminal_result: decision.outcome,
+        },
+      });
+      assert.deepEqual([receipt.terminal.outcome, receipt.terminal.reason], [
+        row.outcome, row.reason,
+      ], row.name);
+      assert.equal(receipt.attempts[0].evidence.num_turns, 2, row.name);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('U24 keeps legacy broad v1 receipts readable but rejects broad fresh checkpoints', async () => {
@@ -355,14 +671,53 @@ test('U24 keeps legacy broad v1 receipts readable but rejects broad fresh checkp
     out_of_band_terminal_count: 0,
   };
   const before = JSON.stringify(legacyReceipt);
-  assert.equal(
-    diagnostic.interpretDiagnosticArtifacts(legacyReceipt, validWitness()).reason,
-    'invalid-envelope',
+  const interpretedLegacy = diagnostic.interpretDiagnosticArtifacts(legacyReceipt, validWitness());
+  assert.equal(interpretedLegacy.reason, 'invalid-envelope');
+  assert.deepEqual(
+    interpretedLegacy.accounting,
+    expectedAccounting({ rows: 1, turns: 0, unknown: 1 }),
   );
   assert.equal(JSON.stringify(legacyReceipt), before);
+  assert.throws(() => diagnostic.interpretDiagnosticArtifacts({
+    ...legacyReceipt,
+    attempts: [{
+      ...legacyReceipt.attempts[0],
+      evidence: diagnosticAttempt({ elapsedMs: 10, numTurns: 2 }).attemptEvidence,
+      attempted_call_result: 'valid',
+      terminal_result: null,
+    }],
+    terminal: null,
+  }, validWitness()), /attempt evidence/);
+  const legacyTurnOnlyEvidence = diagnosticAttempt({
+    status: 'operational_error', payloadValid: false, numTurns: 1, completeJsonCandidateMs: 3,
+  }).attemptEvidence;
+  assert.throws(() => diagnostic.interpretDiagnosticArtifacts({
+    ...legacyReceipt,
+    attempts: [{ ...legacyReceipt.attempts[0], evidence: legacyTurnOnlyEvidence }],
+  }, validWitness()), /attempt evidence/);
 
   const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-envelope-checkpoint-'));
   try {
+    const legacyAppendPath = path.join(root, 'legacy-append.json');
+    const legacyAppendReceipt = {
+      schema_version: 'polygram-memory-routing-timeout-diagnostic/v1',
+      sequence: 1,
+      preflight_complete: true,
+      campaign_elapsed_ms: 0,
+      attempts: [],
+      terminal: null,
+      out_of_band_terminal_count: 0,
+    };
+    await writeFile(legacyAppendPath, `${JSON.stringify(legacyAppendReceipt)}\n`, { mode: 0o600 });
+    await assert.rejects(diagnostic.checkpointDiagnosticReceipt(
+      legacyAppendPath,
+      legacyAppendReceipt,
+      {
+        kind: 'out_of_band', campaign_elapsed_ms: 1,
+        outcome: 'diagnostic-failure', reason: 'campaign-budget-exhausted',
+      },
+    ), /v1|read-only|append/);
+
     const initializedReceipt = async (name) => {
       const receiptPath = path.join(root, `${name}.json`);
       let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
@@ -440,6 +795,473 @@ test('U24 keeps legacy broad v1 receipts readable but rejects broad fresh checkp
   }
 });
 
+test('U24 reopens every v1 envelope discriminator without inventing turn evidence', async () => {
+  const diagnostic = await diagnosticModule();
+  const reasons = [
+    'invalid-envelope-framing',
+    'missing-envelope-payload',
+    'invalid-envelope-duration-metrics',
+    'invalid-envelope-turn-count',
+    'invalid-envelope-duration-and-turn-count',
+  ];
+  const allNullEvidence = diagnosticAttempt({
+    status: 'operational_error', elapsedMs: 10, payloadValid: false,
+  }).attemptEvidence;
+  const receiptFor = (schemaVersion, reason, evidence, versionFields = {}) => ({
+    schema_version: schemaVersion,
+    sequence: 2,
+    preflight_complete: true,
+    campaign_elapsed_ms: 10,
+    attempts: [{
+      fixture_id: 'work-01', repetition: 1, ordinal: 1,
+      evidence,
+      slow_valid: false,
+      attempted_call_result: 'diagnostic-failure',
+      terminal_result: 'diagnostic-failure',
+    }],
+    terminal: {
+      outcome: 'diagnostic-failure',
+      reason,
+      next_decision: 'fix-review-and-rerun-changed-diagnostic',
+    },
+    out_of_band_terminal_count: 0,
+    ...versionFields,
+  });
+
+  for (const reason of reasons) {
+    const receipt = receiptFor(
+      'polygram-memory-routing-timeout-diagnostic/v1',
+      reason,
+      allNullEvidence,
+    );
+    assert.equal(
+      diagnostic.interpretDiagnosticArtifacts(receipt, validWitness()).reason,
+      reason,
+      `v1/${reason}`,
+    );
+  }
+
+  const v2Fields = { out_of_band_outer_invocation_started: false };
+  const turnOnlyEvidence = diagnosticAttempt({
+    status: 'operational_error', elapsedMs: 10, payloadValid: false,
+    numTurns: 2, completeJsonCandidateMs: 3,
+  }).attemptEvidence;
+  for (const reason of ['missing-envelope-payload', 'invalid-envelope-duration-metrics']) {
+    assert.equal(diagnostic.interpretDiagnosticArtifacts(receiptFor(
+      'polygram-memory-routing-timeout-diagnostic/v2', reason, turnOnlyEvidence, v2Fields,
+    ), validWitness()).reason, reason, `v2/turn-only/${reason}`);
+  }
+  for (const reason of [
+    'invalid-envelope-framing',
+    'invalid-envelope-turn-count',
+    'invalid-envelope-duration-and-turn-count',
+  ]) {
+    assert.throws(() => diagnostic.interpretDiagnosticArtifacts(receiptFor(
+      'polygram-memory-routing-timeout-diagnostic/v2', reason, turnOnlyEvidence, v2Fields,
+    ), validWitness()), /envelope|terminal|attempt evidence/, `v2/contradiction/${reason}`);
+  }
+  assert.throws(() => diagnostic.interpretDiagnosticArtifacts(receiptFor(
+    'polygram-memory-routing-timeout-diagnostic/v2',
+    'invalid-envelope-duration-metrics',
+    allNullEvidence,
+    v2Fields,
+  ), validWitness()), /envelope|terminal|attempt evidence/, 'v2 duration evidence is required');
+  for (const reason of [
+    'invalid-envelope-framing',
+    'missing-envelope-payload',
+    'invalid-envelope-turn-count',
+    'invalid-envelope-duration-and-turn-count',
+  ]) {
+    assert.equal(diagnostic.interpretDiagnosticArtifacts(receiptFor(
+      'polygram-memory-routing-timeout-diagnostic/v2', reason, allNullEvidence, v2Fields,
+    ), validWitness()).reason, reason, `v2/all-null/${reason}`);
+  }
+
+  assert.throws(() => diagnostic.interpretDiagnosticArtifacts(receiptFor(
+    'polygram-memory-routing-timeout-diagnostic/v2',
+    'invalid-envelope',
+    allNullEvidence,
+    v2Fields,
+  ), validWitness()), /legacy|receipt|terminal/);
+});
+
+test('U24 reopens the historical v1 before-input timeout close shape unchanged', async () => {
+  const diagnostic = await diagnosticModule();
+  const receipt = {
+    schema_version: 'polygram-memory-routing-timeout-diagnostic/v1',
+    sequence: 2,
+    preflight_complete: true,
+    campaign_elapsed_ms: 120_000,
+    attempts: [{
+      fixture_id: 'work-01',
+      repetition: 1,
+      ordinal: 1,
+      evidence: {
+        phase: 'starting',
+        stdin_flush_ms: null,
+        first_stdout_ms: null,
+        complete_json_candidate_ms: null,
+        stdout_end_ms: null,
+        close_ms: 120_000,
+        total_elapsed_ms: 120_000,
+        stdout_bytes: 100,
+        stderr_bytes: 0,
+        payload_valid: false,
+        duration_ms: null,
+        duration_api_ms: null,
+        num_turns: null,
+      },
+      slow_valid: false,
+      attempted_call_result: 'diagnostic-failure',
+      terminal_result: 'diagnostic-failure',
+    }],
+    terminal: {
+      outcome: 'diagnostic-failure',
+      reason: 'hard-timeout-before-input',
+      next_decision: 'fix-review-and-rerun-changed-diagnostic',
+    },
+    out_of_band_terminal_count: 0,
+  };
+  const before = JSON.stringify(receipt);
+  assert.equal(
+    diagnostic.interpretDiagnosticArtifacts(receipt, validWitness()).reason,
+    'hard-timeout-before-input',
+  );
+  assert.equal(JSON.stringify(receipt), before);
+});
+
+test('U24 preserves parsed auth and missing-output turns through the durable v2 boundary', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const [adapters, { loadRoutingFixtures }, { runRoutingCase }, diagnostic] = await Promise.all([
+    import(`${ROOT}/adapters.mjs`),
+    import(`${ROOT}/fixtures.mjs`),
+    import(`${ROOT}/harness.mjs`),
+    diagnosticModule(),
+  ]);
+  const fixtures = loadRoutingFixtures().filter((fixture) => fixture.expected !== 'quarantine');
+  const fixture = fixtures[0];
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-priority-turns-'));
+  const cases = [
+    {
+      name: 'api-error',
+      envelope: {
+        is_error: true,
+        terminal_reason: 'api_error',
+        modelUsage: { 'claude-haiku-exact': {} },
+        duration_ms: 8,
+        duration_api_ms: 7,
+        num_turns: 3,
+      },
+      errorCode: 'ROUTER_AUTH_UNAVAILABLE',
+      reason: 'integrity-failure',
+      numTurns: 3,
+    },
+    {
+      name: 'output-missing',
+      envelope: {
+        is_error: false,
+        modelUsage: { 'claude-haiku-exact': {} },
+        duration_ms: 8,
+        duration_api_ms: 7,
+        num_turns: 4,
+      },
+      errorCode: 'ROUTER_OUTPUT_MISSING',
+      reason: 'missing-envelope-payload',
+      numTurns: 4,
+    },
+  ];
+  try {
+    for (const row of cases) {
+      assert.throws(() => adapters.parseClaudeResult(JSON.stringify(row.envelope)), (error) => {
+        assert.equal(error.code, row.errorCode, row.name);
+        assert.deepEqual(error.claudeTurnEvidence, { num_turns: row.numTurns }, row.name);
+        assert.equal(
+          Object.getOwnPropertyDescriptor(error, 'claudeTurnEvidence').enumerable,
+          false,
+          row.name,
+        );
+        return true;
+      });
+      const binary = path.join(root, row.name);
+      await writeFile(binary, [
+        '#!/usr/bin/env node',
+        `process.stdout.write(${JSON.stringify(JSON.stringify(row.envelope))});`,
+        '',
+      ].join('\n'), { mode: 0o700 });
+      const result = await runRoutingCase({
+        fixture,
+        adapter: adapters.createClaudeAdapter({
+          binary,
+          expectedObservedModel: 'claude-haiku-exact',
+          timeoutMs: 5_000,
+          tempRoot: root,
+        }),
+      });
+      assert.equal(result.errorCode, row.errorCode, row.name);
+      assert.equal(result.attemptEvidence.num_turns, row.numTurns, row.name);
+      assert.equal(JSON.stringify(result).includes('claudeTurnEvidence'), false, row.name);
+      const decision = diagnostic.classifyDiagnosticEvent({ result, callOrdinal: 1 });
+      assert.deepEqual([decision.outcome, decision.reason], [
+        'diagnostic-failure', row.reason,
+      ], row.name);
+
+      const receiptPath = path.join(root, `${row.name}.json`);
+      let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
+      receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+        kind: 'preflight', campaign_elapsed_ms: 0,
+      });
+      receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+        kind: 'attempt', campaign_elapsed_ms: 10, reason: decision.reason,
+        attempt: {
+          fixture_id: fixture.id, repetition: 1, ordinal: 1,
+          evidence: result.attemptEvidence,
+          slow_valid: false,
+          attempted_call_result: decision.outcome,
+          terminal_result: decision.outcome,
+        },
+      });
+      assert.equal(receipt.attempts[0].evidence.num_turns, row.numTurns, row.name);
+      assert.deepEqual(
+        diagnostic.interpretDiagnosticArtifacts(receipt, validWitness()).accounting,
+        expectedAccounting({ rows: 1, turns: row.numTurns }),
+        row.name,
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('U24 v2 out-of-band checkpoints durably record whether an outer invocation started', async () => {
+  const [diagnostic, { loadRoutingFixtures }] = await Promise.all([
+    diagnosticModule(),
+    import(`${ROOT}/fixtures.mjs`),
+  ]);
+  const fixtures = loadRoutingFixtures().filter((fixture) => fixture.expected !== 'quarantine');
+  const campaignCases = [
+    {
+      name: 'busy-check-error', checkBusy: async () => { throw new Error('busy failed'); },
+      routeOnce: async () => assert.fail('must not launch'), checkpointAttempt: async () => {},
+      reason: 'integrity-failure', started: false,
+    },
+    {
+      name: 'busy', checkBusy: async () => true,
+      routeOnce: async () => assert.fail('must not launch'), checkpointAttempt: async () => {},
+      reason: 'production-became-busy', started: false,
+    },
+    {
+      name: 'reservation-error', checkBusy: async () => false,
+      monotonicNowMs: () => Number.NaN,
+      routeOnce: async () => assert.fail('must not launch'), checkpointAttempt: async () => {},
+      reason: 'integrity-failure', started: false,
+    },
+    {
+      name: 'budget', checkBusy: async () => false,
+      monotonicNowMs: () => diagnostic.DIAGNOSTIC_LIMITS.terminalCheckpointMs,
+      routeOnce: async () => assert.fail('must not launch'), checkpointAttempt: async () => {},
+      reason: 'campaign-budget-exhausted', started: false,
+    },
+    {
+      name: 'route-throw', checkBusy: async () => false,
+      routeOnce: async () => { throw new Error('route failed'); },
+      checkpointAttempt: async () => {}, reason: 'integrity-failure', started: true,
+    },
+    {
+      name: 'result-validation', checkBusy: async () => false,
+      routeOnce: async () => undefined,
+      checkpointAttempt: async () => {}, reason: 'unknown-evidence', started: true,
+    },
+    {
+      name: 'attempt-checkpoint', checkBusy: async () => false,
+      routeOnce: async () => diagnosticAttempt({ numTurns: 2 }),
+      checkpointAttempt: async () => { throw new Error('checkpoint failed'); },
+      reason: 'checkpoint-unconfirmed', started: true,
+    },
+  ];
+  for (const row of campaignCases) {
+    const outOfBand = [];
+    const result = await diagnostic.runDiagnosticCampaign({
+      fixtures,
+      activatedAtMs: 0,
+      monotonicNowMs: row.monotonicNowMs || (() => 0),
+      checkBusy: row.checkBusy,
+      routeOnce: row.routeOnce,
+      checkpointAttempt: row.checkpointAttempt,
+      checkpointOutOfBand: async (decision, outerInvocationStarted) => {
+        outOfBand.push({ reason: decision.reason, outerInvocationStarted });
+      },
+    });
+    assert.equal(result.reason, row.reason, row.name);
+    assert.deepEqual(outOfBand, [{
+      reason: row.reason, outerInvocationStarted: row.started,
+    }], row.name);
+  }
+
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-oob-phase-'));
+  const initialized = async (name) => {
+    const receiptPath = path.join(root, `${name}.json`);
+    let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
+    assert.equal(receipt.out_of_band_outer_invocation_started, false);
+    receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+      kind: 'preflight', campaign_elapsed_ms: 0,
+    });
+    return { receiptPath, receipt };
+  };
+  try {
+    for (const row of [
+      ...[
+        ['integrity-failure', 'diagnostic-failure'],
+        ['production-became-busy', 'inconclusive'],
+        ['campaign-budget-exhausted', 'diagnostic-failure'],
+        ['call-arithmetic-mismatch', 'diagnostic-failure'],
+      ].map(([reason, outcome]) => ({
+        name: `pre-spawn-${reason}`, outcome, reason, started: false, possible: 0,
+      })),
+      ...[
+        'integrity-failure',
+        'invalid-evidence',
+        'unknown-evidence',
+        'checkpoint-unconfirmed',
+      ].map((reason) => ({
+        name: `post-launch-${reason}`,
+        outcome: 'diagnostic-failure',
+        reason,
+        started: true,
+        possible: 1,
+      })),
+    ]) {
+      const state = await initialized(row.name);
+      const checkpoint = {
+        kind: 'out_of_band', campaign_elapsed_ms: 1,
+        outcome: row.outcome, reason: row.reason,
+        outer_invocation_started: row.started,
+      };
+      state.receipt = await diagnostic.checkpointDiagnosticReceipt(
+        state.receiptPath, state.receipt, checkpoint,
+      );
+      assert.equal(
+        state.receipt.out_of_band_outer_invocation_started,
+        row.started,
+        row.name,
+      );
+      assert.deepEqual(
+        diagnostic.interpretDiagnosticArtifacts(state.receipt, validWitness()).accounting,
+        expectedAccounting({ rows: 0, turns: 0, possible: row.possible }),
+        row.name,
+      );
+    }
+
+    const missing = await initialized('missing');
+    await assert.rejects(diagnostic.checkpointDiagnosticReceipt(
+      missing.receiptPath, missing.receipt,
+      {
+        kind: 'out_of_band', campaign_elapsed_ms: 1,
+        outcome: 'inconclusive', reason: 'production-became-busy',
+      },
+    ), /outer.invocation|out-of-band/);
+    for (const [name, checkpoint] of [
+      ['extra', {
+        kind: 'out_of_band', campaign_elapsed_ms: 1,
+        outcome: 'inconclusive', reason: 'production-became-busy',
+        outer_invocation_started: false, extra: true,
+      }],
+      ['false-post-launch', {
+        kind: 'out_of_band', campaign_elapsed_ms: 1,
+        outcome: 'diagnostic-failure', reason: 'unknown-evidence',
+        outer_invocation_started: false,
+      }],
+      ['true-pre-spawn', {
+        kind: 'out_of_band', campaign_elapsed_ms: 1,
+        outcome: 'inconclusive', reason: 'production-became-busy',
+        outer_invocation_started: true,
+      }],
+    ]) {
+      const state = await initialized(name);
+      await assert.rejects(diagnostic.checkpointDiagnosticReceipt(
+        state.receiptPath, state.receipt, checkpoint,
+      ), /out-of-band|outer.invocation/);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('U24 rejects payload-valid stream sentinels before durable stream classification', async () => {
+  const [diagnostic, { loadRoutingFixtures }] = await Promise.all([
+    diagnosticModule(),
+    import(`${ROOT}/fixtures.mjs`),
+  ]);
+  const fixtures = loadRoutingFixtures().filter((fixture) => fixture.expected !== 'quarantine');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-stream-contradiction-'));
+  try {
+    for (const [stream, errorCode] of [
+      ['stdout', 'ROUTER_OUTPUT_TOO_LARGE'],
+      ['stderr', 'ROUTER_STDERR_TOO_LARGE'],
+    ]) {
+      const overLimitField = `${stream}_bytes`;
+      const contradictory = diagnosticAttempt({
+        elapsedMs: 10,
+        ...(stream === 'stdout'
+          ? { stdoutBytes: 'over_limit' }
+          : { stderrBytes: 'over_limit' }),
+      });
+      assert.equal(contradictory.attemptEvidence.payload_valid, true, stream);
+      assert.equal(
+        diagnostic.classifyDiagnosticEvent({ result: contradictory }).reason,
+        'invalid-evidence',
+        stream,
+      );
+
+      const receiptPath = path.join(root, `${stream}-contradictory.json`);
+      let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
+      receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+        kind: 'preflight', campaign_elapsed_ms: 0,
+      });
+      const campaign = await diagnostic.runDiagnosticCampaign({
+        fixtures,
+        activatedAtMs: 0,
+        monotonicNowMs: () => 0,
+        checkBusy: async () => false,
+        routeOnce: async () => contradictory,
+        checkpointAttempt: async () => assert.fail('contradictory evidence is not an attempt'),
+        checkpointOutOfBand: async (decision, outerInvocationStarted) => {
+          receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+            kind: 'out_of_band', campaign_elapsed_ms: 1,
+            outcome: decision.outcome,
+            reason: decision.reason,
+            outer_invocation_started: outerInvocationStarted,
+          });
+        },
+      });
+      assert.equal(campaign.reason, 'invalid-evidence', stream);
+      assert.equal(receipt.terminal.reason, 'invalid-evidence', stream);
+      assert.equal(receipt.out_of_band_outer_invocation_started, true, stream);
+      assert.deepEqual(
+        diagnostic.interpretDiagnosticArtifacts(receipt, validWitness()).accounting,
+        expectedAccounting({ rows: 0, turns: 0, possible: 1 }),
+        stream,
+      );
+
+      const normal = diagnosticAttempt({
+        status: 'operational_error', errorCode, elapsedMs: 10,
+        payloadValid: false,
+        ...(stream === 'stdout'
+          ? { stdoutBytes: 'over_limit' }
+          : { stderrBytes: 'over_limit' }),
+      });
+      assert.equal(normal.attemptEvidence[overLimitField], 'over_limit', stream);
+      assert.equal(
+        diagnostic.classifyDiagnosticEvent({ result: normal }).reason,
+        'stream-over-limit',
+        `${stream}/normal`,
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('U24 diagnostic checkpoints missing attempt evidence as an out-of-band failure', async () => {
   const [{ loadRoutingFixtures }, diagnostic] = await Promise.all([
     import(`${ROOT}/fixtures.mjs`),
@@ -492,6 +1314,511 @@ test('U24 diagnostic attempts an out-of-band terminal checkpoint after attempt c
   }
 });
 
+test('U24 derives exact and ranged outer-invocation accounting from validated v2 receipts', async () => {
+  const [diagnostic, { loadRoutingFixtures }] = await Promise.all([
+    diagnosticModule(),
+    import(`${ROOT}/fixtures.mjs`),
+  ]);
+  const fixtures = loadRoutingFixtures().filter((fixture) => fixture.expected !== 'quarantine');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-accounting-'));
+  const initialized = async (name) => {
+    const receiptPath = path.join(root, `${name}.json`);
+    let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
+    receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+      kind: 'preflight', campaign_elapsed_ms: 0,
+    });
+    return { receiptPath, receipt };
+  };
+  const appendValid = async (state, ordinal, numTurns, terminal = null) => {
+    const result = diagnosticAttempt({ elapsedMs: 10, numTurns });
+    return diagnostic.checkpointDiagnosticReceipt(state.receiptPath, state.receipt, {
+      kind: 'attempt', campaign_elapsed_ms: ordinal,
+      ...(terminal ? { reason: terminal.reason } : {}),
+      attempt: {
+        fixture_id: fixtures[(ordinal - 1) % fixtures.length].id,
+        repetition: Math.floor((ordinal - 1) / fixtures.length) + 1,
+        ordinal,
+        evidence: result.attemptEvidence,
+        slow_valid: false,
+        attempted_call_result: terminal?.outcome || 'valid',
+        terminal_result: terminal?.outcome || null,
+      },
+    });
+  };
+  try {
+    const attemptTerminal = await initialized('attempt-terminal');
+    const qualityResult = parsedRouterQualityAttempt({ elapsedMs: 10, numTurns: 2 });
+    const qualityDecision = diagnostic.classifyDiagnosticEvent({ result: qualityResult });
+    attemptTerminal.receipt = await diagnostic.checkpointDiagnosticReceipt(
+      attemptTerminal.receiptPath,
+      attemptTerminal.receipt,
+      {
+        kind: 'attempt', campaign_elapsed_ms: 1, reason: qualityDecision.reason,
+        attempt: {
+          fixture_id: fixtures[0].id, repetition: 1, ordinal: 1,
+          evidence: qualityResult.attemptEvidence,
+          slow_valid: false,
+          attempted_call_result: qualityDecision.outcome,
+          terminal_result: qualityDecision.outcome,
+        },
+      },
+    );
+    const attemptTerminalResult = diagnostic.interpretDiagnosticArtifacts(
+      attemptTerminal.receipt,
+      validWitness(),
+    );
+    assert.deepEqual(
+      attemptTerminalResult.accounting,
+      expectedAccounting({ rows: 1, turns: 2 }),
+    );
+
+    const preSpawn = await initialized('pre-spawn');
+    preSpawn.receipt = await appendValid(preSpawn, 1, 3);
+    preSpawn.receipt = await diagnostic.checkpointDiagnosticReceipt(
+      preSpawn.receiptPath,
+      preSpawn.receipt,
+      {
+        kind: 'out_of_band', campaign_elapsed_ms: 2,
+        outcome: 'inconclusive', reason: 'production-became-busy',
+        outer_invocation_started: false,
+      },
+    );
+    const preSpawnResult = diagnostic.interpretDiagnosticArtifacts(preSpawn.receipt, validWitness());
+    assert.deepEqual(
+      preSpawnResult.accounting,
+      expectedAccounting({ rows: 1, turns: 3 }),
+    );
+
+    const unknown = await initialized('unknown');
+    const invalidTurnResult = diagnosticAttempt({
+      status: 'operational_error', errorCode: 'ROUTER_OUTPUT_MALFORMED',
+      elapsedMs: 10, payloadValid: false, numTurns: null,
+    });
+    unknown.receipt = await diagnostic.checkpointDiagnosticReceipt(
+      unknown.receiptPath,
+      unknown.receipt,
+      {
+        kind: 'attempt', campaign_elapsed_ms: 1, reason: 'invalid-envelope-turn-count',
+        attempt: {
+          fixture_id: fixtures[0].id, repetition: 1, ordinal: 1,
+          evidence: invalidTurnResult.attemptEvidence,
+          slow_valid: false,
+          attempted_call_result: 'diagnostic-failure',
+          terminal_result: 'diagnostic-failure',
+        },
+      },
+    );
+    const unknownResult = diagnostic.interpretDiagnosticArtifacts(unknown.receipt, validWitness());
+    assert.deepEqual(
+      unknownResult.accounting,
+      expectedAccounting({ rows: 1, turns: 0, unknown: 1 }),
+    );
+
+    const nonterminal = await initialized('nonterminal');
+    nonterminal.receipt = await appendValid(nonterminal, 1, 4);
+    const nonterminalResult = diagnostic.interpretDiagnosticArtifacts(
+      nonterminal.receipt,
+      validWitness(),
+    );
+    assert.deepEqual(
+      nonterminalResult.accounting,
+      expectedAccounting({ rows: 1, turns: 4, possible: 1 }),
+    );
+
+    const ceilingReceipt = {
+      schema_version: 'polygram-memory-routing-timeout-diagnostic/v2',
+      sequence: 111,
+      preflight_complete: true,
+      campaign_elapsed_ms: 110,
+      attempts: Array.from({ length: 110 }, (_, index) => {
+        const ordinal = index + 1;
+        const terminal = ordinal === 110;
+        return {
+          fixture_id: fixtures[index % fixtures.length].id,
+          repetition: Math.floor(index / fixtures.length) + 1,
+          ordinal,
+          evidence: diagnosticAttempt({ elapsedMs: 10, numTurns: ordinal === 1 ? 2 : 1 })
+            .attemptEvidence,
+          slow_valid: false,
+          attempted_call_result: terminal ? 'inconclusive' : 'valid',
+          terminal_result: terminal ? 'inconclusive' : null,
+        };
+      }),
+      terminal: {
+        outcome: 'inconclusive',
+        reason: 'call-ceiling-fast-only',
+        next_decision: 'preserve-u24-stop-and-choose-alternate-policy',
+      },
+      out_of_band_terminal_count: 0,
+      out_of_band_outer_invocation_started: false,
+    };
+    const ceilingResult = diagnostic.interpretDiagnosticArtifacts(
+      ceilingReceipt,
+      validWitness(),
+    );
+    assert.deepEqual(
+      ceilingResult.accounting,
+      expectedAccounting({ rows: 110, turns: 111 }),
+    );
+    assert.deepEqual([
+      attemptTerminalResult,
+      preSpawnResult,
+      unknownResult,
+      nonterminalResult,
+      ceilingResult,
+    ].map(({ outcome, next_decision: nextDecision, accounting }) => [
+      outcome,
+      nextDecision,
+      accounting.possible_uncheckpointed_outer_invocations,
+      accounting.exact_internal_turn_total_available,
+    ]), [
+      ['router-quality-failure', 'revise-router-contract-or-prompt-in-reviewed-plan', 0, true],
+      ['inconclusive', 'preserve-u24-stop-and-choose-alternate-policy', 0, true],
+      ['diagnostic-failure', 'fix-review-and-rerun-changed-diagnostic', 0, false],
+      ['diagnostic-failure', 'fix-review-and-rerun-changed-diagnostic', 1, false],
+      ['inconclusive', 'preserve-u24-stop-and-choose-alternate-policy', 0, true],
+    ]);
+    assert.deepEqual(Object.keys(ceilingReceipt).sort(), [
+      'attempts', 'campaign_elapsed_ms', 'out_of_band_outer_invocation_started',
+      'out_of_band_terminal_count', 'preflight_complete', 'schema_version', 'sequence', 'terminal',
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('U24 fails closed when individually valid turn evidence overflows aggregate arithmetic', async () => {
+  const [diagnostic, { loadRoutingFixtures }] = await Promise.all([
+    diagnosticModule(),
+    import(`${ROOT}/fixtures.mjs`),
+  ]);
+  const fixtures = loadRoutingFixtures().filter((fixture) => fixture.expected !== 'quarantine');
+  const receipt = {
+    schema_version: 'polygram-memory-routing-timeout-diagnostic/v2',
+    sequence: 3,
+    preflight_complete: true,
+    campaign_elapsed_ms: 2,
+    attempts: [Number.MAX_SAFE_INTEGER, 1].map((numTurns, index) => ({
+      fixture_id: fixtures[index].id,
+      repetition: 1,
+      ordinal: index + 1,
+      evidence: diagnosticAttempt({ elapsedMs: 10, numTurns }).attemptEvidence,
+      slow_valid: false,
+      attempted_call_result: 'valid',
+      terminal_result: null,
+    })),
+    terminal: null,
+    out_of_band_terminal_count: 0,
+    out_of_band_outer_invocation_started: false,
+  };
+  assert.throws(
+    () => diagnostic.interpretDiagnosticArtifacts(receipt, validWitness()),
+    /aggregate|safe integer|overflow/i,
+  );
+  for (const row of [
+    {
+      name: 'cleanup',
+      witness: validWitness({
+        inactive: false,
+        cgroup_empty: true,
+        detached_child_removed: true,
+        cleanup_confirmed: false,
+      }),
+      primaryReason: null,
+      reason: 'cleanup-unconfirmed',
+      cleanupConfirmed: false,
+    },
+    {
+      name: 'cleanup-over-integrity',
+      witness: validWitness({
+        inactive: false,
+        cgroup_empty: true,
+        detached_child_removed: true,
+        cleanup_confirmed: false,
+      }),
+      primaryReason: 'integrity-failure',
+      reason: 'cleanup-unconfirmed',
+      cleanupConfirmed: false,
+    },
+    {
+      name: 'integrity', witness: validWitness(), primaryReason: 'integrity-failure',
+      reason: 'integrity-failure', cleanupConfirmed: true,
+    },
+    {
+      name: 'runner', witness: validWitness(), primaryReason: 'runner-nonterminal',
+      reason: 'runner-nonterminal', cleanupConfirmed: true,
+    },
+  ]) {
+    const interpreted = diagnostic.interpretDiagnosticArtifacts(receipt, row.witness, {
+      primaryReason: row.primaryReason,
+    });
+    assert.equal(interpreted.reason, row.reason, row.name);
+    assert.equal(interpreted.cleanup_confirmed, row.cleanupConfirmed, row.name);
+    assert.deepEqual(interpreted.accounting, { available: false }, row.name);
+  }
+});
+
+test('U24 accounts route throws and attempt-checkpoint failures as possible uncheckpointed work', async () => {
+  const [diagnostic, { loadRoutingFixtures }] = await Promise.all([
+    diagnosticModule(),
+    import(`${ROOT}/fixtures.mjs`),
+  ]);
+  const fixtures = loadRoutingFixtures().filter((fixture) => fixture.expected !== 'quarantine');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-uncheckpointed-'));
+  try {
+    for (const [name, routeOnce, checkpointAttempt, expectedReason] of [
+      ['route-throw', async () => { throw new Error('route failed'); }, async () => {},
+        'integrity-failure'],
+      ['attempt-checkpoint', async () => diagnosticAttempt({ numTurns: 2 }),
+        async () => { throw new Error('checkpoint failed'); }, 'checkpoint-unconfirmed'],
+    ]) {
+      const receiptPath = path.join(root, `${name}.json`);
+      let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
+      receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+        kind: 'preflight', campaign_elapsed_ms: 0,
+      });
+      const campaign = await diagnostic.runDiagnosticCampaign({
+        fixtures,
+        activatedAtMs: 0,
+        monotonicNowMs: () => 0,
+        checkBusy: async () => false,
+        routeOnce,
+        checkpointAttempt,
+        checkpointOutOfBand: async (decision, outerInvocationStarted) => {
+          receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+            kind: 'out_of_band', campaign_elapsed_ms: 1,
+            outcome: decision.outcome, reason: decision.reason,
+            outer_invocation_started: outerInvocationStarted,
+          });
+        },
+      });
+      assert.equal(campaign.reason, expectedReason, name);
+      const interpreted = diagnostic.interpretDiagnosticArtifacts(
+        JSON.parse(await readFile(receiptPath, 'utf8')),
+        validWitness(),
+      );
+      assert.equal(interpreted.reason, expectedReason, name);
+      assert.deepEqual(
+        interpreted.accounting,
+        expectedAccounting({ rows: 0, turns: 0, possible: 1 }),
+        name,
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('U24 timeout route forwards neither a hidden turn cap nor structured-output retry override', async () => {
+  const adapters = await import(`${ROOT}/adapters.mjs`);
+  const invocation = adapters.buildClaudeInvocation({
+    binary: '/opt/claude', model: 'haiku', schema: { type: 'object' },
+  });
+  assert.equal(invocation.argv.includes('--max-turns'), false);
+  assert.equal(invocation.argv.some((value) => String(value).startsWith('--max-turns=')), false);
+  assert.equal(adapters.subscriptionOnlyEnv({
+    HOME: '/home/router',
+    MAX_STRUCTURED_OUTPUT_RETRIES: '1',
+  }).MAX_STRUCTURED_OUTPUT_RETRIES, undefined);
+});
+
+test('U24 runbook requires renewed immutable-commit approval using explicit accounting terms', async () => {
+  const runbook = await readFile(path.resolve(__dirname, `${ROOT}/README.md`), 'utf8');
+  assert.match(runbook, /campaign ceiling is 110\s+serial outer invocations/i);
+  assert.match(runbook, /120-second deadline for each outer invocation/i);
+  assert.match(runbook, /internal agent-loop turns\s+are not separately pre-capped/i);
+  assert.match(runbook, /provider retries remain opaque/i);
+  assert.match(runbook, /new approval that names the reviewed immutable\s+40-hex commit/i);
+  assert.match(runbook, /earlier\s+approval is consumed/i);
+});
+
+test('U24 launcher preserves failure precedence while using reopened accounting', async () => {
+  const diagnostic = await diagnosticModule();
+  const receipt = {
+    schema_version: 'polygram-memory-routing-timeout-diagnostic/v2',
+    sequence: 2,
+    preflight_complete: true,
+    campaign_elapsed_ms: 1,
+    attempts: [{
+      fixture_id: 'work-01', repetition: 1, ordinal: 1,
+      evidence: diagnosticAttempt({ elapsedMs: 10, numTurns: 2 }).attemptEvidence,
+      slow_valid: false,
+      attempted_call_result: 'valid',
+      terminal_result: null,
+    }],
+    terminal: null,
+    out_of_band_terminal_count: 0,
+    out_of_band_outer_invocation_started: false,
+  };
+  const launcherAccounting = expectedAccounting({ rows: 1, turns: 2, possible: 1 });
+  const cases = [
+    {
+      name: 'cleanup',
+      runService: async () => {},
+      stop: async () => {},
+      final: { inactive: false, cgroup_empty: false, detached_child_removed: false },
+      beforeInterpret: async () => {},
+      witness: validWitness({
+        inactive: false, cgroup_empty: false, detached_child_removed: false,
+        cleanup_confirmed: false,
+      }),
+      reason: 'cleanup-unconfirmed',
+    },
+    {
+      name: 'run',
+      runService: async () => { throw new Error('run failed'); },
+      stop: async () => {},
+      final: { inactive: true, cgroup_empty: true, detached_child_removed: true },
+      beforeInterpret: async () => {}, witness: validWitness(), reason: 'runner-nonterminal',
+    },
+    {
+      name: 'stop',
+      runService: async () => {},
+      stop: async () => { throw new Error('stop failed'); },
+      final: { inactive: true, cgroup_empty: true, detached_child_removed: true },
+      beforeInterpret: async () => {}, witness: validWitness(), reason: 'runner-nonterminal',
+    },
+    {
+      name: 'runtime',
+      runService: async () => {},
+      stop: async () => {},
+      final: { inactive: true, cgroup_empty: true, detached_child_removed: true },
+      beforeInterpret: async () => { throw new Error('runtime drift'); },
+      witness: validWitness(), reason: 'integrity-failure',
+    },
+  ];
+  for (const row of cases) {
+    let reads = 0;
+    const interpreted = await diagnostic.runWithUnitLauncher({
+      launcher: {
+        preflight: async () => validPreflight(),
+        runService: row.runService,
+        stop: row.stop,
+        inspectFinal: async () => row.final,
+      },
+      scratchPath: `/private/polygram-u24-${row.name}`,
+      receiptPath: '/private/evidence/receipt.json',
+      unitWitnessPath: '/private/evidence/unit.json',
+      expectedModel: 'claude-haiku-exact',
+      runInside: async () => {},
+      confirmReceiptDurability: async () => true,
+      writeUnitWitness: async () => {},
+      readArtifacts: async () => {
+        reads += 1;
+        return { receipt, unitWitness: row.witness };
+      },
+      beforeInterpret: row.beforeInterpret,
+    });
+    assert.equal(reads, 1, row.name);
+    assert.equal(interpreted.reason, row.reason, row.name);
+    assert.deepEqual(interpreted.accounting, launcherAccounting, row.name);
+  }
+
+  const unavailable = await diagnostic.runWithUnitLauncher({
+    launcher: {
+      preflight: async () => validPreflight(),
+      runService: async () => {},
+      stop: async () => {},
+      inspectFinal: async () => ({
+        inactive: true, cgroup_empty: true, detached_child_removed: true,
+      }),
+    },
+    scratchPath: '/private/polygram-u24-no-artifacts',
+    receiptPath: '/private/evidence/receipt.json',
+    unitWitnessPath: '/private/evidence/unit.json',
+    expectedModel: 'claude-haiku-exact',
+    runInside: async () => {},
+    confirmReceiptDurability: async () => true,
+    writeUnitWitness: async () => {},
+    readArtifacts: async () => { throw new Error('no artifacts'); },
+  });
+  assert.equal(unavailable.reason, 'checkpoint-unconfirmed');
+  assert.deepEqual(unavailable.accounting, { available: false });
+});
+
+test('U24 launcher keeps local cleanup precedence when drift and artifact reads both fail', async () => {
+  const diagnostic = await diagnosticModule();
+  const cases = [
+    {
+      name: 'drift-clean',
+      final: { inactive: true, cgroup_empty: true, detached_child_removed: true },
+      beforeInterpret: async () => { throw new Error('runtime drift'); },
+      reason: 'integrity-failure', cleanupConfirmed: true,
+    },
+    {
+      name: 'drift-unclean',
+      final: { inactive: false, cgroup_empty: true, detached_child_removed: true },
+      beforeInterpret: async () => { throw new Error('runtime drift'); },
+      reason: 'cleanup-unconfirmed', cleanupConfirmed: false,
+    },
+    {
+      name: 'artifact-only',
+      final: { inactive: true, cgroup_empty: true, detached_child_removed: true },
+      beforeInterpret: async () => {},
+      reason: 'checkpoint-unconfirmed', cleanupConfirmed: false,
+    },
+  ];
+  for (const row of cases) {
+    const result = await diagnostic.runWithUnitLauncher({
+      launcher: {
+        preflight: async () => validPreflight(),
+        runService: async () => {},
+        stop: async () => {},
+        inspectFinal: async () => row.final,
+      },
+      scratchPath: `/private/polygram-u24-combined-${row.name}`,
+      receiptPath: '/private/evidence/receipt.json',
+      unitWitnessPath: '/private/evidence/unit.json',
+      expectedModel: 'claude-haiku-exact',
+      runInside: async () => {},
+      confirmReceiptDurability: async () => true,
+      writeUnitWitness: async () => {},
+      beforeInterpret: row.beforeInterpret,
+      readArtifacts: async () => { throw new Error('artifact read failed'); },
+    });
+    assert.deepEqual(result, {
+      outcome: 'diagnostic-failure',
+      reason: row.reason,
+      next_decision: 'fix-review-and-rerun-changed-diagnostic',
+      cleanup_confirmed: row.cleanupConfirmed,
+      accounting: { available: false },
+    }, row.name);
+  }
+});
+
+test('U24 interpreter accepts only launcher-derived primary failure reasons', async () => {
+  const diagnostic = await diagnosticModule();
+  const receipt = {
+    schema_version: 'polygram-memory-routing-timeout-diagnostic/v2',
+    sequence: 2,
+    preflight_complete: true,
+    campaign_elapsed_ms: 1,
+    attempts: [{
+      fixture_id: 'work-01', repetition: 1, ordinal: 1,
+      evidence: diagnosticAttempt({ elapsedMs: 10, numTurns: 2 }).attemptEvidence,
+      slow_valid: false,
+      attempted_call_result: 'valid',
+      terminal_result: null,
+    }],
+    terminal: null,
+    out_of_band_terminal_count: 0,
+    out_of_band_outer_invocation_started: false,
+  };
+
+  assert.throws(
+    () => diagnostic.interpretDiagnosticArtifacts(receipt, validWitness(), {
+      primaryReason: 'invalid-envelope-framing',
+    }),
+    /invalid primary diagnostic failure reason/,
+  );
+  for (const primaryReason of ['integrity-failure', 'runner-nonterminal']) {
+    assert.equal(
+      diagnostic.interpretDiagnosticArtifacts(receipt, validWitness(), { primaryReason }).reason,
+      primaryReason,
+    );
+  }
+});
+
 test('U24 diagnostic binds every call to one attested Claude runtime', async () => {
   const diagnostic = await diagnosticModule();
   const runtime = {
@@ -527,6 +1854,62 @@ test('U24 diagnostic binds every call to one attested Claude runtime', async () 
   assert.equal(result.outcome, 'inconclusive');
   assert.equal(adapters[0].binary, runtime.canonicalPath);
   assert.equal(reattestations, 110);
+});
+
+test('U24 runtime drift before spawn is durably accounted as exact pre-invocation work', async () => {
+  const diagnostic = await diagnosticModule();
+  const runtime = {
+    canonicalPath: '/trusted/claude-2.1.220',
+    version: '2.1.220 (Claude Code)',
+    sha256: 'a'.repeat(64),
+    dev: 1,
+    ino: 2,
+    size: 3,
+  };
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-runtime-pre-spawn-'));
+  const receiptPath = path.join(root, 'receipt.json');
+  let adapterRouteCalls = 0;
+  try {
+    let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
+    receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+      kind: 'preflight', campaign_elapsed_ms: 0,
+    });
+    const result = await diagnostic.runLiveDiagnosticCampaign({
+      claudeBin: '/operator/claude',
+      expectedModel: 'claude-haiku-exact',
+      scratchPath: '/private/scratch',
+      activatedAtMs: 0,
+      monotonicNowMs: () => 0,
+      checkBusy: async () => false,
+      checkpointAttempt: async () => assert.fail('no attempt can be checkpointed'),
+      checkpointOutOfBand: async (decision, outerInvocationStarted) => {
+        receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+          kind: 'out_of_band', campaign_elapsed_ms: 1,
+          outcome: decision.outcome,
+          reason: decision.reason,
+          outer_invocation_started: outerInvocationStarted,
+        });
+      },
+      attestRuntime: async () => runtime,
+      assertRuntimeIdentityUnchanged: async () => { throw new Error('runtime drift'); },
+      createAdapter: () => ({
+        id: 'claude:haiku',
+        async route() { adapterRouteCalls += 1; return diagnosticAttempt(); },
+      }),
+      runCase: async ({ adapter }) => adapter.route(),
+    });
+    assert.deepEqual([result.outcome, result.reason], [
+      'diagnostic-failure', 'integrity-failure',
+    ]);
+    assert.equal(adapterRouteCalls, 0);
+    assert.equal(receipt.out_of_band_outer_invocation_started, false);
+    assert.deepEqual(
+      diagnostic.interpretDiagnosticArtifacts(receipt, validWitness()).accounting,
+      expectedAccounting({ rows: 0, turns: 0 }),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('U24 receipt rejects contradictory terminal and slow evidence and validates witness shape', async () => {
@@ -623,6 +2006,7 @@ test('U24 launcher derives its result only from reopened durable artifacts', asy
           campaign_elapsed_ms: 1,
           outcome: 'diagnostic-failure',
           reason: 'campaign-budget-exhausted',
+          outer_invocation_started: false,
         });
         return { outcome: 'old-cap-false-rejection' };
       },
@@ -675,6 +2059,7 @@ test('U24 launcher records unconfirmed receipt durability in the closed unit wit
         await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
           kind: 'out_of_band', campaign_elapsed_ms: 1,
           outcome: 'inconclusive', reason: 'production-became-busy',
+          outer_invocation_started: false,
         });
       },
     });
@@ -956,7 +2341,7 @@ test('U24 inside mode independently verifies its unit before checkpointing or ro
         events.push('route');
         await options.checkpointOutOfBand({
           outcome: 'inconclusive', reason: 'production-became-busy',
-        });
+        }, false);
         return { outcome: 'inconclusive' };
       },
       checkBusy: async () => false,
@@ -966,6 +2351,7 @@ test('U24 inside mode independently verifies its unit before checkpointing or ro
     const receipt = JSON.parse(await readFile(receiptPath, 'utf8'));
     assert.equal(receipt.preflight_complete, true);
     assert.equal(receipt.terminal.outcome, 'inconclusive');
+    assert.equal(receipt.out_of_band_outer_invocation_started, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1096,8 +2482,8 @@ test('U24 timeout diagnostic implements all precedence rows and next decisions',
     [{ result: diagnosticAttempt({ status: 'operational_error', errorCode: 'ROUTER_OUTPUT_TOO_LARGE', stdoutBytes: 'over_limit' }) }, 'diagnostic-failure'],
     [{ result: diagnosticAttempt({ status: 'operational_error', errorCode: 'ROUTER_PROCESS_EXIT', payloadValid: true }) }, 'process-boundary-fault'],
     [{ result: { ...parsedRouterQualityAttempt(), status: 'mismatch', errorCode: 'ROUTER_EXPECTATION_MISMATCH' } }, 'router-quality-failure'],
-    [{ result: diagnosticAttempt({ status: 'operational_error', errorCode: 'ROUTER_TIMEOUT', phase: 'awaiting_output', elapsedMs: 120_000 }) }, 'route-unsuitable-at-diagnostic-ceiling'],
-    [{ result: diagnosticAttempt({ status: 'operational_error', errorCode: 'ROUTER_TIMEOUT', phase: 'starting', elapsedMs: 120_000 }) }, 'diagnostic-failure'],
+    [{ result: closedProcessAttempt({ afterInput: true }) }, 'route-unsuitable-at-diagnostic-ceiling'],
+    [{ result: closedProcessAttempt({ afterInput: false }) }, 'diagnostic-failure'],
     [{ result: diagnosticAttempt({ status: 'operational_error', errorCode: 'ROUTER_OUTPUT_MALFORMED' }) }, 'diagnostic-failure'],
     [{ result: diagnosticAttempt({ elapsedMs: 60_001 }) }, null, true],
     [{ result: diagnosticAttempt({ elapsedMs: 60_000 }) }, null, false],
@@ -1169,10 +2555,7 @@ test('U24 timeout campaign calls 22 fixtures five times once each and preserves 
     routeOnce: async () => {
       terminalCalls += 1;
       if (terminalCalls === 1) return diagnosticAttempt({ elapsedMs: 60_001 });
-      return diagnosticAttempt({
-        status: 'operational_error', errorCode: 'ROUTER_TIMEOUT',
-        phase: 'awaiting_output', elapsedMs: 120_000,
-      });
+      return closedProcessAttempt({ afterInput: true });
     },
     checkpointAttempt: async () => {},
     checkpointOutOfBand: async () => {},
@@ -1421,6 +2804,7 @@ test('U24 timeout launcher seam proves a transient service and interprets cleanu
     next_decision: 'fix-review-and-rerun-changed-diagnostic',
     slow_valid_observed: false,
     cleanup_confirmed: true,
+    accounting: expectedAccounting({ rows: 0, turns: 0, possible: 1 }),
   });
   assert.equal(JSON.stringify(preserved), before);
   assert.equal(diagnostic.interpretDiagnosticArtifacts(preserved, validWitness({
@@ -1441,20 +2825,19 @@ test('U24 timeout classification keeps soft evidence attempt-local at exact boun
     result: diagnosticAttempt({ elapsedMs: 120_000 }),
   }).slow_valid, true);
   assert.deepEqual([
-    ['starting', 'diagnostic-failure'],
-    ['awaiting_output', 'route-unsuitable-at-diagnostic-ceiling'],
-    ['output_started', 'route-unsuitable-at-diagnostic-ceiling'],
-    ['awaiting_close', 'route-unsuitable-at-diagnostic-ceiling'],
-  ].map(([phase, expected]) => [phase, classifyDiagnosticEvent({
-    result: diagnosticAttempt({
-      status: 'operational_error', errorCode: 'ROUTER_TIMEOUT',
-      phase, elapsedMs: 120_000,
-    }),
-  }).outcome, expected]), [
-    ['starting', 'diagnostic-failure', 'diagnostic-failure'],
-    ['awaiting_output', 'route-unsuitable-at-diagnostic-ceiling', 'route-unsuitable-at-diagnostic-ceiling'],
-    ['output_started', 'route-unsuitable-at-diagnostic-ceiling', 'route-unsuitable-at-diagnostic-ceiling'],
-    ['awaiting_close', 'route-unsuitable-at-diagnostic-ceiling', 'route-unsuitable-at-diagnostic-ceiling'],
+    ['before-input', closedProcessAttempt({ afterInput: false }), 'diagnostic-failure'],
+    ['after-input', closedProcessAttempt({ afterInput: true }),
+      'route-unsuitable-at-diagnostic-ceiling'],
+    ['after-output', closedProcessAttempt({ afterInput: true, outputStarted: true }),
+      'route-unsuitable-at-diagnostic-ceiling'],
+  ].map(([stage, result, expected]) => [
+    stage, classifyDiagnosticEvent({ result }).outcome, expected,
+  ]), [
+    ['before-input', 'diagnostic-failure', 'diagnostic-failure'],
+    ['after-input', 'route-unsuitable-at-diagnostic-ceiling',
+      'route-unsuitable-at-diagnostic-ceiling'],
+    ['after-output', 'route-unsuitable-at-diagnostic-ceiling',
+      'route-unsuitable-at-diagnostic-ceiling'],
   ]);
   for (const errorCode of [
     'ROUTER_OUTPUT_MALFORMED', 'ROUTER_OUTPUT_MISSING', 'ROUTER_MODEL_IDENTITY',
@@ -1692,6 +3075,7 @@ test('U24 timeout receipt enforces its sequence bound, one out-of-band terminal,
       campaign_elapsed_ms: 110,
       outcome: 'diagnostic-failure',
       reason: 'campaign-budget-exhausted',
+      outer_invocation_started: false,
     });
     assert.equal(receipt.sequence, 111);
     assert.equal(receipt.out_of_band_terminal_count, 1);
@@ -1828,6 +3212,7 @@ test('U24 receipt rejects impossible attempt terminals and non-OOB terminal chec
       {
         kind: 'out_of_band', campaign_elapsed_ms: 120_000,
         outcome: 'route-unsuitable-at-diagnostic-ceiling', reason: 'hard-timeout-after-input',
+        outer_invocation_started: false,
       },
     ), /out-of-band/);
   } finally {
@@ -2425,11 +3810,12 @@ async function assertMissingIntegrityEvidenceOutOfBand() {
             kind: 'attempt', campaign_elapsed_ms: 1, reason: decision.reason, attempt,
           });
         },
-        checkpointOutOfBand: async (decision) => {
+        checkpointOutOfBand: async (decision, outerInvocationStarted) => {
           outOfBandCheckpoints += 1;
           receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
             kind: 'out_of_band', campaign_elapsed_ms: 1,
             outcome: decision.outcome, reason: decision.reason,
+            outer_invocation_started: outerInvocationStarted,
           });
         },
       });
@@ -2479,6 +3865,7 @@ async function assertRunnerNonterminalNotOutOfBand() {
       campaign_elapsed_ms: 1,
       outcome: 'diagnostic-failure',
       reason: 'runner-nonterminal',
+      outer_invocation_started: false,
     }), /out-of-band/);
     assert.deepEqual(diagnostic.interpretDiagnosticArtifacts(receipt, validWitness()), {
       outcome: 'diagnostic-failure',
@@ -2486,6 +3873,7 @@ async function assertRunnerNonterminalNotOutOfBand() {
       next_decision: 'fix-review-and-rerun-changed-diagnostic',
       slow_valid_observed: false,
       cleanup_confirmed: true,
+      accounting: expectedAccounting({ rows: 0, turns: 0, possible: 1 }),
     });
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -2550,14 +3938,14 @@ async function assertTimeoutStreamPrecedenceRoundTrips() {
   const cases = [
     {
       name: 'after-input',
-      phase: 'awaiting_output',
+      afterInput: true,
       outcome: 'route-unsuitable-at-diagnostic-ceiling',
       reason: 'hard-timeout-after-input',
       overLimit: { stdoutBytes: 'over_limit' },
     },
     {
       name: 'before-input',
-      phase: 'starting',
+      afterInput: false,
       outcome: 'diagnostic-failure',
       reason: 'hard-timeout-before-input',
       overLimit: { stderrBytes: 'over_limit' },
@@ -2565,10 +3953,7 @@ async function assertTimeoutStreamPrecedenceRoundTrips() {
   ];
   try {
     for (const row of cases) {
-      const cleanResult = diagnosticAttempt({
-        status: 'operational_error', errorCode: 'ROUTER_TIMEOUT',
-        phase: row.phase, elapsedMs: 120_000, payloadValid: false, cleanupConfirmed: true,
-      });
+      const cleanResult = closedProcessAttempt({ afterInput: row.afterInput });
       const decision = diagnostic.classifyDiagnosticEvent({ result: cleanResult, callOrdinal: 1 });
       assert.deepEqual([decision.outcome, decision.reason], [row.outcome, row.reason], row.name);
 
@@ -2591,9 +3976,8 @@ async function assertTimeoutStreamPrecedenceRoundTrips() {
         row.outcome, row.reason,
       ], row.name);
 
-      const overLimitResult = diagnosticAttempt({
-        status: 'operational_error', errorCode: 'ROUTER_TIMEOUT',
-        phase: row.phase, elapsedMs: 120_000, payloadValid: false, cleanupConfirmed: true,
+      const overLimitResult = closedProcessAttempt({
+        afterInput: row.afterInput,
         ...row.overLimit,
       });
       assert.equal(

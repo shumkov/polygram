@@ -3,8 +3,12 @@
 Date: 2026-08-18  
 Status: the reviewed single-retry implementation and VPS shape gate passed;
 the one authorized full VPS gate stopped on two exhausted process timeouts,
-and the follow-up timeout characterization stopped safely on its first call
-with an ambiguous invalid-envelope result. U24 remains blocked.
+the first timeout characterization stopped safely on its first call with an
+ambiguous invalid-envelope result, and the reviewed discriminator rerun stopped
+safely on its first call with `invalid-envelope-turn-count`. U24 remains
+blocked. The turn-count contract review and implementation are complete; the
+next gate is one changed campaign from a signed immutable commit after fresh
+approval using the reviewed outer-invocation accounting terms.
 
 ## Decision
 
@@ -161,10 +165,11 @@ and no exhausted natural retry. Two recoveries plus two exhaustions therefore
 fail it. This is operational timeout/process-boundary reliability evidence,
 not a privacy, model-identity, projection, or arithmetic failure. The retry
 implementation and review are complete, but U24 remains blocked. Do not rerun
-the unchanged gate in hope that it happens to pass. The next decision is a
-separate, narrow characterization of the timeouts/process boundary and router
-choice; it is not part of this evidence run. A finite passing fixture would
-still leave residual semantic-miss risk as an explicit rollout decision.
+the unchanged gate in hope that it happens to pass. The next decision requires
+a signed immutable changed commit, fresh approval using the reviewed
+outer-invocation accounting terms, and one bounded VPS campaign; it is not part
+of this historical evidence run. A finite passing fixture would still leave
+residual semantic-miss risk as an explicit rollout decision.
 
 ## VPS timeout-characterization evidence
 
@@ -207,3 +212,55 @@ one-campaign rule, do not rerun the unchanged diagnostic. The next step is to
 add a closed, content-free envelope-failure category, review that change, and
 only then authorize a changed diagnostic run. No release or memory-feature
 enablement follows from this result.
+
+### Envelope-discriminator rerun
+
+After the five-category discriminator was implemented, independently reviewed,
+and committed, Ivan separately approved one changed campaign from exact commit
+`dfd2fc271ce1f764b32d8ac88e3407bef444b53b`, with a hard ceiling of 110
+Claude Haiku calls. The exact seven-file Git archive had SHA-256
+`4034adeab65502019436d528a55f95a0051aa77bfa14057149693c1cee9598c4`.
+Its commit-scoped owner-only staging receipt and no-model transient-systemd
+capability check both passed before launch. The runtime, model, prompt, schema,
+fixtures, auth, tools, environment, timeout, retry, and production boundaries
+were unchanged from the first characterization.
+
+The changed campaign again stopped after its first ordinary call, now with the
+specific closed reason selected by the reviewed discriminator:
+
+```text
+primary outcome        diagnostic-failure
+reason                 invalid-envelope-turn-count
+fixture / repetition   work-01 / 1
+attempts               1
+campaign elapsed       17,511 ms
+attempt elapsed        7,992 ms
+stdout / stderr        1,610 / 0 bytes
+JSON candidate         observed at 7,403 ms
+process close          confirmed at 7,992 ms
+payload valid          false
+unit inactive          true
+cgroup empty           true
+scratch cleanup        confirmed
+```
+
+The durable receipt SHA-256 is
+`2008bcc2356194c8ceda9e3fd738b7d87dd2c2be91274133a24df5eac0ca8525`;
+the unit-witness SHA-256 is
+`44d8f58c715b6f20f8a67697e79b508e9b70485dc298a54b49d85083dc49f317`.
+The receipt reached sequence 2 with one attempt and no out-of-band terminal.
+Its unit witness proves the transient service inactive, cgroup empty, detached
+child removed, terminal receipt reopened/fsynced, and cleanup confirmed. The
+fresh campaign scratch was removed. No service restart, package/configuration,
+database, production-memory, or Telegram mutation occurred.
+
+This result rules out framing, missing output, and duration-metric validation
+as the selected clean-close failure class. It proves only that the returned
+envelope failed the diagnostic's exact `num_turns === 1` contract; the
+content-free receipt deliberately does not retain whether `num_turns` was
+missing, malformed, or a different integer. Do not rerun this unchanged
+implementation. That invariant has now been replaced by the reviewed positive
+safe-integer turn-evidence contract, with actual values retained in fresh v2
+receipts and aggregate accounting derived from reopened evidence. U24 and
+memory-feature enablement remain blocked until a signed immutable changed
+commit receives fresh approval and its one bounded VPS campaign is reviewed.
