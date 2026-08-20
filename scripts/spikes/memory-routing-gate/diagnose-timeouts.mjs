@@ -74,9 +74,35 @@ const INTEGRITY_CODES = new Set([
   'ROUTER_MODEL_IDENTITY',
   'ROUTER_TOOL_USE',
 ]);
-const INVALID_ENVELOPE_CODES = new Set([
-  'ROUTER_OUTPUT_MALFORMED',
-  'ROUTER_OUTPUT_MISSING',
+const CLAUDE_ENVELOPE_FAILURES = Object.freeze({
+  'json-framing': Object.freeze({
+    errorCode: 'ROUTER_OUTPUT_MALFORMED',
+    reason: 'invalid-envelope-framing',
+  }),
+  'output-missing': Object.freeze({
+    errorCode: 'ROUTER_OUTPUT_MISSING',
+    reason: 'missing-envelope-payload',
+  }),
+  'duration-metrics-invalid': Object.freeze({
+    errorCode: 'ROUTER_OUTPUT_MALFORMED',
+    reason: 'invalid-envelope-duration-metrics',
+  }),
+  'turn-count-invalid': Object.freeze({
+    errorCode: 'ROUTER_OUTPUT_MALFORMED',
+    reason: 'invalid-envelope-turn-count',
+  }),
+  'duration-and-turn-count-invalid': Object.freeze({
+    errorCode: 'ROUTER_OUTPUT_MALFORMED',
+    reason: 'invalid-envelope-duration-and-turn-count',
+  }),
+});
+const LEGACY_INVALID_ENVELOPE_REASON = 'invalid-envelope';
+const INVALID_ENVELOPE_CODES = new Set(
+  Object.values(CLAUDE_ENVELOPE_FAILURES).map(({ errorCode }) => errorCode),
+);
+const ENVELOPE_REASONS = new Set([
+  LEGACY_INVALID_ENVELOPE_REASON,
+  ...Object.values(CLAUDE_ENVELOPE_FAILURES).map(({ reason }) => reason),
 ]);
 const PROCESS_CODES = new Set([
   'ROUTER_TIMEOUT',
@@ -133,7 +159,7 @@ const CLOSED_REASONS = new Set([
   'hard-timeout-after-input',
   'hard-timeout-before-input',
   'early-process-exit',
-  'invalid-envelope',
+  ...ENVELOPE_REASONS,
   'invalid-success-evidence',
   'success-after-hard-deadline',
   'slow-valid',
@@ -158,7 +184,7 @@ const OUTCOME_REASONS = Object.freeze({
     'stream-over-limit',
     'hard-timeout-before-input',
     'early-process-exit',
-    'invalid-envelope',
+    ...ENVELOPE_REASONS,
     'invalid-success-evidence',
     'success-after-hard-deadline',
     'runner-nonterminal',
@@ -294,6 +320,23 @@ function receiptAttemptEvidenceValid(evidence) {
   });
 }
 
+function claudeEnvelopeFailureReason(result) {
+  let descriptor;
+  try {
+    descriptor = result && typeof result === 'object'
+      ? Object.getOwnPropertyDescriptor(result, 'claudeEnvelopeFailure')
+      : null;
+  } catch {
+    return null;
+  }
+  if (descriptor?.enumerable !== false
+      || !Object.hasOwn(descriptor, 'value')
+      || typeof descriptor.value !== 'string'
+      || !Object.hasOwn(CLAUDE_ENVELOPE_FAILURES, descriptor.value)) return null;
+  const mapping = CLAUDE_ENVELOPE_FAILURES[descriptor.value];
+  return mapping?.errorCode === result.errorCode ? mapping.reason : null;
+}
+
 export function classifyDiagnosticEvent({
   integrityFailure = false,
   result,
@@ -351,7 +394,10 @@ export function classifyDiagnosticEvent({
     return classified('diagnostic-failure', 'early-process-exit');
   }
   if (INVALID_ENVELOPE_CODES.has(result?.errorCode)) {
-    return classified('diagnostic-failure', 'invalid-envelope');
+    return classified(
+      'diagnostic-failure',
+      claudeEnvelopeFailureReason(result) || 'invalid-evidence',
+    );
   }
   if (result) {
     if (result.status !== 'accepted' || !acceptedAttemptValid(result.attemptEvidence)) {
@@ -771,6 +817,13 @@ function validateAttemptTerminalRelationship(attempt, terminal) {
   }
   if (terminal.outcome !== 'diagnostic-failure') return;
   const closeConfirmed = Number.isInteger(evidence.close_ms);
+  if (ENVELOPE_REASONS.has(terminal.reason)) {
+    if (evidence.payload_valid !== false || !closeConfirmed
+        || streamOverLimit(evidence) || !successMetricsAbsent(evidence)) {
+      throw new Error('invalid envelope terminal evidence');
+    }
+    return;
+  }
   switch (terminal.reason) {
     case 'cleanup-unconfirmed':
       if (evidence.close_ms !== null
@@ -799,12 +852,6 @@ function validateAttemptTerminalRelationship(attempt, terminal) {
           || streamOverLimit(evidence)
           || evidence.total_elapsed_ms > DIAGNOSTIC_LIMITS.hardDeadlineMs) {
         throw new Error('invalid early-exit terminal evidence');
-      }
-      break;
-    case 'invalid-envelope':
-      if (evidence.payload_valid !== false || !closeConfirmed
-          || streamOverLimit(evidence) || !successMetricsAbsent(evidence)) {
-        throw new Error('invalid envelope terminal evidence');
       }
       break;
     case 'invalid-success-evidence':
@@ -920,10 +967,17 @@ export async function checkpointDiagnosticReceipt(filePath, receipt, checkpoint)
     next = { ...receipt, sequence: 1, preflight_complete: true, campaign_elapsed_ms: elapsed };
   } else if (checkpoint.kind === 'attempt') {
     if (!receipt.preflight_complete) throw new Error('preflight checkpoint is required');
+    const reason = checkpoint.reason;
+    if (reason === LEGACY_INVALID_ENVELOPE_REASON) {
+      throw new Error('legacy invalid-envelope reason cannot be checkpointed');
+    }
     const attempt = sanitizeCheckpointAttempt(checkpoint.attempt, receipt.attempts.length + 1);
+    if (attempt.terminal_result && typeof reason !== 'string') {
+      throw new Error('terminal attempt reason is required');
+    }
     const terminal = attempt.terminal_result ? {
       outcome: attempt.terminal_result,
-      reason: checkpoint.reason,
+      reason,
       next_decision: nextDecisionFor(attempt.terminal_result),
     } : null;
     next = {

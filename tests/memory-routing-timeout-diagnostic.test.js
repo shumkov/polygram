@@ -124,6 +124,322 @@ test('U24 diagnostic rejects nonmonotonic, phase-impossible, and nonboolean atte
   assert.equal(classifyDiagnosticEvent({ result: stringPayload }).reason, 'invalid-evidence');
 });
 
+test('U24 maps real Claude envelope failures through the classifier and v1 checkpoint', async () => {
+  const [{ parseClaudeResult }, { loadRoutingFixtures }, { runRoutingCase }, diagnostic] = await Promise.all([
+    import(`${ROOT}/adapters.mjs`),
+    import(`${ROOT}/fixtures.mjs`),
+    import(`${ROOT}/harness.mjs`),
+    diagnosticModule(),
+  ]);
+  const fixtures = loadRoutingFixtures().filter((fixture) => fixture.expected !== 'quarantine');
+  const fixture = fixtures[0];
+  const validEnvelope = {
+    is_error: false,
+    structured_output: fixture.oracleOutput,
+    modelUsage: { 'claude-haiku-exact': {} },
+    duration_ms: 1,
+    duration_api_ms: 1,
+    num_turns: 1,
+  };
+  const mappings = [
+    ['{bad', 'ROUTER_OUTPUT_MALFORMED', 'json-framing', 'invalid-envelope-framing'],
+    [JSON.stringify({ ...validEnvelope, structured_output: null }),
+      'ROUTER_OUTPUT_MISSING', 'output-missing', 'missing-envelope-payload'],
+    [JSON.stringify({ ...validEnvelope, duration_ms: null }),
+      'ROUTER_OUTPUT_MALFORMED', 'duration-metrics-invalid',
+      'invalid-envelope-duration-metrics'],
+    [JSON.stringify({ ...validEnvelope, num_turns: 2 }),
+      'ROUTER_OUTPUT_MALFORMED', 'turn-count-invalid', 'invalid-envelope-turn-count'],
+    [JSON.stringify({ ...validEnvelope, duration_ms: null, num_turns: 2 }),
+      'ROUTER_OUTPUT_MALFORMED', 'duration-and-turn-count-invalid',
+      'invalid-envelope-duration-and-turn-count'],
+  ];
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-envelope-round-trip-'));
+  try {
+    for (const [stdout, errorCode, claudeEnvelopeFailure, reason] of mappings) {
+      const result = await runRoutingCase({
+        fixture,
+        adapter: {
+          id: claudeEnvelopeFailure,
+          async route() {
+            try {
+              return parseClaudeResult(stdout);
+            } catch (error) {
+              Object.defineProperty(error, 'attemptEvidence', {
+                value: diagnosticAttempt({
+                  status: 'operational_error', errorCode, elapsedMs: 10, payloadValid: false,
+                }).attemptEvidence,
+              });
+              throw error;
+            }
+          },
+        },
+      });
+      assert.equal(result.errorCode, errorCode, claudeEnvelopeFailure);
+      assert.equal(result.claudeEnvelopeFailure, claudeEnvelopeFailure, claudeEnvelopeFailure);
+      assert.equal(
+        Object.getOwnPropertyDescriptor(result, 'claudeEnvelopeFailure').enumerable,
+        false,
+        claudeEnvelopeFailure,
+      );
+
+      const decision = diagnostic.classifyDiagnosticEvent({ result });
+      assert.deepEqual(
+        [decision.outcome, decision.reason],
+        ['diagnostic-failure', reason],
+        claudeEnvelopeFailure,
+      );
+      const receiptPath = path.join(root, `${claudeEnvelopeFailure}.json`);
+      let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
+      receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+        kind: 'preflight', campaign_elapsed_ms: 0,
+      });
+      const campaign = await diagnostic.runDiagnosticCampaign({
+        fixtures,
+        activatedAtMs: 0,
+        monotonicNowMs: () => 0,
+        checkBusy: async () => false,
+        routeOnce: async () => result,
+        checkpointAttempt: async (attempt, checkpointDecision) => {
+          receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+            kind: 'attempt',
+            campaign_elapsed_ms: 10,
+            attempt,
+            reason: checkpointDecision.reason,
+          });
+        },
+        checkpointOutOfBand: async () => {
+          assert.fail('a valid envelope mapping must checkpoint as an attempt');
+        },
+      });
+      assert.deepEqual([campaign.outcome, campaign.reason], ['diagnostic-failure', reason]);
+      assert.equal(receipt.schema_version, 'polygram-memory-routing-timeout-diagnostic/v1');
+      assert.equal(receipt.sequence, 2);
+      assert.deepEqual(Object.keys(receipt).sort(), [
+        'attempts',
+        'campaign_elapsed_ms',
+        'out_of_band_terminal_count',
+        'preflight_complete',
+        'schema_version',
+        'sequence',
+        'terminal',
+      ]);
+      assert.deepEqual(Object.keys(receipt.attempts[0]).sort(), [
+        'attempted_call_result',
+        'evidence',
+        'fixture_id',
+        'ordinal',
+        'repetition',
+        'slow_valid',
+        'terminal_result',
+      ]);
+      assert.equal(receipt.terminal.reason, reason);
+      assert.equal(JSON.stringify(receipt).includes('claudeEnvelopeFailure'), false);
+      assert.equal(diagnostic.interpretDiagnosticArtifacts(receipt, validWitness()).reason, reason);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('U24 envelope carrier validation fails closed only at the envelope precedence branch', async () => {
+  const { classifyDiagnosticEvent } = await diagnosticModule();
+  const mappings = new Map([
+    ['ROUTER_OUTPUT_MALFORMED/json-framing', 'invalid-envelope-framing'],
+    ['ROUTER_OUTPUT_MISSING/output-missing', 'missing-envelope-payload'],
+    ['ROUTER_OUTPUT_MALFORMED/duration-metrics-invalid', 'invalid-envelope-duration-metrics'],
+    ['ROUTER_OUTPUT_MALFORMED/turn-count-invalid', 'invalid-envelope-turn-count'],
+    ['ROUTER_OUTPUT_MALFORMED/duration-and-turn-count-invalid',
+      'invalid-envelope-duration-and-turn-count'],
+  ]);
+  const categories = [
+    'json-framing',
+    'output-missing',
+    'duration-metrics-invalid',
+    'turn-count-invalid',
+    'duration-and-turn-count-invalid',
+  ];
+  const carried = (options, value, descriptor = {}) => {
+    const result = diagnosticAttempt({
+      status: 'operational_error', payloadValid: false, ...options,
+    });
+    Object.defineProperty(result, 'claudeEnvelopeFailure', {
+      value,
+      enumerable: false,
+      ...descriptor,
+    });
+    return result;
+  };
+
+  for (const errorCode of ['ROUTER_OUTPUT_MALFORMED', 'ROUTER_OUTPUT_MISSING']) {
+    for (const category of categories) {
+      const expected = mappings.get(`${errorCode}/${category}`) || 'invalid-evidence';
+      assert.equal(
+        classifyDiagnosticEvent({ result: carried({ errorCode }, category) }).reason,
+        expected,
+        `${errorCode}/${category}`,
+      );
+    }
+    assert.equal(classifyDiagnosticEvent({
+      result: diagnosticAttempt({ status: 'operational_error', errorCode, payloadValid: false }),
+    }).reason, 'invalid-evidence', `${errorCode}/missing`);
+  }
+  assert.equal(classifyDiagnosticEvent({
+    result: carried({ errorCode: 'ROUTER_OUTPUT_MALFORMED' }, 'unknown-category'),
+  }).reason, 'invalid-evidence');
+  assert.equal(classifyDiagnosticEvent({
+    result: carried(
+      { errorCode: 'ROUTER_OUTPUT_MALFORMED' },
+      'json-framing',
+      { enumerable: true },
+    ),
+  }).reason, 'invalid-evidence');
+  assert.equal(classifyDiagnosticEvent({
+    result: carried({ errorCode: 'ROUTER_OUTPUT_MALFORMED' }, 7),
+  }).reason, 'invalid-evidence');
+
+  const precedenceCases = [
+    [carried({
+      errorCode: 'ROUTER_TIMEOUT', cleanupConfirmed: false, elapsedMs: 120_000,
+    }, 'json-framing'), 'cleanup-unconfirmed'],
+    [carried({
+      errorCode: 'ROUTER_OUTPUT_TOO_LARGE', stdoutBytes: 'over_limit',
+    }, 'json-framing'), 'stream-over-limit'],
+    [carried({ errorCode: 'ROUTER_PROCESS_EXIT', payloadValid: true }, 'json-framing'),
+      'payload-valid-process-boundary'],
+    [carried({ errorCode: 'ROUTER_PROCESS_EXIT' }, 'json-framing'), 'early-process-exit'],
+    ...['ROUTER_AUTH_UNAVAILABLE', 'ROUTER_CLAUDE_RUNTIME_MISMATCH',
+      'ROUTER_MODEL_IDENTITY', 'ROUTER_TOOL_USE'].map((errorCode) => [
+      carried({ errorCode }, 'json-framing'), 'integrity-failure',
+    ]),
+    [Object.defineProperty(parsedRouterQualityAttempt(), 'claudeEnvelopeFailure', {
+      value: 'json-framing',
+    }), 'router-quality-failure'],
+  ];
+  for (const [result, reason] of precedenceCases) {
+    assert.equal(classifyDiagnosticEvent({ result }).reason, reason, result.errorCode);
+  }
+
+  const accepted = diagnosticAttempt();
+  Object.defineProperty(accepted, 'claudeEnvelopeFailure', { value: 'json-framing' });
+  assert.equal(classifyDiagnosticEvent({ result: accepted }).reason, 'fast-valid');
+});
+
+test('U24 keeps legacy broad v1 receipts readable but rejects broad fresh checkpoints', async () => {
+  const diagnostic = await diagnosticModule();
+  const cleanEnvelopeEvidence = diagnosticAttempt({
+    status: 'operational_error',
+    errorCode: 'ROUTER_OUTPUT_MALFORMED',
+    elapsedMs: 10,
+    payloadValid: false,
+  }).attemptEvidence;
+  const legacyReceipt = {
+    schema_version: 'polygram-memory-routing-timeout-diagnostic/v1',
+    sequence: 2,
+    preflight_complete: true,
+    campaign_elapsed_ms: 10,
+    attempts: [{
+      fixture_id: 'work-01',
+      repetition: 1,
+      ordinal: 1,
+      evidence: cleanEnvelopeEvidence,
+      slow_valid: false,
+      attempted_call_result: 'diagnostic-failure',
+      terminal_result: 'diagnostic-failure',
+    }],
+    terminal: {
+      outcome: 'diagnostic-failure',
+      reason: 'invalid-envelope',
+      next_decision: 'fix-review-and-rerun-changed-diagnostic',
+    },
+    out_of_band_terminal_count: 0,
+  };
+  const before = JSON.stringify(legacyReceipt);
+  assert.equal(
+    diagnostic.interpretDiagnosticArtifacts(legacyReceipt, validWitness()).reason,
+    'invalid-envelope',
+  );
+  assert.equal(JSON.stringify(legacyReceipt), before);
+
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-envelope-checkpoint-'));
+  try {
+    const initializedReceipt = async (name) => {
+      const receiptPath = path.join(root, `${name}.json`);
+      let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
+      receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+        kind: 'preflight', campaign_elapsed_ms: 0,
+      });
+      return { receiptPath, receipt };
+    };
+    const checkpoint = (reason, evidence) => ({
+      kind: 'attempt',
+      campaign_elapsed_ms: 10,
+      reason,
+      attempt: {
+        fixture_id: 'work-01',
+        repetition: 1,
+        ordinal: 1,
+        evidence,
+        slow_valid: false,
+        attempted_call_result: 'diagnostic-failure',
+        terminal_result: 'diagnostic-failure',
+      },
+    });
+
+    const broad = await initializedReceipt('broad');
+    await assert.rejects(
+      diagnostic.checkpointDiagnosticReceipt(
+        broad.receiptPath,
+        broad.receipt,
+        checkpoint('invalid-envelope', cleanEnvelopeEvidence),
+      ),
+      /invalid-envelope|legacy|checkpoint/,
+    );
+
+    const stateful = await initializedReceipt('stateful');
+    const statefulCheckpoint = checkpoint('invalid-envelope-framing', cleanEnvelopeEvidence);
+    let reasonReads = 0;
+    Object.defineProperty(statefulCheckpoint, 'reason', {
+      enumerable: true,
+      get() {
+        reasonReads += 1;
+        return reasonReads === 1 ? 'invalid-envelope-framing' : 'invalid-envelope';
+      },
+    });
+    const statefulResult = await diagnostic.checkpointDiagnosticReceipt(
+      stateful.receiptPath,
+      stateful.receipt,
+      statefulCheckpoint,
+    );
+    assert.equal(reasonReads, 1);
+    assert.equal(statefulResult.terminal.reason, 'invalid-envelope-framing');
+    assert.equal(
+      JSON.parse(await readFile(stateful.receiptPath, 'utf8')).terminal.reason,
+      'invalid-envelope-framing',
+    );
+
+    for (const reason of [
+      'invalid-envelope-framing',
+      'missing-envelope-payload',
+      'invalid-envelope-duration-metrics',
+      'invalid-envelope-turn-count',
+      'invalid-envelope-duration-and-turn-count',
+    ]) {
+      await assert.rejects(
+        diagnostic.checkpointDiagnosticReceipt(
+          broad.receiptPath,
+          broad.receipt,
+          checkpoint(reason, diagnosticAttempt({ elapsedMs: 10 }).attemptEvidence),
+        ),
+        /envelope|terminal|attempt evidence/,
+        reason,
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('U24 diagnostic checkpoints missing attempt evidence as an out-of-band failure', async () => {
   const [{ loadRoutingFixtures }, diagnostic] = await Promise.all([
     import(`${ROOT}/fixtures.mjs`),

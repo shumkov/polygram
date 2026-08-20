@@ -30,6 +30,13 @@ const CLOSED_ERROR_CODES = new Set([
   'ROUTER_MODEL_IDENTITY',
   'ROUTER_GATE_FAILURE',
 ]);
+const CLAUDE_ENVELOPE_FAILURE_CODES = Object.freeze({
+  'json-framing': 'ROUTER_OUTPUT_MALFORMED',
+  'output-missing': 'ROUTER_OUTPUT_MISSING',
+  'duration-metrics-invalid': 'ROUTER_OUTPUT_MALFORMED',
+  'turn-count-invalid': 'ROUTER_OUTPUT_MALFORMED',
+  'duration-and-turn-count-invalid': 'ROUTER_OUTPUT_MALFORMED',
+});
 const OBSERVED_MODEL_RE = /^claude-[a-z0-9-]+$/;
 const ATTEMPT_PHASES = new Set([
   'starting',
@@ -116,6 +123,17 @@ function safeObservedModels(response) {
 function responseEvidence(response) {
   const observedModels = safeObservedModels(response);
   return observedModels.length > 0 ? { observedModels } : {};
+}
+
+function withClaudeEnvelopeFailure(result, response, errorCode) {
+  const descriptor = response && typeof response === 'object'
+    ? Object.getOwnPropertyDescriptor(response, 'claudeEnvelopeFailure')
+    : null;
+  const claudeEnvelopeFailure = descriptor?.enumerable === false ? descriptor.value : null;
+  if (typeof claudeEnvelopeFailure !== 'string'
+      || CLAUDE_ENVELOPE_FAILURE_CODES[claudeEnvelopeFailure] !== errorCode) return result;
+  Object.defineProperty(result, 'claudeEnvelopeFailure', { value: claudeEnvelopeFailure });
+  return result;
 }
 
 function modelIdentityResolved(adapter, response, observedModels) {
@@ -237,11 +255,11 @@ export async function runRoutingCase({ fixture, adapter }) {
       ...evidence,
       ...safeAttemptEvidence,
     };
-    if (!error?.diagnostics) return result;
-    return {
+    const safeResult = !error?.diagnostics ? result : {
       ...result,
       diagnostics: sanitizeProcessDiagnostics(error.diagnostics),
     };
+    return withClaudeEnvelopeFailure(safeResult, error, errorCode);
   }
   const evidence = responseEvidence(response);
   const observedModels = evidence.observedModels || [];

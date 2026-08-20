@@ -1011,6 +1011,245 @@ test('U24 Claude envelope exposes one observed model and rejects API/auth errors
   })), /ROUTER_AUTH_UNAVAILABLE/);
 });
 
+test('U24 classifies only five Claude envelope failure shapes without changing public errors', async () => {
+  const { adapters } = await modules();
+  const validEnvelope = {
+    is_error: false,
+    structured_output: { category: 'work', parts: [{ kind: 'work', text: 'Fact.' }] },
+    modelUsage: { 'claude-haiku-example': {} },
+    duration_ms: 1,
+    duration_api_ms: 1,
+    num_turns: 1,
+  };
+  const failureFor = (stdout) => {
+    let failure;
+    assert.throws(() => adapters.parseClaudeResult(stdout), (error) => {
+      failure = error;
+      return true;
+    });
+    return failure;
+  };
+  const assertFailure = (stdout, code, claudeEnvelopeFailure, observedModels, label) => {
+    const failure = failureFor(stdout);
+    assert.equal(failure.code, code, label);
+    assert.equal(failure.claudeEnvelopeFailure, claudeEnvelopeFailure, label);
+    assert.equal(Object.getOwnPropertyDescriptor(failure, 'claudeEnvelopeFailure').enumerable, false, label);
+    assert.equal(Object.keys(failure).includes('claudeEnvelopeFailure'), false, label);
+    assert.equal(JSON.stringify(failure).includes('claudeEnvelopeFailure'), false, label);
+    if (observedModels === undefined) {
+      assert.equal(Object.hasOwn(failure, 'observedModels'), false, label);
+    } else {
+      assert.deepEqual(failure.observedModels, observedModels, label);
+    }
+  };
+  const validJson = JSON.stringify(validEnvelope);
+  const framing = [
+    ['invalid', '{bad'],
+    ['incomplete', '{"is_error":false'],
+    ['multiple values', `${validJson}{}`],
+    ['trailing bytes', `${validJson} trailing`],
+    ['raw NaN token', validJson.replace('"duration_ms":1', '"duration_ms":NaN')],
+    ['raw Infinity token', validJson.replace('"duration_ms":1', '"duration_ms":Infinity')],
+  ];
+  for (const [label, stdout] of framing) {
+    assertFailure(stdout, 'ROUTER_OUTPUT_MALFORMED', 'json-framing', undefined, label);
+  }
+
+  for (const [label, missingOutput] of [
+    ['no output fields', { ...validEnvelope, structured_output: null }],
+    ['wrong output field types', { ...validEnvelope, structured_output: 'not-an-object', result: null }],
+  ]) {
+    assertFailure(
+      JSON.stringify(missingOutput),
+      'ROUTER_OUTPUT_MISSING',
+      'output-missing',
+      ['claude-haiku-example'],
+      label,
+    );
+  }
+
+  for (const field of ['duration_ms', 'duration_api_ms']) {
+    for (const value of [undefined, null, '1', 0.5, -1, 120_001]) {
+      assertFailure(
+        JSON.stringify({ ...validEnvelope, [field]: value }),
+        'ROUTER_OUTPUT_MALFORMED',
+        'duration-metrics-invalid',
+        ['claude-haiku-example'],
+        `${field}=${String(value)}`,
+      );
+    }
+  }
+
+  for (const numTurns of [undefined, null, '1', 0, 1.5, 2]) {
+    assertFailure(
+      JSON.stringify({ ...validEnvelope, num_turns: numTurns }),
+      'ROUTER_OUTPUT_MALFORMED',
+      'turn-count-invalid',
+      ['claude-haiku-example'],
+      `num_turns=${String(numTurns)}`,
+    );
+  }
+  assertFailure(
+    JSON.stringify({ ...validEnvelope, duration_ms: -1, num_turns: 2 }),
+    'ROUTER_OUTPUT_MALFORMED',
+    'duration-and-turn-count-invalid',
+    ['claude-haiku-example'],
+    'duration and turn count',
+  );
+
+  const emptyResult = adapters.parseClaudeResult(JSON.stringify({
+    ...validEnvelope,
+    structured_output: null,
+    result: '',
+  }));
+  assert.equal(emptyResult.raw, '');
+  assert.deepEqual(emptyResult.observedModels, ['claude-haiku-example']);
+  assert.equal(Object.hasOwn(emptyResult, 'claudeEnvelopeFailure'), false);
+
+  const accepted = adapters.parseClaudeResult(validJson);
+  assert.deepEqual(accepted, {
+    raw: '{"category":"work","parts":[{"kind":"work","text":"Fact."}]}',
+    observedModels: ['claude-haiku-example'],
+  });
+  assert.deepEqual(Object.keys(accepted), ['raw', 'observedModels']);
+  assert.equal(Object.hasOwn(accepted, 'claudeEnvelopeFailure'), false);
+
+  const authFailure = failureFor(JSON.stringify({
+    ...validEnvelope,
+    is_error: true,
+    result: 'provider content must not escape',
+  }));
+  assert.equal(authFailure.code, 'ROUTER_AUTH_UNAVAILABLE');
+  assert.equal(Object.hasOwn(authFailure, 'claudeEnvelopeFailure'), false);
+});
+
+test('U24 carries only an allowlisted non-enumerable envelope failure through runRoutingCase', async () => {
+  const { adapters, fixtures, harness } = await modules();
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
+  const baseEnvelope = {
+    is_error: false,
+    structured_output: fixture.oracleOutput,
+    modelUsage: { 'claude-haiku-exact': {} },
+    duration_ms: 1,
+    duration_api_ms: 1,
+    num_turns: 1,
+  };
+  const cases = [
+    ['{bad', 'ROUTER_OUTPUT_MALFORMED', 'json-framing'],
+    [JSON.stringify({ ...baseEnvelope, structured_output: null }), 'ROUTER_OUTPUT_MISSING', 'output-missing'],
+    [JSON.stringify({ ...baseEnvelope, duration_ms: null }), 'ROUTER_OUTPUT_MALFORMED', 'duration-metrics-invalid'],
+    [JSON.stringify({ ...baseEnvelope, num_turns: 2 }), 'ROUTER_OUTPUT_MALFORMED', 'turn-count-invalid'],
+    [JSON.stringify({ ...baseEnvelope, duration_ms: -1, num_turns: 2 }), 'ROUTER_OUTPUT_MALFORMED', 'duration-and-turn-count-invalid'],
+  ];
+
+  for (const [stdout, errorCode, claudeEnvelopeFailure] of cases) {
+    const result = await harness.runRoutingCase({
+      fixture,
+      adapter: {
+        id: claudeEnvelopeFailure,
+        async route() {
+          try {
+            return adapters.parseClaudeResult(stdout);
+          } catch (error) {
+            error.untrustedResponse = 'raw provider content';
+            error.arbitrary = { identifier: 'must-not-survive' };
+            throw error;
+          }
+        },
+      },
+    });
+    assert.equal(result.status, 'operational_error', claudeEnvelopeFailure);
+    assert.equal(result.errorCode, errorCode, claudeEnvelopeFailure);
+    assert.equal(result.claudeEnvelopeFailure, claudeEnvelopeFailure, claudeEnvelopeFailure);
+    assert.equal(Object.getOwnPropertyDescriptor(result, 'claudeEnvelopeFailure').enumerable, false);
+    assert.equal(Object.keys(result).includes('claudeEnvelopeFailure'), false);
+    assert.equal(Object.hasOwn({ ...result }, 'claudeEnvelopeFailure'), false);
+    assert.equal(JSON.stringify(result).includes('claudeEnvelopeFailure'), false);
+    assert.equal(JSON.stringify(result).includes('raw provider content'), false);
+    assert.equal(JSON.stringify(result).includes('must-not-survive'), false);
+    assert.equal(Object.hasOwn(result.attemptEvidence || {}, 'claudeEnvelopeFailure'), false);
+  }
+
+  for (const [code, claudeEnvelopeFailure] of [
+    ['ROUTER_OUTPUT_MALFORMED', undefined],
+    ['ROUTER_OUTPUT_MALFORMED', 'output-missing'],
+    ['ROUTER_OUTPUT_MISSING', 'json-framing'],
+    ['ROUTER_OUTPUT_SCHEMA', 'json-framing'],
+    ['ROUTER_OUTPUT_MALFORMED', 'provider-supplied-value'],
+  ]) {
+    const result = await harness.runRoutingCase({
+      fixture,
+      adapter: {
+        id: 'untrusted-envelope-failure',
+        async route() {
+          const error = Object.assign(new Error('raw provider content'), {
+            code,
+            secret: 'must-not-survive',
+          });
+          if (claudeEnvelopeFailure !== undefined) {
+            Object.defineProperty(error, 'claudeEnvelopeFailure', { value: claudeEnvelopeFailure });
+          }
+          throw error;
+        },
+      },
+    });
+    assert.equal(Object.hasOwn(result, 'claudeEnvelopeFailure'), false, `${code}/${claudeEnvelopeFailure}`);
+    assert.equal(JSON.stringify(result).includes('raw provider content'), false);
+    assert.equal(JSON.stringify(result).includes('must-not-survive'), false);
+  }
+
+  const accepted = await harness.runRoutingCase({
+    fixture,
+    adapter: {
+      id: 'accepted-envelope',
+      route: async () => adapters.parseClaudeResult(JSON.stringify(baseEnvelope)),
+    },
+  });
+  const expectedAccepted = {
+    fixtureId: fixture.id,
+    expected: fixture.expected,
+    status: 'accepted',
+    category: 'work',
+    partKinds: ['work'],
+    projection: {
+      queueForRetry: false,
+      writes: [{ kind: 'work', destinations: ['own_private', 'general'] }],
+    },
+    observedModels: ['claude-haiku-exact'],
+  };
+  assert.deepEqual(accepted, expectedAccepted);
+  assert.equal(JSON.stringify(accepted), JSON.stringify(expectedAccepted));
+  assert.equal(Object.hasOwn(accepted, 'claudeEnvelopeFailure'), false);
+
+  let calls = 0;
+  const retried = await harness.runRoutingCaseWithRetry({
+    fixture,
+    adapter: {
+      id: 'classified-retry',
+      async route() {
+        calls += 1;
+        return adapters.parseClaudeResult('{bad');
+      },
+    },
+  });
+  assert.equal(calls, 2);
+  assert.equal(retried.errorCode, 'ROUTER_OUTPUT_MALFORMED');
+  assert.equal(retried.attemptCount, 2);
+  assert.equal(Object.hasOwn(retried, 'claudeEnvelopeFailure'), false);
+  assert.equal(Object.hasOwn(retried.firstAttempt, 'claudeEnvelopeFailure'), false);
+  assert.equal(JSON.stringify(retried).includes('claudeEnvelopeFailure'), false);
+
+  const summary = await harness.runRoutingEvaluation({
+    fixtures: [fixture],
+    adapters: [{
+      id: 'classified-summary',
+      route: async () => adapters.parseClaudeResult('{bad'),
+    }],
+    repetitions: 1,
+  });
+  assert.equal(JSON.stringify(summary).includes('claudeEnvelopeFailure'), false);
+});
+
 test('U24 runner requires explicit absolute pinned binaries, receipt, and bounded mode', async () => {
   const { runner } = await modules();
   assert.deepEqual(runner.parseArgs([
@@ -1256,6 +1495,65 @@ test('U24 keeps an incremental JSON candidate as phase evidence but rejects trai
       assert.equal(Number.isInteger(result.attemptEvidence.stdout_end_ms), true, name);
       assert.equal(result.attemptEvidence.payload_valid, false, name);
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('U24 keeps a process failure primary when recovery parsing finds a classified envelope fault', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const { adapters, fixtures, harness } = await modules();
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-envelope-precedence-test-'));
+  const fixture = fixtures.loadRoutingFixtures().find((row) => row.family === 'work');
+  const output = JSON.stringify({
+    is_error: false,
+    structured_output: fixture.oracleOutput,
+    modelUsage: { 'claude-haiku-exact': {} },
+    duration_ms: -1,
+    duration_api_ms: 1,
+    num_turns: 1,
+  });
+  try {
+    const processFailureBinary = await writeFakeClaude(root, 'process-failure', [
+      `process.stdout.write(${JSON.stringify(output)});`,
+      'process.exitCode = 7;',
+    ].join('\n'));
+    const processFailure = await harness.runRoutingCase({
+      fixture,
+      adapter: adapters.createClaudeAdapter({
+        binary: processFailureBinary,
+        expectedObservedModel: 'claude-haiku-exact',
+        timeoutMs: 5_000,
+        tempRoot: root,
+      }),
+    });
+    assert.equal(processFailure.errorCode, 'ROUTER_PROCESS_EXIT');
+    assert.equal(processFailure.diagnostics.exitCode, 7);
+    assert.equal(processFailure.diagnostics.cleanupConfirmed, true);
+    assert.equal(processFailure.attemptEvidence.payload_valid, false);
+    assert.equal(Object.hasOwn(processFailure, 'claudeEnvelopeFailure'), false);
+
+    const cleanCloseBinary = await writeFakeClaude(
+      root,
+      'clean-close',
+      `process.stdout.write(${JSON.stringify(output)});`,
+    );
+    const cleanClose = await harness.runRoutingCase({
+      fixture,
+      adapter: adapters.createClaudeAdapter({
+        binary: cleanCloseBinary,
+        expectedObservedModel: 'claude-haiku-exact',
+        timeoutMs: 5_000,
+        tempRoot: root,
+      }),
+    });
+    assert.equal(cleanClose.errorCode, 'ROUTER_OUTPUT_MALFORMED');
+    assert.equal(cleanClose.claudeEnvelopeFailure, 'duration-metrics-invalid');
+    assert.equal(Object.getOwnPropertyDescriptor(cleanClose, 'claudeEnvelopeFailure').enumerable, false);
+    assert.equal(cleanClose.attemptEvidence.payload_valid, false);
+    assert.equal(Object.hasOwn(cleanClose.attemptEvidence, 'claudeEnvelopeFailure'), false);
+    assert.equal(JSON.stringify(cleanClose).includes('claudeEnvelopeFailure'), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

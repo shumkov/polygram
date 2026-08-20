@@ -742,7 +742,7 @@ are new prerequisites or gates and do not renumber existing units.
 
 ### U24. Narrow routing/auth boundary spike (blocker)
 
-- **Status (2026-08-18):** Before the retry amendment, the reviewed Node 24
+- **Status (2026-08-20):** Before the retry amendment, the reviewed Node 24
   harness and adjacent secret/memory tests passed 127/127. After the amendment,
   the focused suite passed 28/28 and the adjacent six-file suite passed 92/92.
   The deterministic single-retry amendment is implemented, red-to-green
@@ -753,9 +753,17 @@ are new prerequisites or gates and do not renumber existing units.
   recovered retries, and two confirmed-cleanup timeout retries exhausted.
   Exact model identity, projection/arithmetic checks, and 20/20 injected fault
   outcomes passed. U24 remains blocked by operational timeout/process-boundary
-  reliability, not a privacy or model-identity failure. Do not rerun the
-  unchanged gate in hope of a stochastic pass; the next decision is a separate
-  narrow characterization of the timeout/process boundary and router choice.
+  reliability, not a privacy or model-identity failure. The reviewed follow-up
+  timeout characterization then ran once from exact commit `d37de69` and
+  stopped safely after its first 7.3-second call with
+  `diagnostic-failure / invalid-envelope`. Process close, transient-unit
+  inactivity, empty cgroup, durable checkpointing, and scratch cleanup were
+  all confirmed. Its content-free receipt proves that one JSON candidate was
+  observed, but cannot distinguish invalid/trailing JSON from a valid envelope
+  whose required duration or turn-count fields failed the diagnostic contract.
+  Do not rerun either unchanged gate. U24 remains blocked while a reviewed
+  amendment adds a closed envelope-failure category and reruns only the changed
+  diagnostic.
 - **Goal:** Decide whether the smallest successor to U22 is safe enough to
   implement: unchanged native extraction followed by a separate narrow
   personal-sensitivity routing/splitting pass.

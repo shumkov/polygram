@@ -2,8 +2,9 @@
 
 Date: 2026-08-18  
 Status: the reviewed single-retry implementation and VPS shape gate passed;
-the one authorized full VPS gate stopped on two exhausted process timeouts, so
-U24 remains blocked.
+the one authorized full VPS gate stopped on two exhausted process timeouts,
+and the follow-up timeout characterization stopped safely on its first call
+with an ambiguous invalid-envelope result. U24 remains blocked.
 
 ## Decision
 
@@ -164,3 +165,45 @@ the unchanged gate in hope that it happens to pass. The next decision is a
 separate, narrow characterization of the timeouts/process boundary and router
 choice; it is not part of this evidence run. A finite passing fixture would
 still leave residual semantic-miss risk as an explicit rollout decision.
+
+## VPS timeout-characterization evidence
+
+On 2026-08-20, the separately reviewed timeout diagnostic ran once from exact
+commit `d37de69d4198218bb0fac80432f7855ac0c43fa9`. It used Claude CLI
+`2.1.220`, exact model `claude-haiku-4-5-20251001`, the verified transient
+systemd user-service boundary, and fresh mode-0600 evidence paths. Both
+Polygram bots were idle before launch; the runner retained its per-call busy
+gate.
+
+The campaign stopped after its first ordinary call:
+
+```text
+primary outcome        diagnostic-failure
+reason                 invalid-envelope
+fixture / repetition   work-01 / 1
+attempts               1
+elapsed                7,311 ms
+stdout / stderr        1,608 / 0 bytes
+JSON candidate         observed at 6,670 ms
+process close          confirmed at 7,311 ms
+payload valid          false
+unit inactive          true
+cgroup empty           true
+scratch cleanup        confirmed
+```
+
+The durable receipt SHA-256 is
+`95bef22ccb268eb3cde5b9250c58a719433e6013b5cb1a595cab70e6b690c4a7`;
+the unit-witness SHA-256 is
+`44d8f58c715b6f20f8a67697e79b508e9b70485dc298a54b49d85083dc49f317`.
+The receipt and witness contain no prompt, result body, stderr, path, unit
+name, PID, or source-derived digest.
+
+This is diagnostic evidence, not a routing-quality, privacy, timeout, or
+process-cleanup failure. The current content-free evidence cannot distinguish
+invalid/trailing JSON from a structurally valid Claude envelope whose required
+duration or turn-count fields failed the diagnostic contract. Per the reviewed
+one-campaign rule, do not rerun the unchanged diagnostic. The next step is to
+add a closed, content-free envelope-failure category, review that change, and
+only then authorize a changed diagnostic run. No release or memory-feature
+enablement follows from this result.

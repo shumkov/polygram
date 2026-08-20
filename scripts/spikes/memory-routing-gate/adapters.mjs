@@ -12,6 +12,13 @@ const MAX_CLAUDE_DURATION_MS = 120_000;
 const MAX_STDOUT_BYTES = 1_000_000;
 const MAX_STDERR_BYTES = 256_000;
 const OVER_LIMIT = 'over_limit';
+const CLAUDE_ENVELOPE_FAILURE = Object.freeze({
+  JSON_FRAMING: 'json-framing',
+  OUTPUT_MISSING: 'output-missing',
+  DURATION_METRICS_INVALID: 'duration-metrics-invalid',
+  TURN_COUNT_INVALID: 'turn-count-invalid',
+  DURATION_AND_TURN_COUNT_INVALID: 'duration-and-turn-count-invalid',
+});
 const SAFE_ENV_KEYS = new Set([
   'HOME', 'USER', 'LOGNAME', 'PATH', 'SHELL',
   'TMPDIR', 'TMP', 'TEMP', 'LANG',
@@ -306,28 +313,48 @@ export function inspectCodexAuth(binary) {
 }
 
 export function sanitizeClaudeMetrics(envelope = {}) {
+  return claudeMetricValidation(envelope).claudeMetrics;
+}
+
+function claudeMetricValidation(envelope = {}) {
   const boundedDuration = (value) => (
     Number.isInteger(value) && value >= 0 && value <= MAX_CLAUDE_DURATION_MS ? value : null
   );
   const durationMs = boundedDuration(envelope.duration_ms);
   const durationApiMs = boundedDuration(envelope.duration_api_ms);
-  if (durationMs === null || durationApiMs === null || envelope.num_turns !== 1) return null;
+  const durationMetricsValid = durationMs !== null && durationApiMs !== null;
+  const turnCountValid = envelope.num_turns === 1;
   return {
-    duration_ms: durationMs,
-    duration_api_ms: durationApiMs,
-    num_turns: 1,
+    durationMetricsValid,
+    turnCountValid,
+    claudeMetrics: durationMetricsValid && turnCountValid ? {
+      duration_ms: durationMs,
+      duration_api_ms: durationApiMs,
+      num_turns: 1,
+    } : null,
   };
+}
+
+function withClaudeEnvelopeFailure(error, claudeEnvelopeFailure) {
+  Object.defineProperty(error, 'claudeEnvelopeFailure', { value: claudeEnvelopeFailure });
+  return error;
 }
 
 export function parseClaudeResult(stdout) {
   let envelope;
   try { envelope = JSON.parse(stdout); } catch {
-    throw Object.assign(new Error('ROUTER_OUTPUT_MALFORMED'), { code: 'ROUTER_OUTPUT_MALFORMED' });
+    throw withClaudeEnvelopeFailure(
+      Object.assign(new Error('ROUTER_OUTPUT_MALFORMED'), { code: 'ROUTER_OUTPUT_MALFORMED' }),
+      CLAUDE_ENVELOPE_FAILURE.JSON_FRAMING,
+    );
   }
   const observedModels = envelope?.modelUsage && typeof envelope.modelUsage === 'object'
     ? Object.keys(envelope.modelUsage).sort()
     : [];
   const envelopeError = (code) => Object.assign(new Error(code), { code, observedModels });
+  const envelopeFailure = (code, failure) => withClaudeEnvelopeFailure(
+    envelopeError(code), failure,
+  );
   if (envelope?.is_error === true || envelope?.terminal_reason === 'api_error') {
     throw envelopeError('ROUTER_AUTH_UNAVAILABLE');
   }
@@ -337,10 +364,18 @@ export function parseClaudeResult(stdout) {
   } else if (typeof envelope?.result === 'string') {
     raw = envelope.result;
   } else {
-    throw envelopeError('ROUTER_OUTPUT_MISSING');
+    throw envelopeFailure('ROUTER_OUTPUT_MISSING', CLAUDE_ENVELOPE_FAILURE.OUTPUT_MISSING);
   }
-  const claudeMetrics = sanitizeClaudeMetrics(envelope);
-  if (!claudeMetrics) throw envelopeError('ROUTER_OUTPUT_MALFORMED');
+  const metrics = claudeMetricValidation(envelope);
+  if (!metrics.durationMetricsValid || !metrics.turnCountValid) {
+    const failure = !metrics.durationMetricsValid && !metrics.turnCountValid
+      ? CLAUDE_ENVELOPE_FAILURE.DURATION_AND_TURN_COUNT_INVALID
+      : !metrics.durationMetricsValid
+        ? CLAUDE_ENVELOPE_FAILURE.DURATION_METRICS_INVALID
+        : CLAUDE_ENVELOPE_FAILURE.TURN_COUNT_INVALID;
+    throw envelopeFailure('ROUTER_OUTPUT_MALFORMED', failure);
+  }
+  const { claudeMetrics } = metrics;
   const result = { raw, observedModels };
   Object.defineProperty(result, 'claudeMetrics', { value: claudeMetrics });
   return result;
