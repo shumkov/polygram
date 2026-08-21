@@ -121,6 +121,18 @@ attempt-checkpoint failures after launch are `true`. Historical v1 receipts
 remain read-only and retain their legacy reason-based interpretation. A nonterminal
 receipt or any unconfirmed close/cgroup cleanup is interpreted as
 `diagnostic-failure` without rewriting the preserved receipt.
+
+Every newly written v2 attempt has the exact content-free fields
+`router_quality_code` and `router_quality_observed_category`, normally `null`.
+Only the terminal `router-quality-failure` attempt may carry one of the ten
+closed router-quality codes; only `ROUTER_EXPECTATION_MISMATCH` carries an
+observed `work`, `personal`, or `mixed` category. Ordinary in-memory campaign
+results omit both fields. The launcher reports the discriminator only after it
+reopens and validates the receipt with the unit witness, and the launch command
+returns it only after the final evidence copy and hashes succeed. Earlier v2
+working receipts were internal, undeployed spike artifacts and are not migrated;
+their committed findings and hashes remain the historical record.
+
 If post-run runtime verification and artifact reopening both fail, the already
 established local unit witness preserves `integrity-failure` after confirmed
 cleanup or `cleanup-unconfirmed` otherwise; accounting remains unavailable.

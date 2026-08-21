@@ -289,7 +289,61 @@ function parsedRouterQualityAttempt({ elapsedMs = 10, numTurns = 1 } = {}) {
     duration_api_ms: Math.min(elapsedMs, 120_000),
     num_turns: numTurns,
   });
-  return result;
+  return { ...result, fixtureId: 'work-01', expected: 'work' };
+}
+
+function routerQualityResult(fixture, errorCode, category, extra = {}) {
+  return {
+    ...parsedRouterQualityAttempt(),
+    fixtureId: fixture.id,
+    expected: fixture.expected,
+    status: errorCode === 'ROUTER_EXPECTATION_MISMATCH' ? 'mismatch' : 'operational_error',
+    errorCode,
+    ...(category === undefined ? {} : { category }),
+    ...extra,
+  };
+}
+
+async function runRouterQualityRoundTrip(options) {
+  const {
+    diagnostic, fixtures, root, name, errorCode, category, extraResult, targetOrdinal = 1,
+  } = options;
+  const receiptPath = path.join(root, `${name}-receipt.json`);
+  const witnessPath = path.join(root, `${name}-unit-witness.json`);
+  let receipt = await diagnostic.createDiagnosticReceipt(receiptPath);
+  receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+    kind: 'preflight', campaign_elapsed_ms: 0,
+  });
+  let calls = 0;
+  const campaign = await diagnostic.runDiagnosticCampaign({
+    fixtures,
+    activatedAtMs: 0,
+    monotonicNowMs: () => 0,
+    checkBusy: async () => false,
+    routeOnce: async ({ fixture, callOrdinal }) => {
+      calls += 1;
+      return callOrdinal === targetOrdinal
+        ? routerQualityResult(fixture, errorCode, category, extraResult)
+        : diagnosticAttempt();
+    },
+    checkpointAttempt: async (attempt, decision) => {
+      receipt = await diagnostic.checkpointDiagnosticReceipt(receiptPath, receipt, {
+        kind: 'attempt', campaign_elapsed_ms: attempt.ordinal, reason: decision.reason, attempt,
+      });
+    },
+    checkpointOutOfBand: async () => {},
+  });
+  await diagnostic.createUnitWitness(witnessPath, {
+    inactive: true, cgroup_empty: true, detached_child_removed: true,
+    receipt_checkpoint_confirmed: true,
+  });
+  const artifacts = await diagnostic.readDiagnosticArtifacts(receiptPath, witnessPath);
+  return {
+    calls,
+    campaign,
+    receipt: artifacts.receipt,
+    interpreted: diagnostic.interpretDiagnosticArtifacts(artifacts.receipt, artifacts.unitWitness),
+  };
 }
 
 test('U24 diagnostic rejects nonmonotonic, phase-impossible, and nonboolean attempt evidence', async () => {
@@ -479,6 +533,8 @@ test('U24 maps real Claude envelope failures through the classifier and v2 check
         'fixture_id',
         'ordinal',
         'repetition',
+        'router_quality_code',
+        'router_quality_observed_category',
         'slow_valid',
         'terminal_result',
       ]);
@@ -818,6 +874,9 @@ test('U24 reopens every v1 envelope discriminator without inventing turn evidenc
       slow_valid: false,
       attempted_call_result: 'diagnostic-failure',
       terminal_result: 'diagnostic-failure',
+      ...(schemaVersion === 'polygram-memory-routing-timeout-diagnostic/v2'
+        ? { router_quality_code: null, router_quality_observed_category: null }
+        : {}),
     }],
     terminal: {
       outcome: 'diagnostic-failure',
@@ -1360,6 +1419,8 @@ test('U24 derives exact and ranged outer-invocation accounting from validated v2
           slow_valid: false,
           attempted_call_result: qualityDecision.outcome,
           terminal_result: qualityDecision.outcome,
+          router_quality_code: 'ROUTER_OUTPUT_SECRET',
+          router_quality_observed_category: null,
         },
       },
     );
@@ -1442,6 +1503,8 @@ test('U24 derives exact and ranged outer-invocation accounting from validated v2
           slow_valid: false,
           attempted_call_result: terminal ? 'inconclusive' : 'valid',
           terminal_result: terminal ? 'inconclusive' : null,
+          router_quality_code: null,
+          router_quality_observed_category: null,
         };
       }),
       terminal: {
@@ -1506,6 +1569,8 @@ test('U24 fails closed when individually valid turn evidence overflows aggregate
       slow_valid: false,
       attempted_call_result: 'valid',
       terminal_result: null,
+      router_quality_code: null,
+      router_quality_observed_category: null,
     })),
     terminal: null,
     out_of_band_terminal_count: 0,
@@ -1645,6 +1710,8 @@ test('U24 launcher preserves failure precedence while using reopened accounting'
       slow_valid: false,
       attempted_call_result: 'valid',
       terminal_result: null,
+      router_quality_code: null,
+      router_quality_observed_category: null,
     }],
     terminal: null,
     out_of_band_terminal_count: 0,
@@ -1799,6 +1866,8 @@ test('U24 interpreter accepts only launcher-derived primary failure reasons', as
       slow_valid: false,
       attempted_call_result: 'valid',
       terminal_result: null,
+      router_quality_code: null,
+      router_quality_observed_category: null,
     }],
     terminal: null,
     out_of_band_terminal_count: 0,
@@ -2481,7 +2550,12 @@ test('U24 timeout diagnostic implements all precedence rows and next decisions',
     [{ productionBusy: true }, 'inconclusive'],
     [{ result: diagnosticAttempt({ status: 'operational_error', errorCode: 'ROUTER_OUTPUT_TOO_LARGE', stdoutBytes: 'over_limit' }) }, 'diagnostic-failure'],
     [{ result: diagnosticAttempt({ status: 'operational_error', errorCode: 'ROUTER_PROCESS_EXIT', payloadValid: true }) }, 'process-boundary-fault'],
-    [{ result: { ...parsedRouterQualityAttempt(), status: 'mismatch', errorCode: 'ROUTER_EXPECTATION_MISMATCH' } }, 'router-quality-failure'],
+    [{ result: {
+      ...parsedRouterQualityAttempt(),
+      status: 'mismatch',
+      errorCode: 'ROUTER_EXPECTATION_MISMATCH',
+      category: 'personal',
+    } }, 'router-quality-failure'],
     [{ result: closedProcessAttempt({ afterInput: true }) }, 'route-unsuitable-at-diagnostic-ceiling'],
     [{ result: closedProcessAttempt({ afterInput: false }) }, 'diagnostic-failure'],
     [{ result: diagnosticAttempt({ status: 'operational_error', errorCode: 'ROUTER_OUTPUT_MALFORMED' }) }, 'diagnostic-failure'],
@@ -2565,6 +2639,179 @@ test('U24 timeout campaign calls 22 fixtures five times once each and preserves 
   assert.equal(terminal.attempts[0].slow_valid, true);
   assert.equal(terminal.attempts.some((attempt) => attempt.slow_valid), true);
   assert.equal(busyChecks, 2);
+});
+
+test('U24 round-trips all router-quality codes and categories content-free and stops at 53', async () => {
+  const [{ loadRoutingFixtures }, diagnostic] = await Promise.all([
+    import(`${ROOT}/fixtures.mjs`),
+    diagnosticModule(),
+  ]);
+  const fixtures = loadRoutingFixtures().filter((fixture) => fixture.expected !== 'quarantine');
+  const cases = [
+    'ROUTER_EXPECTATION_MISMATCH',
+    'ROUTER_OUTPUT_SCHEMA',
+    'ROUTER_PARTS_OVERLAP',
+    'ROUTER_MIXED_AMBIGUOUS',
+    'ROUTER_MIXED_COVERAGE',
+    'ROUTER_MIXED_SENSITIVE_MISSING',
+    'ROUTER_MIXED_WORK_SENSITIVE',
+    'ROUTER_MIXED_NOT_EXTRACTIVE',
+    'ROUTER_PERSONAL_VETO',
+    'ROUTER_OUTPUT_SECRET',
+  ].map((errorCode) => ({
+    errorCode,
+    targetOrdinal: 1,
+    category: errorCode === 'ROUTER_EXPECTATION_MISMATCH' ? 'personal' : undefined,
+  })).concat([
+    { errorCode: 'ROUTER_EXPECTATION_MISMATCH', targetOrdinal: 53, category: 'work' },
+    { errorCode: 'ROUTER_EXPECTATION_MISMATCH', targetOrdinal: 17, category: 'mixed' },
+  ]);
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-router-codes-'));
+  try {
+    for (const [index, testCase] of cases.entries()) {
+      const { errorCode, targetOrdinal, category } = testCase;
+      const row = await runRouterQualityRoundTrip({
+        diagnostic,
+        fixtures,
+        root,
+        name: `code-${index}`,
+        targetOrdinal,
+        errorCode,
+        category,
+        extraResult: {
+          raw: 'must-not-survive',
+          prompt: 'must-not-survive',
+          stderr: 'must-not-survive',
+          explanation: 'must-not-survive',
+        },
+      });
+      const terminalAttempt = row.receipt.attempts.at(-1);
+      assert.equal(row.calls, targetOrdinal, `${errorCode}/${category}`);
+      assert.deepEqual([row.campaign.outcome, row.campaign.reason], [
+        'router-quality-failure', 'router-quality-failure',
+      ], errorCode);
+      assert.ok(row.campaign.attempts.every((attempt) => (
+        !Object.hasOwn(attempt, 'router_quality_code')
+        && !Object.hasOwn(attempt, 'router_quality_observed_category')
+      )), errorCode);
+      assert.deepEqual([
+        terminalAttempt.router_quality_code,
+        terminalAttempt.router_quality_observed_category,
+        row.interpreted.router_quality_code,
+        row.interpreted.router_quality_observed_category,
+      ], [errorCode, category ?? null, errorCode, category ?? null], errorCode);
+      assert.equal(JSON.stringify(row.receipt).includes('must-not-survive'), false, errorCode);
+      if (index === 0) {
+        const suppressed = [
+          diagnostic.interpretDiagnosticArtifacts(row.receipt, validWitness({
+            inactive: false,
+            cgroup_empty: false,
+            detached_child_removed: false,
+            cleanup_confirmed: false,
+          })),
+          diagnostic.interpretDiagnosticArtifacts(
+            row.receipt,
+            validWitness(),
+            { primaryReason: 'runner-nonterminal' },
+          ),
+        ];
+        assert.ok(suppressed.every((result) => !Object.hasOwn(result, 'router_quality_code')));
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('U24 rejects invalid router-quality source and receipt placement', async () => {
+  const [{ loadRoutingFixtures }, diagnostic] = await Promise.all([
+    import(`${ROOT}/fixtures.mjs`),
+    diagnosticModule(),
+  ]);
+  const fixtures = loadRoutingFixtures().filter((fixture) => fixture.expected !== 'quarantine');
+  const fixture = fixtures[0];
+  const validMismatch = routerQualityResult(fixture, 'ROUTER_EXPECTATION_MISMATCH', 'personal');
+  const invalidSources = [
+    ['stale-fixture-id', { ...validMismatch, fixtureId: 'work-02' }],
+    ['stale-expected', { ...validMismatch, expected: 'personal' }],
+    ['same-category', { ...validMismatch, category: 'work' }],
+    ['mismatch-operational-code', { ...validMismatch, errorCode: 'ROUTER_PERSONAL_VETO' }],
+    ['operational-mismatch-code', {
+      ...validMismatch, status: 'operational_error', category: undefined,
+    }],
+    ['operational-category', routerQualityResult(fixture, 'ROUTER_PERSONAL_VETO', 'work')],
+    ['unknown-mismatch-code', { ...validMismatch, errorCode: 'ROUTER_UNKNOWN' }],
+    ['unknown-operational-code', {
+      ...diagnosticAttempt({
+        status: 'operational_error', errorCode: 'ROUTER_UNKNOWN', payloadValid: false,
+      }),
+      fixtureId: fixture.id,
+      expected: fixture.expected,
+    }],
+  ];
+  for (const [name, source] of invalidSources) {
+    let attemptCheckpoints = 0;
+    const campaign = await diagnostic.runDiagnosticCampaign({
+      fixtures,
+      activatedAtMs: 0,
+      monotonicNowMs: () => 0,
+      checkBusy: async () => false,
+      routeOnce: async () => source,
+      checkpointAttempt: async () => { attemptCheckpoints += 1; },
+      checkpointOutOfBand: async () => {},
+    });
+    assert.equal(attemptCheckpoints, 0, name);
+    assert.deepEqual([campaign.outcome, campaign.reason, campaign.attempts.length], [
+      'diagnostic-failure', 'invalid-evidence', 0,
+    ], name);
+  }
+  const root = await mkdtemp(path.join(os.tmpdir(), 'polygram-u24-router-placement-'));
+  try {
+    const valid = await runRouterQualityRoundTrip({
+      diagnostic, fixtures, root, name: 'valid', errorCode: 'ROUTER_OUTPUT_SECRET',
+    });
+    const mutations = [
+      ['nonterminal-code', (attempt) => { attempt.terminal_result = null; }],
+      ['non-router-terminal-code', (attempt) => {
+        attempt.terminal_result = 'diagnostic-failure';
+        attempt.attempted_call_result = 'diagnostic-failure';
+      }],
+      ['missing-code', (attempt) => { attempt.router_quality_code = null; }],
+      ['operational-category', (attempt) => {
+        attempt.router_quality_observed_category = 'personal';
+      }],
+      ['equal-category', (attempt) => {
+        attempt.router_quality_code = 'ROUTER_EXPECTATION_MISMATCH';
+        attempt.router_quality_observed_category = 'work';
+      }],
+      ['unknown-code', (attempt) => { attempt.router_quality_code = 'ROUTER_UNKNOWN'; }],
+      ['missing-code-key', (attempt) => { delete attempt.router_quality_code; }],
+      ['extra-content-key', (attempt) => { attempt.raw_output = 'forbidden'; }],
+      ['stale-fixture', (attempt) => { attempt.fixture_id = 'work-02'; }],
+    ];
+    for (const [name, mutate] of mutations) {
+      const tampered = structuredClone(valid.receipt);
+      mutate(tampered.attempts.at(-1));
+      assert.throws(
+        () => diagnostic.interpretDiagnosticArtifacts(tampered, validWitness()),
+        /attempt evidence|router-quality discriminator/,
+        name,
+      );
+    }
+    const appendPath = path.join(root, 'invalid-append.json');
+    let appendReceipt = await diagnostic.createDiagnosticReceipt(appendPath);
+    appendReceipt = await diagnostic.checkpointDiagnosticReceipt(appendPath, appendReceipt, {
+      kind: 'preflight', campaign_elapsed_ms: 0,
+    });
+    const invalidAppend = structuredClone(valid.receipt.attempts[0]);
+    invalidAppend.attempted_call_result = 'valid';
+    invalidAppend.terminal_result = null;
+    await assert.rejects(diagnostic.checkpointDiagnosticReceipt(appendPath, appendReceipt, {
+      kind: 'attempt', campaign_elapsed_ms: 1, attempt: invalidAppend,
+    }), /router-quality discriminator/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('U24 timeout campaign checks busy and reservation before every spawn', async () => {
@@ -2886,7 +3133,12 @@ test('U24 timeout campaign lets every later terminal class win without erasing s
       status: 'operational_error', errorCode: 'ROUTER_PROCESS_EXIT',
       elapsedMs: 90_000, payloadValid: true,
     }),
-    { ...parsedRouterQualityAttempt(), status: 'mismatch', errorCode: 'ROUTER_EXPECTATION_MISMATCH' },
+    {
+      ...parsedRouterQualityAttempt(),
+      status: 'mismatch',
+      errorCode: 'ROUTER_EXPECTATION_MISMATCH',
+      category: 'personal',
+    },
     diagnosticAttempt({ status: 'operational_error', errorCode: 'ROUTER_MODEL_IDENTITY' }),
     diagnosticAttempt({
       status: 'operational_error', errorCode: 'ROUTER_OUTPUT_TOO_LARGE',
@@ -2906,9 +3158,12 @@ test('U24 timeout campaign lets every later terminal class win without erasing s
       activatedAtMs: 0,
       monotonicNowMs: () => 0,
       checkBusy: async () => false,
-      routeOnce: async () => {
+      routeOnce: async ({ fixture }) => {
         calls += 1;
-        return calls === 1 ? diagnosticAttempt({ elapsedMs: 60_001 }) : terminalResults[index];
+        if (calls === 1) return diagnosticAttempt({ elapsedMs: 60_001 });
+        return index === 1
+          ? { ...terminalResults[index], fixtureId: fixture.id, expected: fixture.expected }
+          : terminalResults[index];
       },
       checkpointAttempt: async () => {},
       checkpointOutOfBand: async () => {},

@@ -67,6 +67,7 @@ const ROUTER_QUALITY_CODES = new Set([
   'ROUTER_PERSONAL_VETO',
   'ROUTER_OUTPUT_SECRET',
 ]);
+const ROUTER_CATEGORIES = new Set(['work', 'personal', 'mixed']);
 const INTEGRITY_CODES = new Set([
   'ROUTER_AUTH_AMBIGUOUS',
   'ROUTER_AUTH_UNAVAILABLE',
@@ -381,9 +382,42 @@ function claudeEnvelopeFailureReason(result) {
   return mapping?.errorCode === result.errorCode ? mapping.reason : null;
 }
 
+function routerQualityDiscriminator(result, fixture) {
+  const recognizedNonQuality = INTEGRITY_CODES.has(result?.errorCode)
+    || PROCESS_CODES.has(result?.errorCode)
+    || INVALID_ENVELOPE_CODES.has(result?.errorCode);
+  const candidate = result?.status === 'mismatch'
+    || ROUTER_QUALITY_CODES.has(result?.errorCode)
+    || (result?.status === 'operational_error' && !recognizedNonQuality);
+  if (!candidate) return null;
+  const expected = fixture?.expected ?? result?.expected;
+  const bindingValid = typeof result?.fixtureId === 'string'
+    && ROUTER_CATEGORIES.has(result?.expected)
+    && (!fixture || (result.fixtureId === fixture.id && result.expected === fixture.expected));
+  if (!bindingValid || !ROUTER_CATEGORIES.has(expected)) return false;
+  if (result.status === 'mismatch') {
+    if (result.errorCode !== 'ROUTER_EXPECTATION_MISMATCH'
+        || !ROUTER_CATEGORIES.has(result.category)
+        || (expected !== 'mixed' && result.category === expected)) return false;
+    return {
+      router_quality_code: result.errorCode,
+      router_quality_observed_category: result.category,
+    };
+  }
+  if (result.status !== 'operational_error'
+      || result.errorCode === 'ROUTER_EXPECTATION_MISMATCH'
+      || !ROUTER_QUALITY_CODES.has(result.errorCode)
+      || (result.category !== undefined && result.category !== null)) return false;
+  return {
+    router_quality_code: result.errorCode,
+    router_quality_observed_category: null,
+  };
+}
+
 export function classifyDiagnosticEvent({
   integrityFailure = false,
   result,
+  fixture,
   productionBusy = false,
   runnerDied = false,
   reservationFits = true,
@@ -393,10 +427,10 @@ export function classifyDiagnosticEvent({
   if (integrityFailure || INTEGRITY_CODES.has(result?.errorCode)) {
     return classified('diagnostic-failure', 'integrity-failure');
   }
-  const routerQuality = result?.status === 'mismatch'
-    || ROUTER_QUALITY_CODES.has(result?.errorCode);
+  const routerQuality = routerQualityDiscriminator(result, fixture);
+  if (routerQuality === false) return classified('diagnostic-failure', 'invalid-evidence');
   if (result && invalidNumericEvidence(result.attemptEvidence, {
-    allowParsedRouterEnvelope: routerQuality,
+    allowParsedRouterEnvelope: routerQuality !== null,
   })) {
     return classified('diagnostic-failure', 'invalid-evidence');
   }
@@ -414,7 +448,7 @@ export function classifyDiagnosticEvent({
       && result.attemptEvidence?.payload_valid === true) {
     return classified('process-boundary-fault', 'payload-valid-process-boundary');
   }
-  if (routerQuality) {
+  if (routerQuality !== null) {
     return classified('router-quality-failure', 'router-quality-failure');
   }
   if (result?.errorCode === 'ROUTER_TIMEOUT') {
@@ -485,6 +519,7 @@ function reservationFits(activatedAtMs, nowMs) {
 }
 
 function receiptAttempt({ fixture, repetition, ordinal, result, decision }) {
+  const discriminator = routerQualityDiscriminator(result, fixture);
   return {
     fixture_id: fixture.id,
     repetition,
@@ -493,6 +528,9 @@ function receiptAttempt({ fixture, repetition, ordinal, result, decision }) {
     slow_valid: decision.slow_valid,
     attempted_call_result: decision.outcome || 'valid',
     terminal_result: decision.outcome,
+    router_quality_code: discriminator?.router_quality_code ?? null,
+    router_quality_observed_category:
+      discriminator?.router_quality_observed_category ?? null,
   };
 }
 
@@ -501,7 +539,11 @@ function campaignResult(decision, attempts) {
     outcome: decision.outcome,
     reason: decision.reason,
     next_decision: nextDecisionFor(decision.outcome),
-    attempts,
+    attempts: attempts.map(({
+      router_quality_code: _routerQualityCode,
+      router_quality_observed_category: _routerQualityObservedCategory,
+      ...attempt
+    }) => attempt),
     slow_valid_observed: attempts.some((attempt) => attempt.slow_valid === true),
   };
 }
@@ -591,6 +633,7 @@ export async function runDiagnosticCampaign({
       }
       const decision = classifyDiagnosticEvent({
         result,
+        fixture,
         callOrdinal,
         priorAttempts: attempts,
       });
@@ -997,7 +1040,7 @@ function validateAttemptTerminalRelationship(attempt, terminal, receiptSchema) {
 function validateStoredAttempt(attempt, expectedOrdinal, receiptSchema) {
   const expectedFixture = DIAGNOSTIC_FIXTURES[(expectedOrdinal - 1) % DIAGNOSTIC_FIXTURES.length];
   const expectedRepetition = Math.floor((expectedOrdinal - 1) / DIAGNOSTIC_FIXTURES.length) + 1;
-  if (!hasExactKeys(attempt, [
+  const attemptFields = [
     'fixture_id',
     'repetition',
     'ordinal',
@@ -1005,7 +1048,11 @@ function validateStoredAttempt(attempt, expectedOrdinal, receiptSchema) {
     'slow_valid',
     'attempted_call_result',
     'terminal_result',
-  ])
+    ...(receiptSchema === RECEIPT_SCHEMA_V2
+      ? ['router_quality_code', 'router_quality_observed_category']
+      : []),
+  ];
+  if (!hasExactKeys(attempt, attemptFields)
       || attempt.fixture_id !== expectedFixture?.id
       || attempt.repetition !== expectedRepetition
       || attempt.ordinal !== expectedOrdinal
@@ -1018,6 +1065,25 @@ function validateStoredAttempt(attempt, expectedOrdinal, receiptSchema) {
       || (attempt.terminal_result !== null
         && attempt.attempted_call_result !== attempt.terminal_result)) {
     throw new Error('invalid attempt evidence');
+  }
+  if (receiptSchema === RECEIPT_SCHEMA_V2) {
+    const routerQualityTerminal = attempt.terminal_result === 'router-quality-failure';
+    if (!routerQualityTerminal) {
+      if (attempt.router_quality_code !== null
+          || attempt.router_quality_observed_category !== null) {
+        throw new Error('invalid router-quality discriminator');
+      }
+    } else if (!ROUTER_QUALITY_CODES.has(attempt.router_quality_code)) {
+      throw new Error('invalid router-quality discriminator');
+    } else if (attempt.router_quality_code === 'ROUTER_EXPECTATION_MISMATCH') {
+      if (!ROUTER_CATEGORIES.has(attempt.router_quality_observed_category)
+          || (expectedFixture.expected !== 'mixed'
+            && attempt.router_quality_observed_category === expectedFixture.expected)) {
+        throw new Error('invalid router-quality discriminator');
+      }
+    } else if (attempt.router_quality_observed_category !== null) {
+      throw new Error('invalid router-quality discriminator');
+    }
   }
   const cleanSuccess = attempt.attempted_call_result === 'valid'
     || ['old-cap-false-rejection', 'inconclusive'].includes(attempt.attempted_call_result);
@@ -1063,6 +1129,8 @@ function sanitizeCheckpointAttempt(attempt, expectedOrdinal) {
     slow_valid: attempt.slow_valid,
     attempted_call_result: attempt.attempted_call_result,
     terminal_result: attempt.terminal_result,
+    router_quality_code: attempt.router_quality_code ?? null,
+    router_quality_observed_category: attempt.router_quality_observed_category ?? null,
   };
   validateStoredAttempt(sanitized, expectedOrdinal, RECEIPT_SCHEMA_V2);
   return sanitized;
@@ -1955,6 +2023,13 @@ export function interpretDiagnosticArtifacts(receipt, unitWitness, {
   }
   return {
     ...receipt.terminal,
+    ...(receipt.terminal.outcome === 'router-quality-failure'
+      ? {
+          router_quality_code: receipt.attempts.at(-1).router_quality_code,
+          router_quality_observed_category:
+            receipt.attempts.at(-1).router_quality_observed_category,
+        }
+      : {}),
     slow_valid_observed: slowObserved,
     cleanup_confirmed: true,
     accounting,
