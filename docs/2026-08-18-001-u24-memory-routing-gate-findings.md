@@ -2,14 +2,16 @@
 
 Date: 2026-08-18  
 Status: the reviewed single-retry implementation and VPS shape gate passed;
-the one authorized full VPS gate stopped on two exhausted process timeouts,
-the first timeout characterization stopped safely on its first call with an
-ambiguous invalid-envelope result, and the reviewed discriminator rerun stopped
-safely on its first call with `invalid-envelope-turn-count`. U24 remains
-blocked. The turn-count correction then completed, and its one approved changed
-campaign stopped cleanly at outer invocation 53 with
-`router-quality-failure` on `personal-01` repetition 3. The next gate is a
-reviewed router-contract or prompt revision; do not rerun the unchanged route.
+the authorized full gate and subsequent diagnostic campaigns exposed timeout,
+envelope, and turn-accounting defects without changing production state. After
+the turn-accounting campaign stopped at outer invocation 53 with a generic
+`router-quality-failure`, the reviewed discriminator was added. Its one
+approved changed campaign completed all 110 outer invocations with valid,
+fast results and no router-quality terminal, ending with the pre-registered
+`inconclusive / call-ceiling-fast-only` disposition. U24 remains blocked; do
+not rerun the unchanged campaign. The next decision is to choose a separately
+reviewed alternate policy rather than tune the router from a non-reproduced
+failure.
 
 ## Decision
 
@@ -311,7 +313,67 @@ removed, and terminal receipt durably reopened. Scratch cleanup also passed.
 The content-free receipt intentionally retains neither the model output nor a
 finer router error code, so this run cannot distinguish a category mismatch
 from a schema or deterministic-guard rejection. It is nevertheless a terminal
-router-quality result under the reviewed table. Do not rerun this unchanged
-commit or route. U24 and memory-feature enablement remain blocked pending a
-reviewed router-contract or prompt revision. No Polygram service, package,
-configuration, database, Telegram, or production-memory state was changed.
+router-quality result under the reviewed table. At that point, the next step
+was a reviewed diagnostic-discriminator change before any router-contract or
+prompt decision; the following section records its campaign. The unchanged
+commit or route was not rerun. No Polygram service, package, configuration,
+database, Telegram, or production-memory state was changed.
+
+### Router-quality discriminator campaign
+
+The closed router-quality discriminator was implemented, independently
+reviewed, and signed as exact commit
+`54aa7f19bb49d07888c96d7903e25ff5af5c75b5`. Its exact seven-file Git archive
+had SHA-256
+`87883bec83e59c5c0dd0ba8c06cf301ea2752b1274fe71c63931b97a8f9a8e74`.
+The commit-scoped owner-only staging import and no-model transient-systemd
+capability gate passed. The pinned VPS Claude CLI remained `2.1.220` with
+SHA-256
+`674f61f20ff306f3100cf9200e4c36c4b70278b5bef2884549819b942a89c863`,
+and the exact model remained `claude-haiku-4-5-20251001`. Both Polygram bots
+were idle immediately before the campaign. Ivan then approved at most 110
+serial outer invocations at 120 seconds each and separately acknowledged that
+internal agent-loop turns and provider retries were not separately pre-capped
+or fully observable.
+
+The campaign ran once and reached its reviewed ceiling:
+
+```text
+primary outcome              inconclusive
+reason                       call-ceiling-fast-only
+next decision                preserve-u24-stop-and-choose-alternate-policy
+outer invocations            110 exact
+known internal turns         220 exact
+unknown/uncheckpointed work  0 / 0
+fixtures                     22, each exercised five times
+valid / terminal attempts    109 / 1 inconclusive
+slow-valid attempts          0
+router discriminators        0
+campaign elapsed             1,039,253 ms
+outer elapsed range          6,280–22,532 ms
+Claude duration range        3,348–19,489 ms
+Claude API duration range    4,155–20,529 ms
+cleanup confirmed            true
+```
+
+Every attempt returned a structurally valid payload with `num_turns: 2`. The
+final attempt was `uncertain-02`, repetition 5, ordinal 110; it completed in
+10,520 ms and carried the ceiling disposition. The receipt reached sequence
+111 with no out-of-band terminal. Its 78,100 bytes hash to
+`ce7e56069a4d6bcc2b6b73ec929cad108c5759b2a4defc2c0eb361d5296668c4`.
+The 221-byte unit witness hashes to
+`44d8f58c715b6f20f8a67697e79b508e9b70485dc298a54b49d85083dc49f317`.
+Independent reopening proved the evidence and durable copies byte-identical,
+the transient service inactive with an empty cgroup, and campaign scratch
+removed.
+
+The earlier ordinal-53 router-quality failure therefore did not reproduce in
+the full changed campaign, so the new discriminator correctly remained null
+on every attempt. This does not prove the router is deterministic or establish
+the pre-registered U24 pass bar: a finite all-fast campaign after a prior
+failure is explicitly inconclusive. Do not rerun this commit unchanged and do
+not tune the prompt from the earlier non-reproduced failure. U24 and memory
+enablement remain blocked while the next reviewed work chooses an alternate
+policy for stochastic router outcomes. No Polygram application service,
+package, configuration, database, Telegram, or production-memory state was
+changed; no release, deploy, or restart occurred.

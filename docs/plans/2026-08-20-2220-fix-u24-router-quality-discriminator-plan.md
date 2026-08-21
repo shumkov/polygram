@@ -186,3 +186,41 @@ The terminal attempt is the sole durable owner of the discriminator. The top-lev
 - `tests/memory-routing-timeout-diagnostic.test.js` owns the existing receipt, accounting, and lifecycle regression patterns.
 - `docs/2026-08-18-001-u24-memory-routing-gate-findings.md` records the signed `6db4377` campaign and its generic ordinal-53 result.
 - `docs/plans/2026-07-31-002-feat-shumabit-scoped-memory-plan.md` retains the U24 dependency block.
+
+---
+
+## Execution Outcome
+
+U1 was independently reviewed, signed as exact commit
+`54aa7f19bb49d07888c96d7903e25ff5af5c75b5`, and staged from an exact
+seven-file Git archive with SHA-256
+`87883bec83e59c5c0dd0ba8c06cf301ea2752b1274fe71c63931b97a8f9a8e74`.
+Under exact Node `24.4.0`, the final focused suite passed 92/92 and the
+disjoint adjacent memory/secret suite passed 91/91, both with zero skips. The
+repository-standard suite reported 4,510 tests: 4,495 passed, zero failed, and
+15 intentional capability/platform skips. Independent correctness, security,
+testing, maintainability, reliability, and project-standards reviews were
+clean after the one testing finding was fixed with a demonstrated red-to-green
+regression.
+
+The owner-only staging import and no-model transient-systemd capability gate
+passed. After fresh approval of the exact outer-invocation boundary and the
+internal-turn/provider-retry caveat, U2 ran one campaign and no unchanged
+rerun.
+
+The campaign reached all 110 outer invocations with 220 exact observed
+internal agent-loop turns, zero unknown or possible uncheckpointed work, zero
+slow-valid attempts, and no router-quality terminal. It ended with the
+pre-registered `inconclusive / call-ceiling-fast-only` disposition and
+`preserve-u24-stop-and-choose-alternate-policy` next decision. Consequently no
+discriminator was present, which proves the earlier ordinal-53 generic failure
+did not reproduce but does not establish the U24 pass bar.
+
+The durable receipt SHA-256 is
+`ce7e56069a4d6bcc2b6b73ec929cad108c5759b2a4defc2c0eb361d5296668c4`;
+the unit-witness SHA-256 is
+`44d8f58c715b6f20f8a67697e79b508e9b70485dc298a54b49d85083dc49f317`.
+Independent validation proved byte-identical evidence copies, confirmed
+cleanup, and removed scratch. U24 and memory enablement remain blocked pending
+a separately reviewed alternate policy. No production application state,
+release, deploy, or restart was involved.

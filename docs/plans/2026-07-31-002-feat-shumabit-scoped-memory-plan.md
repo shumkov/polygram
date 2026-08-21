@@ -2,7 +2,7 @@
 title: Provider-Neutral Scoped Memory for Shumabit - Plan
 type: feat
 date: 2026-07-31
-revised: 2026-08-20
+revised: 2026-08-21
 topic: shumabit-scoped-memory
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
@@ -783,8 +783,16 @@ are new prerequisites or gates and do not renumber existing units.
   turns, and no unknown or possible uncheckpointed work. Unit inactivity,
   empty cgroup, detached-child removal, durable evidence, and scratch cleanup
   all passed. The content-free receipt does not retain the raw output or a
-  finer router subreason. Do not rerun the unchanged route. U24 remains blocked
-  pending a reviewed router-contract or prompt revision.
+  finer router subreason. The reviewed closed discriminator was then committed
+  as `54aa7f1`. Its one approved changed campaign exercised all 22 fixtures
+  five times: 110 exact outer invocations, 220 exact observed internal turns,
+  zero slow-valid rows, and no router-quality terminal. Receipt/witness copies,
+  exact accounting, unit cleanup, and scratch cleanup passed. The terminal was
+  the pre-registered `inconclusive / call-ceiling-fast-only`; the earlier
+  failure did not reproduce, but this finite run does not meet the U24 pass
+  bar. Do not rerun either campaign unchanged. U24 remains blocked while a
+  separately reviewed alternate policy for stochastic router outcomes is
+  chosen.
 - **Goal:** Decide whether the smallest successor to U22 is safe enough to
   implement: unchanged native extraction followed by a separate narrow
   personal-sensitivity routing/splitting pass.
@@ -1322,10 +1330,15 @@ no duplicate estimate. No estimate assumes a managed-provider alternative.
   `d37de69` and `dfd2fc2` diagnostics then stopped safely on ambiguous envelope
   and exact-one turn assumptions. After the turn-accounting correction, the
   one approved `6db4377` campaign stopped cleanly at outer invocation 53 with
-  `router-quality-failure` on `personal-01` repetition 3. The content-free
-  receipt proves exact outer/inner accounting and cleanup but retains no raw
-  output or finer router cause. This gate remains open pending a reviewed
-  router-contract or prompt revision and must not be rerun unchanged.
+  a generic `router-quality-failure` on `personal-01` repetition 3. The
+  reviewed discriminator was then added in `54aa7f1`; its one approved changed
+  campaign completed all 110 outer invocations with 220 exact observed
+  internal turns, zero slow-valid rows, and no router-quality terminal. It
+  ended `inconclusive / call-ceiling-fast-only`; receipt/witness copies,
+  cleanup, and exact accounting passed. The earlier failure did not reproduce,
+  but this does not satisfy the U24 pass bar. This gate remains open while a
+  separately reviewed alternate policy for stochastic router outcomes is
+  chosen, and neither campaign may be rerun unchanged.
 - U16a: host/provider confirmation and model staging, process-writer overlap,
   same-scope cross-process storage, then five production-class Linux runs with
   owner/busy/cleanup attestations. The existing same-process 5/5 failure and
