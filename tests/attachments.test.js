@@ -183,12 +183,10 @@ describe('filterAttachments — rc.68 widened MIME allowlist', () => {
   });
 
   test('tar.gz is accepted under octet-stream (Telegram compound-extension archives)', () => {
-    // Trigger: Ivan tried to share wa-fix-2026-08-28.tar.gz and got
-    // "mime not allowed (application/octet-stream)" rejected — Telegram
-    // reports .tar.gz/.tgz as generic octet-stream (no compound-extension
-    // sniffing), and extensionOf() only sees the last dot segment ('gz'),
-    // so the zip-only extension fallback didn't cover it.
-    const atts = [{ name: 'wa-fix-2026-08-28.tar.gz', mime_type: 'application/octet-stream', size: 100 }];
+    // Telegram reports .tar.gz/.tgz as generic octet-stream (no
+    // compound-extension sniffing), and extensionOf() only sees the last
+    // dot segment ('gz'), so the zip-only extension fallback didn't cover it.
+    const atts = [{ name: 'export-2026-08-28.tar.gz', mime_type: 'application/octet-stream', size: 100 }];
     const { accepted, rejected } = filterAttachments(atts);
     assert.equal(accepted.length, 1);
     assert.equal(rejected.length, 0);
@@ -204,13 +202,14 @@ describe('filterAttachments — rc.68 widened MIME allowlist', () => {
     assert.equal(rejected.length, 0);
   });
 
-  test('gzip accepted under explicit MIME (application/gzip and application/x-gzip)', () => {
+  test('gzip and tar accepted under explicit MIME (application/gzip, application/x-gzip, application/x-tar)', () => {
     const atts = [
       { name: 'a.gz', mime_type: 'application/gzip', size: 100 },
       { name: 'b.gz', mime_type: 'application/x-gzip', size: 100 },
+      { name: 'c.tar', mime_type: 'application/x-tar', size: 100 },
     ];
     const { accepted, rejected } = filterAttachments(atts);
-    assert.equal(accepted.length, 2);
+    assert.equal(accepted.length, 3);
     assert.equal(rejected.length, 0);
   });
 
