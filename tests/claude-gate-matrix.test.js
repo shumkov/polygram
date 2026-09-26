@@ -2215,6 +2215,10 @@ test('matrix evidence rejects unknown and malformed normalized lifecycle records
         { type: 'mode' },
         { type: 'permission-mode' },
         { type: 'rate_limit_event' },
+        // 2.1.283 writes `{"type":"atis-latch","atis":"", sessionId}` rows:
+        // no uuid, no parent, nothing Polygram reads. Recognized, not ignored,
+        // so a change in its shape still surfaces as an unknown row.
+        { type: 'atis-latch' },
       ],
     },
   }).pass, true);

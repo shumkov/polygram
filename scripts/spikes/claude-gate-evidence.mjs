@@ -421,6 +421,9 @@ const NORMALIZED_GATE_LIFECYCLE_SCHEMAS = {
   mode: (record) => Object.keys(record).length === 1,
   'permission-mode': (record) => Object.keys(record).length === 1,
   rate_limit_event: (record) => Object.keys(record).length === 1,
+  // Written by Claude Code 2.1.283 without a uuid or parent; carries no
+  // lifecycle data and nothing in Polygram or Orchestra reads it.
+  'atis-latch': (record) => Object.keys(record).length === 1,
 };
 
 export function normalizedGateLifecycleRecordSchemaMatches(record) {
