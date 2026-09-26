@@ -137,6 +137,34 @@ function projectedInsertionsSchemaMatches(byBaseline) {
   );
 }
 
+// The opt-in auto-background path may be declared a known upstream
+// regression, with a reason, so it is reported instead of run. The default
+// path is what production runs and must always be gated.
+const KNOWN_REGRESSION = 'known-regression';
+
+function delayedMcpModesSchemaMatches(modes) {
+  const knownRegression = modes?.autoBackground === KNOWN_REGRESSION;
+  return (
+    hasExactKeys(
+      modes,
+      knownRegression
+        ? ['autoBackground', 'default', 'knownRegressionReason']
+        : ['autoBackground', 'default'],
+    )
+    && ['foreground', 'background', KNOWN_REGRESSION].includes(
+      modes.autoBackground,
+    )
+    && ['foreground', 'background'].includes(modes.default)
+    && (
+      !knownRegression
+      || (
+        typeof modes.knownRegressionReason === 'string'
+        && modes.knownRegressionReason.trim().length > 0
+      )
+    )
+  );
+}
+
 function passiveSessionAttachmentCountsSchemaMatches(counts) {
   return (
     counts
@@ -157,13 +185,7 @@ export function gateExpectationsSchemaMatches(expectations) {
     )
     && projectedInsertionsSchemaMatches(expectations.projectedInsertions)
     && typeof expectations.wrapperRequired === 'boolean'
-    && hasExactKeys(expectations.delayedMcpModes, ['autoBackground', 'default'])
-    && ['foreground', 'background'].includes(
-      expectations.delayedMcpModes.autoBackground,
-    )
-    && ['foreground', 'background'].includes(
-      expectations.delayedMcpModes.default,
-    )
+    && delayedMcpModesSchemaMatches(expectations.delayedMcpModes)
     && [0, 1].includes(expectations.subagentTaskUpdated)
     && isNonNegativeInteger(expectations.taskReminderInsertions)
     && /^claude-opus-[a-z0-9-]+$/.test(expectations.resolvedOpus || '')
@@ -356,6 +378,33 @@ function versionSpecificLifecycleMatches(
   }
 }
 
+// Cells a version declares as known upstream regressions are not scheduled;
+// every authoritative summary lists them so they are never silently dropped.
+export function matrixKnownRegressions(manifest) {
+  const regressions = [];
+  for (const versionKey of ['old', 'candidate']) {
+    const version = manifest.versions[versionKey];
+    const expectations = expectationsFor(manifest.expectations, version);
+    for (const scenario of manifest.scenarios) {
+      if (versionKey === 'old' && scenario.candidateOnly) continue;
+      if (
+        DELAYED_MCP_SCENARIOS.has(scenario.id)
+        && expectedDelayedMcpMode(
+          expectations,
+          delayedMcpAutoBackground(scenario),
+        ) === KNOWN_REGRESSION
+      ) {
+        regressions.push({
+          id: `${versionKey}:${scenario.id}`,
+          version,
+          reason: expectations.delayedMcpModes.knownRegressionReason,
+        });
+      }
+    }
+  }
+  return regressions;
+}
+
 export function buildClaudeMatrixRuns({
   manifest,
   binaries,
@@ -426,6 +475,7 @@ export function buildClaudeMatrixRuns({
           delayedMcpAutoBackground(scenario),
         )
         : null;
+      if (delayedMcpMode === KNOWN_REGRESSION) continue;
       const versionSpecificLifecycleOracle =
         VERSION_SPECIFIC_LIFECYCLE_ORACLES.get(scenario.id);
       if (
@@ -2592,6 +2642,7 @@ export function purgeAcceptedGateArtifacts({
   expectedRuns,
   expectedScenarios,
   expectedManifestSha256,
+  expectedKnownRegressions = [],
   claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects'),
 }) {
   assertSafeRunPrefix(runPrefix);
@@ -2604,6 +2655,7 @@ export function purgeAcceptedGateArtifacts({
     'completedRunCount',
     'expectedAuthoritativeRunCount',
     'failCount',
+    'knownRegressions',
     'manifestSha256',
     'maxBridgeReadyToMcpReadyMs',
     'notApplicableCount',
@@ -2628,6 +2680,11 @@ export function purgeAcceptedGateArtifacts({
     'runId',
     'status',
   ];
+  const knownRegressionList = Array.isArray(expectedKnownRegressions)
+    ? expectedKnownRegressions
+    : [];
+  const authoritativeRunCount =
+    AUTHORITATIVE_RUN_COUNT - knownRegressionList.length;
   const expectedRunList = Array.isArray(expectedRuns) ? expectedRuns : [];
   const expectedIds = expectedRunList.map((run) => run?.id);
   const expectedRunIds = expectedRunList.map(
@@ -2701,32 +2758,34 @@ export function purgeAcceptedGateArtifacts({
   if (
     !hasExactKeys(summary, expectedSummaryKeys)
     || summary.schemaVersion !== 1
+    || !Array.isArray(expectedKnownRegressions)
+    || !isDeepStrictEqual(summary.knownRegressions, expectedKnownRegressions)
     || summary?.authoritative !== true
     || summary?.status !== 'PASS'
     || summary?.runPrefix !== runPrefix
     || summary.manifestSha256 !== expectedManifestSha256
     || !SHA256_RE.test(expectedManifestSha256 || '')
-    || expectedRunList.length !== AUTHORITATIVE_RUN_COUNT
-    || new Set(expectedIds).size !== AUTHORITATIVE_RUN_COUNT
-    || new Set(expectedRunIds).size !== AUTHORITATIVE_RUN_COUNT
+    || expectedRunList.length !== authoritativeRunCount
+    || new Set(expectedIds).size !== authoritativeRunCount
+    || new Set(expectedRunIds).size !== authoritativeRunCount
     || expectedScenarioMap.size !== expectedScenarioList.length
     || expectedRunList.some(
       (run) => !expectedScenarioMap.has(run?.scenarioId),
     )
-    || summary.expectedAuthoritativeRunCount !== AUTHORITATIVE_RUN_COUNT
-    || summary.selectedRunCount !== AUTHORITATIVE_RUN_COUNT
-    || summary.completedRunCount !== AUTHORITATIVE_RUN_COUNT
+    || summary.expectedAuthoritativeRunCount !== authoritativeRunCount
+    || summary.selectedRunCount !== authoritativeRunCount
+    || summary.completedRunCount !== authoritativeRunCount
     || !isNonNegativeInteger(summary.passCount)
     || !isNonNegativeInteger(summary.notApplicableCount)
     || summary.passCount + summary.notApplicableCount
-      !== AUTHORITATIVE_RUN_COUNT
+      !== authoritativeRunCount
     || !Array.isArray(summary.results)
     || summary.results.filter(({ status }) => status === 'PASS').length
       !== summary.passCount
     || summary.failCount !== 0
     || summary.blockedCount !== 0
     || !isNonNegativeInteger(summary.maxBridgeReadyToMcpReadyMs)
-    || summary.results.length !== AUTHORITATIVE_RUN_COUNT
+    || summary.results.length !== authoritativeRunCount
     || !isDeepStrictEqual(resultIds, expectedIds)
     || !isDeepStrictEqual(resultRunIds, expectedRunIds)
     || !validSummaryResults

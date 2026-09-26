@@ -614,13 +614,26 @@ test('every compared CLI version has reviewed per-version expectations', async (
   assert.equal(CANDIDATE_EXPECTATIONS.resolvedOpus, 'claude-opus-5-5');
   for (const key of [
     'wrapperRequired',
-    'delayedMcpModes',
     'subagentTaskUpdated',
     'taskReminderInsertions',
     'workflowSizeGuideline',
   ]) {
     assert.deepEqual(CANDIDATE_EXPECTATIONS[key], OLD_EXPECTATIONS[key], key);
   }
+  // The production delayed-MCP path keeps the old declaration; only the
+  // opt-in path is a declared upstream regression on 2.1.283.
+  assert.equal(
+    CANDIDATE_EXPECTATIONS.delayedMcpModes.default,
+    OLD_EXPECTATIONS.delayedMcpModes.default,
+  );
+  assert.equal(
+    CANDIDATE_EXPECTATIONS.delayedMcpModes.autoBackground,
+    'known-regression',
+  );
+  assert.match(
+    CANDIDATE_EXPECTATIONS.delayedMcpModes.knownRegressionReason,
+    /CLAUDE_AUTO_BACKGROUND_TASKS/,
+  );
   assert.notDeepEqual(
     CANDIDATE_EXPECTATIONS.workflowSizeGuidelineAnchors,
     OLD_EXPECTATIONS.workflowSizeGuidelineAnchors,
@@ -876,9 +889,10 @@ test('every matrix cell has a real driver, oracle, cost, and artifact collector'
 });
 
 test('delayed MCP gates the production default path and the opt-in path with per-version modes', async () => {
-  const { buildClaudeMatrixRuns } = await import(
-    '../scripts/spikes/claude-gate-matrix.mjs'
-  );
+  const {
+    buildClaudeMatrixRuns,
+    matrixKnownRegressions,
+  } = await import('../scripts/spikes/claude-gate-matrix.mjs');
   const optIn = manifest.scenarios.find(({ id }) => id === 'delayed-mcp');
   const productionPath = manifest.scenarios.find(
     ({ id }) => id === 'delayed-mcp-foreground',
@@ -914,14 +928,54 @@ test('delayed MCP gates the production default path and the opt-in path with per
   for (const versionKey of ['old', 'candidate']) {
     const modes = manifest.expectations[manifest.versions[versionKey]]
       .delayedMcpModes;
-    const optInRun = runs.find((run) => run.id === `${versionKey}:delayed-mcp`);
     const defaultRun = runs.find(
       (run) => run.id === `${versionKey}:delayed-mcp-foreground`,
     );
-    assert.deepEqual(optInRun.args, ['--expected-mode', modes.autoBackground]);
-    assert.equal(optInRun.delayedMcpAutoBackground, true);
     assert.deepEqual(defaultRun.args, ['--expected-mode', modes.default]);
     assert.equal(defaultRun.delayedMcpAutoBackground, false);
+  }
+  const oldOptInRun = runs.find((run) => run.id === 'old:delayed-mcp');
+  assert.deepEqual(oldOptInRun.args, ['--expected-mode', 'background']);
+  assert.equal(oldOptInRun.delayedMcpAutoBackground, true);
+  // The candidate's opt-in path is a declared upstream regression: it is not
+  // scheduled, and the summary reports it instead of silently dropping it.
+  assert.equal(runs.some((run) => run.id === 'candidate:delayed-mcp'), false);
+  assert.deepEqual(matrixKnownRegressions(manifest), [{
+    id: 'candidate:delayed-mcp',
+    version: CANDIDATE_VERSION,
+    reason: CANDIDATE_EXPECTATIONS.delayedMcpModes.knownRegressionReason,
+  }]);
+
+  // The default path is what production runs, so it can never be waived.
+  for (const delayedMcpModes of [
+    {
+      autoBackground: 'background',
+      default: 'known-regression',
+      knownRegressionReason: 'waived',
+    },
+    { autoBackground: 'known-regression', default: 'foreground' },
+    {
+      autoBackground: 'known-regression',
+      default: 'foreground',
+      knownRegressionReason: ' ',
+    },
+    {
+      autoBackground: 'background',
+      default: 'foreground',
+      knownRegressionReason: 'stray reason',
+    },
+  ]) {
+    const waived = structuredClone(manifest);
+    waived.expectations[CANDIDATE_VERSION].delayedMcpModes = delayedMcpModes;
+    assert.throws(() => buildClaudeMatrixRuns({
+      manifest: waived,
+      binaries: {
+        old: '/private/bin/claude-old',
+        candidate: '/private/bin/claude-candidate',
+      },
+      artifactBaseDir: '/private/artifacts',
+      runPrefix: 'delayed-waived',
+    }), /malformed/, JSON.stringify(delayedMcpModes));
   }
 
   for (const mutate of [
@@ -1260,7 +1314,8 @@ test('matrix runner schedules every old gate before candidate gates with exact s
     runPrefix: 'matrix-test',
   });
 
-  assert.equal(runs.length, 24);
+  // 24 cells minus the candidate's declared known regression.
+  assert.equal(runs.length, 23);
   assert.ok(runs.slice(0, 11).every((run) => run.versionKey === 'old'));
   assert.ok(runs.slice(11).every((run) => run.versionKey === 'candidate'));
   // Each cell carries the expectations of the version its binary must attest.
@@ -1315,17 +1370,15 @@ test('matrix runner schedules every old gate before candidate gates with exact s
     '/private/bin/claude-2.1.220',
   );
   assert.equal(
-    runs.find((run) => run.id === 'candidate:delayed-mcp')
+    runs.find((run) => run.id === 'candidate:delayed-mcp-foreground')
       .env.CLAUDE_GATE_EXPECTED_VERSION,
     '2.1.283',
   );
-  for (const versionKey of ['old', 'candidate']) {
-    assert.equal(
-      runs.find((run) => run.id === `${versionKey}:delayed-mcp`)
-        .env.CLAUDE_AUTO_BACKGROUND_TASKS,
-      '1',
-    );
-  }
+  assert.equal(
+    runs.find((run) => run.id === 'old:delayed-mcp')
+      .env.CLAUDE_AUTO_BACKGROUND_TASKS,
+    '1',
+  );
   assert.ok(
     runs
       .filter((run) => run.scenarioId === 'delayed-mcp')
@@ -1424,13 +1477,13 @@ test('matrix child environments clear ambient SDK auto-background before the dec
     );
     assert.equal(undeclaredEnv.PRESERVE_ME, 'yes');
 
-    const declaredEnv = buildClaudeMatrixChildEnv(
-      ambient,
-      runs.find((run) => run.id === `${versionKey}:delayed-mcp`).env,
-    );
-    assert.equal(declaredEnv.CLAUDE_AUTO_BACKGROUND_TASKS, '1');
-    assert.equal(declaredEnv.PRESERVE_ME, 'yes');
   }
+  const declaredEnv = buildClaudeMatrixChildEnv(
+    ambient,
+    runs.find((run) => run.id === 'old:delayed-mcp').env,
+  );
+  assert.equal(declaredEnv.CLAUDE_AUTO_BACKGROUND_TASKS, '1');
+  assert.equal(declaredEnv.PRESERVE_ME, 'yes');
 });
 
 test('matrix scenarios cannot replace runner-owned gate selectors', async () => {
@@ -1477,9 +1530,15 @@ test('declared SDK compatibility deltas use strict version-specific lifecycle or
     ...OLD_EXPECTATIONS,
     delayedMcpModes: { autoBackground: 'foreground', default: 'foreground' },
   };
+  // 2.1.220 declares the opt-in path as native background; judge both sides
+  // by that declaration so the oracle itself is exercised.
+  const BACKGROUND_OPT_IN = {
+    oldExpectations: OLD_EXPECTATIONS,
+    candidateExpectations: OLD_EXPECTATIONS,
+  };
 
   assert.equal(evaluateMatrixEvidencePair({
-    ...MANIFEST_EXPECTATIONS,
+    ...BACKGROUND_OPT_IN,
     scenario,
     oldResult,
     candidateResult,
@@ -1489,12 +1548,19 @@ test('declared SDK compatibility deltas use strict version-specific lifecycle or
     oldResult: foregroundResult,
     candidateResult,
     oldExpectations: foregroundExpectations,
-    candidateExpectations: CANDIDATE_EXPECTATIONS,
+    candidateExpectations: OLD_EXPECTATIONS,
   }).pass, true);
+  // A declared known regression accepts no evidence at all.
+  assert.deepEqual(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
+    scenario,
+    oldResult,
+    candidateResult,
+  }).differences, ['lifecycle']);
   // The old binary is judged by its own declaration: a foreground run from a
   // version declared as backgrounding is a regression, not an old baseline.
   assert.deepEqual(evaluateMatrixEvidencePair({
-    ...MANIFEST_EXPECTATIONS,
+    ...BACKGROUND_OPT_IN,
     scenario,
     oldResult: foregroundResult,
     candidateResult,
@@ -1506,9 +1572,9 @@ test('declared SDK compatibility deltas use strict version-specific lifecycle or
   }).differences, ['lifecycle']);
   const delayedRun = {
     scenarioId: 'delayed-mcp',
-    versionKey: 'candidate',
-    version: CANDIDATE_VERSION,
-    expectations: CANDIDATE_EXPECTATIONS,
+    versionKey: 'old',
+    version: OLD_VERSION,
+    expectations: OLD_EXPECTATIONS,
     delayedMcpAutoBackground: true,
     model: 'claude-sonnet-4-6',
     effort: 'medium',
@@ -1520,7 +1586,7 @@ test('declared SDK compatibility deltas use strict version-specific lifecycle or
     matrixScenario: 'delayed-mcp',
     status: 'PASS',
     attestation: {
-      version: CANDIDATE_VERSION,
+      version: OLD_VERSION,
       model: 'claude-sonnet-4-6',
       effort: 'medium',
     },
@@ -1564,7 +1630,7 @@ test('declared SDK compatibility deltas use strict version-specific lifecycle or
   mismatched.evidence.nativeLifecycleProof
     .correlations.notificationTaskMatchesStarted = false;
   assert.equal(evaluateMatrixEvidencePair({
-    ...MANIFEST_EXPECTATIONS,
+    ...BACKGROUND_OPT_IN,
     scenario,
     oldResult,
     candidateResult: mismatched,
@@ -1577,7 +1643,7 @@ test('declared SDK compatibility deltas use strict version-specific lifecycle or
     const invalidScenario = structuredClone(scenario);
     invalidScenario.comparison.lifecycle = lifecycle;
     assert.equal(evaluateMatrixEvidencePair({
-      ...MANIFEST_EXPECTATIONS,
+      ...BACKGROUND_OPT_IN,
       scenario: invalidScenario,
       oldResult,
       candidateResult,
@@ -3590,14 +3656,16 @@ function acceptedGateScenarios() {
 function acceptedGateSummary(
   runs,
   manifestSha256 = 'a'.repeat(64),
+  knownRegressions = [],
 ) {
   return {
     schemaVersion: 1,
     runPrefix: 'matrix',
     authoritative: true,
-    selectedRunCount: AUTHORITATIVE_RUN_COUNT,
-    expectedAuthoritativeRunCount: AUTHORITATIVE_RUN_COUNT,
+    selectedRunCount: runs.length,
+    expectedAuthoritativeRunCount: runs.length,
     manifestSha256,
+    knownRegressions,
     results: runs.map((run, index) => ({
       id: run.id,
       runId: run.env.CLAUDE_GATE_RUN_ID,
@@ -3612,8 +3680,8 @@ function acceptedGateSummary(
       artifactValidation: { pass: true, reasons: [] },
       pairComparison: null,
     })),
-    completedRunCount: AUTHORITATIVE_RUN_COUNT,
-    passCount: AUTHORITATIVE_RUN_COUNT,
+    completedRunCount: runs.length,
+    passCount: runs.length,
     notApplicableCount: 0,
     failCount: 0,
     blockedCount: 0,
@@ -3946,6 +4014,50 @@ test('accepted matrix cleanup binds startup handshakes to revalidated evidence',
     summaryResults,
     summaryMaximumMs: 0,
   }), false);
+});
+
+test('accepted matrix cleanup accepts a declared known regression only when the summary lists it', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-gate-known-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.chmodSync(dir, 0o700);
+  const { runs, scenarios } = createAcceptedGateFixture(dir);
+  const { purgeAcceptedGateArtifacts } = await import(
+    '../scripts/spikes/claude-gate-matrix.mjs'
+  );
+  const knownRegression = {
+    id: 'candidate:delayed-mcp',
+    version: CANDIDATE_VERSION,
+    reason: 'declared upstream regression',
+  };
+  const expectedRuns = runs.slice(0, AUTHORITATIVE_RUN_COUNT - 1);
+  const purge = (summary, expectedKnownRegressions) => purgeAcceptedGateArtifacts({
+    artifactBaseDir: dir,
+    runPrefix: 'matrix',
+    claudeProjectsDir: path.join(dir, 'fake-claude-projects'),
+    expectedRuns,
+    expectedScenarios: scenarios,
+    expectedManifestSha256: 'a'.repeat(64),
+    expectedKnownRegressions,
+    summary,
+  });
+  // A summary that silently drops the waived cell is not authoritative.
+  assert.throws(
+    () => purge(acceptedGateSummary(expectedRuns), [knownRegression]),
+    /complete authoritative PASS/,
+  );
+  // Nor may one cell short of the full matrix pass without a declaration.
+  assert.throws(
+    () => purge(acceptedGateSummary(expectedRuns), []),
+    /complete authoritative PASS/,
+  );
+  purge(
+    acceptedGateSummary(expectedRuns, 'a'.repeat(64), [knownRegression]),
+    [knownRegression],
+  );
+  assert.equal(
+    fs.existsSync(path.join(dir, expectedRuns[0].env.CLAUDE_GATE_RUN_ID, 'raw-private')),
+    false,
+  );
 });
 
 test('accepted matrix cleanup removes private evidence and preserves sanitized results', async (t) => {

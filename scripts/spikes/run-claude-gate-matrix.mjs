@@ -17,6 +17,7 @@ import {
   evaluateMatrixRunResult,
   evaluateMatrixVersionEvidence,
   MATRIX_MANIFEST_PATH,
+  matrixKnownRegressions,
   MATRIX_NOT_APPLICABLE_EXIT_CODE,
   purgeAcceptedGateArtifacts,
 } from './claude-gate-matrix.mjs';
@@ -77,6 +78,7 @@ if (acceptedRunPrefix) {
     expectedRuns,
     expectedScenarios: manifest.scenarios,
     expectedManifestSha256: manifestSha256,
+    expectedKnownRegressions: matrixKnownRegressions(manifest),
   });
   console.log(`accepted sanitized matrix ${acceptedRunPrefix}; private evidence removed`);
   process.exit(0);
@@ -113,6 +115,7 @@ const summary = {
   selectedRunCount: runs.length,
   expectedAuthoritativeRunCount,
   manifestSha256,
+  knownRegressions: matrixKnownRegressions(manifest),
   results: [],
 };
 const scenarios = new Map(
@@ -330,4 +333,7 @@ console.log(
       ? `, ${summary.notApplicableCount} NOT-APPLICABLE`
       : ''),
 );
+for (const regression of summary.knownRegressions) {
+  console.log(`known regression, not run: ${regression.id} (${regression.version}): ${regression.reason}`);
+}
 process.exit(summary.status === 'PASS' ? 0 : 1);
