@@ -646,9 +646,10 @@ export function summarizeLifecycleShape(lifecycle) {
 }
 
 // Ambient SDK stream rows whose presence and count depend on timing rather
-// than on the turn: rate-limit and thinking-token updates, and the
-// commands_changed notice Claude streams when its command catalogue finishes
-// loading or refreshes, which lands after some queries' init and not others.
+// than on the turn: rate-limit and thinking-token updates, tool_progress
+// heartbeats (every 30 s of a long-running tool), and the commands_changed
+// notice Claude streams when its command catalogue finishes loading or
+// refreshes, which lands after some queries' init and not others.
 const SDK_AMBIENT_SYSTEM_SUBTYPES = new Set([
   'commands_changed',
   'thinking_tokens',
@@ -658,6 +659,7 @@ export function summarizeSdkLifecycleSemantics(lifecycle) {
   if (!Array.isArray(lifecycle) || lifecycle.length === 0) return null;
   const records = lifecycle.filter((record) => (
     record?.type !== 'rate_limit_event'
+    && record?.type !== 'tool_progress'
     && !(
       record?.type === 'system'
       && SDK_AMBIENT_SYSTEM_SUBTYPES.has(record.subtype)

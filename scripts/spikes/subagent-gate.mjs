@@ -1,8 +1,11 @@
+// `tool_progress` is the SDK's heartbeat while the Agent tool keeps running
+// (every 30 s), so whether it appears depends on how long the subagent takes.
 const ALLOWED_RECORD_TYPES = new Set([
   'assistant',
   'rate_limit_event',
   'result',
   'system',
+  'tool_progress',
   'user',
 ]);
 // `commands_changed` is an ambient notice Claude streams when its command

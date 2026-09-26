@@ -2422,6 +2422,8 @@ test('matrix evidence rejects unknown and malformed normalized lifecycle records
         // 2.1.283 writes a running `cost-state` total (USD, durations,
         // per-model usage) that nothing in the lifecycle depends on.
         { type: 'cost-state' },
+        // SDK heartbeat streamed while a long tool (e.g. an Agent) runs.
+        { type: 'tool_progress' },
       ],
     },
   }).pass, true);
@@ -2608,6 +2610,33 @@ test('SDK semantic comparison ignores the timing-dependent commands_changed noti
       )),
     },
   }).pass, false);
+});
+
+// tool_progress heartbeats are streamed every 30 s while a tool such as an
+// Agent keeps running, so their count follows wall-clock time, not the turn.
+test('SDK semantic comparison ignores tool_progress heartbeats', async () => {
+  const { evaluateMatrixEvidencePair } = await import(
+    '../scripts/spikes/claude-gate-matrix.mjs'
+  );
+  const scenario = {
+    comparison: {
+      lifecycle: 'sdk-semantic-shape-v1',
+      equalFields: ['resolvedModel'],
+    },
+  };
+  const turn = [
+    system('init'),
+    { type: 'assistant', hasParent: false, contentTypes: ['tool_use'], toolNames: ['Agent'] },
+    { type: 'result', subtype: 'success' },
+  ];
+  const oldResult = { resolvedModel: 'claude-sonnet-4-6', lifecycle: turn };
+  const candidateResult = {
+    resolvedModel: 'claude-sonnet-4-6',
+    lifecycle: [turn[0], turn[1], { type: 'tool_progress' }, turn[2]],
+  };
+  assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS, scenario, oldResult, candidateResult,
+  }).pass, true);
 });
 
 test('SDK semantic lifecycle comparison ignores streaming noise but rejects missing tools', async () => {
