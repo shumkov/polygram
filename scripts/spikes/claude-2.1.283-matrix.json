@@ -54,7 +54,7 @@
             { "index": 4, "record": { "type": "attachment", "attachmentType": "remote_session_change" } },
             { "index": 8, "record": { "type": "attachment", "attachmentType": "environment" } },
             { "index": 9, "record": { "type": "attachment", "attachmentType": "model" } },
-            { "index": 14, "record": { "type": "attachment", "attachmentType": "deferred_tools_record" } }
+            { "index": [14, 15], "record": { "type": "attachment", "attachmentType": "deferred_tools_record" } }
           ]
         },
         "workflow-fallback-v1": {
@@ -66,7 +66,7 @@
             { "index": 4, "record": { "type": "attachment", "attachmentType": "remote_session_change" } },
             { "index": 8, "record": { "type": "attachment", "attachmentType": "environment" } },
             { "index": 9, "record": { "type": "attachment", "attachmentType": "model" } },
-            { "index": 14, "record": { "type": "attachment", "attachmentType": "deferred_tools_record" } }
+            { "index": [14, 15], "record": { "type": "attachment", "attachmentType": "deferred_tools_record" } }
           ]
         }
       },

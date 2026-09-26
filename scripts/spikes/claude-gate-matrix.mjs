@@ -127,12 +127,33 @@ function projectedInsertionsSchemaMatches(byBaseline) {
         && rows.length > 0
         && rows.every((row, index) => (
           hasExactKeys(row, ['index', 'record'])
-          && isNonNegativeInteger(row.index)
-          && (index === 0 || row.index > rows[index - 1].index)
+          && insertionPositionsSchemaMatches(row.index)
+          && (
+            index === 0
+            || Math.min(...insertionPositions(row.index))
+              > Math.max(...insertionPositions(rows[index - 1].index))
+          )
           && normalizedGateLifecycleRecordSchemaMatches(row.record)
         ))
       ))
     ))
+  );
+}
+
+// A declared row sits at one exact index, or at either of two adjacent
+// indices when the version writes it in the same instant as its neighbour
+// and the two land in either order.
+function insertionPositions(index) {
+  return Array.isArray(index) ? index : [index];
+}
+
+function insertionPositionsSchemaMatches(index) {
+  if (isNonNegativeInteger(index)) return true;
+  return (
+    Array.isArray(index)
+    && index.length === 2
+    && index.every(isNonNegativeInteger)
+    && index[1] === index[0] + 1
   );
 }
 
@@ -965,13 +986,18 @@ function adjustedProjectedLifecycle({ result, policy, expectations }) {
   for (const [stream, rows] of Object.entries(positional)) {
     const records = adjusted[stream];
     if (!Array.isArray(records)) return null;
-    if (rows.some(({ index, record }) => (
-      index >= records.length
-      || encoded(records[index]) !== encoded(record)
-    ))) {
-      return null;
+    const chosen = [];
+    for (const { index, record } of rows) {
+      // The first allowed position holding the record is removed; a copy at
+      // the other position stays behind and fails the baseline comparison.
+      const position = insertionPositions(index).find((candidate) => (
+        candidate < records.length
+        && encoded(records[candidate]) === encoded(record)
+      ));
+      if (position === undefined) return null;
+      chosen.push(position);
     }
-    for (const { index } of [...rows].reverse()) records.splice(index, 1);
+    for (const position of chosen.reverse()) records.splice(position, 1);
   }
   return adjusted;
 }

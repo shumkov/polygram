@@ -111,13 +111,16 @@ version's `projectedInsertions`, keyed by the policy's `baselineId`, as exact
 index and record pairs. Identical rows elsewhere (every turn has a
 `UserPromptSubmit`) make count-based removal ambiguous, so each declared row
 must sit at exactly its index before it is removed; a missing, moved, renamed,
-duplicated, or undeclared row fails. `2.1.283` declares its five session-start
+duplicated, or undeclared row fails. A row the CLI writes in the same instant as
+its neighbour may instead declare two adjacent indices (`[14, 15]`) and is
+accepted at either one only; any other reordering still fails. `2.1.283` declares its five session-start
 attachments, `environment` and `model` after the first prompt,
 `deferred_tools_record` after the first turn's context attachments, and the
 `UserPromptSubmit` it now fires for the prompt folded into the third CLI turn.
-`2.1.220` declares none. The CLI rows were observed in an authoritative run;
-the Workflow rows are inferred from them (with `deferred_tools_record` after
-`command_permissions`) and fail closed until a run confirms them. Each run may then
+`2.1.220` declares none. The CLI rows were observed in an authoritative run.
+In six Workflow runs, `deferred_tools_record` and `command_permissions` landed
+in either order, so the Workflow baselines accept the record on either side of
+`command_permissions`; the CLI contract keeps one exact index. Each run may then
 remove exactly the number of reviewed `task_reminder` rows its version declares
 (one on both `2.1.220` and `2.1.283`); either version may also remove at most
 one interrupt-correlated `hook_cancelled`. One source-bound composite proof must

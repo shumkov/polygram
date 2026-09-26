@@ -3071,6 +3071,114 @@ test('2.1.283 CLI-contract rows are accepted only as declared, at their observed
   }).pass, false);
 });
 
+test('2.1.283 Workflow accepts deferred_tools_record on either side of command_permissions only', async () => {
+  const {
+    evaluateMatrixScenarioEvidence,
+    evaluateMatrixVersionEvidence,
+    nestedWorkflowLifecycleMatches,
+  } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  // Both orders were observed across six real 2.1.283 runs: the two passive
+  // attachments are written in the same instant and land in either order.
+  const indexOf = (session, type) => session.findIndex(
+    (record) => record.attachmentType === type,
+  );
+  const withSession = (result, mutate) => {
+    const copy = structuredClone(result);
+    mutate(copy.lifecycle.session);
+    copy.lifecycleSources.session.rawRecordCount = copy.lifecycle.session.length;
+    copy.lifecycleSources.session.normalizedRecordCount =
+      copy.lifecycle.session.length;
+    return copy;
+  };
+  for (const deliveryMode of ['direct', 'fallback']) {
+    const scenario = manifest.scenarios.find(
+      ({ id }) => id === `workflow-${deliveryMode}`,
+    );
+    const recordFirst = workflowMatrixResult(with283SessionRows(
+      workflowLifecycleFixture({ deliveryMode, bashPairs: 2, subagentStops: 3 }),
+      { recordAfter: 'skill_listing' },
+    ), deliveryMode);
+    const permissionsFirst = withSession(recordFirst, (session) => {
+      const record = indexOf(session, 'deferred_tools_record');
+      [session[record], session[record + 1]] = [session[record + 1], session[record]];
+    });
+    const order = (result) => result.lifecycle.session
+      .filter((record) => ['deferred_tools_record', 'command_permissions']
+        .includes(record.attachmentType))
+      .map((record) => record.attachmentType);
+    assert.deepEqual(order(recordFirst), ['deferred_tools_record', 'command_permissions']);
+    assert.deepEqual(order(permissionsFirst), ['command_permissions', 'deferred_tools_record']);
+
+    const judge = (result) => evaluateMatrixVersionEvidence({
+      scenario,
+      versionKey: 'candidate',
+      expectations: CANDIDATE_EXPECTATIONS,
+      results: [result],
+    }).pass;
+    assert.equal(judge(recordFirst), true);
+    assert.equal(judge(permissionsFirst), true);
+    assert.equal(evaluateMatrixScenarioEvidence({
+      ...MANIFEST_EXPECTATIONS,
+      scenario,
+      oldResults: [workflowMatrixResult(workflowLifecycleFixture({
+        deliveryMode,
+        bashPairs: 2,
+        subagentStops: 3,
+      }), deliveryMode)],
+      candidateResults: [permissionsFirst],
+    }).pass, true);
+    if (deliveryMode === 'direct') {
+      assert.equal(nestedWorkflowLifecycleMatches({
+        result: permissionsFirst,
+        policy: scenario.comparison.lifecycle,
+        expectations: CANDIDATE_EXPECTATIONS,
+      }), true);
+    }
+
+    for (const [name, mutate] of Object.entries({
+      missing: (session) => {
+        session.splice(indexOf(session, 'deferred_tools_record'), 1);
+      },
+      'duplicated on both sides': (session) => {
+        session.splice(
+          indexOf(session, 'command_permissions') + 1,
+          0,
+          attachment('deferred_tools_record'),
+        );
+      },
+      'after the turn boundary': (session) => {
+        const [record] = session.splice(indexOf(session, 'deferred_tools_record'), 1);
+        session.splice(indexOf(session, 'command_permissions') + 2, 0, record);
+      },
+      'before skill_listing': (session) => {
+        const [record] = session.splice(indexOf(session, 'deferred_tools_record'), 1);
+        session.splice(indexOf(session, 'skill_listing'), 0, record);
+      },
+      'another adjacent pair swapped': (session) => {
+        const skill = indexOf(session, 'skill_listing');
+        [session[skill - 1], session[skill]] = [session[skill], session[skill - 1]];
+      },
+    })) {
+      for (const base of [recordFirst, permissionsFirst]) {
+        assert.equal(judge(withSession(base, mutate)), false, `${deliveryMode}: ${name}`);
+      }
+    }
+  }
+
+  // The CLI contract has no such race, so its row stays exact.
+  const cliScenario = manifest.scenarios.find(({ id }) => id === 'cli-contract');
+  const swappedCli = structuredClone(CLI_LIFECYCLE_FIXTURES.candidate1);
+  const session = swappedCli.lifecycle.session;
+  const record = indexOf(session, 'deferred_tools_record');
+  [session[record], session[record + 1]] = [session[record + 1], session[record]];
+  assert.equal(evaluateMatrixVersionEvidence({
+    scenario: cliScenario,
+    versionKey: 'candidate',
+    expectations: CANDIDATE_EXPECTATIONS,
+    results: [CLI_LIFECYCLE_FIXTURES.candidate1, swappedCli],
+  }).pass, false);
+});
+
 test('positional insertion declarations are validated before any run', async () => {
   const { expectationsFor } = await import(
     '../scripts/spikes/claude-gate-matrix.mjs'
@@ -3081,6 +3189,19 @@ test('positional insertion declarations are validated before any run', async () 
     { 'cli-contract-v1': { session: [] } },
     { 'cli-contract-v1': { transcript: declared.session } },
     { 'cli-contract-v1': { session: [{ index: -1, record: attachment('date') }] } },
+    // A position choice is bounded to two adjacent indices after the
+    // previous declared row.
+    { 'cli-contract-v1': { session: [{ index: [14, 16], record: attachment('date') }] } },
+    { 'cli-contract-v1': { session: [{ index: [14, 15, 16], record: attachment('date') }] } },
+    { 'cli-contract-v1': { session: [{ index: [15, 14], record: attachment('date') }] } },
+    {
+      'cli-contract-v1': {
+        session: [
+          { index: [3, 4], record: attachment('date') },
+          { index: 4, record: attachment('model') },
+        ],
+      },
+    },
     { 'cli-contract-v1': { session: [{ index: 0, record: { type: 'unknown-row' } }] } },
   ]) {
     assert.throws(() => expectationsFor({
