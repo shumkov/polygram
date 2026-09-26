@@ -607,13 +607,13 @@ describe('MODEL_VERSIONS_DESC', () => {
   });
 
   // `/model opus` tells the user which concrete model the alias runs. That
-  // answer comes from the pinned claude CLI, not from us — the pinned 2.1.220
-  // resolves `--model opus` to claude-opus-5 (2.1.173 resolved it to
-  // claude-opus-4-8). A generic /^claude-/ assertion lets the mapping rot
+  // answer comes from the pinned claude CLI, not from us — the pinned 2.1.283
+  // resolves `--model opus` to claude-opus-5-5 (2.1.220 resolved it to
+  // claude-opus-5). A generic /^claude-/ assertion lets the mapping rot
   // silently through a CLI bump, and the reply then names a model the session
   // isn't running.
   test('opus names the model the pinned CLI actually resolves it to', () => {
-    assert.equal(MODEL_VERSIONS_DESC.opus, 'claude-opus-5');
+    assert.equal(MODEL_VERSIONS_DESC.opus, 'claude-opus-5-5');
   });
 });
 

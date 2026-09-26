@@ -19,6 +19,7 @@ const assert = require('node:assert/strict');
 const {
   createBuildSdkOptions,
   filterEnv,
+  withoutPromptSnapshot,
   CHILD_ENV_ALLOWLIST,
   CHILD_ENV_PREFIXES,
 } = require('../lib/sdk/build-options');
@@ -208,6 +209,42 @@ describe('buildSdkOptions — richText-aware display hint', () => {
     for (const out of [plainOut, richOut]) {
       assert.match(out.systemPrompt.append, /NEVER emit shell-context canned strings/);
     }
+  });
+});
+
+// Claude Code records a conversation's system prompt once and replays the
+// record on every resume until compaction. The display hint changes with
+// richText and between releases, so SDK sessions opt out of the recording or
+// resumed chats would keep stale formatting rules.
+describe('buildSdkOptions — system prompt is rendered fresh on resume', () => {
+  test('the default preset+append prompt carries snapshot: false', () => {
+    const out = createBuildSdkOptions(baseDeps())('chat-1', baseCtx());
+    assert.equal(out.systemPrompt.type, 'preset');
+    assert.equal(out.systemPrompt.snapshot, false);
+    assert.match(out.systemPrompt.append, /NEVER emit shell-context canned strings/);
+  });
+
+  test('a resumed session still opts out (resume is when a record would be replayed)', () => {
+    const out = createBuildSdkOptions(baseDeps())('chat-1', baseCtx({ existingSessionId: 'sid-1' }));
+    assert.equal(out.systemPrompt.snapshot, false);
+  });
+
+  test('string and string[] prompts (agent bodies) become custom prompts with snapshot: false', () => {
+    assert.deepEqual(withoutPromptSnapshot('agent body'),
+      { type: 'custom', prompt: 'agent body', snapshot: false });
+    assert.deepEqual(withoutPromptSnapshot(['a', 'b']),
+      { type: 'custom', prompt: ['a', 'b'], snapshot: false });
+  });
+
+  test('object prompts keep their fields and gain snapshot: false', () => {
+    assert.deepEqual(withoutPromptSnapshot({ type: 'custom', prompt: 'p', snapshot: true }),
+      { type: 'custom', prompt: 'p', snapshot: false });
+    assert.deepEqual(withoutPromptSnapshot({ type: 'preset', preset: 'claude_code', append: 'x' }),
+      { type: 'preset', preset: 'claude_code', append: 'x', snapshot: false });
+  });
+
+  test('no prompt stays no prompt', () => {
+    assert.equal(withoutPromptSnapshot(undefined), undefined);
   });
 });
 

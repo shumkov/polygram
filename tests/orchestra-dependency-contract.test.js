@@ -137,3 +137,24 @@ test('installed Orchestra sends clean replay only to the expected live process',
   );
   assert.equal(calls.length, 1);
 });
+
+// Orchestra pins the Agent SDK whose bundled claude defines the CLI pin; the
+// gate spikes import the SDK through Polygram's own dependency. Both must name
+// the same exact version, or npm installs a second ~240 MB copy and the gate
+// exercises a different SDK than production runs.
+test('Polygram and Orchestra pin the same exact Agent SDK version', () => {
+  const sdk = '@anthropic-ai/claude-agent-sdk';
+  assert.equal(
+    packageJson.dependencies[sdk],
+    orchestraPackage.optionalDependencies[sdk],
+  );
+  assert.equal(
+    lockfile.packages[`node_modules/${sdk}`].version,
+    packageJson.dependencies[sdk],
+  );
+  assert.equal(
+    lockfile.packages[`node_modules/@shumkov/orchestra/node_modules/${sdk}`],
+    undefined,
+    'Orchestra resolves the same hoisted SDK copy',
+  );
+});
