@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 
 import {
@@ -33,7 +34,17 @@ const { encodeCwd } = require('../../lib/util/claude-session-jsonl');
 
 const RUN_PREFIX_RE = /^[A-Za-z0-9._-]{1,96}$/;
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
-const AUTHORITATIVE_RUN_COUNT = 21;
+const AUTHORITATIVE_RUN_COUNT = 24;
+const SNAPSHOT_SCENARIO = 'candidate-system-prompt-snapshot';
+const CLI_PROCESS_TREE_SCENARIOS = new Set([
+  'cli-contract',
+  'workflow-direct',
+  'workflow-fallback',
+  SNAPSHOT_SCENARIO,
+]);
+// A driver exits with this code when it proved its precondition absent on
+// this host; the sanitized result must then say NOT-APPLICABLE as well.
+export const MATRIX_NOT_APPLICABLE_EXIT_CODE = 3;
 const RUNNER_OWNED_ENV_KEYS = new Set([
   'CLAUDE_GATE_BIN',
   'CLAUDE_GATE_EXPECTED_VERSION',
@@ -43,12 +54,15 @@ const RUNNER_OWNED_ENV_KEYS = new Set([
   'CLAUDE_GATE_SCENARIO_ID',
   'CLAUDE_GATE_EXPECTED_RESOLVED_MODEL',
   'CLAUDE_GATE_DOCUMENTED_WORKFLOW_SIZE_GUIDELINE',
+  'CLAUDE_GATE_MANIFEST_SHA256',
 ]);
 const CROSS_VERSION_POLICIES = new Set(['single', 'all-pairs']);
 const VERSION_SPECIFIC_LIFECYCLE_ORACLES = new Map([
   ['delayed-mcp', 'delayed-mcp-v1'],
+  ['delayed-mcp-foreground', 'delayed-mcp-v1'],
   ['sdk-subagent', 'sdk-subagent-v1'],
 ]);
+const DELAYED_MCP_SCENARIOS = new Set(['delayed-mcp', 'delayed-mcp-foreground']);
 const EVIDENCE_SOURCE_REGISTRY = new Map([
   ['cli-contract', {
     session: 'session.jsonl',
@@ -65,13 +79,179 @@ const EVIDENCE_SOURCE_REGISTRY = new Map([
   ['delayed-mcp', {
     sdk: 'sdk-stream.ndjson',
   }],
+  ['delayed-mcp-foreground', {
+    sdk: 'sdk-stream.ndjson',
+  }],
   ['sdk-subagent', {
     sdk: 'sdk-stream.ndjson',
   }],
   ['candidate-opus-projection', {
     sdk: 'sdk-stream.ndjson',
   }],
+  [SNAPSHOT_SCENARIO, {
+    session: 'session.jsonl',
+  }],
 ]);
+const GATE_EXPECTATION_KEYS = [
+  'delayedMcpModes',
+  'opusPassiveSessionAttachmentCounts',
+  'passiveSessionAttachmentCounts',
+  'projectedInsertions',
+  'resolvedOpus',
+  'subagentTaskUpdated',
+  'taskReminderInsertions',
+  'workflowSizeGuideline',
+  'workflowSizeGuidelineAnchors',
+  'wrapperRequired',
+];
+const WORKFLOW_SIZE_GUIDELINES = new Set([
+  'large',
+  'medium',
+  'small',
+  'unrestricted',
+]);
+
+const PROJECTED_INSERTION_STREAMS = new Set(['hooks', 'session']);
+
+function projectedInsertionsSchemaMatches(byBaseline) {
+  return (
+    byBaseline
+    && typeof byBaseline === 'object'
+    && !Array.isArray(byBaseline)
+    && Object.entries(byBaseline).every(([baselineId, streams]) => (
+      /^[a-z0-9-]+$/.test(baselineId)
+      && streams
+      && typeof streams === 'object'
+      && !Array.isArray(streams)
+      && Object.entries(streams).every(([stream, rows]) => (
+        PROJECTED_INSERTION_STREAMS.has(stream)
+        && Array.isArray(rows)
+        && rows.length > 0
+        && rows.every((row, index) => (
+          hasExactKeys(row, ['index', 'record'])
+          && isNonNegativeInteger(row.index)
+          && (index === 0 || row.index > rows[index - 1].index)
+          && normalizedGateLifecycleRecordSchemaMatches(row.record)
+        ))
+      ))
+    ))
+  );
+}
+
+// The opt-in auto-background path may be waived per version, with a reason,
+// so it is reported instead of run: `known-regression` for a deterministic
+// upstream failure, `not-gated` for a path that is too unreliable to gate and
+// that production does not use. The default path is what production runs and
+// can never be waived.
+const DELAYED_MCP_WAIVERS = new Set(['known-regression', 'not-gated']);
+
+function delayedMcpModesSchemaMatches(modes) {
+  const waived = DELAYED_MCP_WAIVERS.has(modes?.autoBackground);
+  return (
+    hasExactKeys(
+      modes,
+      waived
+        ? ['autoBackground', 'default', 'waiverReason']
+        : ['autoBackground', 'default'],
+    )
+    && (waived || ['foreground', 'background'].includes(modes.autoBackground))
+    && ['foreground', 'background'].includes(modes.default)
+    && (
+      !waived
+      || (
+        typeof modes.waiverReason === 'string'
+        && modes.waiverReason.trim().length > 0
+      )
+    )
+  );
+}
+
+function passiveSessionAttachmentCountsSchemaMatches(counts) {
+  return (
+    counts
+    && typeof counts === 'object'
+    && !Array.isArray(counts)
+    && Object.entries(counts).every(([attachmentType, count]) => (
+      /^[a-z0-9_]+$/.test(attachmentType)
+      && isNonNegativeInteger(count)
+    ))
+  );
+}
+
+export function gateExpectationsSchemaMatches(expectations) {
+  return Boolean(
+    hasExactKeys(expectations, GATE_EXPECTATION_KEYS)
+    && passiveSessionAttachmentCountsSchemaMatches(
+      expectations.passiveSessionAttachmentCounts,
+    )
+    && passiveSessionAttachmentCountsSchemaMatches(
+      expectations.opusPassiveSessionAttachmentCounts,
+    )
+    && Object.keys(expectations.opusPassiveSessionAttachmentCounts).every(
+      (type) => !Object.hasOwn(expectations.passiveSessionAttachmentCounts, type),
+    )
+    && projectedInsertionsSchemaMatches(expectations.projectedInsertions)
+    && typeof expectations.wrapperRequired === 'boolean'
+    && delayedMcpModesSchemaMatches(expectations.delayedMcpModes)
+    && [0, 1].includes(expectations.subagentTaskUpdated)
+    && isNonNegativeInteger(expectations.taskReminderInsertions)
+    && /^claude-opus-[a-z0-9-]+$/.test(expectations.resolvedOpus || '')
+    && WORKFLOW_SIZE_GUIDELINES.has(expectations.workflowSizeGuideline)
+    && Array.isArray(expectations.workflowSizeGuidelineAnchors)
+    && expectations.workflowSizeGuidelineAnchors.length > 0
+    && expectations.workflowSizeGuidelineAnchors.every(
+      (anchor) => typeof anchor === 'string' && anchor.length > 0,
+    )
+  );
+}
+
+// Behaviour that legitimately differs between Claude Code releases is
+// declared per CLI version in the manifest. A version without a reviewed
+// entry has no accepted behaviour, so the gate refuses to judge it.
+export function expectationsFor(expectationsByVersion, attestedVersion) {
+  const declared = (
+    expectationsByVersion
+    && typeof expectationsByVersion === 'object'
+    && !Array.isArray(expectationsByVersion)
+    && typeof attestedVersion === 'string'
+    && Object.hasOwn(expectationsByVersion, attestedVersion)
+  )
+    ? expectationsByVersion[attestedVersion]
+    : undefined;
+  if (declared === undefined) {
+    throw new TypeError(
+      `no gate expectations are declared for Claude Code ${attestedVersion}`,
+    );
+  }
+  if (!gateExpectationsSchemaMatches(declared)) {
+    throw new TypeError(
+      `gate expectations for Claude Code ${attestedVersion} are malformed`,
+    );
+  }
+  return structuredClone(declared);
+}
+
+export const MATRIX_MANIFEST_PATH = fileURLToPath(
+  new URL('./claude-2.1.283-matrix.json', import.meta.url),
+);
+
+// Drivers judge their own evidence against the same reviewed manifest the
+// runner schedules from, keyed by the version the executable attested. Under
+// the runner the manifest must still be the exact bytes it scheduled from.
+export function readGateExpectations(
+  attestedVersion,
+  { expectedManifestSha256 = process.env.CLAUDE_GATE_MANIFEST_SHA256 } = {},
+) {
+  const manifestText = fs.readFileSync(MATRIX_MANIFEST_PATH, 'utf8');
+  if (
+    expectedManifestSha256 !== undefined
+    && hashSensitiveString(manifestText) !== expectedManifestSha256
+  ) {
+    throw new Error('gate manifest changed after the matrix runner read it');
+  }
+  const manifest = JSON.parse(manifestText);
+  return expectationsFor(manifest.expectations, attestedVersion);
+}
 
 function expectedEvidenceSources(scenario) {
   const expected = EVIDENCE_SOURCE_REGISTRY.get(scenario?.id);
@@ -165,22 +345,69 @@ function versionSpecificLifecyclePolicyMatches(scenario, oracle) {
   );
 }
 
-function versionSpecificLifecycleMatches(result, oracle, isCandidate) {
+// Delayed-MCP cells opt into auto-background for both sides or neither, so
+// the declared environment alone selects which per-version mode applies.
+// Production never sets the opt-in and therefore runs the default path.
+function delayedMcpAutoBackground(scenario) {
+  return scenario?.environment?.common?.CLAUDE_AUTO_BACKGROUND_TASKS === '1';
+}
+
+function expectedDelayedMcpMode(expectations, autoBackground) {
+  return expectations.delayedMcpModes[
+    autoBackground ? 'autoBackground' : 'default'
+  ];
+}
+
+function versionSpecificLifecycleMatches(
+  result,
+  oracle,
+  expectations,
+  { delayedMcpAutoBackground: autoBackground } = {},
+) {
+  if (!gateExpectationsSchemaMatches(expectations)) return false;
   try {
     if (oracle === 'delayed-mcp-v1') {
-      const expectedMode = isCandidate ? 'background' : 'foreground';
       return (
-        result?.evidence?.expectedMode === expectedMode
+        typeof autoBackground === 'boolean'
+        && result?.evidence?.expectedMode
+          === expectedDelayedMcpMode(expectations, autoBackground)
         && evaluateDelayedMcpEvidence(result.evidence).pass
       );
     }
     if (oracle === 'sdk-subagent-v1') {
-      return evaluateSubagentEvidence(result, { isCandidate }).pass;
+      return evaluateSubagentEvidence(result, {
+        expectedTaskUpdated: expectations.subagentTaskUpdated,
+      }).pass;
     }
     return false;
   } catch {
     return false;
   }
+}
+
+// Cells a version waives are not scheduled; every authoritative summary lists
+// them with the waiver and reason so they are never silently dropped.
+export function matrixWaivedCells(manifest) {
+  const waived = [];
+  for (const versionKey of ['old', 'candidate']) {
+    const version = manifest.versions[versionKey];
+    const expectations = expectationsFor(manifest.expectations, version);
+    for (const scenario of manifest.scenarios) {
+      if (versionKey === 'old' && scenario.candidateOnly) continue;
+      const mode = DELAYED_MCP_SCENARIOS.has(scenario.id)
+        ? expectedDelayedMcpMode(expectations, delayedMcpAutoBackground(scenario))
+        : null;
+      if (DELAYED_MCP_WAIVERS.has(mode)) {
+        waived.push({
+          id: `${versionKey}:${scenario.id}`,
+          version,
+          waiver: mode,
+          reason: expectations.delayedMcpModes.waiverReason,
+        });
+      }
+    }
+  }
+  return waived;
 }
 
 export function buildClaudeMatrixRuns({
@@ -202,8 +429,22 @@ export function buildClaudeMatrixRuns({
     }
   }
 
+  const passiveTypes = ['old', 'candidate'].map((versionKey) => Object.keys(
+    expectationsFor(manifest.expectations, manifest.versions[versionKey])
+      .passiveSessionAttachmentCounts,
+  ).sort());
+  if (!isDeepStrictEqual(passiveTypes[0], passiveTypes[1])) {
+    throw new TypeError(
+      'both versions must declare counts for the same passive session attachments',
+    );
+  }
+
   const runs = [];
   for (const versionKey of ['old', 'candidate']) {
+    const expectations = expectationsFor(
+      manifest.expectations,
+      manifest.versions[versionKey],
+    );
     for (const scenario of manifest.scenarios) {
       if (versionKey === 'old' && scenario.candidateOnly) continue;
       for (const environment of [
@@ -216,6 +457,30 @@ export function buildClaudeMatrixRuns({
           }
         }
       }
+      if (Object.hasOwn(
+        scenario.environment?.[versionKey] || {},
+        'CLAUDE_AUTO_BACKGROUND_TASKS',
+      )) {
+        throw new TypeError(
+          `${scenario.id} must declare CLAUDE_AUTO_BACKGROUND_TASKS for both versions`,
+        );
+      }
+      const delayedMcp = DELAYED_MCP_SCENARIOS.has(scenario.id);
+      if (
+        delayedMcp
+        && (scenario.args?.[versionKey] || []).includes('--expected-mode')
+      ) {
+        throw new TypeError(
+          `${scenario.id} expected mode comes from the version expectations`,
+        );
+      }
+      const delayedMcpMode = delayedMcp
+        ? expectedDelayedMcpMode(
+          expectations,
+          delayedMcpAutoBackground(scenario),
+        )
+        : null;
+      if (DELAYED_MCP_WAIVERS.has(delayedMcpMode)) continue;
       const versionSpecificLifecycleOracle =
         VERSION_SPECIFIC_LIFECYCLE_ORACLES.get(scenario.id);
       if (
@@ -231,6 +496,7 @@ export function buildClaudeMatrixRuns({
       }
       const { repeatCount } = normalizeComparisonPolicy(scenario);
       const evidenceSources = expectedEvidenceSources(scenario);
+      const opusProjection = scenario.id === 'candidate-opus-projection';
       const {
         maxBridgeReadyToMcpReadyMs,
       } = normalizeAcceptancePolicy(scenario);
@@ -262,8 +528,10 @@ export function buildClaudeMatrixRuns({
             ? scenario.environment?.candidate?.CLAUDE_GATE_MODEL
               || manifest.comparator.model
             : manifest.comparator.model,
-          expectedResolvedModel: scenario.expectedResolvedModel
-            || manifest.comparator.model,
+          expectedResolvedModel: opusProjection
+            ? expectations.resolvedOpus
+            : manifest.comparator.model,
+          expectations: structuredClone(expectations),
           ...(maxBridgeReadyToMcpReadyMs !== undefined && {
             maxBridgeReadyToMcpReadyMs,
           }),
@@ -273,7 +541,7 @@ export function buildClaudeMatrixRuns({
           ...(evidenceSources && {
             evidenceSources: structuredClone(evidenceSources),
           }),
-          ...(scenario.id === 'candidate-opus-projection' && {
+          ...(opusProjection && {
             nestedWorkflowLifecyclePolicy: structuredClone(
               manifest.scenarios.find(
                 ({ id }) => id === 'workflow-direct',
@@ -282,7 +550,13 @@ export function buildClaudeMatrixRuns({
           }),
           effort: manifest.comparator.effort,
           driver: scenario.driver,
-          args: [...(scenario.args?.[versionKey] || [])],
+          args: [
+            ...(scenario.args?.[versionKey] || []),
+            ...(delayedMcp ? ['--expected-mode', delayedMcpMode] : []),
+          ],
+          ...(delayedMcp && {
+            delayedMcpAutoBackground: delayedMcpAutoBackground(scenario),
+          }),
           env: {
             CLAUDE_GATE_BIN: binaries[versionKey],
             CLAUDE_GATE_EXPECTED_VERSION: manifest.versions[versionKey],
@@ -293,12 +567,10 @@ export function buildClaudeMatrixRuns({
             CLAUDE_GATE_SCENARIO_ID: scenario.id,
             ...(scenario.environment?.common || {}),
             ...(scenario.environment?.[versionKey] || {}),
-            ...(versionKey === 'candidate' && scenario.expectedResolvedModel && {
-              CLAUDE_GATE_EXPECTED_RESOLVED_MODEL: scenario.expectedResolvedModel,
-            }),
-            ...(versionKey === 'candidate' && scenario.documentedWorkflowSizeGuideline && {
+            ...(opusProjection && {
+              CLAUDE_GATE_EXPECTED_RESOLVED_MODEL: expectations.resolvedOpus,
               CLAUDE_GATE_DOCUMENTED_WORKFLOW_SIZE_GUIDELINE:
-                scenario.documentedWorkflowSizeGuideline,
+                expectations.workflowSizeGuideline,
             }),
           },
           cost: scenario.cost,
@@ -373,11 +645,28 @@ export function summarizeLifecycleShape(lifecycle) {
   }));
 }
 
+// Ambient SDK stream rows whose presence and count depend on timing rather
+// than on the turn: rate-limit and thinking-token updates, tool_progress
+// heartbeats (every 30 s of a long-running tool), `status` progress notices
+// (e.g. while compacting; the compaction itself is checked by each cell's
+// equal fields), and the commands_changed notice Claude streams when its
+// command catalogue finishes loading or refreshes, which lands after some
+// queries' init and not others.
+const SDK_AMBIENT_SYSTEM_SUBTYPES = new Set([
+  'commands_changed',
+  'status',
+  'thinking_tokens',
+]);
+
 export function summarizeSdkLifecycleSemantics(lifecycle) {
   if (!Array.isArray(lifecycle) || lifecycle.length === 0) return null;
   const records = lifecycle.filter((record) => (
     record?.type !== 'rate_limit_event'
-    && !(record?.type === 'system' && record.subtype === 'thinking_tokens')
+    && record?.type !== 'tool_progress'
+    && !(
+      record?.type === 'system'
+      && SDK_AMBIENT_SYSTEM_SUBTYPES.has(record.subtype)
+    )
     && !(
       record?.type === 'assistant'
       && record.toolNames?.length === 0
@@ -405,10 +694,19 @@ export function summarizeSdkLifecycleSemantics(lifecycle) {
   };
 }
 
+// Context-usage reminders are injected by the service a varying number of
+// times per conversation, even on an unchanged binary. They are not a
+// lifecycle event and nothing downstream reads them, so they carry no
+// compatibility signal and are left out of the pivotal projection.
+const NON_PIVOTAL_ATTACHMENT_TYPES = new Set(['total_tokens_reminder']);
+
 function isSessionPivotal(record) {
   return (
     record?.type === 'queue-operation'
-    || record?.type === 'attachment'
+    || (
+      record?.type === 'attachment'
+      && !NON_PIVOTAL_ATTACHMENT_TYPES.has(record.attachmentType)
+    )
     || (record?.type === 'system' && record.subtype !== 'init')
     || (
       record?.type === 'user'
@@ -534,9 +832,9 @@ function isNonNegativeInteger(value) {
 
 function isTaskReminderInsertion(insertion) {
   return (
-    hasExactKeys(insertion, ['count', 'proof', 'record', 'stream'])
+    hasExactKeys(insertion, ['expectedCountKey', 'proof', 'record', 'stream'])
     && insertion.stream === 'session'
-    && insertion.count === 1
+    && insertion.expectedCountKey === 'taskReminderInsertions'
     && encoded(insertion.record) === encoded(TASK_REMINDER_RECORD)
     && hasExactKeys(insertion.proof, ['eligibility', 'type'])
     && insertion.proof.type === 'session-event-aggregator-removal'
@@ -586,21 +884,22 @@ function insertionKey(insertion) {
   return `${insertion.stream}\0${encoded(insertion.record)}`;
 }
 
-function declaredInsertions(policy, isCandidate) {
-  const candidateOnly = policy?.candidateOnlyInsertions;
+function declaredInsertions(policy, expectations) {
+  const versioned = policy?.versionedInsertions;
   const optional = policy?.optionalInsertions;
   if (
-    !Array.isArray(candidateOnly)
-    || candidateOnly.some((insertion) => !isTaskReminderInsertion(insertion))
+    !gateExpectationsSchemaMatches(expectations)
+    || !Array.isArray(versioned)
+    || versioned.some((insertion) => !isTaskReminderInsertion(insertion))
     || !Array.isArray(optional)
     || optional.some((insertion) => !isHookCancelledInsertion(insertion))
   ) {
     return null;
   }
   const all = [
-    ...candidateOnly.map((insertion) => ({
+    ...versioned.map((insertion) => ({
       ...insertion,
-      expectedCount: isCandidate ? insertion.count : 0,
+      expectedCount: expectations[insertion.expectedCountKey],
       optional: false,
     })),
     ...optional.map((insertion) => ({
@@ -687,8 +986,8 @@ function removalProofMatches({
   });
 }
 
-function insertionEvidence({ result, policy, isCandidate }) {
-  const declarations = declaredInsertions(policy, isCandidate);
+function insertionEvidence({ result, policy, expectations }) {
+  const declarations = declaredInsertions(policy, expectations);
   if (
     declarations === null
     || !lifecycleSourceMatches(result)
@@ -728,9 +1027,44 @@ function insertionEvidence({ result, policy, isCandidate }) {
   return { declarations, targetCounts };
 }
 
-function adjustedProjectedLifecycle({ result, policy, isCandidate }) {
-  const evidence = insertionEvidence({ result, policy, isCandidate });
+// Context attachments a version writes once per session transcript, such as
+// the date, model, and environment records. Claude writes them concurrently
+// with the first channel prompt, so their position races, but each type is
+// unique per session: every declared type must occur exactly its declared
+// count anywhere in the session stream and is then removed. They are passive
+// (no parser event is derived from them), so unlike the task-reminder and
+// cancellation insertions they need no removal proof. A type one version
+// declares with a positive count must be declared (usually as zero) by every
+// compared version, so an old transcript that grows one still fails.
+function removePassiveSessionAttachments(adjusted, expectations) {
+  const counts = expectations.passiveSessionAttachmentCounts;
+  if (Object.keys(counts).length === 0) return true;
+  if (!Array.isArray(adjusted.session)) return false;
+  for (const [attachmentType, expectedCount] of Object.entries(counts)) {
+    const matches = (record) => (
+      record?.type === 'attachment' && record.attachmentType === attachmentType
+    );
+    if (adjusted.session.filter(matches).length !== expectedCount) return false;
+    adjusted.session = adjusted.session.filter((record) => !matches(record));
+  }
+  return true;
+}
+
+// Rows a version adds at fixed positions of a projected baseline, such as an
+// extra UserPromptSubmit for a folded prompt. Identical rows elsewhere in the
+// stream (every turn has a UserPromptSubmit) make count-based removal
+// ambiguous, so these are pinned by exact index and record. Positions refer
+// to the version's projection after the count-based rows are removed.
+function positionalInsertionsFor(policy, expectations) {
+  if (!/^[a-z0-9-]+$/.test(policy?.baselineId || '')) return null;
+  return expectations.projectedInsertions[policy.baselineId] || {};
+}
+
+function adjustedProjectedLifecycle({ result, policy, expectations }) {
+  const evidence = insertionEvidence({ result, policy, expectations });
   if (evidence === null) return null;
+  const positional = positionalInsertionsFor(policy, expectations);
+  if (positional === null) return null;
   const projection = projectLifecycle(result.lifecycle, policy);
   if (projection === null) return null;
   const adjusted = structuredClone(projection);
@@ -748,6 +1082,18 @@ function adjustedProjectedLifecycle({ result, policy, isCandidate }) {
       adjusted[declaration.stream].splice(index, 1);
     }
   }
+  if (!removePassiveSessionAttachments(adjusted, expectations)) return null;
+  for (const [stream, rows] of Object.entries(positional)) {
+    const records = adjusted[stream];
+    if (!Array.isArray(records)) return null;
+    if (rows.some(({ index, record }) => (
+      index >= records.length
+      || encoded(records[index]) !== encoded(record)
+    ))) {
+      return null;
+    }
+    for (const { index } of [...rows].reverse()) records.splice(index, 1);
+  }
   return adjusted;
 }
 
@@ -755,18 +1101,18 @@ function compareProjectedLifecycle({
   leftResult,
   rightResult,
   policy,
-  leftIsCandidate,
-  rightIsCandidate,
+  leftExpectations,
+  rightExpectations,
 }) {
   const leftProjection = adjustedProjectedLifecycle({
     result: leftResult,
     policy,
-    isCandidate: leftIsCandidate,
+    expectations: leftExpectations,
   });
   const rightProjection = adjustedProjectedLifecycle({
     result: rightResult,
     policy,
-    isCandidate: rightIsCandidate,
+    expectations: rightExpectations,
   });
   return (
     leftProjection !== null
@@ -802,14 +1148,14 @@ function projectedBaseline(policy) {
 function matchesProjectedBaseline({
   result,
   policy,
-  isCandidate,
+  expectations,
 }) {
   const baseline = projectedBaseline(policy);
   if (baseline === null) return false;
   const adjusted = adjustedProjectedLifecycle({
     result,
     policy,
-    isCandidate,
+    expectations,
   });
   return adjusted !== null && encoded(adjusted) === encoded(baseline);
 }
@@ -933,7 +1279,7 @@ function privateLifecycleSourcesMatch({
   ) {
     return false;
   }
-  if (run.scenarioId === 'delayed-mcp') {
+  if (DELAYED_MCP_SCENARIOS.has(run.scenarioId)) {
     const claimedProof = result?.evidence?.nativeLifecycleProof;
     let regeneratedProof;
     try {
@@ -983,9 +1329,10 @@ function independentAttestationMatches(run, result) {
     .createHash('sha256')
     .update(realExecutable)
     .digest('hex');
-  const wrapperRequired = run.versionKey === 'candidate';
+  const wrapperRequired = run.expectations?.wrapperRequired;
   return (
-    result.attestation.runId === run.env.CLAUDE_GATE_RUN_ID
+    typeof wrapperRequired === 'boolean'
+    && result.attestation.runId === run.env.CLAUDE_GATE_RUN_ID
     && result.attestation.version === run.version
     && result.attestation.sha256 === executableSha256
     && result.attestation.executablePathHash === executablePathHash
@@ -1223,9 +1570,7 @@ export function privateProcessEvidenceMatches(
   }
   if (!isDeepStrictEqual(wrappers, result.wrapperRecords)) return false;
 
-  if (['cli-contract', 'workflow-direct', 'workflow-fallback'].includes(
-    run.scenarioId,
-  )) {
+  if (CLI_PROCESS_TREE_SCENARIOS.has(run.scenarioId)) {
     let rawTree;
     try {
       rawTree = privateCliProcessTree(privateArtifactDir);
@@ -1269,9 +1614,7 @@ function matrixProcessEvidenceMatches(run, result, privateArtifactDir) {
     sanitizedAttestation: result.attestation,
   };
   try {
-    if (['cli-contract', 'workflow-direct', 'workflow-fallback'].includes(
-      run.scenarioId,
-    )) {
+    if (CLI_PROCESS_TREE_SCENARIOS.has(run.scenarioId)) {
       if (
         !Array.isArray(result.processTree)
         || result.processTree.length === 0
@@ -1426,7 +1769,118 @@ function successfulWorkflowOracleMatches(result, fallback) {
   );
 }
 
-export function matrixScenarioOracleMatches(scenarioId, result) {
+export const SNAPSHOT_REPLY_TOOL = 'mcp__polygram-snapshot-gate-bridge__reply';
+// Orchestra binds its bridge socket at <tmpdir>/<sessionPrefix>-<32 hex>.sock.
+// macOS limits Unix socket paths to 103 bytes and its per-user tmpdir alone
+// is about 49, so the prefix must stay short.
+export const SNAPSHOT_GATE_SESSION_PREFIX = 'pg-snapgate';
+const UNIX_SOCKET_PATH_MAX_BYTES = 103;
+
+export function snapshotGateSocketPathFits(tmpDir) {
+  return Buffer.byteLength(path.join(
+    tmpDir,
+    `${SNAPSHOT_GATE_SESSION_PREFIX}-${'f'.repeat(32)}.sock`,
+  )) <= UNIX_SOCKET_PATH_MAX_BYTES;
+}
+const SNAPSHOT_MARKER_RE = /^SNAPSHOT-(?:FIRST|SECOND)-[0-9a-f]{8}$/;
+
+export function classifyObservedSnapshotHint(texts, { first, second }) {
+  const joined = texts.join('\n');
+  const sawFirst = joined.includes(first);
+  const sawSecond = joined.includes(second);
+  if (sawFirst && sawSecond) return 'both';
+  if (sawFirst) return 'first';
+  if (sawSecond) return 'second';
+  return 'none';
+}
+
+// The hint a leg observed is whatever its transcript's channel replies name.
+// Only the resumed turn's answer can contain a marker; the first turn
+// replies with a separate readiness token.
+export function snapshotHintFromTranscript(records, markers) {
+  const texts = [];
+  for (const record of records) {
+    if (record?.type !== 'assistant') continue;
+    for (const block of record.message?.content || []) {
+      if (
+        block?.type === 'tool_use'
+        && block.name === SNAPSHOT_REPLY_TOOL
+        && typeof block.input?.text === 'string'
+      ) {
+        texts.push(block.input.text);
+      }
+    }
+  }
+  return classifyObservedSnapshotHint(texts, markers);
+}
+
+function snapshotMarkersMatch(markers) {
+  return (
+    hasExactKeys(markers, ['control', 'test'])
+    && ['control', 'test'].every((leg) => (
+      hasExactKeys(markers[leg], ['first', 'second'])
+      && SNAPSHOT_MARKER_RE.test(markers[leg].first)
+      && SNAPSHOT_MARKER_RE.test(markers[leg].second)
+      && markers[leg].first.startsWith('SNAPSHOT-FIRST-')
+      && markers[leg].second.startsWith('SNAPSHOT-SECOND-')
+    ))
+    && new Set([
+      markers.control.first,
+      markers.control.second,
+      markers.test.first,
+      markers.test.second,
+    ]).size === 4
+  );
+}
+
+// Re-derives both legs' observed hints from the private transcripts so a
+// sanitized verdict cannot outlive the evidence it was drawn from.
+export function snapshotPrivateEvidenceMatches({ result, privateArtifactDir }) {
+  try {
+    const readPrivate = (name) => {
+      const filePath = path.join(privateArtifactDir, name);
+      const stat = fs.lstatSync(filePath);
+      if (stat.isSymbolicLink() || !stat.isFile()) return null;
+      return filePath;
+    };
+    const markersPath = readPrivate('snapshot-markers.json');
+    const controlPath = readPrivate('control-session.jsonl');
+    const testPath = readPrivate('session.jsonl');
+    if (!markersPath || !controlPath || !testPath) return false;
+    const markers = JSON.parse(fs.readFileSync(markersPath, 'utf8'));
+    if (!snapshotMarkersMatch(markers)) return false;
+    return (
+      snapshotHintFromTranscript(
+        readGateJsonlRecords(controlPath),
+        markers.control,
+      ) === result.controlObservedHint
+      && snapshotHintFromTranscript(
+        readGateJsonlRecords(testPath),
+        markers.test,
+      ) === result.testObservedHint
+    );
+  } catch {
+    return false;
+  }
+}
+
+function snapshotOracleStatus(result) {
+  if (
+    result.snapshotFlagAdvertised !== true
+    || result.spawnCount !== 4
+    || result.snapshotOnSpawnCount !== 3
+    || result.failureHash !== null
+    || result.failureStage !== null
+    || result.testObservedHint !== 'second'
+  ) {
+    return null;
+  }
+  if (result.controlObservedHint === 'first') return 'PASS';
+  if (result.controlObservedHint === 'second') return 'NOT-APPLICABLE';
+  return null;
+}
+
+export function matrixScenarioOracleMatches(scenarioId, result, expectations) {
   let pass = false;
   if (scenarioId === 'cli-contract') {
     pass = (
@@ -1442,7 +1896,7 @@ export function matrixScenarioOracleMatches(scenarioId, result) {
     pass = successfulWorkflowOracleMatches(result, false);
   } else if (scenarioId === 'workflow-fallback') {
     pass = successfulWorkflowOracleMatches(result, true);
-  } else if (scenarioId === 'delayed-mcp') {
+  } else if (DELAYED_MCP_SCENARIOS.has(scenarioId)) {
     pass = (
       evaluateDelayedMcpEvidence(result.evidence).pass
       && result.markerCount === 1
@@ -1459,8 +1913,9 @@ export function matrixScenarioOracleMatches(scenarioId, result) {
     );
   } else if (scenarioId === 'sdk-subagent') {
     pass = (
-      evaluateSubagentEvidence(result, {
-        isCandidate: result.attestation?.version === '2.1.220',
+      gateExpectationsSchemaMatches(expectations)
+      && evaluateSubagentEvidence(result, {
+        expectedTaskUpdated: expectations.subagentTaskUpdated,
       }).pass
       && result.subagentMessages > 0
       && result.distinctParentCount > 0
@@ -1498,7 +1953,11 @@ export function matrixScenarioOracleMatches(scenarioId, result) {
     );
   } else if (scenarioId === 'candidate-opus-projection') {
     pass = (
-      evaluateOpusProjection({
+      gateExpectationsSchemaMatches(expectations)
+      && result.expectedResolvedModel === expectations.resolvedOpus
+      && result.documentedWorkflowSizeGuideline
+        === expectations.workflowSizeGuideline
+      && evaluateOpusProjection({
         ...result,
         selectedExecutableSha256: result.attestation?.sha256,
         workflowExitStatus: result.workflowStatus === 'PASS' ? 0 : 1,
@@ -1510,6 +1969,9 @@ export function matrixScenarioOracleMatches(scenarioId, result) {
       && result.reasonCount === 0
       && result.reasonHashes.length === 0
     );
+  } else if (scenarioId === SNAPSHOT_SCENARIO) {
+    const expectedStatus = snapshotOracleStatus(result);
+    pass = expectedStatus !== null && result.status === expectedStatus;
   }
   return {
     pass,
@@ -1559,6 +2021,7 @@ export function nestedOpusWorkflowEvidenceMatches({
       scenarioId: 'workflow-direct',
       versionKey: run.versionKey,
       version: run.version,
+      expectations: run.expectations,
       model: run.model,
       effort: run.effort,
       expectedResolvedModel: run.expectedResolvedModel,
@@ -1578,7 +2041,7 @@ export function nestedOpusWorkflowEvidenceMatches({
       && nestedWorkflowLifecycleMatches({
         result: nestedResult,
         policy: run.nestedWorkflowLifecyclePolicy,
-        isCandidate: run.versionKey === 'candidate',
+        expectations: run.expectations,
       })
       && result.workflowStatus === nestedResult.status
       && result.workflowPolicyOverridePresent
@@ -1593,15 +2056,26 @@ export function nestedOpusWorkflowEvidenceMatches({
   }
 }
 
+// The nested Workflow runs on the production Opus model, whose session also
+// carries the passive attachments the version declares for Opus only (such as
+// the bypass-mode `auto_mode` steer); the comparator Sonnet cells never do.
 export function nestedWorkflowLifecycleMatches({
   result,
   policy,
-  isCandidate,
+  expectations,
 }) {
+  if (!gateExpectationsSchemaMatches(expectations)) return false;
   return matchesProjectedBaseline({
     result,
     policy,
-    isCandidate,
+    expectations: {
+      ...expectations,
+      passiveSessionAttachmentCounts: {
+        ...expectations.passiveSessionAttachmentCounts,
+        ...expectations.opusPassiveSessionAttachmentCounts,
+      },
+      opusPassiveSessionAttachmentCounts: {},
+    },
   });
 }
 
@@ -1675,12 +2149,19 @@ export function evaluateMatrixRunResult({
     if (result.matrixScenario !== run.scenarioId) {
       reasons.push('sanitized result scenario does not match the matrix cell');
     }
-    if (result.status !== 'PASS') {
+    const acceptedStatuses = run.scenarioId === SNAPSHOT_SCENARIO
+      ? ['PASS', 'NOT-APPLICABLE']
+      : ['PASS'];
+    if (!acceptedStatuses.includes(result.status)) {
       reasons.push('sanitized result did not report PASS');
     }
     if (
       run?.env
-      && !matrixScenarioOracleMatches(run.scenarioId, result).pass
+      && !matrixScenarioOracleMatches(
+        run.scenarioId,
+        result,
+        run.expectations,
+      ).pass
     ) {
       reasons.push('sanitized result does not satisfy the scenario oracle');
     }
@@ -1694,6 +2175,13 @@ export function evaluateMatrixRunResult({
       })
     ) {
       reasons.push('candidate Opus projection does not match nested Workflow evidence');
+    }
+    if (
+      run?.env
+      && run.scenarioId === SNAPSHOT_SCENARIO
+      && !snapshotPrivateEvidenceMatches({ result, privateArtifactDir })
+    ) {
+      reasons.push('snapshot hints do not match the private leg transcripts');
     }
     if (
       run?.env
@@ -1730,7 +2218,8 @@ export function evaluateMatrixRunResult({
         || !versionSpecificLifecycleMatches(
           result,
           expectedVersionSpecificOracle,
-          run.versionKey === 'candidate',
+          run.expectations,
+          { delayedMcpAutoBackground: run.delayedMcpAutoBackground },
         )
       )
     ) {
@@ -1789,8 +2278,8 @@ function compareEvidencePair({
   scenario,
   leftResult,
   rightResult,
-  leftIsCandidate = false,
-  rightIsCandidate = false,
+  leftExpectations = null,
+  rightExpectations = null,
 }) {
   const differences = [];
   for (const field of scenario?.comparison?.equalFields || []) {
@@ -1816,12 +2305,14 @@ function compareEvidencePair({
       || !versionSpecificLifecycleMatches(
         leftResult,
         versionSpecificLifecycleOracle,
-        leftIsCandidate,
+        leftExpectations,
+        { delayedMcpAutoBackground: delayedMcpAutoBackground(scenario) },
       )
       || !versionSpecificLifecycleMatches(
         rightResult,
         versionSpecificLifecycleOracle,
-        rightIsCandidate,
+        rightExpectations,
+        { delayedMcpAutoBackground: delayedMcpAutoBackground(scenario) },
       )
     ) {
       differences.push('lifecycle');
@@ -1857,19 +2348,19 @@ function compareEvidencePair({
       !matchesProjectedBaseline({
         result: leftResult,
         policy: lifecyclePolicy,
-        isCandidate: leftIsCandidate,
+        expectations: leftExpectations,
       })
       || !matchesProjectedBaseline({
         result: rightResult,
         policy: lifecyclePolicy,
-        isCandidate: rightIsCandidate,
+        expectations: rightExpectations,
       })
       || !compareProjectedLifecycle({
         leftResult,
         rightResult,
         policy: lifecyclePolicy,
-        leftIsCandidate,
-        rightIsCandidate,
+        leftExpectations,
+        rightExpectations,
       })
     ) {
       differences.push('lifecycle');
@@ -1887,12 +2378,15 @@ export function evaluateMatrixEvidencePair({
   scenario,
   oldResult,
   candidateResult,
+  oldExpectations,
+  candidateExpectations,
 }) {
   return compareEvidencePair({
     scenario,
     leftResult: oldResult,
     rightResult: candidateResult,
-    rightIsCandidate: true,
+    leftExpectations: oldExpectations,
+    rightExpectations: candidateExpectations,
   });
 }
 
@@ -1932,6 +2426,7 @@ export function evaluateMatrixVersionEvidence({
   scenario,
   versionKey,
   results,
+  expectations,
 }) {
   let policy;
   try {
@@ -1954,7 +2449,7 @@ export function evaluateMatrixVersionEvidence({
         pass: matchesProjectedBaseline({
           result,
           policy: scenario.comparison.lifecycle,
-          isCandidate: versionKey === 'candidate',
+          expectations,
         }),
         differences: [],
       });
@@ -1970,8 +2465,8 @@ export function evaluateMatrixVersionEvidence({
         scenario,
         leftResult: results[left],
         rightResult: results[right],
-        leftIsCandidate: versionKey === 'candidate',
-        rightIsCandidate: versionKey === 'candidate',
+        leftExpectations: expectations,
+        rightExpectations: expectations,
       }),
     });
   }
@@ -1985,6 +2480,8 @@ export function evaluateMatrixCrossVersionEvidence({
   scenario,
   oldResults,
   candidateResults,
+  oldExpectations,
+  candidateExpectations,
 }) {
   let policy;
   try {
@@ -2026,7 +2523,8 @@ export function evaluateMatrixCrossVersionEvidence({
       scenario,
       leftResult: oldResult,
       rightResult: candidateResult,
-      rightIsCandidate: true,
+      leftExpectations: oldExpectations,
+      rightExpectations: candidateExpectations,
     }),
   }));
   return {
@@ -2039,6 +2537,8 @@ export function evaluateMatrixScenarioEvidence({
   scenario,
   oldResults,
   candidateResults,
+  oldExpectations,
+  candidateExpectations,
 }) {
   const comparisons = [];
   for (const versionKey of ['old', 'candidate']) {
@@ -2046,6 +2546,9 @@ export function evaluateMatrixScenarioEvidence({
       scenario,
       versionKey,
       results: versionKey === 'old' ? oldResults : candidateResults,
+      expectations: versionKey === 'old'
+        ? oldExpectations
+        : candidateExpectations,
     });
     comparisons.push(...versionComparison.comparisons);
     if (!versionComparison.pass) {
@@ -2056,6 +2559,8 @@ export function evaluateMatrixScenarioEvidence({
     scenario,
     oldResults,
     candidateResults,
+    oldExpectations,
+    candidateExpectations,
   });
   comparisons.push(...crossVersionComparison.comparisons);
   return {
@@ -2182,6 +2687,7 @@ export function purgeAcceptedGateArtifacts({
   expectedRuns,
   expectedScenarios,
   expectedManifestSha256,
+  expectedWaivedCells = [],
   claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects'),
 }) {
   assertSafeRunPrefix(runPrefix);
@@ -2194,8 +2700,10 @@ export function purgeAcceptedGateArtifacts({
     'completedRunCount',
     'expectedAuthoritativeRunCount',
     'failCount',
+    'waivedCells',
     'manifestSha256',
     'maxBridgeReadyToMcpReadyMs',
+    'notApplicableCount',
     'passCount',
     'results',
     'runPrefix',
@@ -2217,6 +2725,11 @@ export function purgeAcceptedGateArtifacts({
     'runId',
     'status',
   ];
+  const waivedCellList = Array.isArray(expectedWaivedCells)
+    ? expectedWaivedCells
+    : [];
+  const authoritativeRunCount =
+    AUTHORITATIVE_RUN_COUNT - waivedCellList.length;
   const expectedRunList = Array.isArray(expectedRuns) ? expectedRuns : [];
   const expectedIds = expectedRunList.map((run) => run?.id);
   const expectedRunIds = expectedRunList.map(
@@ -2248,6 +2761,14 @@ export function purgeAcceptedGateArtifacts({
       && entry.differences.length === 0
     ))
   );
+  const acceptedRunOutcome = (result, expectedRun) => (
+    (result.status === 'PASS' && result.exitCode === 0)
+    || (
+      expectedRun?.scenarioId === SNAPSHOT_SCENARIO
+      && result.status === 'NOT-APPLICABLE'
+      && result.exitCode === MATRIX_NOT_APPLICABLE_EXIT_CODE
+    )
+  );
   const validSummaryResults = Array.isArray(summary?.results)
     && summary.results.every((result, index) => {
       const expectedRun = expectedRunList[index];
@@ -2258,8 +2779,7 @@ export function purgeAcceptedGateArtifacts({
         hasExactKeys(result, allowedKeys)
         && result.id === expectedRun?.id
         && result.runId === expectedRun?.env?.CLAUDE_GATE_RUN_ID
-        && result.status === 'PASS'
-        && result.exitCode === 0
+        && acceptedRunOutcome(result, expectedRun)
         && isNonNegativeInteger(result.elapsedMs)
         && result.driver === expectedRun?.driver
         && isDeepStrictEqual(result.args, expectedRun?.args)
@@ -2283,26 +2803,34 @@ export function purgeAcceptedGateArtifacts({
   if (
     !hasExactKeys(summary, expectedSummaryKeys)
     || summary.schemaVersion !== 1
+    || !Array.isArray(expectedWaivedCells)
+    || !isDeepStrictEqual(summary.waivedCells, expectedWaivedCells)
     || summary?.authoritative !== true
     || summary?.status !== 'PASS'
     || summary?.runPrefix !== runPrefix
     || summary.manifestSha256 !== expectedManifestSha256
     || !SHA256_RE.test(expectedManifestSha256 || '')
-    || expectedRunList.length !== AUTHORITATIVE_RUN_COUNT
-    || new Set(expectedIds).size !== AUTHORITATIVE_RUN_COUNT
-    || new Set(expectedRunIds).size !== AUTHORITATIVE_RUN_COUNT
+    || expectedRunList.length !== authoritativeRunCount
+    || new Set(expectedIds).size !== authoritativeRunCount
+    || new Set(expectedRunIds).size !== authoritativeRunCount
     || expectedScenarioMap.size !== expectedScenarioList.length
     || expectedRunList.some(
       (run) => !expectedScenarioMap.has(run?.scenarioId),
     )
-    || summary.expectedAuthoritativeRunCount !== AUTHORITATIVE_RUN_COUNT
-    || summary.selectedRunCount !== AUTHORITATIVE_RUN_COUNT
-    || summary.completedRunCount !== AUTHORITATIVE_RUN_COUNT
-    || summary.passCount !== AUTHORITATIVE_RUN_COUNT
+    || summary.expectedAuthoritativeRunCount !== authoritativeRunCount
+    || summary.selectedRunCount !== authoritativeRunCount
+    || summary.completedRunCount !== authoritativeRunCount
+    || !isNonNegativeInteger(summary.passCount)
+    || !isNonNegativeInteger(summary.notApplicableCount)
+    || summary.passCount + summary.notApplicableCount
+      !== authoritativeRunCount
+    || !Array.isArray(summary.results)
+    || summary.results.filter(({ status }) => status === 'PASS').length
+      !== summary.passCount
     || summary.failCount !== 0
     || summary.blockedCount !== 0
     || !isNonNegativeInteger(summary.maxBridgeReadyToMcpReadyMs)
-    || summary.results.length !== AUTHORITATIVE_RUN_COUNT
+    || summary.results.length !== authoritativeRunCount
     || !isDeepStrictEqual(resultIds, expectedIds)
     || !isDeepStrictEqual(resultRunIds, expectedRunIds)
     || !validSummaryResults
@@ -2364,6 +2892,9 @@ export function purgeAcceptedGateArtifacts({
     const sanitizedResult = JSON.parse(
       fs.readFileSync(sanitizedResultPath, 'utf8'),
     );
+    if (sanitizedResult?.status !== result.status) {
+      throw new Error('retained gate evidence did not revalidate before purge');
+    }
     const privateArtifactDir = path.join(runDir, 'raw-private');
     let artifactValidation;
     try {
@@ -2439,10 +2970,15 @@ export function purgeAcceptedGateArtifacts({
           old: null,
           candidate: null,
         },
+        expectations: {
+          old: null,
+          candidate: null,
+        },
       });
     }
     const evidence = evidenceByScenario.get(run.scenarioId);
     evidence[run.versionKey].push(sanitizedResults[index]);
+    evidence.expectations[run.versionKey] = run.expectations;
     let pairComparison = null;
     if (
       !scenario.candidateOnly
@@ -2452,6 +2988,7 @@ export function purgeAcceptedGateArtifacts({
         scenario,
         versionKey: run.versionKey,
         results: evidence[run.versionKey],
+        expectations: run.expectations,
       });
       evidence.sameVersion[run.versionKey] = versionComparison;
       if (versionComparison.comparisons.length > 0) {
@@ -2473,6 +3010,8 @@ export function purgeAcceptedGateArtifacts({
         scenario,
         oldResults: evidence.old,
         candidateResults: evidence.candidate,
+        oldExpectations: evidence.expectations.old,
+        candidateExpectations: evidence.expectations.candidate,
       });
       pairComparison = {
         pass: crossVersionComparison.pass,

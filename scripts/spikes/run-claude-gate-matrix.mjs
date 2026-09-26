@@ -16,6 +16,9 @@ import {
   evaluateMatrixCrossVersionEvidence,
   evaluateMatrixRunResult,
   evaluateMatrixVersionEvidence,
+  MATRIX_MANIFEST_PATH,
+  matrixWaivedCells,
+  MATRIX_NOT_APPLICABLE_EXIT_CODE,
   purgeAcceptedGateArtifacts,
 } from './claude-gate-matrix.mjs';
 
@@ -23,7 +26,6 @@ process.umask(0o077);
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, '..', '..');
-const manifestPath = path.join(scriptDir, 'claude-2.1.220-matrix.json');
 
 function argument(name) {
   const index = process.argv.indexOf(name);
@@ -49,7 +51,7 @@ if (!artifactBaseDir || !oldBin || !candidateBin) {
   );
   process.exit(64);
 }
-const manifestText = fs.readFileSync(manifestPath, 'utf8');
+const manifestText = fs.readFileSync(MATRIX_MANIFEST_PATH, 'utf8');
 const manifest = JSON.parse(manifestText);
 const manifestSha256 = hashSensitiveString(manifestText);
 if (acceptedRunPrefix) {
@@ -76,6 +78,7 @@ if (acceptedRunPrefix) {
     expectedRuns,
     expectedScenarios: manifest.scenarios,
     expectedManifestSha256: manifestSha256,
+    expectedWaivedCells: matrixWaivedCells(manifest),
   });
   console.log(`accepted sanitized matrix ${acceptedRunPrefix}; private evidence removed`);
   process.exit(0);
@@ -112,6 +115,7 @@ const summary = {
   selectedRunCount: runs.length,
   expectedAuthoritativeRunCount,
   manifestSha256,
+  waivedCells: matrixWaivedCells(manifest),
   results: [],
 };
 const scenarios = new Map(
@@ -127,7 +131,10 @@ for (const [index, run] of runs.entries()) {
     [path.join(repoRoot, run.driver), ...run.args],
     {
       cwd: repoRoot,
-      env: buildClaudeMatrixChildEnv(process.env, run.env),
+      env: buildClaudeMatrixChildEnv(process.env, {
+        ...run.env,
+        CLAUDE_GATE_MANIFEST_SHA256: manifestSha256,
+      }),
       encoding: 'utf8',
       timeout: 15 * 60_000,
       maxBuffer: 20 * 1024 * 1024,
@@ -149,7 +156,9 @@ for (const [index, run] of runs.entries()) {
     ? 'BLOCKED'
     : child.status === 0
       ? 'PASS'
-      : 'FAIL';
+      : child.status === MATRIX_NOT_APPLICABLE_EXIT_CODE
+        ? 'NOT-APPLICABLE'
+        : 'FAIL';
   const sanitizedResultPath = path.join(
     resolvedArtifactBaseDir,
     run.env.CLAUDE_GATE_RUN_ID,
@@ -179,13 +188,18 @@ for (const [index, run] of runs.entries()) {
         reasons: ['sanitized result is malformed'],
       };
     }
-  } else if (!child.error && child.status === 0) {
+  } else if (!child.error && ['PASS', 'NOT-APPLICABLE'].includes(status)) {
     artifactValidation = {
       pass: false,
       reasons: ['sanitized result is missing'],
     };
   }
-  if (status === 'PASS' && !artifactValidation.pass) status = 'BLOCKED';
+  if (
+    ['PASS', 'NOT-APPLICABLE'].includes(status)
+    && (!artifactValidation.pass || sanitizedResult?.status !== status)
+  ) {
+    status = 'BLOCKED';
+  }
 
   let pairComparison = null;
   const scenario = scenarios.get(run.scenarioId);
@@ -198,9 +212,15 @@ for (const [index, run] of runs.entries()) {
           old: null,
           candidate: null,
         },
+        expectations: {
+          old: null,
+          candidate: null,
+        },
       });
     }
-    evidenceByScenario.get(run.scenarioId)[run.versionKey].push(sanitizedResult);
+    const evidence = evidenceByScenario.get(run.scenarioId);
+    evidence[run.versionKey].push(sanitizedResult);
+    evidence.expectations[run.versionKey] = run.expectations;
   }
   const evidence = evidenceByScenario.get(run.scenarioId);
   if (
@@ -212,6 +232,7 @@ for (const [index, run] of runs.entries()) {
       scenario,
       versionKey: run.versionKey,
       results: evidence[run.versionKey],
+      expectations: run.expectations,
     });
     evidence.sameVersion[run.versionKey] = versionComparison;
     if (versionComparison.comparisons.length > 0) {
@@ -244,6 +265,8 @@ for (const [index, run] of runs.entries()) {
         scenario,
         oldResults: evidence.old,
         candidateResults: evidence.candidate,
+        oldExpectations: evidence.expectations.old,
+        candidateExpectations: evidence.expectations.candidate,
       });
       pairComparison = {
         pass: crossVersionComparison.pass,
@@ -273,11 +296,14 @@ for (const [index, run] of runs.entries()) {
     }),
   });
   console.log(`[${index + 1}/${runs.length}] ${run.id} ${status} (${elapsedMs} ms)`);
-  if (status !== 'PASS') break;
+  if (!['PASS', 'NOT-APPLICABLE'].includes(status)) break;
 }
 
 summary.completedRunCount = summary.results.length;
 summary.passCount = summary.results.filter(({ status }) => status === 'PASS').length;
+summary.notApplicableCount = summary.results.filter(
+  ({ status }) => status === 'NOT-APPLICABLE',
+).length;
 summary.failCount = summary.results.filter(({ status }) => status === 'FAIL').length;
 summary.blockedCount = summary.results.filter(({ status }) => status === 'BLOCKED').length;
 summary.maxBridgeReadyToMcpReadyMs = summary.results.reduce(
@@ -289,7 +315,7 @@ summary.maxBridgeReadyToMcpReadyMs = summary.results.reduce(
 );
 summary.status = (
   summary.completedRunCount === summary.selectedRunCount
-  && summary.passCount === summary.selectedRunCount
+  && summary.passCount + summary.notApplicableCount === summary.selectedRunCount
 ) ? 'PASS' : 'FAIL';
 const summaryPath = path.join(
   resolvedArtifactBaseDir,
@@ -301,5 +327,13 @@ fs.writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, {
 });
 fs.chmodSync(summaryPath, 0o600);
 
-console.log(`matrix ${summary.status}: ${summary.passCount}/${summary.selectedRunCount} PASS`);
+console.log(
+  `matrix ${summary.status}: ${summary.passCount}/${summary.selectedRunCount} PASS`
+    + (summary.notApplicableCount > 0
+      ? `, ${summary.notApplicableCount} NOT-APPLICABLE`
+      : ''),
+);
+for (const cell of summary.waivedCells) {
+  console.log(`${cell.waiver}, not run: ${cell.id} (${cell.version}): ${cell.reason}`);
+}
 process.exit(summary.status === 'PASS' ? 0 : 1);

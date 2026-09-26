@@ -85,6 +85,7 @@ export function buildDelayedMcpGatePrompt() {
     'Call mcp__polygram-delayed-gate__delayed_marker exactly once.',
     'If it becomes a background task, wait for its native completion notification.',
     'After the tool completes, reply with exactly the marker returned by the tool and nothing else.',
+    'When a completion notification arrives, your next message must be that visible text reply, not only thinking.',
   ].join(' ');
 }
 

@@ -71,6 +71,23 @@ describe('computeCostUsd', () => {
     assert.notEqual(cost, computeCostUsd(usage, 'claude-unknown-future-9'));
   });
 
+  // Claude Code 2.1.280 made Opus 5.5 the model `--model opus` resolves to.
+  // Without its own entry every Opus turn would be billed at the Sonnet
+  // default. Its cache-read rate is 5% of input, not the usual 10%.
+  test('opus 5.5 turn: priced at its own rates, not the sonnet default', () => {
+    const usage = {
+      inputTokens: 1_000_000,
+      outputTokens: 1_000_000,
+      cacheReadTokens: 1_000_000,
+      cacheCreationTokens: 1_000_000,
+    };
+    const cost = computeCostUsd(usage, 'claude-opus-5-5');
+    // Opus 5.5: input=$4/M, output=$20/M, cacheRead=$0.20/M, cacheCreation=$5/M
+    const expected = 4 + 20 + 0.20 + 5;
+    assert.ok(Math.abs(cost - expected) < 1e-6, `expected ${expected}, got ${cost}`);
+    assert.notEqual(cost, computeCostUsd(usage, 'claude-unknown-future-9'));
+  });
+
   test('opus is the most expensive', () => {
     const usage = { inputTokens: 1_000_000, outputTokens: 1_000_000, cacheReadTokens: 0, cacheCreationTokens: 0 };
     const opus = computeCostUsd(usage, 'claude-opus-4-7');

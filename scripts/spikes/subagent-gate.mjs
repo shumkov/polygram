@@ -1,11 +1,18 @@
+// `tool_progress` is the SDK's heartbeat while the Agent tool keeps running
+// (every 30 s), so whether it appears depends on how long the subagent takes.
 const ALLOWED_RECORD_TYPES = new Set([
   'assistant',
   'rate_limit_event',
   'result',
   'system',
+  'tool_progress',
   'user',
 ]);
+// `commands_changed` is an ambient notice Claude streams when its command
+// set changes, for example after ToolSearch loads a deferred tool. Like the
+// other ambient rows it must carry no task identity.
 const ALLOWED_SYSTEM_SUBTYPES = new Set([
+  'commands_changed',
   'hook_response',
   'hook_started',
   'init',
@@ -561,9 +568,9 @@ export function subagentLifecycleProofSchemaMatches(proof) {
   );
 }
 
-export function evaluateSubagentEvidence(evidence, { isCandidate }) {
-  if (typeof isCandidate !== 'boolean') {
-    throw new TypeError('isCandidate must be a boolean');
+export function evaluateSubagentEvidence(evidence, { expectedTaskUpdated }) {
+  if (![0, 1].includes(expectedTaskUpdated)) {
+    throw new TypeError('expectedTaskUpdated must be 0 or 1');
   }
   const proof = evidence?.subagentLifecycleProof;
   const reasons = [];
@@ -571,8 +578,7 @@ export function evaluateSubagentEvidence(evidence, { isCandidate }) {
     reasons.push('subagent lifecycle proof schema is not recognized');
     return { pass: false, reasons };
   }
-  const expectedTaskUpdated = isCandidate ? 1 : 0;
-  const expectedTaskUpdateCompleted = isCandidate ? true : null;
+  const expectedTaskUpdateCompleted = expectedTaskUpdated === 1 ? true : null;
   if (
     !nonEmptyString(evidence.resolvedModel)
     || evidence.resultSubtype !== 'success'
@@ -635,7 +641,7 @@ export function evaluateSubagentEvidence(evidence, { isCandidate }) {
     && taskNotification < targetToolResult
     && targetToolResult < queryResult
     && (
-      isCandidate
+      expectedTaskUpdated === 1
         ? (
             Number.isInteger(taskUpdated)
             && finalChildRecord < taskUpdated

@@ -47,8 +47,17 @@ const SAFE_RUN_ID_RE = /^[A-Za-z0-9._-]+$/;
 const GATE_MODEL_SELECTORS = new Set(['claude-sonnet-4-6', 'opus']);
 const RESOLVED_GATE_MODELS = new Set([
   'claude-opus-5',
+  'claude-opus-5-5',
   'claude-sonnet-4-6',
 ]);
+const WORKFLOW_SIZE_GUIDELINES = new Set([
+  'large',
+  'medium',
+  'small',
+  'unrestricted',
+]);
+const SNAPSHOT_SCENARIO = 'candidate-system-prompt-snapshot';
+const SNAPSHOT_OBSERVED_HINTS = new Set(['both', 'first', 'none', 'second']);
 const RESULT_SUBTYPES = new Set([
   'error_during_execution',
   'error_max_budget_usd',
@@ -181,6 +190,26 @@ const SANITIZED_RESULT_KEYS = new Map([
     'hookFiredCount',
     'reasonCount',
     'resultSubtypes',
+  ]],
+  [SNAPSHOT_SCENARIO, [
+    'attestation',
+    'controlObservedHint',
+    'evidenceSchemaVersion',
+    'failureHash',
+    'failureStage',
+    'lifecycle',
+    'lifecycleProofs',
+    'lifecycleSources',
+    'matrixScenario',
+    'processTree',
+    'resolvedModel',
+    'scenario',
+    'snapshotFlagAdvertised',
+    'snapshotOnSpawnCount',
+    'spawnCount',
+    'status',
+    'testObservedHint',
+    'wrapperRecords',
   ]],
   ['candidate-opus-projection', [
     ...COMMON_SDK_RESULT_KEYS,
@@ -392,6 +421,14 @@ const NORMALIZED_GATE_LIFECYCLE_SCHEMAS = {
   mode: (record) => Object.keys(record).length === 1,
   'permission-mode': (record) => Object.keys(record).length === 1,
   rate_limit_event: (record) => Object.keys(record).length === 1,
+  // Written by Claude Code 2.1.283 without a uuid or parent; carries no
+  // lifecycle data and nothing in Polygram or Orchestra reads it.
+  'atis-latch': (record) => Object.keys(record).length === 1,
+  // Written by Claude Code 2.1.283 as a running session cost total; no
+  // lifecycle data, and nothing in Polygram or Orchestra reads it.
+  'cost-state': (record) => Object.keys(record).length === 1,
+  // SDK heartbeat streamed every 30 s while a long tool (e.g. an Agent) runs.
+  tool_progress: (record) => Object.keys(record).length === 1,
 };
 
 export function normalizedGateLifecycleRecordSchemaMatches(record) {
@@ -479,8 +516,13 @@ function lifecycleSourcesSchemaMatches(sources, scenario, status) {
     : ['delayed-mcp', 'sdk-subagent', 'candidate-opus-projection']
       .includes(scenario)
       ? ['sdk']
-      : [];
-  if (!hasExactKeys(sources, status === 'PASS' ? expected : Object.keys(sources || {}))) {
+      : scenario === SNAPSHOT_SCENARIO
+        ? ['session']
+        : [];
+  if (!hasExactKeys(
+    sources,
+    status === 'FAIL' ? Object.keys(sources || {}) : expected,
+  )) {
     return false;
   }
   const streams = Object.keys(sources);
@@ -559,7 +601,8 @@ function lifecycleProofsSchemaMatches(proofs, scenario) {
   return (
     Array.isArray(proofs)
     && (
-      ['cli-contract', 'workflow-direct', 'workflow-fallback'].includes(scenario)
+      ['cli-contract', 'workflow-direct', 'workflow-fallback', SNAPSHOT_SCENARIO]
+        .includes(scenario)
         ? proofs.every(removalProofSchemaMatches)
         : proofs.length === 0
     )
@@ -795,7 +838,7 @@ function workflowSizeGuidelineEvidenceSchemaMatches(evidence) {
     ])
     && SHA256_RE.test(evidence.executableSha256)
     && evidence.source === 'selected-binary-runtime-default'
-    && evidence.value === 'medium'
+    && WORKFLOW_SIZE_GUIDELINES.has(evidence.value)
     && typeof evidence.fingerprintMatched === 'boolean'
   );
 }
@@ -877,10 +920,10 @@ function nullableResolvedModel(value) {
 
 function failureScalarSchemaMatches(result, allowedStages) {
   return (
-    (result.status === 'PASS'
-      ? result.failureHash === null && result.failureStage === null
-      : SHA256_RE.test(result.failureHash || '')
-        && allowedStages.has(result.failureStage))
+    (result.status === 'FAIL'
+      ? SHA256_RE.test(result.failureHash || '')
+        && allowedStages.has(result.failureStage)
+      : result.failureHash === null && result.failureStage === null)
   );
 }
 
@@ -1013,8 +1056,8 @@ function scenarioScalarSchemaMatches(result, scenario) {
   if (scenario === 'candidate-opus-projection') {
     return (
       commonSdkScalarSchemaMatches(result, scenario)
-      && result.expectedResolvedModel === 'claude-opus-5'
-      && result.documentedWorkflowSizeGuideline === 'medium'
+      && RESOLVED_GATE_MODELS.has(result.expectedResolvedModel)
+      && WORKFLOW_SIZE_GUIDELINES.has(result.documentedWorkflowSizeGuideline)
       && nullableEnum(result.resultSubtype, RESULT_SUBTYPES)
       && nonNegativeInteger(result.markerCount)
       && (
@@ -1024,17 +1067,46 @@ function scenarioScalarSchemaMatches(result, scenario) {
       && nullableEnum(result.workflowStatus, new Set(['FAIL', 'PASS']))
     );
   }
+  if (scenario === SNAPSHOT_SCENARIO) {
+    return (
+      result.scenario === SNAPSHOT_SCENARIO
+      && nullableResolvedModel(result.resolvedModel)
+      && failureScalarSchemaMatches(result, new Set([
+        'collecting-evidence',
+        'control-first-turn',
+        'control-resumed-turn',
+        'evaluating-snapshot',
+        'initializing',
+        'test-first-turn',
+        'test-resumed-turn',
+      ]))
+      && nonNegativeInteger(result.spawnCount)
+      && nonNegativeInteger(result.snapshotOnSpawnCount)
+      && typeof result.snapshotFlagAdvertised === 'boolean'
+      && nullableEnum(result.controlObservedHint, SNAPSHOT_OBSERVED_HINTS)
+      && nullableEnum(result.testObservedHint, SNAPSHOT_OBSERVED_HINTS)
+    );
+  }
   return false;
 }
 
-export function sanitizedGateResultSchemaMatches(result, scenario) {
+// Matrix cells that reuse another cell's driver share its result shape.
+const SCHEMA_SCENARIO_ALIASES = new Map([
+  ['delayed-mcp-foreground', 'delayed-mcp'],
+]);
+
+export function sanitizedGateResultSchemaMatches(result, matrixScenario) {
+  const scenario = SCHEMA_SCENARIO_ALIASES.get(matrixScenario) ?? matrixScenario;
   const keys = SANITIZED_RESULT_KEYS.get(scenario);
   if (
     !keys
     || !hasExactKeys(result, keys)
-    || result.matrixScenario !== scenario
+    || result.matrixScenario !== matrixScenario
     || result.evidenceSchemaVersion !== 1
-    || !['PASS', 'FAIL'].includes(result.status)
+    || !(
+      ['PASS', 'FAIL'].includes(result.status)
+      || (scenario === SNAPSHOT_SCENARIO && result.status === 'NOT-APPLICABLE')
+    )
     || !attestationSchemaMatches(result.attestation)
     || !Array.isArray(result.wrapperRecords)
     || result.wrapperRecords.some(

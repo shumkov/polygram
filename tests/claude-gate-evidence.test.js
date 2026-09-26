@@ -23,7 +23,7 @@ function wrapperRecord(overrides = {}) {
     pid: 2201,
     ppid: 2200,
     versionProbePid: 2202,
-    version: '2.1.220',
+    version: '2.1.283',
     executableSha256: CANDIDATE_SHA,
     executablePathHash: CANDIDATE_PATH_HASH,
     argvHash: 'a'.repeat(64),
@@ -674,7 +674,7 @@ test('wrapper provenance validation is shared and fails closed', async () => {
   const { validateWrapperProvenance } = await import(moduleUrl);
   const candidate = {
     runId: 'candidate-run',
-    version: '2.1.220',
+    version: '2.1.283',
     sha256: CANDIDATE_SHA,
     sessionLauncher: '/private/wrapper',
     sanitizedAttestation: {
@@ -744,7 +744,7 @@ test('wrapper provenance requires a sampled parent match for a claimed probe', a
   const { validateWrapperProvenance } = await import(moduleUrl);
   const candidate = {
     runId: 'candidate-run',
-    version: '2.1.220',
+    version: '2.1.283',
     sha256: CANDIDATE_SHA,
     sessionLauncher: '/private/wrapper',
     sanitizedAttestation: {
@@ -770,7 +770,7 @@ test('wrapper provenance accepts a wrapped worker after it is reparented', async
   const { validateWrapperProvenance } = await import(moduleUrl);
   const candidate = {
     runId: 'candidate-run',
-    version: '2.1.220',
+    version: '2.1.283',
     sha256: CANDIDATE_SHA,
     sessionLauncher: '/private/wrapper',
     sanitizedAttestation: {
@@ -794,7 +794,7 @@ test('wrapper provenance rejects another observed unwrapped selected worker', as
   const { validateWrapperProvenance } = await import(moduleUrl);
   const candidate = {
     runId: 'candidate-run',
-    version: '2.1.220',
+    version: '2.1.283',
     sha256: CANDIDATE_SHA,
     sessionLauncher: '/private/wrapper',
     sanitizedAttestation: {
@@ -821,7 +821,7 @@ test('wrapper provenance rejects cross-run and ambiguous process identities', as
   const { validateWrapperProvenance } = await import(moduleUrl);
   const candidate = {
     runId: 'candidate-run',
-    version: '2.1.220',
+    version: '2.1.283',
     sha256: CANDIDATE_SHA,
     sessionLauncher: '/private/wrapper',
     sanitizedAttestation: {
@@ -967,7 +967,7 @@ test('macOS process-tree capture resolves a relative pane root and target basena
       return {
         status: 0,
         stdout: pid === '2201'
-          ? 'p2201\nftxt\nn/private/claude-2.1.220\n'
+          ? 'p2201\nftxt\nn/private/claude-2.1.283\n'
           : 'p2200\nftxt\nn/opt/homebrew/bin/fish\n',
       };
     }
@@ -983,14 +983,14 @@ test('macOS process-tree capture resolves a relative pane root and target basena
   const { captureTmuxProcessTree } = await import(processTreeModuleUrl);
   const selection = {
     artifactDir: dir,
-    executablePath: '/private/claude-2.1.220',
+    executablePath: '/private/claude-2.1.283',
   };
 
   assert.deepEqual(captureTmuxProcessTree({
     tmuxSession: 'gate-session',
     selection,
     label: 'unrelated-basenames',
-    spawn: snapshot('/private/claude-2.1.220'),
+    spawn: snapshot('/private/claude-2.1.283'),
     platform: 'darwin',
     realpath: (value) => value,
   }).map(({ pid }) => pid), [2200, 2201]);
@@ -998,7 +998,7 @@ test('macOS process-tree capture resolves a relative pane root and target basena
     tmuxSession: 'gate-session',
     selection,
     label: 'target-basename',
-    spawn: snapshot('claude-2.1.220'),
+    spawn: snapshot('claude-2.1.283'),
     platform: 'darwin',
     realpath: (value) => value,
   }).map(({ pid }) => pid), [2200, 2201]);
@@ -1011,7 +1011,7 @@ test('macOS process-tree capture resolves a relative pane root and target basena
       if (command === 'lsof') return { status: 1, stdout: '' };
       return {
         status: 0,
-        stdout: '2200 100 fish\n2201 2200 /private/claude-2.1.220\n',
+        stdout: '2200 100 fish\n2201 2200 /private/claude-2.1.283\n',
       };
     },
     platform: 'darwin',
@@ -1093,7 +1093,7 @@ test('lifecycle model resolver accepts CLI assistant evidence and rejects confli
   assert.throws(() => resolveGateLifecycleModel({
     records: [
       { type: 'system', subtype: 'init', model: 'claude-sonnet-4-6' },
-      { type: 'assistant', model: 'claude-opus-5' },
+      { type: 'assistant', model: 'claude-opus-5-5' },
     ],
     expectedModel: 'claude-sonnet-4-6',
     label: 'CLI',
@@ -1109,7 +1109,7 @@ test('SDK evidence requires the observed init model and complete process provena
   const { evaluateSdkGateEvidence } = await import(moduleUrl);
   const selection = {
     runId: 'candidate-run',
-    version: '2.1.220',
+    version: '2.1.283',
     sha256: CANDIDATE_SHA,
     model: 'claude-sonnet-4-6',
     sessionLauncher: '/private/wrapper',
@@ -1284,7 +1284,7 @@ test('SDK observer records normalized lifecycle and fails a missing init model',
   mixedModelObserver.observe({
     type: 'assistant',
     message: {
-      model: 'claude-opus-5',
+      model: 'claude-opus-5-5',
       content: [{ type: 'text', text: 'private body' }],
     },
   });

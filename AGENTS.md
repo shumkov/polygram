@@ -34,27 +34,37 @@ needed because the TUI's behaviour, not polygram's logic, drifted.
 
 ### Current pinned version
 
-The version polygram has been validated against is owned by Orchestra.
-Search the exact installed dependency for
+The version polygram has been validated against is owned by Orchestra
+and defined by the Agent SDK: Orchestra pins
+`@anthropic-ai/claude-agent-sdk` exactly, and
 `CLAUDE_CLI_PINNED_VERSION` in
-`node_modules/@shumkov/orchestra/lib/claude-bin.js`.
+`node_modules/@shumkov/orchestra/lib/claude-bin.js` must equal that
+SDK's `claudeCodeVersion` (an Orchestra unit test enforces it).
+Polygram pins the same exact SDK version (a contract test enforces it).
 
 ### How the pin is enforced (hard pin, since 0.10.0-rc.19)
 
 Polygram does **not** spawn the bare `claude` on `$PATH`. Orchestra's
-`ensureVendoredClaudeBin()` resolves the exact pin, copies it from
-`~/.local/share/claude/versions/<version>` into Polygram's
-`~/.local/share/polygram/claude-bin/<version>` vendor directory, and
-returns that absolute path to `CliProcess`. The separate vendor copy is
+`ensureVendoredClaudeBin()` resolves the exact pin and copies it into
+Polygram's `~/.local/share/polygram/claude-bin/<version>` vendor
+directory, then returns that absolute path to `CliProcess`. Sources, in
+order: the Agent SDK's per-platform package
+(`@anthropic-ai/claude-agent-sdk-<platform>-<arch>/claude`, the same
+binary the updater installs), `~/.local/share/claude/versions/<version>`,
+then `claude install <version>`. Each copy must report the pinned
+version via `--version` before it is cached. The separate vendor copy is
 required because Claude's updater both moves the active symlink and
-prunes older versioned binaries.
+prunes older versioned binaries, and `npm i -g` replaces `node_modules`
+under a running daemon. Boot deletes every other vendored version, so
+preserve the previous binary elsewhere before deploying a new pin.
 
 Override CLI selection with `ORCHESTRA_CLAUDE_BIN`. Polygram also uses
 `POLYGRAM_CLAUDE_BIN` as the SDK query's
-`pathToClaudeCodeExecutable`. Compatibility gates set both selectors
-to the same attested path. Daemon boot logs the exact vendored binary
-used by CLI-backed chats; SDK-backed chats remain available if CLI
-preflight fails.
+`pathToClaudeCodeExecutable`; production leaves it unset, so SDK-backed
+chats run the SDK's bundled binary, which is the same version.
+Compatibility gates set both selectors to the same attested path.
+Daemon boot logs the exact vendored binary used by CLI-backed chats;
+SDK-backed chats remain available if CLI preflight fails.
 
 ### Upgrade procedure (separate, deliberate process)
 
@@ -81,11 +91,16 @@ own change with its own validation gate:
    Every applicable cell must pass. Normalize and compare the captured
    session, hook, queue, task-notification, Stop, reply, and worker
    evidence. An unexplained lifecycle change blocks the bump.
-5. **Update `CLAUDE_CLI_PINNED_VERSION`** in Orchestra's
-   `lib/claude-bin.js`, then release and consume the new exact Orchestra
-   version through separately reviewable PRs.
+5. **Move the pin in Orchestra.** `npm i --save-optional --save-exact
+   @anthropic-ai/claude-agent-sdk@<version>` (usually `@latest`), set
+   `CLAUDE_CLI_PINNED_VERSION` to its `claudeCodeVersion`, then release
+   and consume the new exact Orchestra version and the same SDK version
+   in Polygram through separately reviewable PRs.
 6. **Test in staging** for at least 24h on shumorobot before
-   shumabit / umi-assistant. Watch the events DB for
+   shumabit / umi-assistant. shumorobot is SDK-backed, so it does not
+   exercise the CLI backend; the VPS bots share one install and one
+   vendor directory, so restart them together and treat the following
+   24h as the CLI soak. Watch the events DB for
    `autosteer-match-miss`, `autonomous-wakeup-message`, and
    `tool-only-completion` events — these are the leading
    indicators of TUI-format drift.

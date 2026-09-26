@@ -9,9 +9,17 @@ const { encodeCwd } = require('../lib/util/claude-session-jsonl');
 const repoRoot = path.resolve(__dirname, '..');
 const manifestPath = path.join(
   repoRoot,
-  'scripts/spikes/claude-2.1.220-matrix.json',
+  'scripts/spikes/claude-2.1.283-matrix.json',
 );
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+const OLD_VERSION = manifest.versions.old;
+const CANDIDATE_VERSION = manifest.versions.candidate;
+const OLD_EXPECTATIONS = manifest.expectations[OLD_VERSION];
+const CANDIDATE_EXPECTATIONS = manifest.expectations[CANDIDATE_VERSION];
+const MANIFEST_EXPECTATIONS = {
+  oldExpectations: OLD_EXPECTATIONS,
+  candidateExpectations: CANDIDATE_EXPECTATIONS,
+};
 const REPLY_TOOL = 'mcp__polygram-gate-bridge__reply';
 const WORKFLOW_REPLY_TOOL = 'mcp__polygram-workflow-gate-bridge__reply';
 const SESSION_SOURCE_SHA = 'a'.repeat(64);
@@ -251,7 +259,7 @@ function compositeRemovalProof({
   };
 }
 
-function matrixResult(lifecycle, { candidate = false } = {}) {
+function matrixResult(lifecycle, { taskReminder = false } = {}) {
   const sessionRecordCount = lifecycle.session.length;
   return {
     resolvedModel: 'claude-sonnet-4-6',
@@ -267,35 +275,98 @@ function matrixResult(lifecycle, { candidate = false } = {}) {
         normalizedRecordCount: sessionRecordCount,
       },
     },
-    lifecycleProofs: candidate ? [taskReminderProof()] : [],
+    lifecycleProofs: taskReminder ? [taskReminderProof()] : [],
   };
 }
 
+// Rows Claude Code 2.1.283 adds to the same flows, as observed in the
+// authoritative 2.1.220 -> 2.1.283 run: five attachments before the first
+// enqueue, environment and model right after the first channel prompt, and
+// deferred_tools_record after the first turn's context attachments.
+const CONTEXT_ATTACHMENTS_283 = [
+  'instructions',
+  'session_context',
+  'date',
+  'credential_org',
+  'remote_session_change',
+  'environment',
+  'model',
+  'deferred_tools_record',
+];
+const SESSION_START_ATTACHMENTS_283 = [
+  'instructions',
+  'session_context',
+  'date',
+  'credential_org',
+  'remote_session_change',
+].map(attachment);
+
+function with283SessionRows(lifecycle, { recordAfter }) {
+  const session = structuredClone(lifecycle.session);
+  const firstPrompt = session.findIndex(
+    (record) => record.type === 'user' && record.hasParent === false,
+  );
+  session.splice(
+    firstPrompt + 1,
+    0,
+    attachment('environment'),
+    attachment('model'),
+  );
+  const contextEnd = session.findIndex(
+    (record) => record.attachmentType === recordAfter,
+  );
+  session.splice(contextEnd + 1, 0, attachment('deferred_tools_record'));
+  session.unshift(...structuredClone(SESSION_START_ATTACHMENTS_283));
+  return { ...lifecycle, session };
+}
+
+// 2.1.283 also fires UserPromptSubmit for the prompt folded into the third
+// turn, so that turn's transport hooks start with two of them.
+function with283FoldPromptHook(lifecycle) {
+  const hooks = structuredClone(lifecycle.hooks);
+  const promptHooks = hooks.flatMap((record, index) => (
+    record.hookEventName === 'UserPromptSubmit' ? [index] : []
+  ));
+  hooks.splice(promptHooks[2] + 1, 0, hook('UserPromptSubmit'));
+  return { ...lifecycle, hooks };
+}
+
+function cli283Lifecycle(lifecycle) {
+  return with283FoldPromptHook(
+    with283SessionRows(lifecycle, { recordAfter: 'skill_listing' }),
+  );
+}
+
+// Both pinned versions emit one task_reminder in the CLI contract flow; the
+// manifest declares that count per version and the comparator removes it.
 const CLI_LIFECYCLE_FIXTURES = {
   old1: matrixResult(cliLifecycleFixture({
     fileTool: 'Bash',
     subagentStops: 5,
-  })),
+    taskReminderIndex: 28,
+  }), { taskReminder: true }),
   old2: matrixResult(cliLifecycleFixture({
     fileTool: 'Write',
     subagentStops: 4,
-  })),
+    taskReminderIndex: 28,
+  }), { taskReminder: true }),
   old3: matrixResult(cliLifecycleFixture({
     fileTool: 'Write',
     subagentStops: 4,
     extraToolPair: true,
-  })),
-  candidate1: matrixResult(cliLifecycleFixture({
+    taskReminderIndex: 33,
+  }), { taskReminder: true }),
+  candidate1: matrixResult(cli283Lifecycle(cliLifecycleFixture({
     fileTool: 'Bash',
     subagentStops: 5,
     taskReminderIndex: 28,
-  }), { candidate: true }),
-  candidate2: matrixResult(cliLifecycleFixture({
+  })), { taskReminder: true }),
+  candidate2: matrixResult(cli283Lifecycle(cliLifecycleFixture({
     fileTool: 'Write',
     subagentStops: 4,
     extraToolPair: true,
     taskReminderIndex: 33,
-  }), { candidate: true }),
+  })), { taskReminder: true }),
 };
 
 function workflowLifecycleFixture({ deliveryMode, bashPairs, subagentStops }) {
@@ -424,7 +495,7 @@ function completeDelayedMcpResult(expectedMode = 'foreground') {
     status: 'PASS',
     attestation: {
       runId: 'delayed-schema-test',
-      version: '2.1.173',
+      version: '2.1.220',
       sha256: 'a'.repeat(64),
       executablePathHash: 'b'.repeat(64),
       wrapperRequired: false,
@@ -458,7 +529,7 @@ function completeDelayedMcpResult(expectedMode = 'foreground') {
   };
 }
 
-test('Claude 2.1.220 matrix declares every mandatory old/new gate', () => {
+test('Claude 2.1.283 matrix declares every mandatory old/new gate', () => {
   const oldNewIds = manifest.scenarios
     .filter((scenario) => !scenario.candidateOnly)
     .map((scenario) => scenario.id)
@@ -467,6 +538,7 @@ test('Claude 2.1.220 matrix declares every mandatory old/new gate', () => {
   assert.deepEqual(oldNewIds, [
     'cli-contract',
     'delayed-mcp',
+    'delayed-mcp-foreground',
     'sdk-compact',
     'sdk-post-tool-batch',
     'sdk-resume',
@@ -475,10 +547,170 @@ test('Claude 2.1.220 matrix declares every mandatory old/new gate', () => {
     'workflow-direct',
     'workflow-fallback',
   ]);
-  assert.equal(manifest.versions.old, '2.1.173');
-  assert.equal(manifest.versions.candidate, '2.1.220');
+  assert.equal(manifest.versions.old, '2.1.220');
+  assert.equal(manifest.versions.candidate, '2.1.283');
   assert.equal(manifest.comparator.model, 'claude-sonnet-4-6');
   assert.equal(manifest.comparator.effort, 'medium');
+});
+
+test('matrix holds the Agent SDK constant at the installed exact version', () => {
+  // Both sides drive the same SDK and vary only pathToClaudeCodeExecutable,
+  // so an SDK bump must be reviewed together with the manifest.
+  const sdkEntry = require.resolve('@anthropic-ai/claude-agent-sdk');
+  let sdkDir = path.dirname(sdkEntry);
+  while (!fs.existsSync(path.join(sdkDir, 'package.json'))) {
+    sdkDir = path.dirname(sdkDir);
+  }
+  const sdkPackage = JSON.parse(
+    fs.readFileSync(path.join(sdkDir, 'package.json'), 'utf8'),
+  );
+  assert.equal(sdkPackage.name, '@anthropic-ai/claude-agent-sdk');
+  assert.equal(manifest.sdkVersion, sdkPackage.version);
+});
+
+test('every compared CLI version has reviewed per-version expectations', async () => {
+  const {
+    expectationsFor,
+    gateExpectationsSchemaMatches,
+  } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  assert.deepEqual(
+    Object.keys(manifest.expectations).sort(),
+    [OLD_VERSION, CANDIDATE_VERSION].sort(),
+  );
+  for (const version of [OLD_VERSION, CANDIDATE_VERSION]) {
+    assert.equal(
+      gateExpectationsSchemaMatches(manifest.expectations[version]),
+      true,
+      version,
+    );
+    assert.deepEqual(
+      expectationsFor(manifest.expectations, version),
+      manifest.expectations[version],
+    );
+  }
+  // The accepted 2.1.220 candidate behaviour becomes the old baseline.
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(OLD_EXPECTATIONS).filter(
+      ([key]) => key !== 'workflowSizeGuidelineAnchors',
+    )),
+    {
+      wrapperRequired: true,
+      // Production never opts into auto-background, so its foreground
+      // default is gated; the opt-in path is too flaky on 2.1.220 to gate.
+      delayedMcpModes: {
+        autoBackground: 'not-gated',
+        default: 'foreground',
+        waiverReason: OLD_EXPECTATIONS.delayedMcpModes.waiverReason,
+      },
+      subagentTaskUpdated: 1,
+      taskReminderInsertions: 1,
+      resolvedOpus: 'claude-opus-5',
+      workflowSizeGuideline: 'medium',
+      // 2.1.220 writes none of 2.1.283's per-session context attachments.
+      passiveSessionAttachmentCounts: Object.fromEntries(
+        CONTEXT_ATTACHMENTS_283.map((type) => [type, 0]),
+      ),
+      opusPassiveSessionAttachmentCounts: {},
+      projectedInsertions: {},
+    },
+  );
+  // 2.1.283 changes only the production Opus default and the Workflow
+  // size-default code the projection anchors against.
+  assert.equal(CANDIDATE_EXPECTATIONS.resolvedOpus, 'claude-opus-5-5');
+  for (const key of [
+    'wrapperRequired',
+    'subagentTaskUpdated',
+    'taskReminderInsertions',
+    'workflowSizeGuideline',
+  ]) {
+    assert.deepEqual(CANDIDATE_EXPECTATIONS[key], OLD_EXPECTATIONS[key], key);
+  }
+  // The production delayed-MCP path keeps the old declaration; the opt-in
+  // path is a deterministic upstream regression on 2.1.283.
+  assert.equal(
+    CANDIDATE_EXPECTATIONS.delayedMcpModes.default,
+    OLD_EXPECTATIONS.delayedMcpModes.default,
+  );
+  assert.equal(
+    CANDIDATE_EXPECTATIONS.delayedMcpModes.autoBackground,
+    'known-regression',
+  );
+  assert.match(
+    CANDIDATE_EXPECTATIONS.delayedMcpModes.waiverReason,
+    /CLAUDE_AUTO_BACKGROUND_TASKS/,
+  );
+  assert.match(
+    OLD_EXPECTATIONS.delayedMcpModes.waiverReason,
+    /unused in production/,
+  );
+  assert.notDeepEqual(
+    CANDIDATE_EXPECTATIONS.workflowSizeGuidelineAnchors,
+    OLD_EXPECTATIONS.workflowSizeGuidelineAnchors,
+  );
+
+  // An undeclared or malformed version has no accepted behaviour.
+  assert.throws(
+    () => expectationsFor(manifest.expectations, '2.1.173'),
+    /no gate expectations are declared for Claude Code 2\.1\.173/,
+  );
+  assert.throws(
+    () => expectationsFor(manifest.expectations, '__proto__'),
+    /no gate expectations are declared/,
+  );
+  assert.throws(
+    () => expectationsFor(undefined, CANDIDATE_VERSION),
+    /no gate expectations are declared/,
+  );
+  assert.throws(
+    () => expectationsFor({
+      [CANDIDATE_VERSION]: {
+        ...CANDIDATE_EXPECTATIONS,
+        delayedMcpModes: { autoBackground: 'maybe', default: 'foreground' },
+      },
+    }, CANDIDATE_VERSION),
+    /malformed/,
+  );
+});
+
+test('drivers read expectations only from the manifest bytes the runner scheduled', async () => {
+  const { readGateExpectations } = await import(
+    '../scripts/spikes/claude-gate-matrix.mjs'
+  );
+  const manifestSha256 = crypto.createHash('sha256')
+    .update(fs.readFileSync(manifestPath, 'utf8'))
+    .digest('hex');
+  assert.deepEqual(
+    readGateExpectations(CANDIDATE_VERSION, {
+      expectedManifestSha256: manifestSha256,
+    }),
+    CANDIDATE_EXPECTATIONS,
+  );
+  assert.throws(() => readGateExpectations(CANDIDATE_VERSION, {
+    expectedManifestSha256: 'f'.repeat(64),
+  }), /manifest changed/);
+  assert.throws(
+    () => readGateExpectations('2.1.173', { expectedManifestSha256: manifestSha256 }),
+    /no gate expectations are declared/,
+  );
+});
+
+test('matrix runs refuse a manifest version without declared expectations', async () => {
+  const { buildClaudeMatrixRuns } = await import(
+    '../scripts/spikes/claude-gate-matrix.mjs'
+  );
+  for (const versionKey of ['old', 'candidate']) {
+    const invalidManifest = structuredClone(manifest);
+    delete invalidManifest.expectations[manifest.versions[versionKey]];
+    assert.throws(() => buildClaudeMatrixRuns({
+      manifest: invalidManifest,
+      binaries: {
+        old: '/private/bin/claude-old',
+        candidate: '/private/bin/claude-candidate',
+      },
+      artifactBaseDir: '/private/artifacts',
+      runPrefix: 'matrix-missing-expectations',
+    }), /no gate expectations are declared/);
+  }
 });
 
 test('sanitized delayed-MCP schema rejects arbitrary nested payloads', async () => {
@@ -565,11 +797,11 @@ test('every matrix cell has a real driver, oracle, cost, and artifact collector'
           ],
         );
         assert.deepEqual(
-          scenario.comparison.lifecycle.candidateOnlyInsertions,
+          scenario.comparison.lifecycle.versionedInsertions,
           [{
             stream: 'session',
             record: attachment('task_reminder'),
-            count: 1,
+            expectedCountKey: 'taskReminderInsertions',
             proof: {
               type: 'session-event-aggregator-removal',
               eligibility: 'task-reminder-v1',
@@ -625,7 +857,7 @@ test('every matrix cell has a real driver, oracle, cost, and artifact collector'
           ],
         );
         assert.deepEqual(
-          scenario.comparison.lifecycle.candidateOnlyInsertions,
+          scenario.comparison.lifecycle.versionedInsertions,
           [],
         );
         assert.deepEqual(
@@ -641,7 +873,10 @@ test('every matrix cell has a real driver, oracle, cost, and artifact collector'
               : WORKFLOW_FALLBACK_HOOKS,
           },
         );
-      } else if (scenario.id === 'delayed-mcp') {
+      } else if (
+        scenario.id === 'delayed-mcp'
+        || scenario.id === 'delayed-mcp-foreground'
+      ) {
         assert.deepEqual(scenario.comparison.lifecycle, {
           mode: 'version-specific-oracle',
           oracle: 'delayed-mcp-v1',
@@ -662,23 +897,135 @@ test('every matrix cell has a real driver, oracle, cost, and artifact collector'
   }
 });
 
-test('delayed MCP uses the same threshold and version-specific modes', () => {
-  const scenario = manifest.scenarios.find(({ id }) => id === 'delayed-mcp');
+test('delayed MCP gates the production default path and the opt-in path with per-version modes', async () => {
+  const {
+    buildClaudeMatrixRuns,
+    matrixWaivedCells,
+  } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  const optIn = manifest.scenarios.find(({ id }) => id === 'delayed-mcp');
+  const productionPath = manifest.scenarios.find(
+    ({ id }) => id === 'delayed-mcp-foreground',
+  );
 
+  for (const scenario of [optIn, productionPath]) {
+    assert.equal(
+      scenario.environment.common.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS,
+      '1000',
+    );
+    // The mode is derived from the attested version, never duplicated here.
+    assert.deepEqual(scenario.args, { old: [], candidate: [] });
+    for (const versionKey of ['old', 'candidate']) {
+      assert.equal(scenario.environment[versionKey], undefined);
+    }
+  }
+  // Production never sets the opt-in, so one cell must run without it.
+  assert.equal(optIn.environment.common.CLAUDE_AUTO_BACKGROUND_TASKS, '1');
   assert.equal(
-    scenario.environment.common.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS,
-    '1000',
-  );
-  assert.equal(
-    scenario.environment.candidate.CLAUDE_AUTO_BACKGROUND_TASKS,
-    '1',
-  );
-  assert.equal(
-    Object.hasOwn(scenario.environment.old || {}, 'CLAUDE_AUTO_BACKGROUND_TASKS'),
+    Object.hasOwn(productionPath.environment.common, 'CLAUDE_AUTO_BACKGROUND_TASKS'),
     false,
   );
-  assert.deepEqual(scenario.args.old, ['--expected-mode', 'foreground']);
-  assert.deepEqual(scenario.args.candidate, ['--expected-mode', 'background']);
+
+  const runs = buildClaudeMatrixRuns({
+    manifest,
+    binaries: {
+      old: '/private/bin/claude-old',
+      candidate: '/private/bin/claude-candidate',
+    },
+    artifactBaseDir: '/private/artifacts',
+    runPrefix: 'delayed-modes',
+  });
+  for (const versionKey of ['old', 'candidate']) {
+    const modes = manifest.expectations[manifest.versions[versionKey]]
+      .delayedMcpModes;
+    const defaultRun = runs.find(
+      (run) => run.id === `${versionKey}:delayed-mcp-foreground`,
+    );
+    assert.deepEqual(defaultRun.args, ['--expected-mode', modes.default]);
+    assert.equal(defaultRun.delayedMcpAutoBackground, false);
+  }
+  // Both versions waive the opt-in path: neither run is scheduled, and the
+  // summary reports each waiver instead of silently dropping the cell.
+  assert.equal(runs.some((run) => run.scenarioId === 'delayed-mcp'), false);
+  assert.deepEqual(matrixWaivedCells(manifest), [
+    {
+      id: 'old:delayed-mcp',
+      version: OLD_VERSION,
+      waiver: 'not-gated',
+      reason: OLD_EXPECTATIONS.delayedMcpModes.waiverReason,
+    },
+    {
+      id: 'candidate:delayed-mcp',
+      version: CANDIDATE_VERSION,
+      waiver: 'known-regression',
+      reason: CANDIDATE_EXPECTATIONS.delayedMcpModes.waiverReason,
+    },
+  ]);
+
+  // The default path is what production runs, so it can never be waived.
+  for (const delayedMcpModes of [
+    {
+      autoBackground: 'background',
+      default: 'known-regression',
+      waiverReason: 'waived',
+    },
+    {
+      autoBackground: 'background',
+      default: 'not-gated',
+      waiverReason: 'waived',
+    },
+    { autoBackground: 'known-regression', default: 'foreground' },
+    { autoBackground: 'not-gated', default: 'foreground' },
+    {
+      autoBackground: 'not-gated',
+      default: 'foreground',
+      waiverReason: ' ',
+    },
+    {
+      autoBackground: 'background',
+      default: 'foreground',
+      waiverReason: 'stray reason',
+    },
+    {
+      autoBackground: 'skipped',
+      default: 'foreground',
+      waiverReason: 'unknown waiver',
+    },
+  ]) {
+    const waived = structuredClone(manifest);
+    waived.expectations[OLD_VERSION].delayedMcpModes = delayedMcpModes;
+    assert.throws(() => buildClaudeMatrixRuns({
+      manifest: waived,
+      binaries: {
+        old: '/private/bin/claude-old',
+        candidate: '/private/bin/claude-candidate',
+      },
+      artifactBaseDir: '/private/artifacts',
+      runPrefix: 'delayed-waived',
+    }), /malformed/, JSON.stringify(delayedMcpModes));
+  }
+
+  for (const mutate of [
+    (invalid) => {
+      invalid.scenarios.find(({ id }) => id === 'delayed-mcp')
+        .args.old = ['--expected-mode', 'background'];
+    },
+    (invalid) => {
+      invalid.scenarios.find(({ id }) => id === 'delayed-mcp-foreground')
+        .environment.candidate = { CLAUDE_AUTO_BACKGROUND_TASKS: '1' };
+    },
+  ]) {
+    const invalid = structuredClone(manifest);
+    mutate(invalid);
+    assert.throws(() => buildClaudeMatrixRuns({
+      manifest: invalid,
+      binaries: {
+        old: '/private/bin/claude-old',
+        candidate: '/private/bin/claude-candidate',
+      },
+      artifactBaseDir: '/private/artifacts',
+      runPrefix: 'delayed-modes-invalid',
+    }), /expected mode comes from the version expectations|for both versions/);
+  }
 });
 
 test('SDK compact gate uses one ordered manual same-session boundary', () => {
@@ -698,15 +1045,16 @@ test('SDK compact gate uses one ordered manual same-session boundary', () => {
   assert.match(driver, /evaluateManualCompactEvidence/);
 });
 
-test('candidate-only production projection proves the Opus 5 resolution', () => {
+test('candidate-only production projection proves the declared Opus resolution', () => {
   const scenario = manifest.scenarios.find(
     ({ id }) => id === 'candidate-opus-projection',
   );
 
   assert.equal(scenario.candidateOnly, true);
   assert.equal(scenario.environment.candidate.CLAUDE_GATE_MODEL, 'opus');
-  assert.equal(scenario.expectedResolvedModel, 'claude-opus-5');
-  assert.equal(scenario.documentedWorkflowSizeGuideline, 'medium');
+  // Expected values come only from the attested version's expectations.
+  assert.equal(Object.hasOwn(scenario, 'expectedResolvedModel'), false);
+  assert.equal(Object.hasOwn(scenario, 'documentedWorkflowSizeGuideline'), false);
   assert.match(scenario.artifactCollector, /private SDK stream/);
   assert.match(scenario.artifactCollector, /nested Workflow session/);
 });
@@ -824,8 +1172,8 @@ test('matrix parent rejects shared Workflow delivery failures and false Opus PAS
 
   const opus = {
     status: 'PASS',
-    resolvedModel: 'claude-opus-5',
-    expectedResolvedModel: 'claude-opus-5',
+    resolvedModel: 'claude-opus-5-5',
+    expectedResolvedModel: 'claude-opus-5-5',
     documentedWorkflowSizeGuideline: 'medium',
     workflowPolicyOverridePresent: false,
     workflowSizeGuidelineEvidence: {
@@ -848,7 +1196,11 @@ test('matrix parent rejects shared Workflow delivery failures and false Opus PAS
     reasonHashes: [],
   };
   assert.equal(
-    matrixScenarioOracleMatches('candidate-opus-projection', opus).pass,
+    matrixScenarioOracleMatches(
+      'candidate-opus-projection',
+      opus,
+      CANDIDATE_EXPECTATIONS,
+    ).pass,
     true,
   );
   for (const mutation of [
@@ -857,12 +1209,22 @@ test('matrix parent rejects shared Workflow delivery failures and false Opus PAS
     { workflowMetadata: [] },
     { markerCount: 0 },
     { reasonCount: 1, reasonHashes: ['b'.repeat(64)] },
+    // A self-consistent claim for the previous Opus default is still wrong
+    // for a candidate whose declared `opus` resolution moved on.
+    { resolvedModel: 'claude-opus-5', expectedResolvedModel: 'claude-opus-5' },
+    { documentedWorkflowSizeGuideline: 'small' },
   ]) {
     assert.equal(matrixScenarioOracleMatches(
       'candidate-opus-projection',
       { ...opus, ...mutation },
+      CANDIDATE_EXPECTATIONS,
     ).pass, false);
   }
+  assert.equal(
+    matrixScenarioOracleMatches('candidate-opus-projection', opus).pass,
+    false,
+    'an Opus claim without declared expectations must not pass',
+  );
 });
 
 test('matrix parent binds the Opus projection to nested Workflow source evidence', async (t) => {
@@ -881,12 +1243,13 @@ test('matrix parent binds the Opus projection to nested Workflow source evidence
     run: {
       scenarioId: 'candidate-opus-projection',
       versionKey: 'candidate',
-      version: '2.1.220',
+      version: '2.1.283',
       model: 'opus',
       effort: 'medium',
-      expectedResolvedModel: 'claude-opus-5',
+      expectedResolvedModel: 'claude-opus-5-5',
+      expectations: CANDIDATE_EXPECTATIONS,
       env: {
-        CLAUDE_GATE_BIN: '/private/claude-2.1.220',
+        CLAUDE_GATE_BIN: '/private/claude-2.1.283',
       },
     },
     result: {
@@ -901,6 +1264,7 @@ test('matrix parent binds the Opus projection to nested Workflow source evidence
 test('nested Opus Workflow evidence must match the checked Workflow lifecycle baseline', async () => {
   const {
     buildClaudeMatrixRuns,
+    evaluateMatrixVersionEvidence,
     nestedWorkflowLifecycleMatches,
   } = await import('../scripts/spikes/claude-gate-matrix.mjs');
   const workflowScenario = manifest.scenarios.find(
@@ -909,8 +1273,8 @@ test('nested Opus Workflow evidence must match the checked Workflow lifecycle ba
   const runs = buildClaudeMatrixRuns({
     manifest,
     binaries: {
-      old: '/private/bin/claude-2.1.173',
-      candidate: '/private/bin/claude-2.1.220',
+      old: '/private/bin/claude-2.1.220',
+      candidate: '/private/bin/claude-2.1.283',
     },
     artifactBaseDir: '/private/artifacts',
     runPrefix: 'nested-workflow-policy',
@@ -923,33 +1287,73 @@ test('nested Opus Workflow evidence must match the checked Workflow lifecycle ba
     workflowScenario.comparison.lifecycle,
   );
 
-  const nestedResult = {
-    lifecycle: structuredClone(
-      workflowScenario.comparison.lifecycle.projectedBaseline,
-    ),
+  const nestedResultFor = (lifecycle) => ({
+    lifecycle,
     lifecycleSources: {
       session: {
         file: 'session.jsonl',
         stream: 'session',
         sha256: 'a'.repeat(64),
-        rawRecordCount:
-          workflowScenario.comparison.lifecycle.projectedBaseline.session.length,
-        normalizedRecordCount:
-          workflowScenario.comparison.lifecycle.projectedBaseline.session.length,
+        rawRecordCount: lifecycle.session.length,
+        normalizedRecordCount: lifecycle.session.length,
       },
     },
     lifecycleProofs: [],
-  };
+  });
+  const baseline = structuredClone(
+    workflowScenario.comparison.lifecycle.projectedBaseline,
+  );
+  // The nested Workflow runs on the candidate, so it is held to the
+  // candidate's declared session rows; the old-shaped transcript is not.
+  assert.equal(nestedWorkflowLifecycleMatches({
+    result: nestedResultFor(baseline),
+    policy: opusRun.nestedWorkflowLifecyclePolicy,
+    expectations: opusRun.expectations,
+  }), false);
+  const sonnetShaped = with283SessionRows(
+    baseline,
+    { recordAfter: 'skill_listing' },
+  );
+  // On Opus the real nested Workflow also carries the bypass-mode auto_mode
+  // steer before command_permissions; the Sonnet cells never do.
+  assert.equal(nestedWorkflowLifecycleMatches({
+    result: nestedResultFor(sonnetShaped),
+    policy: opusRun.nestedWorkflowLifecyclePolicy,
+    expectations: opusRun.expectations,
+  }), false);
+  const opusShaped = structuredClone(sonnetShaped);
+  opusShaped.session.splice(
+    opusShaped.session.findIndex(
+      (record) => record.attachmentType === 'command_permissions',
+    ),
+    0,
+    attachment('auto_mode'),
+  );
+  const nestedResult = nestedResultFor(opusShaped);
   assert.equal(nestedWorkflowLifecycleMatches({
     result: nestedResult,
     policy: opusRun.nestedWorkflowLifecyclePolicy,
-    isCandidate: true,
+    expectations: opusRun.expectations,
   }), true);
+  const twoSteers = structuredClone(opusShaped);
+  twoSteers.session.push(attachment('auto_mode'));
+  assert.equal(nestedWorkflowLifecycleMatches({
+    result: nestedResultFor(twoSteers),
+    policy: opusRun.nestedWorkflowLifecyclePolicy,
+    expectations: opusRun.expectations,
+  }), false);
+  // The Opus-only allowance never applies to the Sonnet Workflow cells.
+  assert.equal(evaluateMatrixVersionEvidence({
+    scenario: workflowScenario,
+    versionKey: 'candidate',
+    expectations: opusRun.expectations,
+    results: [workflowMatrixResult(opusShaped, 'direct')],
+  }).pass, false);
   nestedResult.lifecycle.session.pop();
   assert.equal(nestedWorkflowLifecycleMatches({
     result: nestedResult,
     policy: opusRun.nestedWorkflowLifecyclePolicy,
-    isCandidate: true,
+    expectations: opusRun.expectations,
   }), false);
 });
 
@@ -960,16 +1364,25 @@ test('matrix runner schedules every old gate before candidate gates with exact s
   const runs = buildClaudeMatrixRuns({
     manifest,
     binaries: {
-      old: '/private/bin/claude-2.1.173',
-      candidate: '/private/bin/claude-2.1.220',
+      old: '/private/bin/claude-2.1.220',
+      candidate: '/private/bin/claude-2.1.283',
     },
     artifactBaseDir: '/private/artifacts',
     runPrefix: 'matrix-test',
   });
 
-  assert.equal(runs.length, 21);
+  // 24 cells minus the two waived opt-in delayed-MCP cells.
+  assert.equal(runs.length, 22);
   assert.ok(runs.slice(0, 10).every((run) => run.versionKey === 'old'));
   assert.ok(runs.slice(10).every((run) => run.versionKey === 'candidate'));
+  // Each cell carries the expectations of the version its binary must attest.
+  for (const run of runs) {
+    assert.deepEqual(
+      run.expectations,
+      manifest.expectations[manifest.versions[run.versionKey]],
+      run.id,
+    );
+  }
   assert.deepEqual(
     runs.filter((run) => run.scenarioId === 'cli-contract').map((run) => ({
       id: run.id,
@@ -1010,24 +1423,17 @@ test('matrix runner schedules every old gate before candidate gates with exact s
       .every((run) => run.repeatIndex === 1 && run.repeatCount === 1),
   );
   assert.equal(
-    runs.find((run) => run.id === 'old:delayed-mcp').env.CLAUDE_GATE_BIN,
-    '/private/bin/claude-2.1.173',
+    runs.find((run) => run.id === 'old:delayed-mcp-foreground').env.CLAUDE_GATE_BIN,
+    '/private/bin/claude-2.1.220',
   );
   assert.equal(
-    runs.find((run) => run.id === 'candidate:delayed-mcp')
+    runs.find((run) => run.id === 'candidate:delayed-mcp-foreground')
       .env.CLAUDE_GATE_EXPECTED_VERSION,
-    '2.1.220',
+    '2.1.283',
   );
+  // With the opt-in path waived on both versions, no scheduled cell opts in.
   assert.equal(
-    runs.find((run) => run.id === 'candidate:delayed-mcp')
-      .env.CLAUDE_AUTO_BACKGROUND_TASKS,
-    '1',
-  );
-  assert.equal(
-    Object.hasOwn(
-      runs.find((run) => run.id === 'old:delayed-mcp').env,
-      'CLAUDE_AUTO_BACKGROUND_TASKS',
-    ),
+    runs.some((run) => Object.hasOwn(run.env, 'CLAUDE_AUTO_BACKGROUND_TASKS')),
     false,
   );
   assert.ok(
@@ -1056,7 +1462,21 @@ test('matrix runner schedules every old gate before candidate gates with exact s
   assert.equal(
     runs.find((run) => run.id === 'candidate:candidate-opus-projection')
       .expectedResolvedModel,
-    'claude-opus-5',
+    'claude-opus-5-5',
+  );
+  assert.equal(
+    runs.find((run) => run.id === 'candidate:candidate-opus-projection')
+      .env.CLAUDE_GATE_EXPECTED_RESOLVED_MODEL,
+    'claude-opus-5-5',
+  );
+  assert.equal(
+    runs.find((run) => run.id === 'candidate:candidate-system-prompt-snapshot')
+      .model,
+    manifest.comparator.model,
+  );
+  assert.equal(
+    runs.some((run) => run.id === 'old:candidate-system-prompt-snapshot'),
+    false,
   );
   assert.equal(
     runs.find((run) => run.id === 'candidate:workflow-direct')
@@ -1076,15 +1496,15 @@ test('matrix runner schedules every old gate before candidate gates with exact s
   assert.throws(() => buildClaudeMatrixRuns({
     manifest: invalidManifest,
     binaries: {
-      old: '/private/bin/claude-2.1.173',
-      candidate: '/private/bin/claude-2.1.220',
+      old: '/private/bin/claude-2.1.220',
+      candidate: '/private/bin/claude-2.1.283',
     },
     artifactBaseDir: '/private/artifacts',
     runPrefix: 'matrix-invalid',
   }), /crossVersion comparison is not recognized/);
 });
 
-test('matrix child environments clear ambient SDK auto-background before candidate opt-in', async () => {
+test('matrix child environments clear ambient SDK auto-background before the declared opt-in', async () => {
   const {
     buildClaudeMatrixChildEnv,
     buildClaudeMatrixRuns,
@@ -1092,8 +1512,8 @@ test('matrix child environments clear ambient SDK auto-background before candida
   const runs = buildClaudeMatrixRuns({
     manifest,
     binaries: {
-      old: '/private/bin/claude-2.1.173',
-      candidate: '/private/bin/claude-2.1.220',
+      old: '/private/bin/claude-2.1.220',
+      candidate: '/private/bin/claude-2.1.283',
     },
     artifactBaseDir: '/private/artifacts',
     runPrefix: 'matrix-env',
@@ -1102,19 +1522,25 @@ test('matrix child environments clear ambient SDK auto-background before candida
     CLAUDE_AUTO_BACKGROUND_TASKS: 'ambient-leak',
     PRESERVE_ME: 'yes',
   };
-  const oldEnv = buildClaudeMatrixChildEnv(
-    ambient,
-    runs.find((run) => run.id === 'old:delayed-mcp').env,
-  );
-  const candidateEnv = buildClaudeMatrixChildEnv(
-    ambient,
-    runs.find((run) => run.id === 'candidate:delayed-mcp').env,
-  );
+  // Cells that do not declare the opt-in must not inherit it from the shell.
+  for (const versionKey of ['old', 'candidate']) {
+    const undeclaredEnv = buildClaudeMatrixChildEnv(
+      ambient,
+      runs.find((run) => run.id === `${versionKey}:sdk-resume`).env,
+    );
+    assert.equal(
+      Object.hasOwn(undeclaredEnv, 'CLAUDE_AUTO_BACKGROUND_TASKS'),
+      false,
+    );
+    assert.equal(undeclaredEnv.PRESERVE_ME, 'yes');
 
-  assert.equal(Object.hasOwn(oldEnv, 'CLAUDE_AUTO_BACKGROUND_TASKS'), false);
-  assert.equal(candidateEnv.CLAUDE_AUTO_BACKGROUND_TASKS, '1');
-  assert.equal(oldEnv.PRESERVE_ME, 'yes');
-  assert.equal(candidateEnv.PRESERVE_ME, 'yes');
+  }
+  const declaredEnv = buildClaudeMatrixChildEnv(ambient, {
+    ...runs.find((run) => run.id === 'old:delayed-mcp-foreground').env,
+    CLAUDE_AUTO_BACKGROUND_TASKS: '1',
+  });
+  assert.equal(declaredEnv.CLAUDE_AUTO_BACKGROUND_TASKS, '1');
+  assert.equal(declaredEnv.PRESERVE_ME, 'yes');
 });
 
 test('matrix scenarios cannot replace runner-owned gate selectors', async () => {
@@ -1137,8 +1563,8 @@ test('matrix scenarios cannot replace runner-owned gate selectors', async () => 
     assert.throws(() => buildClaudeMatrixRuns({
       manifest: invalidManifest,
       binaries: {
-        old: '/private/bin/claude-2.1.173',
-        candidate: '/private/bin/claude-2.1.220',
+        old: '/private/bin/claude-2.1.220',
+        candidate: '/private/bin/claude-2.1.283',
       },
       artifactBaseDir: '/private/artifacts',
       runPrefix: 'matrix-protected-env',
@@ -1152,40 +1578,120 @@ test('declared SDK compatibility deltas use strict version-specific lifecycle or
     evaluateMatrixRunResult,
   } = await import('../scripts/spikes/claude-gate-matrix.mjs');
   const scenario = manifest.scenarios.find(({ id }) => id === 'delayed-mcp');
-  const oldResult = delayedMcpMatrixResult('foreground');
+  const oldResult = delayedMcpMatrixResult('background');
   const candidateResult = delayedMcpMatrixResult('background');
+  const foregroundResult = delayedMcpMatrixResult('foreground');
+  // A version that keeps the delayed handler in the foreground, as releases
+  // before native MCP auto-background did.
+  const foregroundExpectations = {
+    ...OLD_EXPECTATIONS,
+    delayedMcpModes: { autoBackground: 'foreground', default: 'foreground' },
+  };
+  // Both pinned versions waive the opt-in path, so the oracle is exercised
+  // with a version that declares it as native background.
+  const backgroundExpectations = {
+    ...OLD_EXPECTATIONS,
+    delayedMcpModes: { autoBackground: 'background', default: 'foreground' },
+  };
+  const BACKGROUND_OPT_IN = {
+    oldExpectations: backgroundExpectations,
+    candidateExpectations: backgroundExpectations,
+  };
 
   assert.equal(evaluateMatrixEvidencePair({
+    ...BACKGROUND_OPT_IN,
     scenario,
     oldResult,
     candidateResult,
   }).pass, true);
-  assert.equal(evaluateMatrixRunResult({
-    run: {
-      scenarioId: 'delayed-mcp',
-      versionKey: 'candidate',
-      version: '2.1.220',
+  assert.equal(evaluateMatrixEvidencePair({
+    scenario,
+    oldResult: foregroundResult,
+    candidateResult,
+    oldExpectations: foregroundExpectations,
+    candidateExpectations: backgroundExpectations,
+  }).pass, true);
+  // A waived path accepts no evidence at all.
+  assert.deepEqual(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
+    scenario,
+    oldResult,
+    candidateResult,
+  }).differences, ['lifecycle']);
+  // The old binary is judged by its own declaration: a foreground run from a
+  // version declared as backgrounding is a regression, not an old baseline.
+  assert.deepEqual(evaluateMatrixEvidencePair({
+    ...BACKGROUND_OPT_IN,
+    scenario,
+    oldResult: foregroundResult,
+    candidateResult,
+  }).differences, ['lifecycle']);
+  assert.deepEqual(evaluateMatrixEvidencePair({
+    scenario,
+    oldResult,
+    candidateResult,
+  }).differences, ['lifecycle']);
+  const delayedRun = {
+    scenarioId: 'delayed-mcp',
+    versionKey: 'old',
+    version: OLD_VERSION,
+    expectations: backgroundExpectations,
+    delayedMcpAutoBackground: true,
+    model: 'claude-sonnet-4-6',
+    effort: 'medium',
+    versionSpecificLifecycleOracle: 'delayed-mcp-v1',
+  };
+  const delayedRunResult = {
+    ...candidateResult,
+    evidenceSchemaVersion: 1,
+    matrixScenario: 'delayed-mcp',
+    status: 'PASS',
+    attestation: {
+      version: OLD_VERSION,
       model: 'claude-sonnet-4-6',
       effort: 'medium',
-      versionSpecificLifecycleOracle: 'delayed-mcp-v1',
     },
-    result: {
-      ...candidateResult,
-      evidenceSchemaVersion: 1,
-      matrixScenario: 'delayed-mcp',
-      status: 'PASS',
-      attestation: {
-        version: '2.1.220',
-        model: 'claude-sonnet-4-6',
-        effort: 'medium',
-      },
-    },
+  };
+  assert.equal(evaluateMatrixRunResult({
+    run: delayedRun,
+    result: delayedRunResult,
   }).pass, true);
+  assert.equal(evaluateMatrixRunResult({
+    run: { ...delayedRun, expectations: undefined },
+    result: delayedRunResult,
+  }).pass, false);
+  // Without the opt-in the same version is declared foreground, so a
+  // background run on the production path is a behaviour change.
+  assert.equal(evaluateMatrixRunResult({
+    run: {
+      ...delayedRun,
+      scenarioId: 'delayed-mcp-foreground',
+      delayedMcpAutoBackground: false,
+    },
+    result: { ...delayedRunResult, matrixScenario: 'delayed-mcp-foreground' },
+  }).pass, false);
+  assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
+    scenario: manifest.scenarios.find(
+      ({ id }) => id === 'delayed-mcp-foreground',
+    ),
+    oldResult: foregroundResult,
+    candidateResult: foregroundResult,
+  }).pass, true);
+  assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
+    scenario: manifest.scenarios.find(
+      ({ id }) => id === 'delayed-mcp-foreground',
+    ),
+    oldResult: foregroundResult,
+    candidateResult,
+  }).pass, false);
 
   const mismatched = structuredClone(candidateResult);
   mismatched.evidence.nativeLifecycleProof
     .correlations.notificationTaskMatchesStarted = false;
   assert.equal(evaluateMatrixEvidencePair({
+    ...BACKGROUND_OPT_IN,
     scenario,
     oldResult,
     candidateResult: mismatched,
@@ -1198,6 +1704,7 @@ test('declared SDK compatibility deltas use strict version-specific lifecycle or
     const invalidScenario = structuredClone(scenario);
     invalidScenario.comparison.lifecycle = lifecycle;
     assert.equal(evaluateMatrixEvidencePair({
+      ...BACKGROUND_OPT_IN,
       scenario: invalidScenario,
       oldResult,
       candidateResult,
@@ -1209,7 +1716,7 @@ test('declared SDK compatibility deltas use strict version-specific lifecycle or
         comparison?.lifecycle?.mode === 'version-specific-oracle'
       ))
       .map(({ id }) => id),
-    ['delayed-mcp', 'sdk-subagent'],
+    ['delayed-mcp', 'delayed-mcp-foreground', 'sdk-subagent'],
   );
 });
 
@@ -1220,7 +1727,7 @@ test('matrix evidence rejects a green exit with missing or mismatched artifacts'
   } = await import('../scripts/spikes/claude-gate-matrix.mjs');
   const run = {
     scenarioId: 'sdk-resume',
-    version: '2.1.173',
+    version: '2.1.220',
     model: 'claude-sonnet-4-6',
     effort: 'medium',
   };
@@ -1232,7 +1739,7 @@ test('matrix evidence rejects a green exit with missing or mismatched artifacts'
     status: 'PASS',
     resolvedModel: 'claude-sonnet-4-6',
     attestation: {
-      version: '2.1.173',
+      version: '2.1.220',
       model: 'claude-sonnet-4-6',
       effort: 'medium',
     },
@@ -1255,7 +1762,7 @@ test('matrix evidence rejects a green exit with missing or mismatched artifacts'
       status: 'PASS',
       resolvedModel: 'claude-opus-5',
       attestation: {
-        version: '2.1.173',
+        version: '2.1.220',
         model: 'claude-sonnet-4-6',
         effort: 'medium',
       },
@@ -1273,16 +1780,19 @@ test('matrix evidence rejects a green exit with missing or mismatched artifacts'
     resultSubtype: 'success',
   };
   assert.deepEqual(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
     scenario,
     oldResult,
     candidateResult: { ...oldResult },
   }), { pass: true, differences: [] });
   assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
     scenario,
     oldResult,
     candidateResult: { ...oldResult, resolvedModel: 'claude-opus-5' },
   }).pass, false);
   assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
     scenario,
     oldResult: { resolvedModel: 'claude-sonnet-4-6' },
     candidateResult: { resolvedModel: 'claude-sonnet-4-6' },
@@ -1295,7 +1805,7 @@ test('matrix parent independently attests the binary and exact common evidence',
   );
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-parent-attest-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const executablePath = path.join(dir, 'claude-2.1.173');
+  const executablePath = path.join(dir, 'claude-2.1.220');
   fs.writeFileSync(executablePath, 'immutable selected binary', { mode: 0o700 });
   const realExecutable = fs.realpathSync(executablePath);
   const sha256 = crypto.createHash('sha256')
@@ -1307,7 +1817,8 @@ test('matrix parent independently attests the binary and exact common evidence',
   const run = {
     scenarioId: 'sdk-resume',
     versionKey: 'old',
-    version: '2.1.173',
+    version: OLD_VERSION,
+    expectations: OLD_EXPECTATIONS,
     model: 'claude-sonnet-4-6',
     effort: 'medium',
     env: {
@@ -1322,10 +1833,10 @@ test('matrix parent independently attests the binary and exact common evidence',
     status: 'PASS',
     attestation: {
       runId: 'parent-attest-run',
-      version: '2.1.173',
+      version: OLD_VERSION,
       sha256,
       executablePathHash,
-      wrapperRequired: false,
+      wrapperRequired: true,
       model: 'claude-sonnet-4-6',
       effort: 'medium',
     },
@@ -1387,6 +1898,24 @@ test('matrix parent independently attests the binary and exact common evidence',
         sha256: 'f'.repeat(64),
       },
     },
+    privateArtifactDir,
+  }).pass, false);
+  // The declared wrapper requirement is per version, not per matrix side: an
+  // old binary that skipped wrapper provenance fails like a candidate would.
+  assert.equal(evaluateMatrixRunResult({
+    run,
+    result: {
+      ...result,
+      attestation: {
+        ...result.attestation,
+        wrapperRequired: false,
+      },
+    },
+    privateArtifactDir,
+  }).pass, false);
+  assert.equal(evaluateMatrixRunResult({
+    run: { ...run, expectations: undefined },
+    result,
     privateArtifactDir,
   }).pass, false);
   assert.equal(evaluateMatrixRunResult({
@@ -1481,7 +2010,7 @@ test('matrix parent regenerates CLI process claims from private snapshots', asyn
   t.after(() => fs.rmSync(runDir, { recursive: true, force: true }));
   const privateArtifactDir = path.join(runDir, 'raw-private');
   fs.mkdirSync(privateArtifactDir, { mode: 0o700 });
-  const executable = '/private/claude-2.1.173';
+  const executable = '/private/claude-2.1.220';
   const executablePathHash = crypto.createHash('sha256')
     .update(executable)
     .digest('hex');
@@ -1556,7 +2085,7 @@ test('CLI cells require at least ten seconds of MCP-ready deadline headroom', as
   );
   const run = {
     scenarioId: 'cli-contract',
-    version: '2.1.220',
+    version: '2.1.283',
     model: 'claude-sonnet-4-6',
     effort: 'medium',
     maxBridgeReadyToMcpReadyMs: 20_000,
@@ -1567,7 +2096,7 @@ test('CLI cells require at least ten seconds of MCP-ready deadline headroom', as
     status: 'PASS',
     resolvedModel: 'claude-sonnet-4-6',
     attestation: {
-      version: '2.1.220',
+      version: '2.1.283',
       model: 'claude-sonnet-4-6',
       effort: 'medium',
     },
@@ -1638,7 +2167,7 @@ test('matrix runner independently verifies CLI lifecycle source evidence', async
   });
   const run = {
     scenarioId: 'cli-contract',
-    version: '2.1.173',
+    version: '2.1.220',
     model: 'claude-sonnet-4-6',
     effort: 'medium',
     evidenceSources: {
@@ -1652,7 +2181,7 @@ test('matrix runner independently verifies CLI lifecycle source evidence', async
     status: 'PASS',
     resolvedModel: 'claude-sonnet-4-6',
     attestation: {
-      version: '2.1.173',
+      version: '2.1.220',
       model: 'claude-sonnet-4-6',
       effort: 'medium',
     },
@@ -1755,7 +2284,7 @@ test('matrix parent binds delayed result claims to the raw terminal SDK result',
   const privateArtifactDir = path.join(dir, 'raw-private');
   fs.mkdirSync(privateArtifactDir, { mode: 0o700 });
   const sourcePath = path.join(privateArtifactDir, 'sdk-stream.ndjson');
-  const marker = 'MCP-COMPLETE:2.1.220:result-source';
+  const marker = 'MCP-COMPLETE:2.1.283:result-source';
   const markerHash = crypto.createHash('sha256').update(marker).digest('hex');
   const records = [
     {
@@ -1807,18 +2336,29 @@ test('matrix parent binds delayed result claims to the raw terminal SDK result',
   const run = {
     scenarioId: 'delayed-mcp',
     versionKey: 'old',
-    version: '2.1.173',
+    version: '2.1.220',
+    // The claim is a foreground run on the default path, so the raw
+    // terminal-result mismatch is the only lifecycle failure.
+    expectations: OLD_EXPECTATIONS,
+    delayedMcpAutoBackground: false,
     model: 'claude-sonnet-4-6',
     effort: 'medium',
     evidenceSources: { sdk: 'sdk-stream.ndjson' },
     versionSpecificLifecycleOracle: 'delayed-mcp-v1',
   };
 
-  assert.equal(evaluateMatrixRunResult({
+  const validation = evaluateMatrixRunResult({
     run,
     result: claimed,
     privateArtifactDir,
-  }).pass, false);
+  });
+  assert.equal(validation.pass, false);
+  assert.ok(validation.reasons.includes(
+    'sanitized lifecycle source does not match the private session artifact',
+  ));
+  assert.equal(validation.reasons.includes(
+    'sanitized result does not satisfy the version-specific lifecycle oracle',
+  ), false);
 });
 
 test('matrix parent rejects gate-owned raw sources that are not private', async (t) => {
@@ -1850,7 +2390,7 @@ test('matrix evidence rejects unknown and malformed normalized lifecycle records
   );
   const run = {
     scenarioId: 'sdk-resume',
-    version: '2.1.173',
+    version: '2.1.220',
     model: 'claude-sonnet-4-6',
     effort: 'medium',
   };
@@ -1860,7 +2400,7 @@ test('matrix evidence rejects unknown and malformed normalized lifecycle records
     status: 'PASS',
     resolvedModel: 'claude-sonnet-4-6',
     attestation: {
-      version: '2.1.173',
+      version: '2.1.220',
       model: 'claude-sonnet-4-6',
       effort: 'medium',
     },
@@ -1875,6 +2415,15 @@ test('matrix evidence rejects unknown and malformed normalized lifecycle records
         { type: 'mode' },
         { type: 'permission-mode' },
         { type: 'rate_limit_event' },
+        // 2.1.283 writes `{"type":"atis-latch","atis":"", sessionId}` rows:
+        // no uuid, no parent, nothing Polygram reads. Recognized, not ignored,
+        // so a change in its shape still surfaces as an unknown row.
+        { type: 'atis-latch' },
+        // 2.1.283 writes a running `cost-state` total (USD, durations,
+        // per-model usage) that nothing in the lifecycle depends on.
+        { type: 'cost-state' },
+        // SDK heartbeat streamed while a long tool (e.g. an Agent) runs.
+        { type: 'tool_progress' },
       ],
     },
   }).pass, true);
@@ -1922,6 +2471,7 @@ test('matrix evidence rejects unknown and malformed normalized lifecycle records
     { type: 'brand-new-upstream-row' },
   );
   assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
     scenario: cliScenario,
     oldResult: oldWithUnknownRecord,
     candidateResult: CLI_LIFECYCLE_FIXTURES.candidate1,
@@ -1932,6 +2482,7 @@ test('matrix evidence rejects unknown and malformed normalized lifecycle records
   );
   oldWithMalformedStream.lifecycle.unexpected = 'not-a-record-stream';
   assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
     scenario: cliScenario,
     oldResult: oldWithMalformedStream,
     candidateResult: CLI_LIFECYCLE_FIXTURES.candidate1,
@@ -1963,11 +2514,13 @@ test('matrix evidence compares normalized lifecycle shapes fail closed', async (
   };
 
   assert.deepEqual(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
     scenario,
     oldResult: common,
     candidateResult: { ...common, lifecycle: [...common.lifecycle] },
   }), { pass: true, differences: [] });
   assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
     scenario,
     oldResult: common,
     candidateResult: {
@@ -1979,6 +2532,7 @@ test('matrix evidence compares normalized lifecycle shapes fail closed', async (
     },
   }).pass, false);
   assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
     scenario,
     oldResult: common,
     candidateResult: {
@@ -1990,11 +2544,13 @@ test('matrix evidence compares normalized lifecycle shapes fail closed', async (
     },
   }).pass, false);
   assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
     scenario,
     oldResult: common,
     candidateResult: { resolvedModel: common.resolvedModel },
   }).pass, false);
   assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
     scenario: {
       comparison: {
         equalFields: ['resolvedModel'],
@@ -2004,6 +2560,113 @@ test('matrix evidence compares normalized lifecycle shapes fail closed', async (
     oldResult: common,
     candidateResult: common,
   }).pass, false);
+});
+
+test('SDK semantic comparison ignores the timing-dependent commands_changed notice only', async () => {
+  const { evaluateMatrixEvidencePair } = await import(
+    '../scripts/spikes/claude-gate-matrix.mjs'
+  );
+  const scenario = {
+    comparison: {
+      lifecycle: 'sdk-semantic-shape-v1',
+      equalFields: ['resolvedModel'],
+    },
+  };
+  const turn = [
+    system('init'),
+    {
+      type: 'assistant',
+      hasParent: false,
+      contentTypes: ['text'],
+      toolNames: [],
+    },
+    { type: 'result', subtype: 'success' },
+  ];
+  const oldResult = {
+    resolvedModel: 'claude-sonnet-4-6',
+    lifecycle: [...turn, ...turn],
+  };
+  // Real 2.1.283 sdk-resume: the notice followed the second query's init
+  // but not the first, so its count is not a property of the turn.
+  const candidateResult = {
+    resolvedModel: 'claude-sonnet-4-6',
+    lifecycle: [...turn, system('init'), system('commands_changed'), ...turn.slice(1)],
+  };
+  assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
+    scenario,
+    oldResult,
+    candidateResult,
+  }).pass, true);
+  // Any other new system row is still lifecycle drift.
+  assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
+    scenario,
+    oldResult,
+    candidateResult: {
+      ...candidateResult,
+      lifecycle: candidateResult.lifecycle.map((record) => (
+        record.subtype === 'commands_changed' ? system('commands_reloaded') : record
+      )),
+    },
+  }).pass, false);
+});
+
+// tool_progress heartbeats are streamed every 30 s while a tool such as an
+// Agent keeps running, so their count follows wall-clock time, not the turn.
+test('SDK semantic comparison ignores tool_progress heartbeats', async () => {
+  const { evaluateMatrixEvidencePair } = await import(
+    '../scripts/spikes/claude-gate-matrix.mjs'
+  );
+  const scenario = {
+    comparison: {
+      lifecycle: 'sdk-semantic-shape-v1',
+      equalFields: ['resolvedModel'],
+    },
+  };
+  const turn = [
+    system('init'),
+    { type: 'assistant', hasParent: false, contentTypes: ['tool_use'], toolNames: ['Agent'] },
+    { type: 'result', subtype: 'success' },
+  ];
+  const oldResult = { resolvedModel: 'claude-sonnet-4-6', lifecycle: turn };
+  const candidateResult = {
+    resolvedModel: 'claude-sonnet-4-6',
+    lifecycle: [turn[0], turn[1], { type: 'tool_progress' }, turn[2]],
+  };
+  assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS, scenario, oldResult, candidateResult,
+  }).pass, true);
+});
+
+// `status` progress notices (e.g. while compacting) are streamed a varying
+// number of times: two real 2.1.283 sdk-compact runs produced 2 and 3,
+// while the compaction itself is checked through the cell's equal fields.
+test('SDK semantic comparison ignores the status progress notice count', async () => {
+  const { evaluateMatrixEvidencePair } = await import(
+    '../scripts/spikes/claude-gate-matrix.mjs'
+  );
+  const scenario = {
+    comparison: {
+      lifecycle: 'sdk-semantic-shape-v1',
+      equalFields: ['resolvedModel'],
+    },
+  };
+  const turn = [
+    system('init'),
+    system('status'),
+    { type: 'assistant', hasParent: false, contentTypes: ['text'], toolNames: [] },
+    system('status'),
+    { type: 'result', subtype: 'success' },
+  ];
+  const oldResult = { resolvedModel: 'claude-sonnet-4-6', lifecycle: turn };
+  const candidateResult = {
+    resolvedModel: 'claude-sonnet-4-6',
+    lifecycle: [...turn.slice(0, 4), system('status'), turn[4]],
+  };
+  assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS, scenario, oldResult, candidateResult,
+  }).pass, true);
 });
 
 test('SDK semantic lifecycle comparison ignores streaming noise but rejects missing tools', async () => {
@@ -2082,11 +2745,13 @@ test('SDK semantic lifecycle comparison ignores streaming noise but rejects miss
   ];
 
   assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
     scenario,
     oldResult: { ...common, lifecycle: oldLifecycle },
     candidateResult: { ...common, lifecycle: candidateLifecycle },
   }).pass, true);
   assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
     scenario,
     oldResult: { ...common, lifecycle: oldLifecycle },
     candidateResult: {
@@ -2112,13 +2777,17 @@ test('Workflow lifecycle comparison excludes only worker-internal volatility', a
       bashPairs: 2,
       subagentStops: 3,
     }), deliveryMode);
-    const candidateResult = workflowMatrixResult(workflowLifecycleFixture({
-      deliveryMode,
-      bashPairs: 4,
-      subagentStops: 4,
-    }), deliveryMode);
+    const candidateResult = workflowMatrixResult(with283SessionRows(
+      workflowLifecycleFixture({
+        deliveryMode,
+        bashPairs: 4,
+        subagentStops: 4,
+      }),
+      { recordAfter: 'skill_listing' },
+    ), deliveryMode);
 
     assert.equal(evaluateMatrixEvidencePair({
+      ...MANIFEST_EXPECTATIONS,
       scenario: {
         comparison: {
           ...scenario.comparison,
@@ -2129,6 +2798,7 @@ test('Workflow lifecycle comparison excludes only worker-internal volatility', a
       candidateResult,
     }).pass, false);
     assert.equal(evaluateMatrixEvidencePair({
+      ...MANIFEST_EXPECTATIONS,
       scenario,
       oldResult,
       candidateResult,
@@ -2179,6 +2849,7 @@ test('Workflow lifecycle comparison excludes only worker-internal volatility', a
       const mutated = structuredClone(candidateResult);
       mutate(mutated);
       assert.equal(evaluateMatrixEvidencePair({
+        ...MANIFEST_EXPECTATIONS,
         scenario,
         oldResult,
         candidateResult: mutated,
@@ -2187,13 +2858,13 @@ test('Workflow lifecycle comparison excludes only worker-internal volatility', a
 
     const policyMutations = [
       (mutatedScenario) => {
-        delete mutatedScenario.comparison.lifecycle.candidateOnlyInsertions;
+        delete mutatedScenario.comparison.lifecycle.versionedInsertions;
       },
       (mutatedScenario) => {
-        mutatedScenario.comparison.lifecycle.candidateOnlyInsertions = null;
+        mutatedScenario.comparison.lifecycle.versionedInsertions = null;
       },
       (mutatedScenario) => {
-        mutatedScenario.comparison.lifecycle.candidateOnlyInsertions = {};
+        mutatedScenario.comparison.lifecycle.versionedInsertions = {};
       },
       (mutatedScenario) => {
         delete mutatedScenario.comparison.lifecycle.optionalInsertions;
@@ -2212,6 +2883,7 @@ test('Workflow lifecycle comparison excludes only worker-internal volatility', a
       const mutatedScenario = structuredClone(scenario);
       mutate(mutatedScenario);
       assert.equal(evaluateMatrixEvidencePair({
+        ...MANIFEST_EXPECTATIONS,
         scenario: mutatedScenario,
         oldResult,
         candidateResult,
@@ -2248,6 +2920,7 @@ test('Workflow lifecycle comparison excludes only worker-internal volatility', a
       const mutated = structuredClone(candidateResult);
       mutate(mutated);
       assert.equal(evaluateMatrixEvidencePair({
+        ...MANIFEST_EXPECTATIONS,
         scenario,
         oldResult,
         candidateResult: mutated,
@@ -2274,11 +2947,13 @@ test('single-run Workflow evidence must match its absolute lifecycle baseline', 
   assert.equal(evaluateMatrixVersionEvidence({
     scenario,
     versionKey: 'old',
+    expectations: OLD_EXPECTATIONS,
     results: [result],
   }).pass, true);
   assert.equal(evaluateMatrixVersionEvidence({
     scenario,
     versionKey: 'old',
+    expectations: OLD_EXPECTATIONS,
     results: [invalid],
   }).pass, false);
 });
@@ -2321,6 +2996,7 @@ test('CLI lifecycle comparison tolerates only demonstrated same-version volatili
   ];
   for (const [left, right] of strictVolatilityPairs) {
     assert.equal(evaluateMatrixEvidencePair({
+      ...MANIFEST_EXPECTATIONS,
       scenario: strictScenario,
       oldResult: left,
       candidateResult: right,
@@ -2335,6 +3011,7 @@ test('CLI lifecycle comparison tolerates only demonstrated same-version volatili
   assert.equal(evaluateMatrixVersionEvidence({
     scenario: cliScenario,
     versionKey: 'old',
+    expectations: OLD_EXPECTATIONS,
     results: oldPairs[0],
   }).pass, true);
   const incompatibleOld = structuredClone(CLI_LIFECYCLE_FIXTURES.old2);
@@ -2345,10 +3022,12 @@ test('CLI lifecycle comparison tolerates only demonstrated same-version volatili
   assert.equal(evaluateMatrixVersionEvidence({
     scenario: cliScenario,
     versionKey: 'old',
+    expectations: OLD_EXPECTATIONS,
     results: [CLI_LIFECYCLE_FIXTURES.old1, incompatibleOld],
   }).pass, false);
   const outcomes = oldPairs.map((oldResults) => (
     evaluateMatrixScenarioEvidence({
+      ...MANIFEST_EXPECTATIONS,
       scenario: cliScenario,
       oldResults,
       candidateResults: [
@@ -2379,6 +3058,7 @@ test('CLI lifecycle comparison tolerates only demonstrated same-version volatili
   const invalidPolicyScenario = structuredClone(cliScenario);
   invalidPolicyScenario.comparison.crossVersion = 'first-only';
   assert.deepEqual(evaluateMatrixScenarioEvidence({
+    ...MANIFEST_EXPECTATIONS,
     scenario: invalidPolicyScenario,
     oldResults: oldPairs[0],
     candidateResults: [
@@ -2412,7 +3092,7 @@ test('CLI lifecycle comparison accepts only a proved interrupt-correlated cancel
       eligibility: 'interrupt-user-prompt-submit-v1',
     },
   }];
-  scenario.comparison.lifecycle.candidateOnlyInsertions[0].proof.eligibility =
+  scenario.comparison.lifecycle.versionedInsertions[0].proof.eligibility =
     'task-reminder-v1';
 
   const oldWithoutCancellation = structuredClone(
@@ -2429,12 +3109,14 @@ test('CLI lifecycle comparison accepts only a proved interrupt-correlated cancel
   oldWithCancellation.lifecycleSources.session.rawRecordCount += 1;
   oldWithCancellation.lifecycleSources.session.normalizedRecordCount += 1;
   oldWithCancellation.lifecycleProofs = [compositeRemovalProof({
+    taskReminderCount: 1,
     hookCancelledCount: 1,
   })];
 
   assert.equal(evaluateMatrixVersionEvidence({
     scenario,
     versionKey: 'old',
+    expectations: OLD_EXPECTATIONS,
     results: [oldWithCancellation, oldWithoutCancellation],
   }).pass, true);
 
@@ -2453,6 +3135,7 @@ test('CLI lifecycle comparison accepts only a proved interrupt-correlated cancel
     hookCancelledCount: 1,
   })];
   assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
     scenario,
     oldResult: oldWithoutCancellation,
     candidateResult: candidateWithUnion,
@@ -2485,10 +3168,411 @@ test('CLI lifecycle comparison accepts only a proved interrupt-correlated cancel
     const invalid = structuredClone(candidateWithUnion);
     mutate(invalid);
     assert.equal(evaluateMatrixEvidencePair({
+      ...MANIFEST_EXPECTATIONS,
       scenario,
       oldResult: oldWithoutCancellation,
       candidateResult: invalid,
     }).pass, false);
+  }
+});
+
+// The projected CLI-contract session sequence of an authoritative 2.1.283
+// run (total_tokens_reminder already excluded). In other runs the five
+// context records before the first enqueue land after the first channel
+// prompt instead, because Claude writes them while that prompt arrives.
+const OBSERVED_CLI_SESSION_283 = [
+  'a:instructions', 'a:session_context', 'a:date', 'a:credential_org',
+  'a:remote_session_change', 'q:enqueue', 'q:dequeue', 'u:root',
+  'a:environment', 'a:model', 'a:deferred_tools_delta',
+  'a:agent_listing_delta', 'a:mcp_instructions_delta', 'a:skill_listing',
+  'a:deferred_tools_record', 's:stop_hook_summary', 's:turn_duration',
+  'q:enqueue', 'q:dequeue', 'u:child', 's:stop_hook_summary',
+  's:turn_duration', 'q:enqueue', 'q:dequeue', 'u:child', 'q:enqueue',
+  'q:remove', 'a:queued_command', 's:stop_hook_summary', 's:turn_duration',
+  'q:enqueue', 'q:dequeue', 'u:child', 'a:task_reminder', 'q:enqueue',
+  'q:dequeue', 'u:child', 's:stop_hook_summary', 's:turn_duration',
+  'q:enqueue', 'q:dequeue', 'u:child', 's:stop_hook_summary',
+  's:turn_duration',
+];
+const OBSERVED_CLI_SESSION_283_LATE_CONTEXT = [
+  ...OBSERVED_CLI_SESSION_283.slice(5, 8),
+  ...OBSERVED_CLI_SESSION_283.slice(0, 5),
+  ...OBSERVED_CLI_SESSION_283.slice(8),
+];
+const OBSERVED_CLI_HOOKS_283 = [
+  'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop',
+  'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop',
+  'UserPromptSubmit', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop',
+  'UserPromptSubmit', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop',
+  'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop',
+];
+
+function decodeObservedSession(code) {
+  const [kind, value] = code.split(':');
+  if (kind === 'a') return attachment(value);
+  if (kind === 'q') return queue(value);
+  if (kind === 's') return system(value);
+  return channelUser(value === 'child');
+}
+
+function observedHooks(names) {
+  return names.map((name) => (
+    name === 'PreToolUse' || name === 'PostToolUse'
+      ? hook(name, REPLY_TOOL)
+      : hook(name)
+  ));
+}
+
+function observedCliResult({ session, hooks }) {
+  return matrixResult({ session, hooks }, { taskReminder: true });
+}
+
+test('2.1.283 context attachments count once each in either observed order', async () => {
+  const {
+    evaluateMatrixScenarioEvidence,
+    evaluateMatrixVersionEvidence,
+  } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  const cliScenario = manifest.scenarios.find(({ id }) => id === 'cli-contract');
+  const hooks = observedHooks(OBSERVED_CLI_HOOKS_283);
+  const early = {
+    session: OBSERVED_CLI_SESSION_283.map(decodeObservedSession),
+    hooks,
+  };
+  const late = {
+    session: OBSERVED_CLI_SESSION_283_LATE_CONTEXT.map(decodeObservedSession),
+    hooks,
+  };
+  assert.equal(OBSERVED_CLI_HOOKS_283.length, CLI_TRANSPORT_HOOKS.length + 1);
+  const withoutReminder = (session) => session.filter(
+    (record) => record.attachmentType !== 'task_reminder',
+  );
+  assert.deepEqual(
+    withoutReminder(CLI_LIFECYCLE_FIXTURES.candidate1.lifecycle.session.filter(
+      (record) => record.type !== 'assistant'
+        && !(record.type === 'user' && !record.originKind),
+    )),
+    withoutReminder(early.session),
+  );
+
+  const oldResults = [CLI_LIFECYCLE_FIXTURES.old1, CLI_LIFECYCLE_FIXTURES.old2];
+  const outcome = evaluateMatrixScenarioEvidence({
+    ...MANIFEST_EXPECTATIONS,
+    scenario: cliScenario,
+    oldResults,
+    candidateResults: [observedCliResult(early), observedCliResult(late)],
+  });
+  assert.equal(outcome.pass, true);
+  assert.ok(outcome.comparisons.every((comparison) => comparison.pass));
+
+  const judgeCandidate = (lifecycle, expectations = CANDIDATE_EXPECTATIONS) => (
+    evaluateMatrixVersionEvidence({
+      scenario: cliScenario,
+      versionKey: 'candidate',
+      expectations,
+      results: [observedCliResult(lifecycle), observedCliResult(early)],
+    }).pass
+  );
+  const mutate = (base, stream, change) => {
+    const copy = structuredClone(base);
+    change(copy[stream]);
+    return copy;
+  };
+  const at = (session, type) => session.findIndex(
+    (record) => record.attachmentType === type,
+  );
+  assert.equal(judgeCandidate(late), true);
+  for (const base of [early, late]) {
+    for (const [name, lifecycle] of Object.entries({
+      'context row missing': mutate(base, 'session', (session) => {
+        session.splice(at(session, 'model'), 1);
+      }),
+      'context row duplicated': mutate(base, 'session', (session) => {
+        session.push(attachment('date'));
+      }),
+      'context row renamed': mutate(base, 'session', (session) => {
+        session[at(session, 'deferred_tools_record')] =
+          attachment('deferred_tools_snapshot');
+      }),
+      'undeclared new attachment': mutate(base, 'session', (session) => {
+        session.splice(1, 0, attachment('output_style_instructions'));
+      }),
+      'non-context rows reordered': mutate(base, 'session', (session) => {
+        const skill = at(session, 'skill_listing');
+        [session[skill - 1], session[skill]] = [session[skill], session[skill - 1]];
+      }),
+      'fold prompt hook missing': mutate(base, 'hooks', (list) => list.splice(9, 1)),
+      // An extra prompt hook on a turn other than the folded one is a
+      // different behaviour, even though the count matches.
+      'extra prompt hook on the first turn instead': mutate(base, 'hooks', (list) => {
+        list.splice(9, 1);
+        list.splice(1, 0, hook('UserPromptSubmit'));
+      }),
+      'second extra prompt hook': mutate(base, 'hooks', (list) => {
+        list.splice(9, 0, hook('UserPromptSubmit'));
+      }),
+    })) {
+      assert.equal(judgeCandidate(lifecycle), false, name);
+    }
+  }
+
+  // The rows are declared for 2.1.283 only: the same transcript attested as
+  // 2.1.220 fails, and a 2.1.220 transcript fails the 2.1.283 entry.
+  assert.equal(judgeCandidate(early, OLD_EXPECTATIONS), false);
+  assert.equal(evaluateMatrixVersionEvidence({
+    scenario: cliScenario,
+    versionKey: 'candidate',
+    expectations: CANDIDATE_EXPECTATIONS,
+    results: oldResults,
+  }).pass, false);
+  const oldWithContext = withSessionRecords(CLI_LIFECYCLE_FIXTURES.old2, (session) => {
+    session.unshift(attachment('date'));
+  });
+  assert.equal(evaluateMatrixVersionEvidence({
+    scenario: cliScenario,
+    versionKey: 'old',
+    expectations: OLD_EXPECTATIONS,
+    results: [CLI_LIFECYCLE_FIXTURES.old1, oldWithContext],
+  }).pass, false);
+
+  // A projected-compatible policy without a baseline id cannot be judged.
+  const anonymous = structuredClone(cliScenario);
+  delete anonymous.comparison.lifecycle.baselineId;
+  assert.equal(evaluateMatrixScenarioEvidence({
+    ...MANIFEST_EXPECTATIONS,
+    scenario: anonymous,
+    oldResults,
+    candidateResults: [observedCliResult(early), observedCliResult(late)],
+  }).pass, false);
+});
+
+test('2.1.283 Workflow accepts its context attachments in either observed order', async () => {
+  const {
+    evaluateMatrixScenarioEvidence,
+    evaluateMatrixVersionEvidence,
+    nestedWorkflowLifecycleMatches,
+  } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  // Six real 2.1.283 runs wrote deferred_tools_record on either side of
+  // command_permissions, and the session-start records race the first prompt.
+  const indexOf = (session, type) => session.findIndex(
+    (record) => record.attachmentType === type,
+  );
+  for (const deliveryMode of ['direct', 'fallback']) {
+    const scenario = manifest.scenarios.find(
+      ({ id }) => id === `workflow-${deliveryMode}`,
+    );
+    const recordFirst = workflowMatrixResult(with283SessionRows(
+      workflowLifecycleFixture({ deliveryMode, bashPairs: 2, subagentStops: 3 }),
+      { recordAfter: 'skill_listing' },
+    ), deliveryMode);
+    const permissionsFirst = withSessionRecords(recordFirst, (session) => {
+      const record = indexOf(session, 'deferred_tools_record');
+      [session[record], session[record + 1]] = [session[record + 1], session[record]];
+    });
+    const lateContext = withSessionRecords(permissionsFirst, (session) => {
+      const context = session.splice(0, 5);
+      session.splice(indexOf(session, 'environment'), 0, ...context);
+    });
+
+    const judge = (result) => evaluateMatrixVersionEvidence({
+      scenario,
+      versionKey: 'candidate',
+      expectations: CANDIDATE_EXPECTATIONS,
+      results: [result],
+    }).pass;
+    for (const result of [recordFirst, permissionsFirst, lateContext]) {
+      assert.equal(judge(result), true);
+    }
+    assert.equal(evaluateMatrixScenarioEvidence({
+      ...MANIFEST_EXPECTATIONS,
+      scenario,
+      oldResults: [workflowMatrixResult(workflowLifecycleFixture({
+        deliveryMode,
+        bashPairs: 2,
+        subagentStops: 3,
+      }), deliveryMode)],
+      candidateResults: [lateContext],
+    }).pass, true);
+    if (deliveryMode === 'direct') {
+      const opusShaped = withSessionRecords(permissionsFirst, (session) => {
+        session.splice(indexOf(session, 'command_permissions'), 0, attachment('auto_mode'));
+      });
+      assert.equal(nestedWorkflowLifecycleMatches({
+        result: opusShaped,
+        policy: scenario.comparison.lifecycle,
+        expectations: CANDIDATE_EXPECTATIONS,
+      }), true);
+    }
+
+    for (const [name, change] of Object.entries({
+      missing: (session) => {
+        session.splice(indexOf(session, 'deferred_tools_record'), 1);
+      },
+      duplicated: (session) => {
+        session.push(attachment('deferred_tools_record'));
+      },
+      'non-context rows reordered': (session) => {
+        const skill = indexOf(session, 'skill_listing');
+        [session[skill - 1], session[skill]] = [session[skill], session[skill - 1]];
+      },
+      'command_permissions moved': (session) => {
+        const [permissions] = session.splice(indexOf(session, 'command_permissions'), 1);
+        session.splice(indexOf(session, 'skill_listing'), 0, permissions);
+      },
+    })) {
+      for (const base of [recordFirst, permissionsFirst]) {
+        assert.equal(
+          judge(withSessionRecords(base, change)),
+          false,
+          `${deliveryMode}: ${name}`,
+        );
+      }
+    }
+  }
+});
+
+test('context-count and positional declarations are validated before any run', async () => {
+  const {
+    buildClaudeMatrixRuns,
+    expectationsFor,
+  } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  const declared = CANDIDATE_EXPECTATIONS.projectedInsertions['cli-contract-v1'];
+  for (const projectedInsertions of [
+    { 'cli-contract-v1': { hooks: [...declared.hooks, ...declared.hooks] } },
+    { 'cli-contract-v1': { hooks: [] } },
+    { 'cli-contract-v1': { transcript: declared.hooks } },
+    { 'cli-contract-v1': { hooks: [{ index: -1, record: hook('UserPromptSubmit') }] } },
+    { 'cli-contract-v1': { hooks: [{ index: [9, 10], record: hook('UserPromptSubmit') }] } },
+    { 'cli-contract-v1': { session: [{ index: 0, record: { type: 'unknown-row' } }] } },
+  ]) {
+    assert.throws(() => expectationsFor({
+      [CANDIDATE_VERSION]: { ...CANDIDATE_EXPECTATIONS, projectedInsertions },
+    }, CANDIDATE_VERSION), /malformed/);
+  }
+  for (const passiveSessionAttachmentCounts of [
+    { date: -1 },
+    { date: 1.5 },
+    { 'Date Record': 1 },
+    [],
+  ]) {
+    assert.throws(() => expectationsFor({
+      [CANDIDATE_VERSION]: {
+        ...CANDIDATE_EXPECTATIONS,
+        passiveSessionAttachmentCounts,
+      },
+    }, CANDIDATE_VERSION), /malformed/);
+  }
+  assert.deepEqual(
+    CANDIDATE_EXPECTATIONS.passiveSessionAttachmentCounts,
+    Object.fromEntries(CONTEXT_ATTACHMENTS_283.map((type) => [type, 1])),
+  );
+  assert.deepEqual(CANDIDATE_EXPECTATIONS.opusPassiveSessionAttachmentCounts, {
+    auto_mode: 1,
+  });
+  // An Opus-only type must not also be counted for every session.
+  assert.throws(() => expectationsFor({
+    [CANDIDATE_VERSION]: {
+      ...CANDIDATE_EXPECTATIONS,
+      opusPassiveSessionAttachmentCounts: { date: 1 },
+    },
+  }, CANDIDATE_VERSION), /malformed/);
+  assert.deepEqual(OLD_EXPECTATIONS.projectedInsertions, {});
+
+  // A type counted for one version must be counted (as zero) for the other.
+  const onlyCandidate = structuredClone(manifest);
+  delete onlyCandidate.expectations[OLD_VERSION]
+    .passiveSessionAttachmentCounts.model;
+  assert.throws(() => buildClaudeMatrixRuns({
+    manifest: onlyCandidate,
+    binaries: {
+      old: '/private/bin/claude-old',
+      candidate: '/private/bin/claude-candidate',
+    },
+    artifactBaseDir: '/private/artifacts',
+    runPrefix: 'passive-types',
+  }), /same passive session attachments/);
+
+  const baselineIds = manifest.scenarios
+    .map((scenario) => scenario.comparison?.lifecycle?.baselineId)
+    .filter(Boolean);
+  assert.deepEqual(baselineIds, [
+    'cli-contract-v1',
+    'workflow-direct-v1',
+    'workflow-fallback-v1',
+  ]);
+  for (const baselineId of Object.keys(CANDIDATE_EXPECTATIONS.projectedInsertions)) {
+    assert.ok(baselineIds.includes(baselineId), baselineId);
+  }
+});
+
+function withSessionRecords(result, mutate) {
+  const copy = structuredClone(result);
+  mutate(copy.lifecycle.session);
+  copy.lifecycleSources.session.rawRecordCount = copy.lifecycle.session.length;
+  copy.lifecycleSources.session.normalizedRecordCount =
+    copy.lifecycle.session.length;
+  return copy;
+}
+
+test('service context-usage reminders are not lifecycle drift, other attachments still are', async () => {
+  const {
+    evaluateMatrixScenarioEvidence,
+    evaluateMatrixVersionEvidence,
+  } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  const cliScenario = manifest.scenarios.find(({ id }) => id === 'cli-contract');
+  // Reproduced on an unchanged 2.1.220 binary: two runs carried two and
+  // three total_tokens_reminder attachments at different turns.
+  const reminder = attachment('total_tokens_reminder');
+  const oldResults = [
+    withSessionRecords(CLI_LIFECYCLE_FIXTURES.old1, (session) => {
+      session.splice(12, 0, reminder);
+      session.splice(24, 0, reminder);
+    }),
+    withSessionRecords(CLI_LIFECYCLE_FIXTURES.old2, (session) => {
+      session.splice(8, 0, reminder);
+      session.splice(20, 0, reminder);
+      session.push(reminder);
+    }),
+  ];
+  assert.equal(evaluateMatrixVersionEvidence({
+    scenario: cliScenario,
+    versionKey: 'old',
+    expectations: OLD_EXPECTATIONS,
+    results: oldResults,
+  }).pass, true);
+  assert.equal(evaluateMatrixScenarioEvidence({
+    ...MANIFEST_EXPECTATIONS,
+    scenario: cliScenario,
+    oldResults,
+    candidateResults: [
+      CLI_LIFECYCLE_FIXTURES.candidate1,
+      CLI_LIFECYCLE_FIXTURES.candidate2,
+    ],
+  }).pass, true);
+
+  // Every other attachment stays pivotal: the queue fold marker, the
+  // declared task reminder, and unknown attachments are still compared.
+  for (const [name, mutate] of Object.entries({
+    'extra queued_command': (session) => {
+      session.splice(12, 0, attachment('queued_command'));
+    },
+    'missing queued_command': (session) => {
+      session.splice(session.findIndex(
+        (record) => record.attachmentType === 'queued_command',
+      ), 1);
+    },
+    'extra task_reminder': (session) => {
+      session.splice(12, 0, attachment('task_reminder'));
+    },
+    'unknown attachment': (session) => {
+      session.splice(12, 0, attachment('total_tokens_reminder_v2'));
+    },
+  })) {
+    assert.equal(evaluateMatrixVersionEvidence({
+      scenario: cliScenario,
+      versionKey: 'old',
+      expectations: OLD_EXPECTATIONS,
+      results: [oldResults[0], withSessionRecords(oldResults[1], mutate)],
+    }).pass, false, name);
   }
 });
 
@@ -2506,6 +3590,7 @@ test('CLI lifecycle comparison rejects undeclared pivotal and transport drift', 
     ];
     for (const result of mutated) mutate(result.lifecycle);
     return evaluateMatrixScenarioEvidence({
+      ...MANIFEST_EXPECTATIONS,
       scenario: cliScenario,
       oldResults: [
         CLI_LIFECYCLE_FIXTURES.old1,
@@ -2567,6 +3652,7 @@ test('CLI lifecycle comparison rejects undeclared pivotal and transport drift', 
     },
   };
 
+  assert.equal(evaluateMutation(() => {}).pass, true, 'unmutated control');
   for (const [name, mutate] of Object.entries(mutations)) {
     assert.equal(evaluateMutation(mutate).pass, false, name);
   }
@@ -2618,6 +3704,7 @@ test('CLI lifecycle comparison rejects a false or stale reminder proof', async (
     ];
     mutate(candidateResults[0]);
     assert.equal(evaluateMatrixScenarioEvidence({
+      ...MANIFEST_EXPECTATIONS,
       scenario: cliScenario,
       oldResults: [
         CLI_LIFECYCLE_FIXTURES.old1,
@@ -2631,8 +3718,15 @@ test('CLI lifecycle comparison rejects a false or stale reminder proof', async (
     structuredClone(CLI_LIFECYCLE_FIXTURES.old1),
     structuredClone(CLI_LIFECYCLE_FIXTURES.old2),
   ];
-  oldResults[0].lifecycleProofs = [taskReminderProof()];
+  // A proof retained for a reminder the old transcript no longer contains is
+  // stale: the old version is declared to emit exactly one.
+  oldResults[0].lifecycle.session = oldResults[0].lifecycle.session.filter(
+    (record) => record.attachmentType !== 'task_reminder',
+  );
+  oldResults[0].lifecycleSources.session.rawRecordCount -= 1;
+  oldResults[0].lifecycleSources.session.normalizedRecordCount -= 1;
   assert.equal(evaluateMatrixScenarioEvidence({
+    ...MANIFEST_EXPECTATIONS,
     scenario: cliScenario,
     oldResults,
     candidateResults: [
@@ -2685,6 +3779,7 @@ test('CLI lifecycle comparison rejects shared reply transport loss', async () =>
   });
 
   assert.equal(evaluateMatrixScenarioEvidence({
+    ...MANIFEST_EXPECTATIONS,
     scenario: cliScenarioWithProjectedBaseline(),
     ...results,
   }).pass, false);
@@ -2705,17 +3800,21 @@ test('CLI lifecycle comparison rejects shared pivotal session loss', async () =>
   });
 
   assert.equal(evaluateMatrixScenarioEvidence({
+    ...MANIFEST_EXPECTATIONS,
     scenario: cliScenarioWithProjectedBaseline(),
     ...results,
   }).pass, false);
 });
 
+const AUTHORITATIVE_RUN_COUNT = 24;
+
 function acceptedGateRuns(runPrefix = 'matrix', executablePath = null) {
-  return Array.from({ length: 21 }, (_, index) => ({
+  return Array.from({ length: AUTHORITATIVE_RUN_COUNT }, (_, index) => ({
     id: `old:sdk-resume:${index + 1}`,
     scenarioId: 'sdk-resume',
     versionKey: 'old',
-    version: '2.1.173',
+    version: OLD_VERSION,
+    expectations: OLD_EXPECTATIONS,
     model: 'claude-sonnet-4-6',
     expectedResolvedModel: 'claude-sonnet-4-6',
     effort: 'medium',
@@ -2743,14 +3842,16 @@ function acceptedGateScenarios() {
 function acceptedGateSummary(
   runs,
   manifestSha256 = 'a'.repeat(64),
+  waivedCells = [],
 ) {
   return {
     schemaVersion: 1,
     runPrefix: 'matrix',
     authoritative: true,
-    selectedRunCount: 21,
-    expectedAuthoritativeRunCount: 21,
+    selectedRunCount: runs.length,
+    expectedAuthoritativeRunCount: runs.length,
     manifestSha256,
+    waivedCells,
     results: runs.map((run, index) => ({
       id: run.id,
       runId: run.env.CLAUDE_GATE_RUN_ID,
@@ -2765,8 +3866,9 @@ function acceptedGateSummary(
       artifactValidation: { pass: true, reasons: [] },
       pairComparison: null,
     })),
-    completedRunCount: 21,
-    passCount: 21,
+    completedRunCount: runs.length,
+    passCount: runs.length,
+    notApplicableCount: 0,
     failCount: 0,
     blockedCount: 0,
     maxBridgeReadyToMcpReadyMs: 0,
@@ -2775,7 +3877,7 @@ function acceptedGateSummary(
 }
 
 function createAcceptedGateFixture(dir, runPrefix = 'matrix') {
-  const executablePath = path.join(dir, 'claude-2.1.173');
+  const executablePath = path.join(dir, 'claude-2.1.220');
   fs.writeFileSync(executablePath, 'immutable selected binary', { mode: 0o700 });
   const realExecutable = fs.realpathSync(executablePath);
   const sha256 = crypto.createHash('sha256')
@@ -2810,7 +3912,7 @@ function createAcceptedGateFixture(dir, runPrefix = 'matrix') {
         version: run.version,
         sha256,
         executablePathHash,
-        wrapperRequired: false,
+        wrapperRequired: true,
         model: run.model,
         effort: run.effort,
       },
@@ -2911,6 +4013,22 @@ test('accepted matrix cleanup rejects a forgeable one-cell authoritative summary
     expectedManifestSha256: 'a'.repeat(64),
     expectedRuns,
     summary: duplicateSummary,
+  }), /complete authoritative PASS/);
+
+  // NOT-APPLICABLE is reserved for the snapshot cell; any other cell must
+  // PASS for the matrix to be accepted.
+  const notApplicableSummary = acceptedGateSummary(expectedRuns);
+  notApplicableSummary.results[0].status = 'NOT-APPLICABLE';
+  notApplicableSummary.results[0].exitCode = 3;
+  notApplicableSummary.passCount -= 1;
+  notApplicableSummary.notApplicableCount = 1;
+  assert.throws(() => purgeAcceptedGateArtifacts({
+    artifactBaseDir: dir,
+    runPrefix: 'matrix',
+    claudeProjectsDir: path.join(dir, 'fake-claude-projects'),
+    expectedManifestSha256: 'a'.repeat(64),
+    expectedRuns,
+    summary: notApplicableSummary,
   }), /complete authoritative PASS/);
 
   const invalidArtifactSummary = acceptedGateSummary(expectedRuns);
@@ -3082,6 +4200,66 @@ test('accepted matrix cleanup binds startup handshakes to revalidated evidence',
     summaryResults,
     summaryMaximumMs: 0,
   }), false);
+});
+
+test('accepted matrix cleanup accepts waived cells only when the summary lists them', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-gate-known-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.chmodSync(dir, 0o700);
+  const { runs, scenarios } = createAcceptedGateFixture(dir);
+  const { purgeAcceptedGateArtifacts } = await import(
+    '../scripts/spikes/claude-gate-matrix.mjs'
+  );
+  const waivedCells = [
+    {
+      id: 'old:delayed-mcp',
+      version: OLD_VERSION,
+      waiver: 'not-gated',
+      reason: 'opt-in path unused in production',
+    },
+    {
+      id: 'candidate:delayed-mcp',
+      version: CANDIDATE_VERSION,
+      waiver: 'known-regression',
+      reason: 'declared upstream regression',
+    },
+  ];
+  const expectedRuns = runs.slice(0, AUTHORITATIVE_RUN_COUNT - waivedCells.length);
+  const purge = (summary, expectedWaivedCells) => purgeAcceptedGateArtifacts({
+    artifactBaseDir: dir,
+    runPrefix: 'matrix',
+    claudeProjectsDir: path.join(dir, 'fake-claude-projects'),
+    expectedRuns,
+    expectedScenarios: scenarios,
+    expectedManifestSha256: 'a'.repeat(64),
+    expectedWaivedCells,
+    summary,
+  });
+  // A summary that silently drops a waived cell is not authoritative.
+  assert.throws(
+    () => purge(acceptedGateSummary(expectedRuns), waivedCells),
+    /complete authoritative PASS/,
+  );
+  assert.throws(
+    () => purge(
+      acceptedGateSummary(expectedRuns, 'a'.repeat(64), waivedCells.slice(1)),
+      waivedCells,
+    ),
+    /complete authoritative PASS/,
+  );
+  // Nor may cells short of the full matrix pass without a declaration.
+  assert.throws(
+    () => purge(acceptedGateSummary(expectedRuns), []),
+    /complete authoritative PASS/,
+  );
+  purge(
+    acceptedGateSummary(expectedRuns, 'a'.repeat(64), waivedCells),
+    waivedCells,
+  );
+  assert.equal(
+    fs.existsSync(path.join(dir, expectedRuns[0].env.CLAUDE_GATE_RUN_ID, 'raw-private')),
+    false,
+  );
 });
 
 test('accepted matrix cleanup removes private evidence and preserves sanitized results', async (t) => {
