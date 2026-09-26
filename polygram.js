@@ -4184,6 +4184,11 @@ async function main() {
         + `${binCheck.vendored ? ' (vendored)' : ''}`,
       );
       pinnedClaudeBin = binCheck.path;
+      // CliProcess checks `claude --help` before passing newer flags; the
+      // probe is synchronous and takes up to a few seconds, so run it here
+      // while boot already blocks instead of on the first chat's spawn.
+      const { supportsClaudeFlag } = require('@shumkov/orchestra').claudeBin;
+      supportsClaudeFlag(pinnedClaudeBin, '--system-prompt-snapshot', { logger: console });
     } else {
       console.warn(`[polygram] WARNING: ${binCheck.reason}`);
     }

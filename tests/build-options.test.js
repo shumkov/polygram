@@ -229,7 +229,9 @@ describe('buildSdkOptions — system prompt is rendered fresh on resume', () => 
     assert.equal(out.systemPrompt.snapshot, false);
   });
 
-  test('string and string[] prompts (agent bodies) become custom prompts with snapshot: false', () => {
+  // Only the custom-object form can carry `snapshot`; the SDK treats a bare
+  // string, a string[] and { type: 'custom', prompt } as the same prompt.
+  test('string and string[] prompts become custom prompts with snapshot: false', () => {
     assert.deepEqual(withoutPromptSnapshot('agent body'),
       { type: 'custom', prompt: 'agent body', snapshot: false });
     assert.deepEqual(withoutPromptSnapshot(['a', 'b']),
