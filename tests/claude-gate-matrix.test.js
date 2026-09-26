@@ -2639,6 +2639,36 @@ test('SDK semantic comparison ignores tool_progress heartbeats', async () => {
   }).pass, true);
 });
 
+// `status` progress notices (e.g. while compacting) are streamed a varying
+// number of times: two real 2.1.283 sdk-compact runs produced 2 and 3,
+// while the compaction itself is checked through the cell's equal fields.
+test('SDK semantic comparison ignores the status progress notice count', async () => {
+  const { evaluateMatrixEvidencePair } = await import(
+    '../scripts/spikes/claude-gate-matrix.mjs'
+  );
+  const scenario = {
+    comparison: {
+      lifecycle: 'sdk-semantic-shape-v1',
+      equalFields: ['resolvedModel'],
+    },
+  };
+  const turn = [
+    system('init'),
+    system('status'),
+    { type: 'assistant', hasParent: false, contentTypes: ['text'], toolNames: [] },
+    system('status'),
+    { type: 'result', subtype: 'success' },
+  ];
+  const oldResult = { resolvedModel: 'claude-sonnet-4-6', lifecycle: turn };
+  const candidateResult = {
+    resolvedModel: 'claude-sonnet-4-6',
+    lifecycle: [...turn.slice(0, 4), system('status'), turn[4]],
+  };
+  assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS, scenario, oldResult, candidateResult,
+  }).pass, true);
+});
+
 test('SDK semantic lifecycle comparison ignores streaming noise but rejects missing tools', async () => {
   const { evaluateMatrixEvidencePair } = await import(
     '../scripts/spikes/claude-gate-matrix.mjs'
