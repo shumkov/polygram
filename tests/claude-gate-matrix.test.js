@@ -610,6 +610,7 @@ test('every compared CLI version has reviewed per-version expectations', async (
       passiveSessionAttachmentCounts: Object.fromEntries(
         CONTEXT_ATTACHMENTS_283.map((type) => [type, 0]),
       ),
+      opusPassiveSessionAttachmentCounts: {},
       projectedInsertions: {},
     },
   );
@@ -1263,6 +1264,7 @@ test('matrix parent binds the Opus projection to nested Workflow source evidence
 test('nested Opus Workflow evidence must match the checked Workflow lifecycle baseline', async () => {
   const {
     buildClaudeMatrixRuns,
+    evaluateMatrixVersionEvidence,
     nestedWorkflowLifecycleMatches,
   } = await import('../scripts/spikes/claude-gate-matrix.mjs');
   const workflowScenario = manifest.scenarios.find(
@@ -1308,15 +1310,45 @@ test('nested Opus Workflow evidence must match the checked Workflow lifecycle ba
     policy: opusRun.nestedWorkflowLifecyclePolicy,
     expectations: opusRun.expectations,
   }), false);
-  const nestedResult = nestedResultFor(with283SessionRows(
+  const sonnetShaped = with283SessionRows(
     baseline,
     { recordAfter: 'skill_listing' },
-  ));
+  );
+  // On Opus the real nested Workflow also carries the bypass-mode auto_mode
+  // steer before command_permissions; the Sonnet cells never do.
+  assert.equal(nestedWorkflowLifecycleMatches({
+    result: nestedResultFor(sonnetShaped),
+    policy: opusRun.nestedWorkflowLifecyclePolicy,
+    expectations: opusRun.expectations,
+  }), false);
+  const opusShaped = structuredClone(sonnetShaped);
+  opusShaped.session.splice(
+    opusShaped.session.findIndex(
+      (record) => record.attachmentType === 'command_permissions',
+    ),
+    0,
+    attachment('auto_mode'),
+  );
+  const nestedResult = nestedResultFor(opusShaped);
   assert.equal(nestedWorkflowLifecycleMatches({
     result: nestedResult,
     policy: opusRun.nestedWorkflowLifecyclePolicy,
     expectations: opusRun.expectations,
   }), true);
+  const twoSteers = structuredClone(opusShaped);
+  twoSteers.session.push(attachment('auto_mode'));
+  assert.equal(nestedWorkflowLifecycleMatches({
+    result: nestedResultFor(twoSteers),
+    policy: opusRun.nestedWorkflowLifecyclePolicy,
+    expectations: opusRun.expectations,
+  }), false);
+  // The Opus-only allowance never applies to the Sonnet Workflow cells.
+  assert.equal(evaluateMatrixVersionEvidence({
+    scenario: workflowScenario,
+    versionKey: 'candidate',
+    expectations: opusRun.expectations,
+    results: [workflowMatrixResult(opusShaped, 'direct')],
+  }).pass, false);
   nestedResult.lifecycle.session.pop();
   assert.equal(nestedWorkflowLifecycleMatches({
     result: nestedResult,
@@ -2525,6 +2557,56 @@ test('matrix evidence compares normalized lifecycle shapes fail closed', async (
   }).pass, false);
 });
 
+test('SDK semantic comparison ignores the timing-dependent commands_changed notice only', async () => {
+  const { evaluateMatrixEvidencePair } = await import(
+    '../scripts/spikes/claude-gate-matrix.mjs'
+  );
+  const scenario = {
+    comparison: {
+      lifecycle: 'sdk-semantic-shape-v1',
+      equalFields: ['resolvedModel'],
+    },
+  };
+  const turn = [
+    system('init'),
+    {
+      type: 'assistant',
+      hasParent: false,
+      contentTypes: ['text'],
+      toolNames: [],
+    },
+    { type: 'result', subtype: 'success' },
+  ];
+  const oldResult = {
+    resolvedModel: 'claude-sonnet-4-6',
+    lifecycle: [...turn, ...turn],
+  };
+  // Real 2.1.283 sdk-resume: the notice followed the second query's init
+  // but not the first, so its count is not a property of the turn.
+  const candidateResult = {
+    resolvedModel: 'claude-sonnet-4-6',
+    lifecycle: [...turn, system('init'), system('commands_changed'), ...turn.slice(1)],
+  };
+  assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
+    scenario,
+    oldResult,
+    candidateResult,
+  }).pass, true);
+  // Any other new system row is still lifecycle drift.
+  assert.equal(evaluateMatrixEvidencePair({
+    ...MANIFEST_EXPECTATIONS,
+    scenario,
+    oldResult,
+    candidateResult: {
+      ...candidateResult,
+      lifecycle: candidateResult.lifecycle.map((record) => (
+        record.subtype === 'commands_changed' ? system('commands_reloaded') : record
+      )),
+    },
+  }).pass, false);
+});
+
 test('SDK semantic lifecycle comparison ignores streaming noise but rejects missing tools', async () => {
   const { evaluateMatrixEvidencePair } = await import(
     '../scripts/spikes/claude-gate-matrix.mjs'
@@ -3249,8 +3331,11 @@ test('2.1.283 Workflow accepts its context attachments in either observed order'
       candidateResults: [lateContext],
     }).pass, true);
     if (deliveryMode === 'direct') {
+      const opusShaped = withSessionRecords(permissionsFirst, (session) => {
+        session.splice(indexOf(session, 'command_permissions'), 0, attachment('auto_mode'));
+      });
       assert.equal(nestedWorkflowLifecycleMatches({
-        result: permissionsFirst,
+        result: opusShaped,
         policy: scenario.comparison.lifecycle,
         expectations: CANDIDATE_EXPECTATIONS,
       }), true);
@@ -3318,6 +3403,16 @@ test('context-count and positional declarations are validated before any run', a
     CANDIDATE_EXPECTATIONS.passiveSessionAttachmentCounts,
     Object.fromEntries(CONTEXT_ATTACHMENTS_283.map((type) => [type, 1])),
   );
+  assert.deepEqual(CANDIDATE_EXPECTATIONS.opusPassiveSessionAttachmentCounts, {
+    auto_mode: 1,
+  });
+  // An Opus-only type must not also be counted for every session.
+  assert.throws(() => expectationsFor({
+    [CANDIDATE_VERSION]: {
+      ...CANDIDATE_EXPECTATIONS,
+      opusPassiveSessionAttachmentCounts: { date: 1 },
+    },
+  }, CANDIDATE_VERSION), /malformed/);
   assert.deepEqual(OLD_EXPECTATIONS.projectedInsertions, {});
 
   // A type counted for one version must be counted (as zero) for the other.

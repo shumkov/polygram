@@ -94,6 +94,7 @@ const EVIDENCE_SOURCE_REGISTRY = new Map([
 ]);
 const GATE_EXPECTATION_KEYS = [
   'delayedMcpModes',
+  'opusPassiveSessionAttachmentCounts',
   'passiveSessionAttachmentCounts',
   'projectedInsertions',
   'resolvedOpus',
@@ -182,6 +183,12 @@ export function gateExpectationsSchemaMatches(expectations) {
     hasExactKeys(expectations, GATE_EXPECTATION_KEYS)
     && passiveSessionAttachmentCountsSchemaMatches(
       expectations.passiveSessionAttachmentCounts,
+    )
+    && passiveSessionAttachmentCountsSchemaMatches(
+      expectations.opusPassiveSessionAttachmentCounts,
+    )
+    && Object.keys(expectations.opusPassiveSessionAttachmentCounts).every(
+      (type) => !Object.hasOwn(expectations.passiveSessionAttachmentCounts, type),
     )
     && projectedInsertionsSchemaMatches(expectations.projectedInsertions)
     && typeof expectations.wrapperRequired === 'boolean'
@@ -638,11 +645,23 @@ export function summarizeLifecycleShape(lifecycle) {
   }));
 }
 
+// Ambient SDK stream rows whose presence and count depend on timing rather
+// than on the turn: rate-limit and thinking-token updates, and the
+// commands_changed notice Claude streams when its command catalogue finishes
+// loading or refreshes, which lands after some queries' init and not others.
+const SDK_AMBIENT_SYSTEM_SUBTYPES = new Set([
+  'commands_changed',
+  'thinking_tokens',
+]);
+
 export function summarizeSdkLifecycleSemantics(lifecycle) {
   if (!Array.isArray(lifecycle) || lifecycle.length === 0) return null;
   const records = lifecycle.filter((record) => (
     record?.type !== 'rate_limit_event'
-    && !(record?.type === 'system' && record.subtype === 'thinking_tokens')
+    && !(
+      record?.type === 'system'
+      && SDK_AMBIENT_SYSTEM_SUBTYPES.has(record.subtype)
+    )
     && !(
       record?.type === 'assistant'
       && record.toolNames?.length === 0
@@ -1746,6 +1765,18 @@ function successfulWorkflowOracleMatches(result, fallback) {
 }
 
 export const SNAPSHOT_REPLY_TOOL = 'mcp__polygram-snapshot-gate-bridge__reply';
+// Orchestra binds its bridge socket at <tmpdir>/<sessionPrefix>-<32 hex>.sock.
+// macOS limits Unix socket paths to 103 bytes and its per-user tmpdir alone
+// is about 49, so the prefix must stay short.
+export const SNAPSHOT_GATE_SESSION_PREFIX = 'pg-snapgate';
+const UNIX_SOCKET_PATH_MAX_BYTES = 103;
+
+export function snapshotGateSocketPathFits(tmpDir) {
+  return Buffer.byteLength(path.join(
+    tmpDir,
+    `${SNAPSHOT_GATE_SESSION_PREFIX}-${'f'.repeat(32)}.sock`,
+  )) <= UNIX_SOCKET_PATH_MAX_BYTES;
+}
 const SNAPSHOT_MARKER_RE = /^SNAPSHOT-(?:FIRST|SECOND)-[0-9a-f]{8}$/;
 
 export function classifyObservedSnapshotHint(texts, { first, second }) {
@@ -2020,15 +2051,26 @@ export function nestedOpusWorkflowEvidenceMatches({
   }
 }
 
+// The nested Workflow runs on the production Opus model, whose session also
+// carries the passive attachments the version declares for Opus only (such as
+// the bypass-mode `auto_mode` steer); the comparator Sonnet cells never do.
 export function nestedWorkflowLifecycleMatches({
   result,
   policy,
   expectations,
 }) {
+  if (!gateExpectationsSchemaMatches(expectations)) return false;
   return matchesProjectedBaseline({
     result,
     policy,
-    expectations,
+    expectations: {
+      ...expectations,
+      passiveSessionAttachmentCounts: {
+        ...expectations.passiveSessionAttachmentCounts,
+        ...expectations.opusPassiveSessionAttachmentCounts,
+      },
+      opusPassiveSessionAttachmentCounts: {},
+    },
   });
 }
 

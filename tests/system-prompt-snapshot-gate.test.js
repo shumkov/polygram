@@ -172,6 +172,37 @@ test('snapshot hints are re-derived from both private leg transcripts', async (t
   }), false);
 });
 
+test('snapshot gate bridge socket fits the reproduced macOS Unix-path limit', async () => {
+  const {
+    SNAPSHOT_GATE_SESSION_PREFIX,
+    snapshotGateSocketPathFits,
+  } = await matrixModule();
+  // The per-user macOS tmpdir where the longer prefix failed with EINVAL.
+  const reproducedTmpDir = '/var/folders/1m/jkbsl8jn10d6pm5wqqt682ym0000gp/T';
+  assert.equal(snapshotGateSocketPathFits(reproducedTmpDir), true);
+  assert.equal(
+    snapshotGateSocketPathFits(`${reproducedTmpDir}/${'x'.repeat(16)}`),
+    false,
+  );
+  assert.ok(
+    Buffer.byteLength(path.join(
+      reproducedTmpDir,
+      `polygram-snapshot-gate-${'f'.repeat(32)}.sock`,
+    )) > 103,
+    'the previous prefix reproduces the failure',
+  );
+  const driver = fs.readFileSync(
+    path.join(repoRoot, 'scripts/spikes/system-prompt-snapshot.mjs'),
+    'utf8',
+  );
+  assert.equal(
+    driver.match(/sessionPrefix: SNAPSHOT_GATE_SESSION_PREFIX/g)?.length,
+    2,
+  );
+  assert.match(driver, /snapshotGateSocketPathFits\(os\.tmpdir\(\)\)/);
+  assert.match(SNAPSHOT_GATE_SESSION_PREFIX, /^[a-z-]+$/);
+});
+
 test('snapshot oracle passes only when the control proves recording is active', async () => {
   const { matrixScenarioOracleMatches } = await matrixModule();
   const judge = (overrides) => matrixScenarioOracleMatches(

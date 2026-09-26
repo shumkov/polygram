@@ -259,6 +259,39 @@ test('per-version subagent task lifecycle accepts model-stream volatility withou
   }
 });
 
+test('ambient commands_changed after a ToolSearch load keeps the subagent lifecycle valid', async () => {
+  const { subagentGate, gateEvidence } = await modules();
+  // Real 2.1.283 order: ToolSearch loads a deferred tool, Claude streams a
+  // commands_changed notice, then the Agent task runs.
+  const withNotice = (notice) => {
+    const messages = subagentMessages({ candidate: true });
+    const searchResult = messages.findIndex((message) => (
+      message.type === 'user'
+      && message.message.content.some((block) => block.tool_use_id === 'search-1')
+    ));
+    messages.splice(searchResult + 1, 0, notice);
+    return resultFromMessages({
+      messages,
+      candidate: true,
+      subagentGate,
+      gateEvidence,
+    });
+  };
+  assert.equal(subagentGate.evaluateSubagentEvidence(
+    withNotice({ type: 'system', subtype: 'commands_changed' }),
+    { expectedTaskUpdated: 1 },
+  ).pass, true);
+  // It stays ambient: task identity on it, or an unreviewed subtype, fails.
+  assert.equal(subagentGate.evaluateSubagentEvidence(
+    withNotice({ type: 'system', subtype: 'commands_changed', task_id: 'task-1' }),
+    { expectedTaskUpdated: 1 },
+  ).pass, false);
+  assert.equal(subagentGate.evaluateSubagentEvidence(
+    withNotice({ type: 'system', subtype: 'brand_new_notice' }),
+    { expectedTaskUpdated: 1 },
+  ).pass, false);
+});
+
 test('successful SDK tool results may omit is_error', async () => {
   const { subagentGate, gateEvidence } = await modules();
   const messages = subagentMessages({ candidate: true });

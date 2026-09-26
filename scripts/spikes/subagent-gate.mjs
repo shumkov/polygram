@@ -5,7 +5,11 @@ const ALLOWED_RECORD_TYPES = new Set([
   'system',
   'user',
 ]);
+// `commands_changed` is an ambient notice Claude streams when its command
+// set changes, for example after ToolSearch loads a deferred tool. Like the
+// other ambient rows it must carry no task identity.
 const ALLOWED_SYSTEM_SUBTYPES = new Set([
+  'commands_changed',
   'hook_response',
   'hook_started',
   'init',

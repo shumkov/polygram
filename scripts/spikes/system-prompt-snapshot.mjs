@@ -26,6 +26,7 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -49,6 +50,8 @@ import {
 } from './claude-gate-evidence.mjs';
 import {
   MATRIX_NOT_APPLICABLE_EXIT_CODE,
+  SNAPSHOT_GATE_SESSION_PREFIX,
+  snapshotGateSocketPathFits,
   snapshotHintFromTranscript,
 } from './claude-gate-matrix.mjs';
 import { makeTreePrivate } from './workflow-fixture.mjs';
@@ -119,7 +122,7 @@ function countSnapshotOnSpawns(selection) {
 
 const selection = await createClaudeGateSelection();
 const runner = withClaudeGateTmuxEnv(
-  createTmuxRunner({ sessionPrefix: 'polygram-snapshot-gate', logger: console }),
+  createTmuxRunner({ sessionPrefix: SNAPSHOT_GATE_SESSION_PREFIX, logger: console }),
   selection,
 );
 let spawnCount = 0;
@@ -169,7 +172,7 @@ async function spawnLeg({
     db: { logEvent() {} },
     appDataDir: path.join(cwd, '.orchestra'),
     attachmentBase: path.join(cwd, '.attachments'),
-    sessionPrefix: 'polygram-snapshot-gate',
+    sessionPrefix: SNAPSHOT_GATE_SESSION_PREFIX,
     bridgeServerName: BRIDGE_SERVER_NAME,
     productName: 'polygram-snapshot-gate',
     surfaceName: 'synthetic channel',
@@ -272,6 +275,9 @@ let lifecycleProofs = [];
 let advertised = false;
 
 try {
+  if (!snapshotGateSocketPathFits(os.tmpdir())) {
+    throw new Error('snapshot gate bridge socket path would exceed the Unix socket limit');
+  }
   advertised = snapshotFlagAdvertised(selection.executablePath);
   if (!advertised) {
     throw new Error('selected executable does not advertise --system-prompt-snapshot');

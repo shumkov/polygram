@@ -124,7 +124,12 @@ Both versions must count the same types. `2.1.283` counts `instructions`,
 `environment`, `model`, and `deferred_tools_record` once each; Claude writes
 them while the first channel prompt arrives, so real runs place them before
 or after it. `2.1.220` counts each as zero. These rows are passive (no parser
-event comes from them), so they need no removal proof.
+event comes from them), so they need no removal proof. The nested Opus
+Workflow additionally counts the version's `opusPassiveSessionAttachmentCounts`
+(`auto_mode`, the bypass-mode steer Claude adds for Opus, once on `2.1.283`);
+the Sonnet cells never accept it. SDK semantic comparisons ignore
+`commands_changed`, an ambient notice whose presence after a query's init
+depends on when Claude's command catalogue finishes loading.
 Rows that are identical to others elsewhere in a stream are instead declared
 under `projectedInsertions`, keyed by the policy's `baselineId`, as exact
 index and record pairs that must sit at exactly that index before removal.
