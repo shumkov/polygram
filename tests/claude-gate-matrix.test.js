@@ -2419,6 +2419,9 @@ test('matrix evidence rejects unknown and malformed normalized lifecycle records
         // no uuid, no parent, nothing Polygram reads. Recognized, not ignored,
         // so a change in its shape still surfaces as an unknown row.
         { type: 'atis-latch' },
+        // 2.1.283 writes a running `cost-state` total (USD, durations,
+        // per-model usage) that nothing in the lifecycle depends on.
+        { type: 'cost-state' },
       ],
     },
   }).pass, true);
