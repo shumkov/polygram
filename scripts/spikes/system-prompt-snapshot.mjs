@@ -8,13 +8,18 @@
 // runs the same two-spawn flow twice through Orchestra's CliProcess: spawn
 // with display hint FIRST, answer one turn, stop, strictly resume the same
 // session with display hint SECOND, and ask which marker the prompt carries.
+// A session launcher forces the snapshot on where a spawn needs recording.
 //
-// - test leg: the unmodified CliProcess launch (snapshot off) must see SECOND;
-// - control leg: a session launcher forces the snapshot on. If it still sees
-//   FIRST, recording is active and the off flag is what made the test leg
-//   see SECOND (PASS). If the control also sees SECOND, recording is not
-//   active for this account, the test proves nothing, and the result is
-//   NOT-APPLICABLE rather than PASS.
+// - control leg: snapshot on for both spawns. Seeing FIRST proves the
+//   service records and replays the prompt for this account.
+// - test leg: the first spawn records with the snapshot on, then the resume
+//   uses the unmodified CliProcess launch (snapshot off), as a production
+//   chat does after a restart. It must see SECOND despite the recording.
+//
+// If the control also sees SECOND, recording is not active for this account,
+// the test leg proves nothing, and the result is NOT-APPLICABLE, not PASS.
+// Both legs' transcripts and markers stay private so the matrix can re-derive
+// the observed hints.
 //
 // Side effects: two gate-owned cwds under the run artifact directory and their
 // Claude session files, registered for acceptance cleanup.
@@ -35,13 +40,17 @@ import {
 import {
   collectGateSessionEvidence,
   copyPrivateGateArtifact,
+  readGateJsonlRecords,
   readWrapperRecords,
   resolveGateLifecycleModel,
   validateWrapperProvenance,
   writePrivateGateFailure,
   writeSanitizedGateResult,
 } from './claude-gate-evidence.mjs';
-import { MATRIX_NOT_APPLICABLE_EXIT_CODE } from './claude-gate-matrix.mjs';
+import {
+  MATRIX_NOT_APPLICABLE_EXIT_CODE,
+  snapshotHintFromTranscript,
+} from './claude-gate-matrix.mjs';
 import { makeTreePrivate } from './workflow-fixture.mjs';
 import {
   captureTmuxProcessTree,
@@ -57,7 +66,7 @@ const SCENARIO = 'candidate-system-prompt-snapshot';
 const BRIDGE_SERVER_NAME = 'polygram-snapshot-gate-bridge';
 const CHAT_ID = '-999000283';
 const THREAD_ID = 283;
-const controlLauncher = fileURLToPath(
+const snapshotOnLauncher = fileURLToPath(
   new URL('./system-prompt-snapshot-launcher.mjs', import.meta.url),
 );
 const noopStreamer = {
@@ -88,16 +97,6 @@ function displayHint(marker) {
   return `Gate display marker: ${marker}`;
 }
 
-function classifyObservedHint(texts, { first, second }) {
-  const joined = texts.join('\n');
-  const sawFirst = joined.includes(first);
-  const sawSecond = joined.includes(second);
-  if (sawFirst && sawSecond) return 'both';
-  if (sawFirst) return 'first';
-  if (sawSecond) return 'second';
-  return 'none';
-}
-
 function snapshotFlagAdvertised(executablePath) {
   const help = spawnSync(executablePath, ['--help'], {
     encoding: 'utf8',
@@ -107,7 +106,7 @@ function snapshotFlagAdvertised(executablePath) {
   return /(^|\s)--system-prompt-snapshot(?![\w-])/m.test(help.stdout || '');
 }
 
-function countControlRewrites(selection) {
+function countSnapshotOnSpawns(selection) {
   const recordsPath = path.join(selection.artifactDir, 'snapshot-launcher.ndjson');
   if (!fs.existsSync(recordsPath)) return 0;
   return fs.readFileSync(recordsPath, 'utf8')
@@ -208,7 +207,7 @@ async function stopLeg(proc) {
   await proc.kill('snapshot-gate-leg-complete');
 }
 
-async function runLeg(name, sessionLauncher) {
+async function runLeg(name, { firstLauncher, resumedLauncher }) {
   const cwd = path.join(selection.artifactDir, `${name}-workspace`);
   fs.mkdirSync(cwd, { mode: 0o700 });
   workspaces.push(cwd);
@@ -223,7 +222,7 @@ async function runLeg(name, sessionLauncher) {
   const firstProc = await spawnLeg({
     legLabel: `${name}-first`,
     cwd,
-    sessionLauncher,
+    sessionLauncher: firstLauncher,
     hint: displayHint(markers.first),
     existingSessionId: null,
     replies,
@@ -244,7 +243,7 @@ async function runLeg(name, sessionLauncher) {
   const resumedProc = await spawnLeg({
     legLabel: `${name}-resumed`,
     cwd,
-    sessionLauncher,
+    sessionLauncher: resumedLauncher,
     hint: displayHint(markers.second),
     existingSessionId: sessionId,
     replies,
@@ -252,19 +251,14 @@ async function runLeg(name, sessionLauncher) {
   if (resumedProc.claudeSessionId !== sessionId) {
     throw new Error(`${name} leg did not resume the recorded session`);
   }
-  const replyStart = replies.length;
   await resumedProc.send(
     'Your system prompt contains one line that starts with "Gate display marker:". '
       + 'Reply through the channel reply tool with exactly the text after that '
       + 'prefix, copied from the system prompt as it is now, and nothing else.',
     { timeoutMs: 120_000, maxTurnMs: 150_000, context: turnContext(2) },
   );
-  const observedHint = classifyObservedHint(
-    replies.slice(replyStart).map((call) => call.text),
-    markers,
-  );
   await stopLeg(resumedProc);
-  return { cwd, sessionId, observedHint };
+  return { cwd, sessionId, markers };
 }
 
 let status = 'FAIL';
@@ -286,16 +280,43 @@ try {
     throw new Error('snapshot gate requires the provenance wrapper launcher');
   }
 
-  const control = await runLeg('control', controlLauncher);
-  controlObservedHint = control.observedHint;
-  const testLeg = await runLeg('test', selection.sessionLauncher);
-  testObservedHint = testLeg.observedHint;
+  const control = await runLeg('control', {
+    firstLauncher: snapshotOnLauncher,
+    resumedLauncher: snapshotOnLauncher,
+  });
+  const testLeg = await runLeg('test', {
+    firstLauncher: snapshotOnLauncher,
+    resumedLauncher: selection.sessionLauncher,
+  });
 
   failureStage = 'collecting-evidence';
+  const privateControlSession = copyPrivateGateArtifact(
+    sessionLogPath(control.cwd, control.sessionId),
+    selection.artifactDir,
+    'control-session.jsonl',
+  );
   const privateSession = copyPrivateGateArtifact(
     sessionLogPath(testLeg.cwd, testLeg.sessionId),
     selection.artifactDir,
     'session.jsonl',
+  );
+  const markersPath = path.join(
+    selection.artifactDir,
+    'raw-private',
+    'snapshot-markers.json',
+  );
+  fs.writeFileSync(markersPath, `${JSON.stringify({
+    control: control.markers,
+    test: testLeg.markers,
+  })}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  fs.chmodSync(markersPath, 0o600);
+  controlObservedHint = snapshotHintFromTranscript(
+    readGateJsonlRecords(privateControlSession),
+    control.markers,
+  );
+  testObservedHint = snapshotHintFromTranscript(
+    readGateJsonlRecords(privateSession),
+    testLeg.markers,
   );
   const sessionEvidence = collectGateSessionEvidence(privateSession);
   lifecycle = { session: sessionEvidence.records };
@@ -316,8 +337,8 @@ try {
   validateWrapperProvenance(selection, readWrapperRecords(selection), {
     observedClaudeProcesses,
   });
-  if (spawnCount !== 4 || countControlRewrites(selection) !== 2) {
-    throw new Error('snapshot gate must spawn two control and two test sessions');
+  if (spawnCount !== 4 || countSnapshotOnSpawns(selection) !== 3) {
+    throw new Error('snapshot gate must spawn three snapshot-on sessions and one snapshot-off resume');
   }
 
   failureStage = 'evaluating-snapshot';
@@ -354,7 +375,7 @@ try {
     attestation: selection.sanitizedAttestation,
     resolvedModel,
     spawnCount,
-    controlSnapshotOnSpawnCount: countControlRewrites(selection),
+    snapshotOnSpawnCount: countSnapshotOnSpawns(selection),
     snapshotFlagAdvertised: advertised,
     controlObservedHint,
     testObservedHint,

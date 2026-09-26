@@ -194,7 +194,6 @@ const SANITIZED_RESULT_KEYS = new Map([
   [SNAPSHOT_SCENARIO, [
     'attestation',
     'controlObservedHint',
-    'controlSnapshotOnSpawnCount',
     'evidenceSchemaVersion',
     'failureHash',
     'failureStage',
@@ -206,6 +205,7 @@ const SANITIZED_RESULT_KEYS = new Map([
     'resolvedModel',
     'scenario',
     'snapshotFlagAdvertised',
+    'snapshotOnSpawnCount',
     'spawnCount',
     'status',
     'testObservedHint',
@@ -1073,7 +1073,7 @@ function scenarioScalarSchemaMatches(result, scenario) {
         'test-resumed-turn',
       ]))
       && nonNegativeInteger(result.spawnCount)
-      && nonNegativeInteger(result.controlSnapshotOnSpawnCount)
+      && nonNegativeInteger(result.snapshotOnSpawnCount)
       && typeof result.snapshotFlagAdvertised === 'boolean'
       && nullableEnum(result.controlObservedHint, SNAPSHOT_OBSERVED_HINTS)
       && nullableEnum(result.testObservedHint, SNAPSHOT_OBSERVED_HINTS)
@@ -1082,12 +1082,18 @@ function scenarioScalarSchemaMatches(result, scenario) {
   return false;
 }
 
-export function sanitizedGateResultSchemaMatches(result, scenario) {
+// Matrix cells that reuse another cell's driver share its result shape.
+const SCHEMA_SCENARIO_ALIASES = new Map([
+  ['delayed-mcp-foreground', 'delayed-mcp'],
+]);
+
+export function sanitizedGateResultSchemaMatches(result, matrixScenario) {
+  const scenario = SCHEMA_SCENARIO_ALIASES.get(matrixScenario) ?? matrixScenario;
   const keys = SANITIZED_RESULT_KEYS.get(scenario);
   if (
     !keys
     || !hasExactKeys(result, keys)
-    || result.matrixScenario !== scenario
+    || result.matrixScenario !== matrixScenario
     || result.evidenceSchemaVersion !== 1
     || !(
       ['PASS', 'FAIL'].includes(result.status)

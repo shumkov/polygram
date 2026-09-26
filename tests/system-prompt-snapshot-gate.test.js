@@ -41,7 +41,7 @@ function snapshotResult(overrides = {}) {
     },
     resolvedModel: 'claude-sonnet-4-6',
     spawnCount: 4,
-    controlSnapshotOnSpawnCount: 2,
+    snapshotOnSpawnCount: 3,
     snapshotFlagAdvertised: true,
     controlObservedHint: 'first',
     testObservedHint: 'second',
@@ -75,6 +75,101 @@ test('snapshot cell is a candidate-only CliProcess cell over the snapshot-off se
   assert.match(driver, /new CliProcess\(/);
   assert.match(driver, /resumePolicy: 'require-existing-session'/);
   assert.match(driver, /system-prompt-snapshot-launcher\.mjs/);
+  // Control records and resumes with the snapshot on; the test leg records
+  // with it on and resumes through the unmodified CliProcess launch.
+  assert.match(
+    driver,
+    /runLeg\('control', \{\s*firstLauncher: snapshotOnLauncher,\s*resumedLauncher: snapshotOnLauncher,/,
+  );
+  assert.match(
+    driver,
+    /runLeg\('test', \{\s*firstLauncher: snapshotOnLauncher,\s*resumedLauncher: selection\.sessionLauncher,/,
+  );
+});
+
+function replyRecord(text) {
+  return {
+    type: 'assistant',
+    message: {
+      content: [{
+        type: 'tool_use',
+        name: 'mcp__polygram-snapshot-gate-bridge__reply',
+        input: { chat_id: '-999000283', text },
+      }],
+    },
+  };
+}
+
+function writeSnapshotEvidence(t, { controlReply, testReply }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-snapshot-evidence-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const markers = {
+    control: { first: 'SNAPSHOT-FIRST-aaaaaaaa', second: 'SNAPSHOT-SECOND-bbbbbbbb' },
+    test: { first: 'SNAPSHOT-FIRST-cccccccc', second: 'SNAPSHOT-SECOND-dddddddd' },
+  };
+  const transcript = (reply) => [
+    { type: 'user', message: { content: 'ready?' } },
+    replyRecord('SNAPSHOT-READY-00000000'),
+    { type: 'user', message: { content: 'which marker?' } },
+    replyRecord(reply(markers)),
+  ].map((record) => JSON.stringify(record)).join('\n');
+  fs.writeFileSync(path.join(dir, 'snapshot-markers.json'), JSON.stringify(markers));
+  fs.writeFileSync(path.join(dir, 'control-session.jsonl'), transcript(controlReply));
+  fs.writeFileSync(path.join(dir, 'session.jsonl'), transcript(testReply));
+  return dir;
+}
+
+test('snapshot hints are re-derived from both private leg transcripts', async (t) => {
+  const { snapshotPrivateEvidenceMatches } = await matrixModule();
+  const recorded = writeSnapshotEvidence(t, {
+    controlReply: (markers) => markers.control.first,
+    testReply: (markers) => markers.test.second,
+  });
+  assert.equal(snapshotPrivateEvidenceMatches({
+    result: snapshotResult(),
+    privateArtifactDir: recorded,
+  }), true);
+  // A sanitized verdict that disagrees with either transcript is rejected,
+  // so NOT-APPLICABLE cannot be claimed for a control that saw the record.
+  assert.equal(snapshotPrivateEvidenceMatches({
+    result: snapshotResult({
+      status: 'NOT-APPLICABLE',
+      controlObservedHint: 'second',
+    }),
+    privateArtifactDir: recorded,
+  }), false);
+  assert.equal(snapshotPrivateEvidenceMatches({
+    result: snapshotResult({ testObservedHint: 'first' }),
+    privateArtifactDir: recorded,
+  }), false);
+
+  const inactive = writeSnapshotEvidence(t, {
+    controlReply: (markers) => markers.control.second,
+    testReply: (markers) => markers.test.second,
+  });
+  assert.equal(snapshotPrivateEvidenceMatches({
+    result: snapshotResult({
+      status: 'NOT-APPLICABLE',
+      controlObservedHint: 'second',
+    }),
+    privateArtifactDir: inactive,
+  }), true);
+
+  // A marker from the other leg does not count for this leg.
+  const crossed = writeSnapshotEvidence(t, {
+    controlReply: (markers) => markers.test.first,
+    testReply: (markers) => markers.test.second,
+  });
+  assert.equal(snapshotPrivateEvidenceMatches({
+    result: snapshotResult(),
+    privateArtifactDir: crossed,
+  }), false);
+
+  fs.rmSync(path.join(recorded, 'control-session.jsonl'));
+  assert.equal(snapshotPrivateEvidenceMatches({
+    result: snapshotResult(),
+    privateArtifactDir: recorded,
+  }), false);
 });
 
 test('snapshot oracle passes only when the control proves recording is active', async () => {
@@ -105,7 +200,10 @@ test('snapshot oracle passes only when the control proves recording is active', 
     { controlObservedHint: 'none' },
     { snapshotFlagAdvertised: false },
     { spawnCount: 3 },
-    { controlSnapshotOnSpawnCount: 1 },
+    // The test leg's first spawn must record with the snapshot on, or the
+    // snapshot-off resume has nothing recorded to bypass.
+    { snapshotOnSpawnCount: 2 },
+    { snapshotOnSpawnCount: 4 },
     { failureStage: 'evaluating-snapshot', failureHash: 'd'.repeat(64) },
   ]) {
     for (const status of ['PASS', 'NOT-APPLICABLE']) {

@@ -8,7 +8,10 @@
   "expectations": {
     "2.1.220": {
       "wrapperRequired": true,
-      "delayedMcpMode": "background",
+      "delayedMcpModes": {
+        "autoBackground": "background",
+        "default": "foreground"
+      },
       "subagentTaskUpdated": 1,
       "taskReminderInsertions": 1,
       "resolvedOpus": "claude-opus-5",
@@ -21,7 +24,10 @@
     },
     "2.1.283": {
       "wrapperRequired": true,
-      "delayedMcpMode": "background",
+      "delayedMcpModes": {
+        "autoBackground": "background",
+        "default": "foreground"
+      },
       "subagentTaskUpdated": 1,
       "taskReminderInsertions": 1,
       "resolvedOpus": "claude-opus-5-5",
@@ -386,8 +392,8 @@
       },
       "driver": "scripts/spikes/delayed-mcp-background.mjs",
       "args": {
-        "old": ["--expected-mode", "background"],
-        "candidate": ["--expected-mode", "background"]
+        "old": [],
+        "candidate": []
       },
       "environment": {
         "common": {
@@ -396,8 +402,40 @@
         }
       },
       "oracle": {
-        "old": "the handler crosses the threshold, emits the version's declared delayed-MCP lifecycle, and delivers one marker",
-        "candidate": "the handler crosses the same threshold, emits the version's declared delayed-MCP lifecycle, and delivers one marker"
+        "old": "with the auto-background opt-in, the handler crosses the threshold, follows the version's declared opt-in delayed-MCP lifecycle, and delivers one marker",
+        "candidate": "with the same opt-in and threshold, the handler follows the candidate's declared opt-in delayed-MCP lifecycle and delivers one marker"
+      },
+      "comparison": {
+        "lifecycle": {
+          "mode": "version-specific-oracle",
+          "oracle": "delayed-mcp-v1"
+        },
+        "equalFields": ["resolvedModel", "markerCount", "resultSubtype"]
+      },
+      "cost": {
+        "usdEstimate": 0.02,
+        "destructive": false
+      },
+      "artifactCollector": "private SDK stream, SDK process snapshots/evidence, wrapper records, run metadata, and sanitized-result.json"
+    },
+    {
+      "id": "delayed-mcp-foreground",
+      "evidenceSources": {
+        "sdk": "sdk-stream.ndjson"
+      },
+      "driver": "scripts/spikes/delayed-mcp-background.mjs",
+      "args": {
+        "old": [],
+        "candidate": []
+      },
+      "environment": {
+        "common": {
+          "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "1000"
+        }
+      },
+      "oracle": {
+        "old": "without the auto-background opt-in, as production runs, the handler crosses the threshold, follows the version's declared default delayed-MCP lifecycle, and delivers one marker",
+        "candidate": "the same production path follows the candidate's declared default delayed-MCP lifecycle and delivers one marker"
       },
       "comparison": {
         "lifecycle": {
@@ -555,7 +593,7 @@
         }
       },
       "oracle": {
-        "candidate": "fresh Opus selection resolves to the candidate's declared Opus model; no Workflow policy override is present; the declared Workflow size default is anchored in the selected binary; bounded topology and complete report are recorded"
+        "candidate": "fresh Opus selection resolves to the candidate's declared Opus model; no Workflow policy override is present; the declared Workflow size default is anchored in the selected binary (the expected medium default assumes the gate account is not on a Pro plan, where the default is small); bounded topology and complete report are recorded"
       },
       "cost": {
         "usdEstimate": 0.3,
@@ -577,13 +615,13 @@
         "common": {}
       },
       "oracle": {
-        "candidate": "a CliProcess chat resumed with a new display hint sees the new hint while a snapshot-on control of the same flow still sees the first one; a control that also sees the new hint reports NOT-APPLICABLE because recording is not active for the account"
+        "candidate": "a CliProcess chat whose first spawn recorded the prompt with the snapshot on, resumed by the unmodified snapshot-off launch with a new display hint, sees the new hint while a snapshot-on/on control still sees the first one; a control that also sees the new hint reports NOT-APPLICABLE because recording is not active for the account"
       },
       "cost": {
         "usdEstimate": 0.06,
         "destructive": false
       },
-      "artifactCollector": "private snapshot-off session, per-leg CLI process trees, wrapper records, and sanitized-result.json"
+      "artifactCollector": "private control and test sessions, leg markers, snapshot-on launcher records, per-spawn CLI process trees, wrapper records, and sanitized-result.json"
     }
   ]
 }

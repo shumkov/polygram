@@ -34,7 +34,7 @@ const { encodeCwd } = require('../../lib/util/claude-session-jsonl');
 
 const RUN_PREFIX_RE = /^[A-Za-z0-9._-]{1,96}$/;
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
-const AUTHORITATIVE_RUN_COUNT = 22;
+const AUTHORITATIVE_RUN_COUNT = 24;
 const SNAPSHOT_SCENARIO = 'candidate-system-prompt-snapshot';
 const CLI_PROCESS_TREE_SCENARIOS = new Set([
   'cli-contract',
@@ -54,12 +54,15 @@ const RUNNER_OWNED_ENV_KEYS = new Set([
   'CLAUDE_GATE_SCENARIO_ID',
   'CLAUDE_GATE_EXPECTED_RESOLVED_MODEL',
   'CLAUDE_GATE_DOCUMENTED_WORKFLOW_SIZE_GUIDELINE',
+  'CLAUDE_GATE_MANIFEST_SHA256',
 ]);
 const CROSS_VERSION_POLICIES = new Set(['single', 'all-pairs']);
 const VERSION_SPECIFIC_LIFECYCLE_ORACLES = new Map([
   ['delayed-mcp', 'delayed-mcp-v1'],
+  ['delayed-mcp-foreground', 'delayed-mcp-v1'],
   ['sdk-subagent', 'sdk-subagent-v1'],
 ]);
+const DELAYED_MCP_SCENARIOS = new Set(['delayed-mcp', 'delayed-mcp-foreground']);
 const EVIDENCE_SOURCE_REGISTRY = new Map([
   ['cli-contract', {
     session: 'session.jsonl',
@@ -76,6 +79,9 @@ const EVIDENCE_SOURCE_REGISTRY = new Map([
   ['delayed-mcp', {
     sdk: 'sdk-stream.ndjson',
   }],
+  ['delayed-mcp-foreground', {
+    sdk: 'sdk-stream.ndjson',
+  }],
   ['sdk-subagent', {
     sdk: 'sdk-stream.ndjson',
   }],
@@ -87,7 +93,7 @@ const EVIDENCE_SOURCE_REGISTRY = new Map([
   }],
 ]);
 const GATE_EXPECTATION_KEYS = [
-  'delayedMcpMode',
+  'delayedMcpModes',
   'resolvedOpus',
   'subagentTaskUpdated',
   'taskReminderInsertions',
@@ -106,7 +112,13 @@ export function gateExpectationsSchemaMatches(expectations) {
   return Boolean(
     hasExactKeys(expectations, GATE_EXPECTATION_KEYS)
     && typeof expectations.wrapperRequired === 'boolean'
-    && ['foreground', 'background'].includes(expectations.delayedMcpMode)
+    && hasExactKeys(expectations.delayedMcpModes, ['autoBackground', 'default'])
+    && ['foreground', 'background'].includes(
+      expectations.delayedMcpModes.autoBackground,
+    )
+    && ['foreground', 'background'].includes(
+      expectations.delayedMcpModes.default,
+    )
     && [0, 1].includes(expectations.subagentTaskUpdated)
     && isNonNegativeInteger(expectations.taskReminderInsertions)
     && /^claude-opus-[a-z0-9-]+$/.test(expectations.resolvedOpus || '')
@@ -150,9 +162,20 @@ export const MATRIX_MANIFEST_PATH = fileURLToPath(
 );
 
 // Drivers judge their own evidence against the same reviewed manifest the
-// runner schedules from, keyed by the version the executable attested.
-export function readGateExpectations(attestedVersion) {
-  const manifest = JSON.parse(fs.readFileSync(MATRIX_MANIFEST_PATH, 'utf8'));
+// runner schedules from, keyed by the version the executable attested. Under
+// the runner the manifest must still be the exact bytes it scheduled from.
+export function readGateExpectations(
+  attestedVersion,
+  { expectedManifestSha256 = process.env.CLAUDE_GATE_MANIFEST_SHA256 } = {},
+) {
+  const manifestText = fs.readFileSync(MATRIX_MANIFEST_PATH, 'utf8');
+  if (
+    expectedManifestSha256 !== undefined
+    && hashSensitiveString(manifestText) !== expectedManifestSha256
+  ) {
+    throw new Error('gate manifest changed after the matrix runner read it');
+  }
+  const manifest = JSON.parse(manifestText);
   return expectationsFor(manifest.expectations, attestedVersion);
 }
 
@@ -248,12 +271,32 @@ function versionSpecificLifecyclePolicyMatches(scenario, oracle) {
   );
 }
 
-function versionSpecificLifecycleMatches(result, oracle, expectations) {
+// Delayed-MCP cells opt into auto-background for both sides or neither, so
+// the declared environment alone selects which per-version mode applies.
+// Production never sets the opt-in and therefore runs the default path.
+function delayedMcpAutoBackground(scenario) {
+  return scenario?.environment?.common?.CLAUDE_AUTO_BACKGROUND_TASKS === '1';
+}
+
+function expectedDelayedMcpMode(expectations, autoBackground) {
+  return expectations.delayedMcpModes[
+    autoBackground ? 'autoBackground' : 'default'
+  ];
+}
+
+function versionSpecificLifecycleMatches(
+  result,
+  oracle,
+  expectations,
+  { delayedMcpAutoBackground: autoBackground } = {},
+) {
   if (!gateExpectationsSchemaMatches(expectations)) return false;
   try {
     if (oracle === 'delayed-mcp-v1') {
       return (
-        result?.evidence?.expectedMode === expectations.delayedMcpMode
+        typeof autoBackground === 'boolean'
+        && result?.evidence?.expectedMode
+          === expectedDelayedMcpMode(expectations, autoBackground)
         && evaluateDelayedMcpEvidence(result.evidence).pass
       );
     }
@@ -305,6 +348,29 @@ export function buildClaudeMatrixRuns({
           }
         }
       }
+      if (Object.hasOwn(
+        scenario.environment?.[versionKey] || {},
+        'CLAUDE_AUTO_BACKGROUND_TASKS',
+      )) {
+        throw new TypeError(
+          `${scenario.id} must declare CLAUDE_AUTO_BACKGROUND_TASKS for both versions`,
+        );
+      }
+      const delayedMcp = DELAYED_MCP_SCENARIOS.has(scenario.id);
+      if (
+        delayedMcp
+        && (scenario.args?.[versionKey] || []).includes('--expected-mode')
+      ) {
+        throw new TypeError(
+          `${scenario.id} expected mode comes from the version expectations`,
+        );
+      }
+      const delayedMcpMode = delayedMcp
+        ? expectedDelayedMcpMode(
+          expectations,
+          delayedMcpAutoBackground(scenario),
+        )
+        : null;
       const versionSpecificLifecycleOracle =
         VERSION_SPECIFIC_LIFECYCLE_ORACLES.get(scenario.id);
       if (
@@ -374,7 +440,13 @@ export function buildClaudeMatrixRuns({
           }),
           effort: manifest.comparator.effort,
           driver: scenario.driver,
-          args: [...(scenario.args?.[versionKey] || [])],
+          args: [
+            ...(scenario.args?.[versionKey] || []),
+            ...(delayedMcp ? ['--expected-mode', delayedMcpMode] : []),
+          ],
+          ...(delayedMcp && {
+            delayedMcpAutoBackground: delayedMcpAutoBackground(scenario),
+          }),
           env: {
             CLAUDE_GATE_BIN: binaries[versionKey],
             CLAUDE_GATE_EXPECTED_VERSION: manifest.versions[versionKey],
@@ -495,10 +567,19 @@ export function summarizeSdkLifecycleSemantics(lifecycle) {
   };
 }
 
+// Context-usage reminders are injected by the service a varying number of
+// times per conversation, even on an unchanged binary. They are not a
+// lifecycle event and nothing downstream reads them, so they carry no
+// compatibility signal and are left out of the pivotal projection.
+const NON_PIVOTAL_ATTACHMENT_TYPES = new Set(['total_tokens_reminder']);
+
 function isSessionPivotal(record) {
   return (
     record?.type === 'queue-operation'
-    || record?.type === 'attachment'
+    || (
+      record?.type === 'attachment'
+      && !NON_PIVOTAL_ATTACHMENT_TYPES.has(record.attachmentType)
+    )
     || (record?.type === 'system' && record.subtype !== 'init')
     || (
       record?.type === 'user'
@@ -1024,7 +1105,7 @@ function privateLifecycleSourcesMatch({
   ) {
     return false;
   }
-  if (run.scenarioId === 'delayed-mcp') {
+  if (DELAYED_MCP_SCENARIOS.has(run.scenarioId)) {
     const claimedProof = result?.evidence?.nativeLifecycleProof;
     let regeneratedProof;
     try {
@@ -1514,11 +1595,94 @@ function successfulWorkflowOracleMatches(result, fallback) {
   );
 }
 
+export const SNAPSHOT_REPLY_TOOL = 'mcp__polygram-snapshot-gate-bridge__reply';
+const SNAPSHOT_MARKER_RE = /^SNAPSHOT-(?:FIRST|SECOND)-[0-9a-f]{8}$/;
+
+export function classifyObservedSnapshotHint(texts, { first, second }) {
+  const joined = texts.join('\n');
+  const sawFirst = joined.includes(first);
+  const sawSecond = joined.includes(second);
+  if (sawFirst && sawSecond) return 'both';
+  if (sawFirst) return 'first';
+  if (sawSecond) return 'second';
+  return 'none';
+}
+
+// The hint a leg observed is whatever its transcript's channel replies name.
+// Only the resumed turn's answer can contain a marker; the first turn
+// replies with a separate readiness token.
+export function snapshotHintFromTranscript(records, markers) {
+  const texts = [];
+  for (const record of records) {
+    if (record?.type !== 'assistant') continue;
+    for (const block of record.message?.content || []) {
+      if (
+        block?.type === 'tool_use'
+        && block.name === SNAPSHOT_REPLY_TOOL
+        && typeof block.input?.text === 'string'
+      ) {
+        texts.push(block.input.text);
+      }
+    }
+  }
+  return classifyObservedSnapshotHint(texts, markers);
+}
+
+function snapshotMarkersMatch(markers) {
+  return (
+    hasExactKeys(markers, ['control', 'test'])
+    && ['control', 'test'].every((leg) => (
+      hasExactKeys(markers[leg], ['first', 'second'])
+      && SNAPSHOT_MARKER_RE.test(markers[leg].first)
+      && SNAPSHOT_MARKER_RE.test(markers[leg].second)
+      && markers[leg].first.startsWith('SNAPSHOT-FIRST-')
+      && markers[leg].second.startsWith('SNAPSHOT-SECOND-')
+    ))
+    && new Set([
+      markers.control.first,
+      markers.control.second,
+      markers.test.first,
+      markers.test.second,
+    ]).size === 4
+  );
+}
+
+// Re-derives both legs' observed hints from the private transcripts so a
+// sanitized verdict cannot outlive the evidence it was drawn from.
+export function snapshotPrivateEvidenceMatches({ result, privateArtifactDir }) {
+  try {
+    const readPrivate = (name) => {
+      const filePath = path.join(privateArtifactDir, name);
+      const stat = fs.lstatSync(filePath);
+      if (stat.isSymbolicLink() || !stat.isFile()) return null;
+      return filePath;
+    };
+    const markersPath = readPrivate('snapshot-markers.json');
+    const controlPath = readPrivate('control-session.jsonl');
+    const testPath = readPrivate('session.jsonl');
+    if (!markersPath || !controlPath || !testPath) return false;
+    const markers = JSON.parse(fs.readFileSync(markersPath, 'utf8'));
+    if (!snapshotMarkersMatch(markers)) return false;
+    return (
+      snapshotHintFromTranscript(
+        readGateJsonlRecords(controlPath),
+        markers.control,
+      ) === result.controlObservedHint
+      && snapshotHintFromTranscript(
+        readGateJsonlRecords(testPath),
+        markers.test,
+      ) === result.testObservedHint
+    );
+  } catch {
+    return false;
+  }
+}
+
 function snapshotOracleStatus(result) {
   if (
     result.snapshotFlagAdvertised !== true
     || result.spawnCount !== 4
-    || result.controlSnapshotOnSpawnCount !== 2
+    || result.snapshotOnSpawnCount !== 3
     || result.failureHash !== null
     || result.failureStage !== null
     || result.testObservedHint !== 'second'
@@ -1546,7 +1710,7 @@ export function matrixScenarioOracleMatches(scenarioId, result, expectations) {
     pass = successfulWorkflowOracleMatches(result, false);
   } else if (scenarioId === 'workflow-fallback') {
     pass = successfulWorkflowOracleMatches(result, true);
-  } else if (scenarioId === 'delayed-mcp') {
+  } else if (DELAYED_MCP_SCENARIOS.has(scenarioId)) {
     pass = (
       evaluateDelayedMcpEvidence(result.evidence).pass
       && result.markerCount === 1
@@ -1817,6 +1981,13 @@ export function evaluateMatrixRunResult({
     }
     if (
       run?.env
+      && run.scenarioId === SNAPSHOT_SCENARIO
+      && !snapshotPrivateEvidenceMatches({ result, privateArtifactDir })
+    ) {
+      reasons.push('snapshot hints do not match the private leg transcripts');
+    }
+    if (
+      run?.env
       && !privateGateArtifactPermissionsMatch(
         path.dirname(privateArtifactDir || ''),
       )
@@ -1851,6 +2022,7 @@ export function evaluateMatrixRunResult({
           result,
           expectedVersionSpecificOracle,
           run.expectations,
+          { delayedMcpAutoBackground: run.delayedMcpAutoBackground },
         )
       )
     ) {
@@ -1937,11 +2109,13 @@ function compareEvidencePair({
         leftResult,
         versionSpecificLifecycleOracle,
         leftExpectations,
+        { delayedMcpAutoBackground: delayedMcpAutoBackground(scenario) },
       )
       || !versionSpecificLifecycleMatches(
         rightResult,
         versionSpecificLifecycleOracle,
         rightExpectations,
+        { delayedMcpAutoBackground: delayedMcpAutoBackground(scenario) },
       )
     ) {
       differences.push('lifecycle');

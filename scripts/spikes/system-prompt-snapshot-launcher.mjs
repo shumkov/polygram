@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
-// Session launcher for the snapshot-on control leg of the system-prompt
-// snapshot gate. Orchestra's CliProcess passes `--system-prompt-snapshot off`
-// whenever the selected binary advertises the flag, so the control leg cannot
-// ask for Claude's default recording through CliProcess options. This
+// Session launcher for the snapshot-on spawns of the system-prompt snapshot
+// gate. Orchestra's CliProcess passes `--system-prompt-snapshot off` whenever
+// the selected binary advertises the flag, so a spawn that must record the
+// prompt cannot ask for Claude's default behaviour through CliProcess options. This
 // launcher rewrites exactly that one pair to `on`, records the rewrite next to
 // the wrapper provenance, and execs the provenance wrapper so the Claude
 // process keeps its attested identity and pid.

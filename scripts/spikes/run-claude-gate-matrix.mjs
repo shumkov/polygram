@@ -128,7 +128,10 @@ for (const [index, run] of runs.entries()) {
     [path.join(repoRoot, run.driver), ...run.args],
     {
       cwd: repoRoot,
-      env: buildClaudeMatrixChildEnv(process.env, run.env),
+      env: buildClaudeMatrixChildEnv(process.env, {
+        ...run.env,
+        CLAUDE_GATE_MANIFEST_SHA256: manifestSha256,
+      }),
       encoding: 'utf8',
       timeout: 15 * 60_000,
       maxBuffer: 20 * 1024 * 1024,

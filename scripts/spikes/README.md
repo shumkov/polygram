@@ -14,7 +14,7 @@ candidate-only cells: a projection proving that `opus` resolves to
 
 Behaviour that legitimately differs between CLI releases is declared per
 attested CLI version under `expectations` (wrapper provenance, delayed-MCP
-mode, subagent `task_updated` count, CLI-contract `task_reminder` count,
+modes with and without the auto-background opt-in, subagent `task_updated` count, CLI-contract `task_reminder` count,
 the `opus` resolution, and the Workflow size default with the byte anchors
 that prove it in that exact binary). Every cell is judged by the entry for
 the version its executable attested, never by whether it sits on the old or
@@ -67,10 +67,12 @@ The matrix covers:
   multiline input, interruption, warm continuation, and file reply;
 - native Workflow direct delivery and forced direct-failure fallback
   after launch-turn closure, with foreign-topic checks;
-- delayed MCP in each version's declared mode (native auto-background
-  completion on both `2.1.220` and `2.1.283`); the runner clears any inherited
-  `CLAUDE_AUTO_BACKGROUND_TASKS` value, then applies only the manifest's
-  opt-in and correlates the task/tool-use lifecycle;
+- delayed MCP twice per version: without `CLAUDE_AUTO_BACKGROUND_TASKS`, the
+  path production runs (declared foreground on both `2.1.220` and `2.1.283`),
+  and with the opt-in (declared native background). The runner clears any
+  inherited value, applies only the manifest's opt-in (which must be common
+  to both sides), derives each driver's `--expected-mode` from the attested
+  version's expectations, and correlates the task/tool-use lifecycle;
 - SDK PostToolBatch, subagent attribution, resume, compaction, and
   tool-less completion;
 - worker-wrapper provenance on both sides and the separate Opus 5.5
@@ -79,22 +81,31 @@ The matrix covers:
   version's semantic anchors in the exact SHA-attested candidate
   executable. From `2.1.283` the default is plan-dependent (`medium`, or
   `small` on Pro plans); the anchors cover both the documented text and the
-  Pro branch, and the gate account is expected not to be on Pro;
+  Pro branch. The expected `medium` assumes the gate account is not on a Pro
+  plan; a run from a Pro account would need `small` declared instead;
 - the system-prompt snapshot contract through Orchestra's `CliProcess`.
   Each leg spawns with display hint A, answers one turn, strictly resumes
   the same session with display hint B, and reports which hint the prompt
-  carries. The test leg uses the normal launch (`--system-prompt-snapshot
-  off`) and must see B. The control leg runs through
-  `system-prompt-snapshot-launcher.mjs`, which rewrites that one flag to `on`
-  before exec-ing the provenance wrapper. The cell passes when the control
-  still sees A; when the control also sees B, recording is not active for
-  the account and the cell is `NOT-APPLICABLE` instead of `PASS`.
+  carries. `system-prompt-snapshot-launcher.mjs` rewrites Orchestra's
+  `--system-prompt-snapshot off` to `on` before exec-ing the provenance
+  wrapper. The control leg records and resumes with the snapshot on. The
+  test leg records with it on, then resumes through the normal launch
+  (snapshot off), as a restarted production chat does, and must see B. The
+  cell passes when the control still sees A; when the control also sees B,
+  recording is not active for the account and the cell is `NOT-APPLICABLE`
+  instead of `PASS`. Both transcripts and the leg markers stay private, and
+  the matrix re-derives both observed hints from them on validation and
+  acceptance.
 
 For every old/new cell, the runner also compares privacy-safe normalized
 lifecycle evidence. Cells use strict shape equality by default. The CLI
 contract runs twice per version and compares its same-version results before
 all four old/new pairings. Each run must first match the manifest's exact
-35-row session-pivotal and 21-row transport-hook baselines. Each run may then
+35-row session-pivotal and 21-row transport-hook baselines. The
+session-pivotal projection leaves out `total_tokens_reminder` attachments:
+the service injects these context-usage reminders a varying number of times
+even on an unchanged binary, and nothing downstream reads them. Every other
+attachment stays pivotal. Each run may then
 remove exactly the number of reviewed `task_reminder` rows its version declares
 (one on both `2.1.220` and `2.1.283`); either version may also remove at most
 one interrupt-correlated `hook_cancelled`. One source-bound composite proof must
