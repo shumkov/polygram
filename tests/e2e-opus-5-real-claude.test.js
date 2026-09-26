@@ -1,19 +1,21 @@
 'use strict';
 
 /**
- * E2E — REAL claude turn on Claude Opus 5.
+ * E2E — REAL claude turn on Claude Opus 5 and Opus 5.5.
  *
  * The model string a chat configures is never validated by polygram: it is
  * handed verbatim to `--model` at spawn. So the only thing that can prove a
- * chat can actually run Opus 5 is a real turn on the pinned binary — a mocked
- * spawn asserts nothing about whether the CLI accepts the string.
+ * chat can actually run an Opus model is a real turn on the pinned binary — a
+ * mocked spawn asserts nothing about whether the CLI accepts the string.
  *
  * Two spawn paths are covered, because they are NOT equivalent:
- *   1. the explicit `claude-opus-5` id — pinned, means Opus 5 on any CLI,
+ *   1. the explicit `claude-opus-5` and `claude-opus-5-5` ids — pinned, mean
+ *      the same model on any CLI; existing chats may carry either one,
  *   2. the bare `opus` alias — resolved by the CLI, and version-dependent:
- *      2.1.173 resolved it to claude-opus-4-8, the pinned 2.1.220 resolves it
- *      to claude-opus-5. MODEL_VERSIONS_DESC claims the latter in the /model
- *      reply, and this is what keeps that claim honest.
+ *      2.1.173 resolved it to claude-opus-4-8, 2.1.220 to claude-opus-5, and
+ *      the pinned 2.1.283 to claude-opus-5-5. MODEL_VERSIONS_DESC claims the
+ *      current one in the /model reply, and this is what keeps that claim
+ *      honest.
  *
  * Evidence is the session JSONL's per-message `model` field (what actually
  * served the turn), not the flag we passed (what we asked for).
@@ -131,25 +133,27 @@ async function runTurnOnModel(model) {
   }
 }
 
-test('e2e: real claude runs a turn on the explicit claude-opus-5 id', {
-  skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
-  timeout: 240_000,
-}, async () => {
-  const { replyText, spawnModel, models, result } = await runTurnOnModel('claude-opus-5');
+for (const modelId of ['claude-opus-5', 'claude-opus-5-5']) {
+  test(`e2e: real claude runs a turn on the explicit ${modelId} id`, {
+    skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',
+    timeout: 240_000,
+  }, async () => {
+    const { replyText, spawnModel, models, result } = await runTurnOnModel(modelId);
 
-  assert.equal(spawnModel, 'claude-opus-5', 'the configured model must reach --model verbatim');
-  assert.match(
-    replyText, /PONGTEST/i,
-    `the turn must complete on Opus 5. result=${JSON.stringify(result).slice(0, 300)}`,
-  );
-  assert.ok(
-    models.includes('claude-opus-5'),
-    `the session JSONL must record claude-opus-5 as the serving model, got ${JSON.stringify(models)}`,
-  );
-  // The cost table must know this model, or turn_metrics silently bills the
-  // turn at the Sonnet `default` — the failure mode is invisible in the chat.
-  assert.ok(MODEL_COSTS['claude-opus-5'], 'claude-opus-5 must have a MODEL_COSTS entry');
-});
+    assert.equal(spawnModel, modelId, 'the configured model must reach --model verbatim');
+    assert.match(
+      replyText, /PONGTEST/i,
+      `the turn must complete on ${modelId}. result=${JSON.stringify(result).slice(0, 300)}`,
+    );
+    assert.ok(
+      models.includes(modelId),
+      `the session JSONL must record ${modelId} as the serving model, got ${JSON.stringify(models)}`,
+    );
+    // The cost table must know this model, or turn_metrics silently bills the
+    // turn at the Sonnet `default` — the failure mode is invisible in the chat.
+    assert.ok(MODEL_COSTS[modelId], `${modelId} must have a MODEL_COSTS entry`);
+  });
+}
 
 test('e2e: the bare `opus` alias resolves to what the /model reply claims', {
   skip: RUN ? false : 'set E2E_REAL_CLAUDE=1 to run (spawns real claude)',

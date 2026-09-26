@@ -6,23 +6,42 @@ scenarios, and API tokens.
 
 ## Pinned-version matrix
 
-`claude-2.1.220-matrix.json` is the auditable old/new contract. It
+`claude-2.1.283-matrix.json` is the auditable old/new contract. It
 keeps the adapter comparison on `claude-sonnet-4-6` at medium effort,
-runs every `2.1.173` comparator before `2.1.220`, and finishes with a
-candidate-only projection proving that `opus` resolves to
-`claude-opus-5`.
+runs every `2.1.220` comparator before `2.1.283`, and finishes with two
+candidate-only cells: a projection proving that `opus` resolves to
+`claude-opus-5-5`, and the system-prompt snapshot contract.
+
+Behaviour that legitimately differs between CLI releases is declared per
+attested CLI version under `expectations` (wrapper provenance, delayed-MCP
+mode, subagent `task_updated` count, CLI-contract `task_reminder` count,
+the `opus` resolution, and the Workflow size default with the byte anchors
+that prove it in that exact binary). Every cell is judged by the entry for
+the version its executable attested, never by whether it sits on the old or
+candidate side. A version without an entry blocks the matrix before any
+run starts. Moving the pin means adding the new version's entry and
+dropping the one that is no longer compared.
+
+The Agent SDK is held constant across both sides: every SDK cell runs the
+installed `@anthropic-ai/claude-agent-sdk` (`sdkVersion` in the manifest,
+checked against the installed package by `npm test`) and varies only
+`pathToClaudeCodeExecutable`. The matrix therefore compares CLI versions,
+not SDK versions.
 
 Preserve and attest the old executable outside both mutable binary
 trees before running the candidate. Then run:
 
 ```sh
 node scripts/spikes/run-claude-gate-matrix.mjs \
-  --old-bin /absolute/path/to/claude-2.1.173 \
-  --candidate-bin /absolute/path/to/claude-2.1.220 \
+  --old-bin /absolute/path/to/claude-2.1.220 \
+  --candidate-bin /absolute/path/to/claude-2.1.283 \
   --artifact-base /absolute/private/artifact-directory
 ```
 
-The runner stops on the first `FAIL` or `BLOCKED` cell. Use
+The runner stops on the first `FAIL` or `BLOCKED` cell. A driver that
+proves its own precondition absent exits 3 with a `NOT-APPLICABLE`
+sanitized result; that cell is reported separately (`notApplicableCount`),
+does not stop the run, and is accepted only for the snapshot cell. Use
 `--version old|candidate` and `--scenario <id>` only for diagnosis or
 an explicit rerun; a filtered summary is marked non-authoritative.
 The artifact base must be a dedicated absolute directory with mode 0700;
@@ -36,8 +55,8 @@ gate-owned cwds are recorded privately and preflighted before deletion:
 
 ```sh
 node scripts/spikes/run-claude-gate-matrix.mjs \
-  --old-bin /absolute/path/to/claude-2.1.173 \
-  --candidate-bin /absolute/path/to/claude-2.1.220 \
+  --old-bin /absolute/path/to/claude-2.1.220 \
+  --candidate-bin /absolute/path/to/claude-2.1.283 \
   --artifact-base /absolute/private/artifact-directory \
   --accept-run <run-prefix>
 ```
@@ -48,23 +67,36 @@ The matrix covers:
   multiline input, interruption, warm continuation, and file reply;
 - native Workflow direct delivery and forced direct-failure fallback
   after launch-turn closure, with foreign-topic checks;
-- delayed MCP foreground behavior on `2.1.173` and native
-  auto-background completion on `2.1.220`; the runner clears any inherited
-  `CLAUDE_AUTO_BACKGROUND_TASKS` value, then opts in only the candidate cell and
-  correlates its task/tool-use lifecycle;
+- delayed MCP in each version's declared mode (native auto-background
+  completion on both `2.1.220` and `2.1.283`); the runner clears any inherited
+  `CLAUDE_AUTO_BACKGROUND_TASKS` value, then applies only the manifest's
+  opt-in and correlates the task/tool-use lifecycle;
 - SDK PostToolBatch, subagent attribution, resume, compaction, and
   tool-less completion;
-- candidate worker-wrapper provenance and the separate Opus 5
+- worker-wrapper provenance on both sides and the separate Opus 5.5
   production-default projection. The public SDK does not emit the Workflow
-  size default, so that projection binds the documented value to semantic
-  anchors in the exact SHA-attested candidate executable.
+  size default, so that projection binds the declared value to the
+  version's semantic anchors in the exact SHA-attested candidate
+  executable. From `2.1.283` the default is plan-dependent (`medium`, or
+  `small` on Pro plans); the anchors cover both the documented text and the
+  Pro branch, and the gate account is expected not to be on Pro;
+- the system-prompt snapshot contract through Orchestra's `CliProcess`.
+  Each leg spawns with display hint A, answers one turn, strictly resumes
+  the same session with display hint B, and reports which hint the prompt
+  carries. The test leg uses the normal launch (`--system-prompt-snapshot
+  off`) and must see B. The control leg runs through
+  `system-prompt-snapshot-launcher.mjs`, which rewrites that one flag to `on`
+  before exec-ing the provenance wrapper. The cell passes when the control
+  still sees A; when the control also sees B, recording is not active for
+  the account and the cell is `NOT-APPLICABLE` instead of `PASS`.
 
 For every old/new cell, the runner also compares privacy-safe normalized
 lifecycle evidence. Cells use strict shape equality by default. The CLI
 contract runs twice per version and compares its same-version results before
 all four old/new pairings. Each run must first match the manifest's exact
-35-row session-pivotal and 21-row transport-hook baselines. Candidate runs may
-then remove one reviewed `task_reminder`; either version may also remove at most
+35-row session-pivotal and 21-row transport-hook baselines. Each run may then
+remove exactly the number of reviewed `task_reminder` rows its version declares
+(one on both `2.1.220` and `2.1.283`); either version may also remove at most
 one interrupt-correlated `hook_cancelled`. One source-bound composite proof must
 show that every removed row's parser push is empty, every retained input line
 emits the same event batch, and final flush is unchanged. The runner
@@ -74,8 +106,9 @@ difference fail the gate.
 
 Every run requires `CLAUDE_GATE_BIN` and
 `CLAUDE_GATE_EXPECTED_VERSION`; the matrix runner supplies those plus
-unique run ids and both CLI/SDK selectors. Candidate runs also use
-`CLAUDE_CODE_PROCESS_WRAPPER` to attest Claude self-spawns.
+unique run ids and both CLI/SDK selectors. Versions that declare
+`wrapperRequired` also use `CLAUDE_CODE_PROCESS_WRAPPER` to attest Claude
+self-spawns.
 
 ## Other operational spikes
 

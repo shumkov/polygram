@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 
 import {
@@ -33,7 +34,17 @@ const { encodeCwd } = require('../../lib/util/claude-session-jsonl');
 
 const RUN_PREFIX_RE = /^[A-Za-z0-9._-]{1,96}$/;
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
-const AUTHORITATIVE_RUN_COUNT = 21;
+const AUTHORITATIVE_RUN_COUNT = 22;
+const SNAPSHOT_SCENARIO = 'candidate-system-prompt-snapshot';
+const CLI_PROCESS_TREE_SCENARIOS = new Set([
+  'cli-contract',
+  'workflow-direct',
+  'workflow-fallback',
+  SNAPSHOT_SCENARIO,
+]);
+// A driver exits with this code when it proved its precondition absent on
+// this host; the sanitized result must then say NOT-APPLICABLE as well.
+export const MATRIX_NOT_APPLICABLE_EXIT_CODE = 3;
 const RUNNER_OWNED_ENV_KEYS = new Set([
   'CLAUDE_GATE_BIN',
   'CLAUDE_GATE_EXPECTED_VERSION',
@@ -71,7 +82,79 @@ const EVIDENCE_SOURCE_REGISTRY = new Map([
   ['candidate-opus-projection', {
     sdk: 'sdk-stream.ndjson',
   }],
+  [SNAPSHOT_SCENARIO, {
+    session: 'session.jsonl',
+  }],
 ]);
+const GATE_EXPECTATION_KEYS = [
+  'delayedMcpMode',
+  'resolvedOpus',
+  'subagentTaskUpdated',
+  'taskReminderInsertions',
+  'workflowSizeGuideline',
+  'workflowSizeGuidelineAnchors',
+  'wrapperRequired',
+];
+const WORKFLOW_SIZE_GUIDELINES = new Set([
+  'large',
+  'medium',
+  'small',
+  'unrestricted',
+]);
+
+export function gateExpectationsSchemaMatches(expectations) {
+  return Boolean(
+    hasExactKeys(expectations, GATE_EXPECTATION_KEYS)
+    && typeof expectations.wrapperRequired === 'boolean'
+    && ['foreground', 'background'].includes(expectations.delayedMcpMode)
+    && [0, 1].includes(expectations.subagentTaskUpdated)
+    && isNonNegativeInteger(expectations.taskReminderInsertions)
+    && /^claude-opus-[a-z0-9-]+$/.test(expectations.resolvedOpus || '')
+    && WORKFLOW_SIZE_GUIDELINES.has(expectations.workflowSizeGuideline)
+    && Array.isArray(expectations.workflowSizeGuidelineAnchors)
+    && expectations.workflowSizeGuidelineAnchors.length > 0
+    && expectations.workflowSizeGuidelineAnchors.every(
+      (anchor) => typeof anchor === 'string' && anchor.length > 0,
+    )
+  );
+}
+
+// Behaviour that legitimately differs between Claude Code releases is
+// declared per CLI version in the manifest. A version without a reviewed
+// entry has no accepted behaviour, so the gate refuses to judge it.
+export function expectationsFor(expectationsByVersion, attestedVersion) {
+  const declared = (
+    expectationsByVersion
+    && typeof expectationsByVersion === 'object'
+    && !Array.isArray(expectationsByVersion)
+    && typeof attestedVersion === 'string'
+    && Object.hasOwn(expectationsByVersion, attestedVersion)
+  )
+    ? expectationsByVersion[attestedVersion]
+    : undefined;
+  if (declared === undefined) {
+    throw new TypeError(
+      `no gate expectations are declared for Claude Code ${attestedVersion}`,
+    );
+  }
+  if (!gateExpectationsSchemaMatches(declared)) {
+    throw new TypeError(
+      `gate expectations for Claude Code ${attestedVersion} are malformed`,
+    );
+  }
+  return structuredClone(declared);
+}
+
+export const MATRIX_MANIFEST_PATH = fileURLToPath(
+  new URL('./claude-2.1.283-matrix.json', import.meta.url),
+);
+
+// Drivers judge their own evidence against the same reviewed manifest the
+// runner schedules from, keyed by the version the executable attested.
+export function readGateExpectations(attestedVersion) {
+  const manifest = JSON.parse(fs.readFileSync(MATRIX_MANIFEST_PATH, 'utf8'));
+  return expectationsFor(manifest.expectations, attestedVersion);
+}
 
 function expectedEvidenceSources(scenario) {
   const expected = EVIDENCE_SOURCE_REGISTRY.get(scenario?.id);
@@ -165,17 +248,19 @@ function versionSpecificLifecyclePolicyMatches(scenario, oracle) {
   );
 }
 
-function versionSpecificLifecycleMatches(result, oracle, isCandidate) {
+function versionSpecificLifecycleMatches(result, oracle, expectations) {
+  if (!gateExpectationsSchemaMatches(expectations)) return false;
   try {
     if (oracle === 'delayed-mcp-v1') {
-      const expectedMode = isCandidate ? 'background' : 'foreground';
       return (
-        result?.evidence?.expectedMode === expectedMode
+        result?.evidence?.expectedMode === expectations.delayedMcpMode
         && evaluateDelayedMcpEvidence(result.evidence).pass
       );
     }
     if (oracle === 'sdk-subagent-v1') {
-      return evaluateSubagentEvidence(result, { isCandidate }).pass;
+      return evaluateSubagentEvidence(result, {
+        expectedTaskUpdated: expectations.subagentTaskUpdated,
+      }).pass;
     }
     return false;
   } catch {
@@ -204,6 +289,10 @@ export function buildClaudeMatrixRuns({
 
   const runs = [];
   for (const versionKey of ['old', 'candidate']) {
+    const expectations = expectationsFor(
+      manifest.expectations,
+      manifest.versions[versionKey],
+    );
     for (const scenario of manifest.scenarios) {
       if (versionKey === 'old' && scenario.candidateOnly) continue;
       for (const environment of [
@@ -231,6 +320,7 @@ export function buildClaudeMatrixRuns({
       }
       const { repeatCount } = normalizeComparisonPolicy(scenario);
       const evidenceSources = expectedEvidenceSources(scenario);
+      const opusProjection = scenario.id === 'candidate-opus-projection';
       const {
         maxBridgeReadyToMcpReadyMs,
       } = normalizeAcceptancePolicy(scenario);
@@ -262,8 +352,10 @@ export function buildClaudeMatrixRuns({
             ? scenario.environment?.candidate?.CLAUDE_GATE_MODEL
               || manifest.comparator.model
             : manifest.comparator.model,
-          expectedResolvedModel: scenario.expectedResolvedModel
-            || manifest.comparator.model,
+          expectedResolvedModel: opusProjection
+            ? expectations.resolvedOpus
+            : manifest.comparator.model,
+          expectations: structuredClone(expectations),
           ...(maxBridgeReadyToMcpReadyMs !== undefined && {
             maxBridgeReadyToMcpReadyMs,
           }),
@@ -273,7 +365,7 @@ export function buildClaudeMatrixRuns({
           ...(evidenceSources && {
             evidenceSources: structuredClone(evidenceSources),
           }),
-          ...(scenario.id === 'candidate-opus-projection' && {
+          ...(opusProjection && {
             nestedWorkflowLifecyclePolicy: structuredClone(
               manifest.scenarios.find(
                 ({ id }) => id === 'workflow-direct',
@@ -293,12 +385,10 @@ export function buildClaudeMatrixRuns({
             CLAUDE_GATE_SCENARIO_ID: scenario.id,
             ...(scenario.environment?.common || {}),
             ...(scenario.environment?.[versionKey] || {}),
-            ...(versionKey === 'candidate' && scenario.expectedResolvedModel && {
-              CLAUDE_GATE_EXPECTED_RESOLVED_MODEL: scenario.expectedResolvedModel,
-            }),
-            ...(versionKey === 'candidate' && scenario.documentedWorkflowSizeGuideline && {
+            ...(opusProjection && {
+              CLAUDE_GATE_EXPECTED_RESOLVED_MODEL: expectations.resolvedOpus,
               CLAUDE_GATE_DOCUMENTED_WORKFLOW_SIZE_GUIDELINE:
-                scenario.documentedWorkflowSizeGuideline,
+                expectations.workflowSizeGuideline,
             }),
           },
           cost: scenario.cost,
@@ -534,9 +624,9 @@ function isNonNegativeInteger(value) {
 
 function isTaskReminderInsertion(insertion) {
   return (
-    hasExactKeys(insertion, ['count', 'proof', 'record', 'stream'])
+    hasExactKeys(insertion, ['expectedCountKey', 'proof', 'record', 'stream'])
     && insertion.stream === 'session'
-    && insertion.count === 1
+    && insertion.expectedCountKey === 'taskReminderInsertions'
     && encoded(insertion.record) === encoded(TASK_REMINDER_RECORD)
     && hasExactKeys(insertion.proof, ['eligibility', 'type'])
     && insertion.proof.type === 'session-event-aggregator-removal'
@@ -586,21 +676,22 @@ function insertionKey(insertion) {
   return `${insertion.stream}\0${encoded(insertion.record)}`;
 }
 
-function declaredInsertions(policy, isCandidate) {
-  const candidateOnly = policy?.candidateOnlyInsertions;
+function declaredInsertions(policy, expectations) {
+  const versioned = policy?.versionedInsertions;
   const optional = policy?.optionalInsertions;
   if (
-    !Array.isArray(candidateOnly)
-    || candidateOnly.some((insertion) => !isTaskReminderInsertion(insertion))
+    !gateExpectationsSchemaMatches(expectations)
+    || !Array.isArray(versioned)
+    || versioned.some((insertion) => !isTaskReminderInsertion(insertion))
     || !Array.isArray(optional)
     || optional.some((insertion) => !isHookCancelledInsertion(insertion))
   ) {
     return null;
   }
   const all = [
-    ...candidateOnly.map((insertion) => ({
+    ...versioned.map((insertion) => ({
       ...insertion,
-      expectedCount: isCandidate ? insertion.count : 0,
+      expectedCount: expectations[insertion.expectedCountKey],
       optional: false,
     })),
     ...optional.map((insertion) => ({
@@ -687,8 +778,8 @@ function removalProofMatches({
   });
 }
 
-function insertionEvidence({ result, policy, isCandidate }) {
-  const declarations = declaredInsertions(policy, isCandidate);
+function insertionEvidence({ result, policy, expectations }) {
+  const declarations = declaredInsertions(policy, expectations);
   if (
     declarations === null
     || !lifecycleSourceMatches(result)
@@ -728,8 +819,8 @@ function insertionEvidence({ result, policy, isCandidate }) {
   return { declarations, targetCounts };
 }
 
-function adjustedProjectedLifecycle({ result, policy, isCandidate }) {
-  const evidence = insertionEvidence({ result, policy, isCandidate });
+function adjustedProjectedLifecycle({ result, policy, expectations }) {
+  const evidence = insertionEvidence({ result, policy, expectations });
   if (evidence === null) return null;
   const projection = projectLifecycle(result.lifecycle, policy);
   if (projection === null) return null;
@@ -755,18 +846,18 @@ function compareProjectedLifecycle({
   leftResult,
   rightResult,
   policy,
-  leftIsCandidate,
-  rightIsCandidate,
+  leftExpectations,
+  rightExpectations,
 }) {
   const leftProjection = adjustedProjectedLifecycle({
     result: leftResult,
     policy,
-    isCandidate: leftIsCandidate,
+    expectations: leftExpectations,
   });
   const rightProjection = adjustedProjectedLifecycle({
     result: rightResult,
     policy,
-    isCandidate: rightIsCandidate,
+    expectations: rightExpectations,
   });
   return (
     leftProjection !== null
@@ -802,14 +893,14 @@ function projectedBaseline(policy) {
 function matchesProjectedBaseline({
   result,
   policy,
-  isCandidate,
+  expectations,
 }) {
   const baseline = projectedBaseline(policy);
   if (baseline === null) return false;
   const adjusted = adjustedProjectedLifecycle({
     result,
     policy,
-    isCandidate,
+    expectations,
   });
   return adjusted !== null && encoded(adjusted) === encoded(baseline);
 }
@@ -983,9 +1074,10 @@ function independentAttestationMatches(run, result) {
     .createHash('sha256')
     .update(realExecutable)
     .digest('hex');
-  const wrapperRequired = run.versionKey === 'candidate';
+  const wrapperRequired = run.expectations?.wrapperRequired;
   return (
-    result.attestation.runId === run.env.CLAUDE_GATE_RUN_ID
+    typeof wrapperRequired === 'boolean'
+    && result.attestation.runId === run.env.CLAUDE_GATE_RUN_ID
     && result.attestation.version === run.version
     && result.attestation.sha256 === executableSha256
     && result.attestation.executablePathHash === executablePathHash
@@ -1223,9 +1315,7 @@ export function privateProcessEvidenceMatches(
   }
   if (!isDeepStrictEqual(wrappers, result.wrapperRecords)) return false;
 
-  if (['cli-contract', 'workflow-direct', 'workflow-fallback'].includes(
-    run.scenarioId,
-  )) {
+  if (CLI_PROCESS_TREE_SCENARIOS.has(run.scenarioId)) {
     let rawTree;
     try {
       rawTree = privateCliProcessTree(privateArtifactDir);
@@ -1269,9 +1359,7 @@ function matrixProcessEvidenceMatches(run, result, privateArtifactDir) {
     sanitizedAttestation: result.attestation,
   };
   try {
-    if (['cli-contract', 'workflow-direct', 'workflow-fallback'].includes(
-      run.scenarioId,
-    )) {
+    if (CLI_PROCESS_TREE_SCENARIOS.has(run.scenarioId)) {
       if (
         !Array.isArray(result.processTree)
         || result.processTree.length === 0
@@ -1426,7 +1514,23 @@ function successfulWorkflowOracleMatches(result, fallback) {
   );
 }
 
-export function matrixScenarioOracleMatches(scenarioId, result) {
+function snapshotOracleStatus(result) {
+  if (
+    result.snapshotFlagAdvertised !== true
+    || result.spawnCount !== 4
+    || result.controlSnapshotOnSpawnCount !== 2
+    || result.failureHash !== null
+    || result.failureStage !== null
+    || result.testObservedHint !== 'second'
+  ) {
+    return null;
+  }
+  if (result.controlObservedHint === 'first') return 'PASS';
+  if (result.controlObservedHint === 'second') return 'NOT-APPLICABLE';
+  return null;
+}
+
+export function matrixScenarioOracleMatches(scenarioId, result, expectations) {
   let pass = false;
   if (scenarioId === 'cli-contract') {
     pass = (
@@ -1459,8 +1563,9 @@ export function matrixScenarioOracleMatches(scenarioId, result) {
     );
   } else if (scenarioId === 'sdk-subagent') {
     pass = (
-      evaluateSubagentEvidence(result, {
-        isCandidate: result.attestation?.version === '2.1.220',
+      gateExpectationsSchemaMatches(expectations)
+      && evaluateSubagentEvidence(result, {
+        expectedTaskUpdated: expectations.subagentTaskUpdated,
       }).pass
       && result.subagentMessages > 0
       && result.distinctParentCount > 0
@@ -1498,7 +1603,11 @@ export function matrixScenarioOracleMatches(scenarioId, result) {
     );
   } else if (scenarioId === 'candidate-opus-projection') {
     pass = (
-      evaluateOpusProjection({
+      gateExpectationsSchemaMatches(expectations)
+      && result.expectedResolvedModel === expectations.resolvedOpus
+      && result.documentedWorkflowSizeGuideline
+        === expectations.workflowSizeGuideline
+      && evaluateOpusProjection({
         ...result,
         selectedExecutableSha256: result.attestation?.sha256,
         workflowExitStatus: result.workflowStatus === 'PASS' ? 0 : 1,
@@ -1510,6 +1619,9 @@ export function matrixScenarioOracleMatches(scenarioId, result) {
       && result.reasonCount === 0
       && result.reasonHashes.length === 0
     );
+  } else if (scenarioId === SNAPSHOT_SCENARIO) {
+    const expectedStatus = snapshotOracleStatus(result);
+    pass = expectedStatus !== null && result.status === expectedStatus;
   }
   return {
     pass,
@@ -1559,6 +1671,7 @@ export function nestedOpusWorkflowEvidenceMatches({
       scenarioId: 'workflow-direct',
       versionKey: run.versionKey,
       version: run.version,
+      expectations: run.expectations,
       model: run.model,
       effort: run.effort,
       expectedResolvedModel: run.expectedResolvedModel,
@@ -1578,7 +1691,7 @@ export function nestedOpusWorkflowEvidenceMatches({
       && nestedWorkflowLifecycleMatches({
         result: nestedResult,
         policy: run.nestedWorkflowLifecyclePolicy,
-        isCandidate: run.versionKey === 'candidate',
+        expectations: run.expectations,
       })
       && result.workflowStatus === nestedResult.status
       && result.workflowPolicyOverridePresent
@@ -1596,12 +1709,12 @@ export function nestedOpusWorkflowEvidenceMatches({
 export function nestedWorkflowLifecycleMatches({
   result,
   policy,
-  isCandidate,
+  expectations,
 }) {
   return matchesProjectedBaseline({
     result,
     policy,
-    isCandidate,
+    expectations,
   });
 }
 
@@ -1675,12 +1788,19 @@ export function evaluateMatrixRunResult({
     if (result.matrixScenario !== run.scenarioId) {
       reasons.push('sanitized result scenario does not match the matrix cell');
     }
-    if (result.status !== 'PASS') {
+    const acceptedStatuses = run.scenarioId === SNAPSHOT_SCENARIO
+      ? ['PASS', 'NOT-APPLICABLE']
+      : ['PASS'];
+    if (!acceptedStatuses.includes(result.status)) {
       reasons.push('sanitized result did not report PASS');
     }
     if (
       run?.env
-      && !matrixScenarioOracleMatches(run.scenarioId, result).pass
+      && !matrixScenarioOracleMatches(
+        run.scenarioId,
+        result,
+        run.expectations,
+      ).pass
     ) {
       reasons.push('sanitized result does not satisfy the scenario oracle');
     }
@@ -1730,7 +1850,7 @@ export function evaluateMatrixRunResult({
         || !versionSpecificLifecycleMatches(
           result,
           expectedVersionSpecificOracle,
-          run.versionKey === 'candidate',
+          run.expectations,
         )
       )
     ) {
@@ -1789,8 +1909,8 @@ function compareEvidencePair({
   scenario,
   leftResult,
   rightResult,
-  leftIsCandidate = false,
-  rightIsCandidate = false,
+  leftExpectations = null,
+  rightExpectations = null,
 }) {
   const differences = [];
   for (const field of scenario?.comparison?.equalFields || []) {
@@ -1816,12 +1936,12 @@ function compareEvidencePair({
       || !versionSpecificLifecycleMatches(
         leftResult,
         versionSpecificLifecycleOracle,
-        leftIsCandidate,
+        leftExpectations,
       )
       || !versionSpecificLifecycleMatches(
         rightResult,
         versionSpecificLifecycleOracle,
-        rightIsCandidate,
+        rightExpectations,
       )
     ) {
       differences.push('lifecycle');
@@ -1857,19 +1977,19 @@ function compareEvidencePair({
       !matchesProjectedBaseline({
         result: leftResult,
         policy: lifecyclePolicy,
-        isCandidate: leftIsCandidate,
+        expectations: leftExpectations,
       })
       || !matchesProjectedBaseline({
         result: rightResult,
         policy: lifecyclePolicy,
-        isCandidate: rightIsCandidate,
+        expectations: rightExpectations,
       })
       || !compareProjectedLifecycle({
         leftResult,
         rightResult,
         policy: lifecyclePolicy,
-        leftIsCandidate,
-        rightIsCandidate,
+        leftExpectations,
+        rightExpectations,
       })
     ) {
       differences.push('lifecycle');
@@ -1887,12 +2007,15 @@ export function evaluateMatrixEvidencePair({
   scenario,
   oldResult,
   candidateResult,
+  oldExpectations,
+  candidateExpectations,
 }) {
   return compareEvidencePair({
     scenario,
     leftResult: oldResult,
     rightResult: candidateResult,
-    rightIsCandidate: true,
+    leftExpectations: oldExpectations,
+    rightExpectations: candidateExpectations,
   });
 }
 
@@ -1932,6 +2055,7 @@ export function evaluateMatrixVersionEvidence({
   scenario,
   versionKey,
   results,
+  expectations,
 }) {
   let policy;
   try {
@@ -1954,7 +2078,7 @@ export function evaluateMatrixVersionEvidence({
         pass: matchesProjectedBaseline({
           result,
           policy: scenario.comparison.lifecycle,
-          isCandidate: versionKey === 'candidate',
+          expectations,
         }),
         differences: [],
       });
@@ -1970,8 +2094,8 @@ export function evaluateMatrixVersionEvidence({
         scenario,
         leftResult: results[left],
         rightResult: results[right],
-        leftIsCandidate: versionKey === 'candidate',
-        rightIsCandidate: versionKey === 'candidate',
+        leftExpectations: expectations,
+        rightExpectations: expectations,
       }),
     });
   }
@@ -1985,6 +2109,8 @@ export function evaluateMatrixCrossVersionEvidence({
   scenario,
   oldResults,
   candidateResults,
+  oldExpectations,
+  candidateExpectations,
 }) {
   let policy;
   try {
@@ -2026,7 +2152,8 @@ export function evaluateMatrixCrossVersionEvidence({
       scenario,
       leftResult: oldResult,
       rightResult: candidateResult,
-      rightIsCandidate: true,
+      leftExpectations: oldExpectations,
+      rightExpectations: candidateExpectations,
     }),
   }));
   return {
@@ -2039,6 +2166,8 @@ export function evaluateMatrixScenarioEvidence({
   scenario,
   oldResults,
   candidateResults,
+  oldExpectations,
+  candidateExpectations,
 }) {
   const comparisons = [];
   for (const versionKey of ['old', 'candidate']) {
@@ -2046,6 +2175,9 @@ export function evaluateMatrixScenarioEvidence({
       scenario,
       versionKey,
       results: versionKey === 'old' ? oldResults : candidateResults,
+      expectations: versionKey === 'old'
+        ? oldExpectations
+        : candidateExpectations,
     });
     comparisons.push(...versionComparison.comparisons);
     if (!versionComparison.pass) {
@@ -2056,6 +2188,8 @@ export function evaluateMatrixScenarioEvidence({
     scenario,
     oldResults,
     candidateResults,
+    oldExpectations,
+    candidateExpectations,
   });
   comparisons.push(...crossVersionComparison.comparisons);
   return {
@@ -2196,6 +2330,7 @@ export function purgeAcceptedGateArtifacts({
     'failCount',
     'manifestSha256',
     'maxBridgeReadyToMcpReadyMs',
+    'notApplicableCount',
     'passCount',
     'results',
     'runPrefix',
@@ -2248,6 +2383,14 @@ export function purgeAcceptedGateArtifacts({
       && entry.differences.length === 0
     ))
   );
+  const acceptedRunOutcome = (result, expectedRun) => (
+    (result.status === 'PASS' && result.exitCode === 0)
+    || (
+      expectedRun?.scenarioId === SNAPSHOT_SCENARIO
+      && result.status === 'NOT-APPLICABLE'
+      && result.exitCode === MATRIX_NOT_APPLICABLE_EXIT_CODE
+    )
+  );
   const validSummaryResults = Array.isArray(summary?.results)
     && summary.results.every((result, index) => {
       const expectedRun = expectedRunList[index];
@@ -2258,8 +2401,7 @@ export function purgeAcceptedGateArtifacts({
         hasExactKeys(result, allowedKeys)
         && result.id === expectedRun?.id
         && result.runId === expectedRun?.env?.CLAUDE_GATE_RUN_ID
-        && result.status === 'PASS'
-        && result.exitCode === 0
+        && acceptedRunOutcome(result, expectedRun)
         && isNonNegativeInteger(result.elapsedMs)
         && result.driver === expectedRun?.driver
         && isDeepStrictEqual(result.args, expectedRun?.args)
@@ -2298,7 +2440,13 @@ export function purgeAcceptedGateArtifacts({
     || summary.expectedAuthoritativeRunCount !== AUTHORITATIVE_RUN_COUNT
     || summary.selectedRunCount !== AUTHORITATIVE_RUN_COUNT
     || summary.completedRunCount !== AUTHORITATIVE_RUN_COUNT
-    || summary.passCount !== AUTHORITATIVE_RUN_COUNT
+    || !isNonNegativeInteger(summary.passCount)
+    || !isNonNegativeInteger(summary.notApplicableCount)
+    || summary.passCount + summary.notApplicableCount
+      !== AUTHORITATIVE_RUN_COUNT
+    || !Array.isArray(summary.results)
+    || summary.results.filter(({ status }) => status === 'PASS').length
+      !== summary.passCount
     || summary.failCount !== 0
     || summary.blockedCount !== 0
     || !isNonNegativeInteger(summary.maxBridgeReadyToMcpReadyMs)
@@ -2364,6 +2512,9 @@ export function purgeAcceptedGateArtifacts({
     const sanitizedResult = JSON.parse(
       fs.readFileSync(sanitizedResultPath, 'utf8'),
     );
+    if (sanitizedResult?.status !== result.status) {
+      throw new Error('retained gate evidence did not revalidate before purge');
+    }
     const privateArtifactDir = path.join(runDir, 'raw-private');
     let artifactValidation;
     try {
@@ -2439,10 +2590,15 @@ export function purgeAcceptedGateArtifacts({
           old: null,
           candidate: null,
         },
+        expectations: {
+          old: null,
+          candidate: null,
+        },
       });
     }
     const evidence = evidenceByScenario.get(run.scenarioId);
     evidence[run.versionKey].push(sanitizedResults[index]);
+    evidence.expectations[run.versionKey] = run.expectations;
     let pairComparison = null;
     if (
       !scenario.candidateOnly
@@ -2452,6 +2608,7 @@ export function purgeAcceptedGateArtifacts({
         scenario,
         versionKey: run.versionKey,
         results: evidence[run.versionKey],
+        expectations: run.expectations,
       });
       evidence.sameVersion[run.versionKey] = versionComparison;
       if (versionComparison.comparisons.length > 0) {
@@ -2473,6 +2630,8 @@ export function purgeAcceptedGateArtifacts({
         scenario,
         oldResults: evidence.old,
         candidateResults: evidence.candidate,
+        oldExpectations: evidence.expectations.old,
+        candidateExpectations: evidence.expectations.candidate,
       });
       pairComparison = {
         pass: crossVersionComparison.pass,

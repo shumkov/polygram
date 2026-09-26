@@ -27,6 +27,7 @@ import {
   createSdkGateObserver,
   writeSanitizedGateResult,
 } from './claude-gate-evidence.mjs';
+import { readGateExpectations } from './claude-gate-matrix.mjs';
 import {
   createSubagentLifecycleProof,
   evaluateSubagentEvidence,
@@ -111,7 +112,7 @@ const evidence = {
   subagentLifecycleProof: createSubagentLifecycleProof(messages),
 };
 const subagentEvaluation = evaluateSubagentEvidence(evidence, {
-  isCandidate: gate.version === '2.1.220',
+  expectedTaskUpdated: readGateExpectations(gate.version).subagentTaskUpdated,
 });
 const pass = (
   sawSubagent

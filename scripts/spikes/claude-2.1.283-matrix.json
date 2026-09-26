@@ -1,8 +1,39 @@
 {
   "schemaVersion": 1,
   "versions": {
-    "old": "2.1.173",
-    "candidate": "2.1.220"
+    "old": "2.1.220",
+    "candidate": "2.1.283"
+  },
+  "sdkVersion": "0.3.283",
+  "expectations": {
+    "2.1.220": {
+      "wrapperRequired": true,
+      "delayedMcpMode": "background",
+      "subagentTaskUpdated": 1,
+      "taskReminderInsertions": 1,
+      "resolvedOpus": "claude-opus-5",
+      "workflowSizeGuideline": "medium",
+      "workflowSizeGuidelineAnchors": [
+        "\"medium\" (the default) fewer than 15",
+        "var rLs,_Td=\"medium\",oko",
+        "settings.workflowSizeGuideline)??Msn(e);return t===void 0?{size:_Td,isDefault:!0}"
+      ]
+    },
+    "2.1.283": {
+      "wrapperRequired": true,
+      "delayedMcpMode": "background",
+      "subagentTaskUpdated": 1,
+      "taskReminderInsertions": 1,
+      "resolvedOpus": "claude-opus-5-5",
+      "workflowSizeGuideline": "medium",
+      "workflowSizeGuidelineAnchors": [
+        "Unset defaults to \"medium\", or \"small\" on Pro plans.",
+        "var _Or=[\"unrestricted\",\"small\",\"medium\",\"large\"],s=\"medium\",u=\"small\";",
+        "function gte(){return tr()===\"pro\"?u:s}",
+        "PCr(le().workflowSizeGuideline,gte())",
+        "function G$n(e,i){let l=GPt(e);return l===void 0?{size:i,isDefault:!0}:{size:l,isDefault:!1}}"
+      ]
+    }
   },
   "comparator": {
     "model": "claude-sonnet-4-6",
@@ -24,8 +55,8 @@
         "common": {}
       },
       "oracle": {
-        "old": "readiness, reply, fold, multiline, interrupt, warm resume, and file reply pass with legacy process-tree evidence",
-        "candidate": "the same lifecycle passes and every observed candidate self-spawn has wrapper provenance"
+        "old": "readiness, reply, fold, multiline, interrupt, warm resume, and file reply pass and every observed self-spawn has wrapper provenance",
+        "candidate": "the same lifecycle passes with the same wrapper provenance"
       },
       "comparison": {
         "runsPerVersion": 2,
@@ -119,14 +150,14 @@
               { "type": "hook", "hookEventName": "Stop" }
             ]
           },
-          "candidateOnlyInsertions": [
+          "versionedInsertions": [
             {
               "stream": "session",
               "record": {
                 "type": "attachment",
                 "attachmentType": "task_reminder"
               },
-              "count": 1,
+              "expectedCountKey": "taskReminderInsertions",
               "proof": {
                 "type": "session-event-aggregator-removal",
                 "eligibility": "task-reminder-v1"
@@ -175,7 +206,7 @@
       },
       "oracle": {
         "old": "one out-of-turn direct sentinel after launch-turn closure, no fallback, and no foreign route",
-        "candidate": "the same delivery result with native Workflow lifecycle and candidate wrapper provenance"
+        "candidate": "the same delivery result with native Workflow lifecycle and wrapper provenance"
       },
       "comparison": {
         "lifecycle": {
@@ -243,7 +274,7 @@
               { "type": "hook", "hookEventName": "Stop" }
             ]
           },
-          "candidateOnlyInsertions": [],
+          "versionedInsertions": [],
           "optionalInsertions": []
         },
         "equalFields": ["resolvedModel", "directCompletionCount", "fallbackCount", "deliveryPipeline", "deliverySentCount", "deliveryFailedCount"]
@@ -270,7 +301,7 @@
       },
       "oracle": {
         "old": "synthetic direct failure produces one transcript fallback and no foreign-route sentinel",
-        "candidate": "the same single fallback result with native Workflow lifecycle and candidate wrapper provenance"
+        "candidate": "the same single fallback result with native Workflow lifecycle and wrapper provenance"
       },
       "comparison": {
         "lifecycle": {
@@ -337,7 +368,7 @@
               { "type": "hook", "hookEventName": "Stop" }
             ]
           },
-          "candidateOnlyInsertions": [],
+          "versionedInsertions": [],
           "optionalInsertions": []
         },
         "equalFields": ["resolvedModel", "directCompletionCount", "fallbackCount", "deliveryPipeline", "deliverySentCount", "deliveryFailedCount"]
@@ -355,20 +386,18 @@
       },
       "driver": "scripts/spikes/delayed-mcp-background.mjs",
       "args": {
-        "old": ["--expected-mode", "foreground"],
+        "old": ["--expected-mode", "background"],
         "candidate": ["--expected-mode", "background"]
       },
       "environment": {
         "common": {
-          "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "1000"
-        },
-        "candidate": {
+          "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "1000",
           "CLAUDE_AUTO_BACKGROUND_TASKS": "1"
         }
       },
       "oracle": {
-        "old": "the handler crosses the threshold, remains foreground, and delivers one marker",
-        "candidate": "the handler crosses the same threshold, emits native background lifecycle, and delivers one marker"
+        "old": "the handler crosses the threshold, emits the version's declared delayed-MCP lifecycle, and delivers one marker",
+        "candidate": "the handler crosses the same threshold, emits the version's declared delayed-MCP lifecycle, and delivers one marker"
       },
       "comparison": {
         "lifecycle": {
@@ -421,8 +450,8 @@
         "common": {}
       },
       "oracle": {
-        "old": "the turn succeeds with attributed subagent output",
-        "candidate": "the turn succeeds with current parent-attributed child-task lifecycle"
+        "old": "the turn succeeds with the version's declared parent-attributed child-task lifecycle",
+        "candidate": "the turn succeeds with the version's declared parent-attributed child-task lifecycle"
       },
       "comparison": {
         "lifecycle": {
@@ -525,16 +554,36 @@
           "CLAUDE_GATE_MODEL": "opus"
         }
       },
-      "expectedResolvedModel": "claude-opus-5",
-      "documentedWorkflowSizeGuideline": "medium",
       "oracle": {
-        "candidate": "fresh Opus selection resolves to claude-opus-5; no Workflow policy override is present; bounded topology and complete report are recorded"
+        "candidate": "fresh Opus selection resolves to the candidate's declared Opus model; no Workflow policy override is present; the declared Workflow size default is anchored in the selected binary; bounded topology and complete report are recorded"
       },
       "cost": {
         "usdEstimate": 0.3,
         "destructive": false
       },
       "artifactCollector": "private SDK stream plus nested Workflow session, hooks, metadata, SDK/CLI process snapshots and evidence, wrapper records, run metadata, and sanitized-result.json"
+    },
+    {
+      "id": "candidate-system-prompt-snapshot",
+      "candidateOnly": true,
+      "evidenceSources": {
+        "session": "session.jsonl"
+      },
+      "driver": "scripts/spikes/system-prompt-snapshot.mjs",
+      "args": {
+        "candidate": []
+      },
+      "environment": {
+        "common": {}
+      },
+      "oracle": {
+        "candidate": "a CliProcess chat resumed with a new display hint sees the new hint while a snapshot-on control of the same flow still sees the first one; a control that also sees the new hint reports NOT-APPLICABLE because recording is not active for the account"
+      },
+      "cost": {
+        "usdEstimate": 0.06,
+        "destructive": false
+      },
+      "artifactCollector": "private snapshot-off session, per-leg CLI process trees, wrapper records, and sanitized-result.json"
     }
   ]
 }

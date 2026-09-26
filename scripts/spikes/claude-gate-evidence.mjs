@@ -47,8 +47,17 @@ const SAFE_RUN_ID_RE = /^[A-Za-z0-9._-]+$/;
 const GATE_MODEL_SELECTORS = new Set(['claude-sonnet-4-6', 'opus']);
 const RESOLVED_GATE_MODELS = new Set([
   'claude-opus-5',
+  'claude-opus-5-5',
   'claude-sonnet-4-6',
 ]);
+const WORKFLOW_SIZE_GUIDELINES = new Set([
+  'large',
+  'medium',
+  'small',
+  'unrestricted',
+]);
+const SNAPSHOT_SCENARIO = 'candidate-system-prompt-snapshot';
+const SNAPSHOT_OBSERVED_HINTS = new Set(['both', 'first', 'none', 'second']);
 const RESULT_SUBTYPES = new Set([
   'error_during_execution',
   'error_max_budget_usd',
@@ -181,6 +190,26 @@ const SANITIZED_RESULT_KEYS = new Map([
     'hookFiredCount',
     'reasonCount',
     'resultSubtypes',
+  ]],
+  [SNAPSHOT_SCENARIO, [
+    'attestation',
+    'controlObservedHint',
+    'controlSnapshotOnSpawnCount',
+    'evidenceSchemaVersion',
+    'failureHash',
+    'failureStage',
+    'lifecycle',
+    'lifecycleProofs',
+    'lifecycleSources',
+    'matrixScenario',
+    'processTree',
+    'resolvedModel',
+    'scenario',
+    'snapshotFlagAdvertised',
+    'spawnCount',
+    'status',
+    'testObservedHint',
+    'wrapperRecords',
   ]],
   ['candidate-opus-projection', [
     ...COMMON_SDK_RESULT_KEYS,
@@ -479,8 +508,13 @@ function lifecycleSourcesSchemaMatches(sources, scenario, status) {
     : ['delayed-mcp', 'sdk-subagent', 'candidate-opus-projection']
       .includes(scenario)
       ? ['sdk']
-      : [];
-  if (!hasExactKeys(sources, status === 'PASS' ? expected : Object.keys(sources || {}))) {
+      : scenario === SNAPSHOT_SCENARIO
+        ? ['session']
+        : [];
+  if (!hasExactKeys(
+    sources,
+    status === 'FAIL' ? Object.keys(sources || {}) : expected,
+  )) {
     return false;
   }
   const streams = Object.keys(sources);
@@ -559,7 +593,8 @@ function lifecycleProofsSchemaMatches(proofs, scenario) {
   return (
     Array.isArray(proofs)
     && (
-      ['cli-contract', 'workflow-direct', 'workflow-fallback'].includes(scenario)
+      ['cli-contract', 'workflow-direct', 'workflow-fallback', SNAPSHOT_SCENARIO]
+        .includes(scenario)
         ? proofs.every(removalProofSchemaMatches)
         : proofs.length === 0
     )
@@ -795,7 +830,7 @@ function workflowSizeGuidelineEvidenceSchemaMatches(evidence) {
     ])
     && SHA256_RE.test(evidence.executableSha256)
     && evidence.source === 'selected-binary-runtime-default'
-    && evidence.value === 'medium'
+    && WORKFLOW_SIZE_GUIDELINES.has(evidence.value)
     && typeof evidence.fingerprintMatched === 'boolean'
   );
 }
@@ -877,10 +912,10 @@ function nullableResolvedModel(value) {
 
 function failureScalarSchemaMatches(result, allowedStages) {
   return (
-    (result.status === 'PASS'
-      ? result.failureHash === null && result.failureStage === null
-      : SHA256_RE.test(result.failureHash || '')
-        && allowedStages.has(result.failureStage))
+    (result.status === 'FAIL'
+      ? SHA256_RE.test(result.failureHash || '')
+        && allowedStages.has(result.failureStage)
+      : result.failureHash === null && result.failureStage === null)
   );
 }
 
@@ -1013,8 +1048,8 @@ function scenarioScalarSchemaMatches(result, scenario) {
   if (scenario === 'candidate-opus-projection') {
     return (
       commonSdkScalarSchemaMatches(result, scenario)
-      && result.expectedResolvedModel === 'claude-opus-5'
-      && result.documentedWorkflowSizeGuideline === 'medium'
+      && RESOLVED_GATE_MODELS.has(result.expectedResolvedModel)
+      && WORKFLOW_SIZE_GUIDELINES.has(result.documentedWorkflowSizeGuideline)
       && nullableEnum(result.resultSubtype, RESULT_SUBTYPES)
       && nonNegativeInteger(result.markerCount)
       && (
@@ -1022,6 +1057,26 @@ function scenarioScalarSchemaMatches(result, scenario) {
         || typeof result.workflowPolicyOverridePresent === 'boolean'
       )
       && nullableEnum(result.workflowStatus, new Set(['FAIL', 'PASS']))
+    );
+  }
+  if (scenario === SNAPSHOT_SCENARIO) {
+    return (
+      result.scenario === SNAPSHOT_SCENARIO
+      && nullableResolvedModel(result.resolvedModel)
+      && failureScalarSchemaMatches(result, new Set([
+        'collecting-evidence',
+        'control-first-turn',
+        'control-resumed-turn',
+        'evaluating-snapshot',
+        'initializing',
+        'test-first-turn',
+        'test-resumed-turn',
+      ]))
+      && nonNegativeInteger(result.spawnCount)
+      && nonNegativeInteger(result.controlSnapshotOnSpawnCount)
+      && typeof result.snapshotFlagAdvertised === 'boolean'
+      && nullableEnum(result.controlObservedHint, SNAPSHOT_OBSERVED_HINTS)
+      && nullableEnum(result.testObservedHint, SNAPSHOT_OBSERVED_HINTS)
     );
   }
   return false;
@@ -1034,7 +1089,10 @@ export function sanitizedGateResultSchemaMatches(result, scenario) {
     || !hasExactKeys(result, keys)
     || result.matrixScenario !== scenario
     || result.evidenceSchemaVersion !== 1
-    || !['PASS', 'FAIL'].includes(result.status)
+    || !(
+      ['PASS', 'FAIL'].includes(result.status)
+      || (scenario === SNAPSHOT_SCENARIO && result.status === 'NOT-APPLICABLE')
+    )
     || !attestationSchemaMatches(result.attestation)
     || !Array.isArray(result.wrapperRecords)
     || result.wrapperRecords.some(

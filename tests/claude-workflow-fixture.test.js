@@ -475,7 +475,7 @@ test('Workflow evidence records topology and completeness without result bodies'
   const summary = summarizeWorkflowRecord({
     status: 'completed',
     agentCount: 3,
-    defaultModel: 'claude-opus-5',
+    defaultModel: 'claude-opus-5-5',
     durationMs: 2_500,
     totalTokens: 800,
     totalToolCalls: 4,
@@ -491,7 +491,7 @@ test('Workflow evidence records topology and completeness without result bodies'
   assert.deepEqual(summary, {
     status: 'completed',
     agentCount: 3,
-    defaultModel: 'claude-opus-5',
+    defaultModel: 'claude-opus-5-5',
     durationMs: 2_500,
     totalTokens: 800,
     totalToolCalls: 4,
@@ -583,55 +583,88 @@ test('Workflow metadata evidence selects only the task-notification-linked run',
   );
 });
 
-test('Workflow default evidence is fingerprinted from the exact selected binary', async (t) => {
+test('Workflow default evidence is fingerprinted with the anchors declared for the selected version', async (t) => {
   const parentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-workflow-default-'));
   t.after(() => fs.rmSync(parentDir, { recursive: true, force: true }));
-
-  const executablePath = path.join(parentDir, 'claude');
-  const runtimeText = [
-    '"medium" (the default) fewer than 15',
-    'var rLs,_Td="medium",oko',
-    'settings.workflowSizeGuideline)??Msn(e);return t===void 0?{size:_Td,isDefault:!0}',
-  ].join('\0');
-  fs.writeFileSync(executablePath, runtimeText);
-  const executableSha256 = crypto
-    .createHash('sha256')
-    .update(runtimeText)
-    .digest('hex');
-
+  const manifest = JSON.parse(fs.readFileSync(
+    path.join(__dirname, '..', 'scripts', 'spikes', 'claude-2.1.283-matrix.json'),
+    'utf8',
+  ));
   const { inspectWorkflowSizeGuidelineDefault } = await import(moduleUrl);
-  assert.deepEqual(
-    await inspectWorkflowSizeGuidelineDefault({
+  const executablePath = path.join(parentDir, 'claude');
+  const writeRuntime = (text) => {
+    fs.writeFileSync(executablePath, text);
+    return crypto.createHash('sha256').update(text).digest('hex');
+  };
+
+  const versions = [manifest.versions.old, manifest.versions.candidate];
+  for (const version of versions) {
+    const { workflowSizeGuideline, workflowSizeGuidelineAnchors } =
+      manifest.expectations[version];
+    const executableSha256 = writeRuntime(workflowSizeGuidelineAnchors.join('\0'));
+    assert.deepEqual(
+      await inspectWorkflowSizeGuidelineDefault({
+        executablePath,
+        executableSha256,
+        expectedGuideline: workflowSizeGuideline,
+        anchors: workflowSizeGuidelineAnchors,
+      }),
+      {
+        source: 'selected-binary-runtime-default',
+        value: workflowSizeGuideline,
+        executableSha256,
+        fingerprintMatched: true,
+      },
+      `${version} anchors must verify a runtime that carries them`,
+    );
+
+    // One missing anchor means the runtime default branch drifted, so the
+    // documented value is no longer proven by this executable.
+    const partialSha256 = writeRuntime(workflowSizeGuidelineAnchors.slice(1).join('\0'));
+    assert.equal((await inspectWorkflowSizeGuidelineDefault({
       executablePath,
-      executableSha256,
+      executableSha256: partialSha256,
+      expectedGuideline: workflowSizeGuideline,
+      anchors: workflowSizeGuidelineAnchors,
+    })).fingerprintMatched, false);
+  }
+
+  // The old release's anchors must not verify the candidate's runtime text:
+  // a CLI bump has to be re-anchored rather than inherit the previous proof.
+  const candidateSha256 = writeRuntime(
+    manifest.expectations[manifest.versions.candidate]
+      .workflowSizeGuidelineAnchors.join('\0'),
+  );
+  assert.equal((await inspectWorkflowSizeGuidelineDefault({
+    executablePath,
+    executableSha256: candidateSha256,
+    expectedGuideline: 'medium',
+    anchors: manifest.expectations[manifest.versions.old]
+      .workflowSizeGuidelineAnchors,
+  })).fingerprintMatched, false);
+
+  // The candidate default is plan-dependent; both the documented text and
+  // the Pro branch are anchored so a changed plan rule cannot pass silently.
+  const candidateAnchors = manifest.expectations[manifest.versions.candidate]
+    .workflowSizeGuidelineAnchors.join('\n');
+  assert.match(candidateAnchors, /Unset defaults to "medium", or "small" on Pro plans\./);
+  assert.match(candidateAnchors, /==="pro"\?u:s/);
+
+  await assert.rejects(
+    inspectWorkflowSizeGuidelineDefault({
+      executablePath,
+      executableSha256: candidateSha256,
       expectedGuideline: 'medium',
     }),
-    {
-      source: 'selected-binary-runtime-default',
-      value: 'medium',
-      executableSha256,
-      fingerprintMatched: true,
-    },
+    /anchors must be the non-empty per-version byte anchors/,
   );
-
-  fs.writeFileSync(executablePath, '"medium" (the default) fewer than 15');
-  const changedSha256 = crypto
-    .createHash('sha256')
-    .update('"medium" (the default) fewer than 15')
-    .digest('hex');
-  const missingRuntimeAssignment = await inspectWorkflowSizeGuidelineDefault({
-    executablePath,
-    executableSha256: changedSha256,
-    expectedGuideline: 'medium',
-  });
-  assert.equal(missingRuntimeAssignment.fingerprintMatched, false);
 });
 
-test('Opus projection requires Opus 5 and a complete unoverridden Workflow', async () => {
+test('Opus projection requires the declared Opus model and a complete unoverridden Workflow', async () => {
   const { evaluateOpusProjection } = await import(moduleUrl);
   const valid = evaluateOpusProjection({
-    resolvedModel: 'claude-opus-5',
-    expectedResolvedModel: 'claude-opus-5',
+    resolvedModel: 'claude-opus-5-5',
+    expectedResolvedModel: 'claude-opus-5-5',
     selectedExecutableSha256: 'a'.repeat(64),
     documentedWorkflowSizeGuideline: 'medium',
     workflowSizeGuidelineEvidence: {
@@ -651,8 +684,8 @@ test('Opus projection requires Opus 5 and a complete unoverridden Workflow', asy
   assert.deepEqual(valid, { pass: true, reasons: [] });
 
   const invalid = evaluateOpusProjection({
-    resolvedModel: 'claude-opus-4-7',
-    expectedResolvedModel: 'claude-opus-5',
+    resolvedModel: 'claude-opus-5',
+    expectedResolvedModel: 'claude-opus-5-5',
     selectedExecutableSha256: 'a'.repeat(64),
     documentedWorkflowSizeGuideline: 'medium',
     workflowSizeGuidelineEvidence: null,

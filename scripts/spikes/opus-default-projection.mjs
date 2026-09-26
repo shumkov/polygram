@@ -18,6 +18,7 @@ import {
   createSdkGateObserver,
   writeSanitizedGateResult,
 } from './claude-gate-evidence.mjs';
+import { readGateExpectations } from './claude-gate-matrix.mjs';
 import {
   evaluateOpusProjection,
   inspectWorkflowSizeGuidelineDefault,
@@ -37,13 +38,23 @@ if (!expectedResolvedModel || !documentedWorkflowSizeGuideline) {
 }
 
 const selection = await createClaudeGateSelection();
-if (selection.version !== '2.1.220' || selection.model !== 'opus') {
-  throw new Error('candidate projection must select Claude Code 2.1.220 with model opus');
+if (selection.model !== 'opus') {
+  throw new Error('candidate projection must select model opus');
+}
+const expectations = readGateExpectations(selection.version);
+if (
+  expectations.resolvedOpus !== expectedResolvedModel
+  || expectations.workflowSizeGuideline !== documentedWorkflowSizeGuideline
+) {
+  throw new Error(
+    `candidate projection inputs do not match the Claude Code ${selection.version} expectations`,
+  );
 }
 const workflowSizeGuidelineEvidence = await inspectWorkflowSizeGuidelineDefault({
   executablePath: selection.executablePath,
   executableSha256: selection.sha256,
   expectedGuideline: documentedWorkflowSizeGuideline,
+  anchors: expectations.workflowSizeGuidelineAnchors,
 });
 const observer = createSdkGateObserver(selection, { expectedResolvedModel });
 

@@ -498,6 +498,7 @@ export async function inspectWorkflowSizeGuidelineDefault({
   executablePath,
   executableSha256,
   expectedGuideline,
+  anchors,
 }) {
   if (typeof executablePath !== 'string' || !path.isAbsolute(executablePath)) {
     throw new TypeError('executablePath must be an absolute path');
@@ -505,20 +506,22 @@ export async function inspectWorkflowSizeGuidelineDefault({
   if (!/^[a-f0-9]{64}$/.test(executableSha256 || '')) {
     throw new TypeError('executableSha256 must be a SHA-256 digest');
   }
-  if (expectedGuideline !== 'medium') {
-    throw new TypeError('the selected-binary fingerprint only defines the medium default');
+  if (!['large', 'medium', 'small', 'unrestricted'].includes(expectedGuideline)) {
+    throw new TypeError('expectedGuideline must be a Workflow size guideline');
+  }
+  if (
+    !Array.isArray(anchors)
+    || anchors.length === 0
+    || anchors.some((anchor) => typeof anchor !== 'string' || anchor.length === 0)
+  ) {
+    throw new TypeError('anchors must be the non-empty per-version byte anchors');
   }
 
-  // These semantic anchors bind the documented value to the executable's
-  // actual no-override branch. Upstream minifier drift intentionally blocks
-  // the gate until the new runtime contract is inspected.
-  const fingerprints = [
-    Buffer.from('"medium" (the default) fewer than 15'),
-    Buffer.from('var rLs,_Td="medium",oko'),
-    Buffer.from(
-      'settings.workflowSizeGuideline)??Msn(e);return t===void 0?{size:_Td,isDefault:!0}',
-    ),
-  ];
+  // The manifest declares, per CLI version, semantic anchors that bind the
+  // documented value to the executable's actual no-override branch. Upstream
+  // minifier drift intentionally blocks the gate until the new runtime
+  // contract is inspected and re-anchored.
+  const fingerprints = anchors.map((anchor) => Buffer.from(anchor));
   const found = fingerprints.map(() => false);
   const maxFingerprintLength = Math.max(
     ...fingerprints.map((fingerprint) => fingerprint.length),

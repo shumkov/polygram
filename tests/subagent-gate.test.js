@@ -4,6 +4,19 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+const manifest = JSON.parse(fs.readFileSync(
+  path.join(__dirname, '..', 'scripts/spikes/claude-2.1.283-matrix.json'),
+  'utf8',
+));
+const CANDIDATE_EXPECTATIONS = manifest.expectations[manifest.versions.candidate];
+// A version whose SDK stream carries no task_updated for the child task. No
+// pinned version behaves this way today, but the per-version oracle must still
+// tell the two lifecycles apart.
+const NO_TASK_UPDATE_EXPECTATIONS = {
+  ...CANDIDATE_EXPECTATIONS,
+  subagentTaskUpdated: 0,
+};
+
 function assistant({
   parent = null,
   blocks,
@@ -179,7 +192,7 @@ function resultFromMessages({
   };
 }
 
-test('2.1.220 subagent task lifecycle accepts model-stream volatility without losing task identity', async () => {
+test('per-version subagent task lifecycle accepts model-stream volatility without losing task identity', async () => {
   const { subagentGate, gateEvidence, matrix } = await modules();
   const oldResult = resultFromMessages({
     messages: subagentMessages({ candidate: false }),
@@ -199,33 +212,51 @@ test('2.1.220 subagent task lifecycle accepts model-stream volatility without lo
 
   assert.equal(
     subagentGate.evaluateSubagentEvidence(oldResult, {
-      isCandidate: false,
+      expectedTaskUpdated: 0,
     }).pass,
     true,
   );
   assert.equal(
     subagentGate.evaluateSubagentEvidence(candidateResult, {
-      isCandidate: true,
+      expectedTaskUpdated: 1,
     }).pass,
     true,
   );
-  assert.deepEqual(matrix.evaluateMatrixEvidencePair({
-    scenario: {
-      id: 'sdk-subagent',
-      comparison: {
-        lifecycle: {
-          mode: 'version-specific-oracle',
-          oracle: 'sdk-subagent-v1',
-        },
-        equalFields: ['resolvedModel', 'resultSubtype'],
+  const scenario = {
+    id: 'sdk-subagent',
+    comparison: {
+      lifecycle: {
+        mode: 'version-specific-oracle',
+        oracle: 'sdk-subagent-v1',
       },
+      equalFields: ['resolvedModel', 'resultSubtype'],
     },
+  };
+  assert.deepEqual(matrix.evaluateMatrixEvidencePair({
+    scenario,
     oldResult,
     candidateResult,
+    oldExpectations: NO_TASK_UPDATE_EXPECTATIONS,
+    candidateExpectations: CANDIDATE_EXPECTATIONS,
   }), {
     pass: true,
     differences: [],
   });
+  // Each side is judged by its own version's declaration, so swapping the
+  // declarations, or omitting one, must fail instead of passing by default.
+  for (const [oldExpectations, candidateExpectations] of [
+    [CANDIDATE_EXPECTATIONS, NO_TASK_UPDATE_EXPECTATIONS],
+    [undefined, CANDIDATE_EXPECTATIONS],
+    [NO_TASK_UPDATE_EXPECTATIONS, undefined],
+  ]) {
+    assert.deepEqual(matrix.evaluateMatrixEvidencePair({
+      scenario,
+      oldResult,
+      candidateResult,
+      oldExpectations,
+      candidateExpectations,
+    }).differences, ['lifecycle']);
+  }
 });
 
 test('successful SDK tool results may omit is_error', async () => {
@@ -244,7 +275,7 @@ test('successful SDK tool results may omit is_error', async () => {
   });
 
   assert.equal(subagentGate.evaluateSubagentEvidence(result, {
-    isCandidate: true,
+    expectedTaskUpdated: 1,
   }).pass, true);
 });
 
@@ -342,7 +373,7 @@ test('subagent proof rejects mixed identities, unmatched results, and unsuccessf
     });
     assert.equal(
       subagentGate.evaluateSubagentEvidence(result, {
-        isCandidate: true,
+        expectedTaskUpdated: 1,
       }).pass,
       false,
     );
@@ -426,7 +457,7 @@ test('subagent lifecycle rejects missing, duplicate, reordered, and unknown task
     });
     assert.equal(
       subagentGate.evaluateSubagentEvidence(result, {
-        isCandidate: true,
+        expectedTaskUpdated: 1,
       }).pass,
       false,
     );
@@ -440,7 +471,7 @@ test('subagent lifecycle rejects missing, duplicate, reordered, and unknown task
   });
   assert.equal(
     subagentGate.evaluateSubagentEvidence(oldWithUpdate, {
-      isCandidate: false,
+      expectedTaskUpdated: 0,
     }).pass,
     false,
   );
@@ -539,7 +570,7 @@ test('review false positives: every tool lineage and child boundary is exact', a
     });
     assert.equal(
       subagentGate.evaluateSubagentEvidence(result, {
-        isCandidate: true,
+        expectedTaskUpdated: 1,
       }).pass,
       false,
       name,
@@ -580,7 +611,7 @@ test('matrix acceptance regenerates the subagent proof from the private SDK stre
     matrixScenario: 'sdk-subagent',
     status: 'PASS',
     attestation: {
-      version: '2.1.220',
+      version: manifest.versions.candidate,
       model: 'claude-sonnet-4-6',
       effort: 'medium',
     },
@@ -593,7 +624,8 @@ test('matrix acceptance regenerates the subagent proof from the private SDK stre
   const run = {
     scenarioId: 'sdk-subagent',
     versionKey: 'candidate',
-    version: '2.1.220',
+    version: manifest.versions.candidate,
+    expectations: CANDIDATE_EXPECTATIONS,
     model: 'claude-sonnet-4-6',
     effort: 'medium',
     versionSpecificLifecycleOracle: 'sdk-subagent-v1',
@@ -604,7 +636,7 @@ test('matrix acceptance regenerates the subagent proof from the private SDK stre
 
   assert.equal(
     subagentGate.evaluateSubagentEvidence(result, {
-      isCandidate: true,
+      expectedTaskUpdated: 1,
     }).pass,
     true,
     'the self-reported sanitized proof remains internally green',

@@ -37,7 +37,7 @@ test('real-Claude gate failures retain a content-free phase label', () => {
   }
 });
 
-function makeFakeClaude(dir, version = '2.1.220', runtimeMs = 0) {
+function makeFakeClaude(dir, version = '2.1.283', runtimeMs = 0) {
   const script = path.join(dir, `claude-${version}.mjs`);
   fs.writeFileSync(script, [
     '#!/usr/bin/env node',
@@ -54,7 +54,7 @@ function makeFakeClaude(dir, version = '2.1.220', runtimeMs = 0) {
 test('Claude gate selector rejects a missing executable path', async () => {
   const { createClaudeGateSelection } = await import(helperUrl);
   await assert.rejects(
-    createClaudeGateSelection({ executablePath: '', expectedVersion: '2.1.220' }),
+    createClaudeGateSelection({ executablePath: '', expectedVersion: '2.1.283' }),
     /absolute executable path/i,
   );
 });
@@ -62,16 +62,16 @@ test('Claude gate selector rejects a missing executable path', async () => {
 test('Claude gate selector rejects a reported version mismatch', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-gate-version-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const executablePath = makeFakeClaude(dir, '2.1.219');
+  const executablePath = makeFakeClaude(dir, '2.1.282');
 
   const { createClaudeGateSelection } = await import(helperUrl);
   await assert.rejects(
     createClaudeGateSelection({
       executablePath,
-      expectedVersion: '2.1.220',
+      expectedVersion: '2.1.283',
       artifactBaseDir: path.join(dir, 'artifacts'),
     }),
-    /expected Claude Code 2\.1\.220.*reported 2\.1\.219/i,
+    /expected Claude Code 2\.1\.283.*reported 2\.1\.282/i,
   );
 });
 
@@ -88,13 +88,13 @@ test('candidate selection attests the executable and propagates selectors to CLI
   } = await import(helperUrl);
   const selection = await createClaudeGateSelection({
     executablePath,
-    expectedVersion: '2.1.220',
+    expectedVersion: '2.1.283',
     artifactBaseDir: path.join(dir, 'artifacts'),
     runId: 'candidate-test-run',
     processEnv: { HOME: dir, PATH: process.env.PATH, KEEP_ME: 'yes' },
   });
 
-  assert.equal(selection.version, '2.1.220');
+  assert.equal(selection.version, '2.1.283');
   assert.equal(selection.sha256, await sha256File(executablePath));
   assert.equal(selection.cliEnv.ORCHESTRA_CLAUDE_BIN, executablePath);
   assert.equal(selection.cliEnv.POLYGRAM_CLAUDE_BIN, executablePath);
@@ -125,7 +125,7 @@ test('candidate selection attests the executable and propagates selectors to CLI
     { pathToClaudeCodeExecutable: '/private/other-claude' },
     { cwd: '/private/other-cwd' },
     { spawnClaudeCodeProcess: () => {} },
-    { model: 'claude-opus-5' },
+    { model: 'claude-opus-5-5' },
     { effort: 'high' },
     { env: { CLAUDE_GATE_BIN: '/private/other-claude' } },
     { env: { CLAUDE_CODE_GATE_RUN_ID: 'other-run' } },
@@ -209,7 +209,7 @@ test('SDK process evidence records a process sampling failure after launch', asy
   const { createClaudeGateSelection } = await import(helperUrl);
   const selection = await createClaudeGateSelection({
     executablePath,
-    expectedVersion: '2.1.220',
+    expectedVersion: '2.1.283',
     artifactBaseDir: path.join(dir, 'artifacts'),
     runId: 'sampling-failure-run',
     processEnv: { PATH: process.env.PATH },
@@ -245,7 +245,7 @@ test('SDK process evidence retains tracking after an initial sampling failure', 
   const { createClaudeGateSelection } = await import(helperUrl);
   const selection = await createClaudeGateSelection({
     executablePath,
-    expectedVersion: '2.1.220',
+    expectedVersion: '2.1.283',
     artifactBaseDir: path.join(dir, 'artifacts'),
     runId: 'initial-sampling-failure-run',
     processEnv: { PATH: process.env.PATH },
@@ -284,7 +284,7 @@ test('SDK process evidence retains selected binary parent pids', async (t) => {
   const { createClaudeGateSelection } = await import(helperUrl);
   const selection = await createClaudeGateSelection({
     executablePath,
-    expectedVersion: '2.1.220',
+    expectedVersion: '2.1.283',
     artifactBaseDir: path.join(dir, 'artifacts'),
     runId: 'process-parent-run',
     processEnv: { PATH: process.env.PATH },
@@ -322,7 +322,7 @@ test('SDK sampling ignores a clearly unrelated macOS basename descendant', async
   const { createClaudeGateSelection } = await import(helperUrl);
   const selection = await createClaudeGateSelection({
     executablePath,
-    expectedVersion: '2.1.220',
+    expectedVersion: '2.1.283',
     artifactBaseDir: path.join(dir, 'artifacts'),
     runId: 'process-node-run',
     processEnv: { PATH: process.env.PATH },
@@ -367,7 +367,7 @@ test('SDK sampling fails when a target-basename descendant cannot be resolved', 
     const { createClaudeGateSelection } = await import(helperUrl);
     const selection = await createClaudeGateSelection({
       executablePath,
-      expectedVersion: '2.1.220',
+      expectedVersion: '2.1.283',
       artifactBaseDir: path.join(dir, 'artifacts'),
       runId: `process-target-${processPlatform}`,
       processEnv: { PATH: process.env.PATH },
@@ -411,7 +411,7 @@ test('SDK sampling fails when a target-basename descendant cannot be resolved', 
 test('SDK sampling ignores a verified selected process that exits during resolution', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-gate-process-exit-race-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const executablePath = makeFakeClaude(dir, '2.1.220', 1_000);
+  const executablePath = makeFakeClaude(dir, '2.1.283', 1_000);
   let childPid;
   let disappearing = false;
   let returnedRacySnapshot = false;
@@ -419,7 +419,7 @@ test('SDK sampling ignores a verified selected process that exits during resolut
   const { createClaudeGateSelection } = await import(helperUrl);
   const selection = await createClaudeGateSelection({
     executablePath,
-    expectedVersion: '2.1.220',
+    expectedVersion: '2.1.283',
     artifactBaseDir: path.join(dir, 'artifacts'),
     runId: 'process-exit-race',
     processEnv: { PATH: process.env.PATH },
@@ -474,7 +474,7 @@ test('a synthetically recorded SDK root is not selected-process evidence', async
   const { createClaudeGateSelection } = await import(helperUrl);
   const selection = await createClaudeGateSelection({
     executablePath,
-    expectedVersion: '2.1.220',
+    expectedVersion: '2.1.283',
     artifactBaseDir: path.join(dir, 'artifacts'),
     runId: 'process-empty-run',
     processEnv: { PATH: process.env.PATH },
@@ -538,7 +538,7 @@ test('process wrapper records privacy-safe provenance and preserves wrapper env 
   assert.equal(record.runId, 'wrapper-test-run');
   assert.ok(Number.isInteger(record.pid) && record.pid > 0);
   assert.ok(Number.isInteger(record.ppid) && record.ppid > 0);
-  assert.equal(record.version, '2.1.220');
+  assert.equal(record.version, '2.1.283');
   assert.ok(Number.isInteger(record.versionProbePid) && record.versionProbePid > 0);
   assert.notEqual(record.versionProbePid, record.pid);
   assert.match(record.executablePathHash, /^[a-f0-9]{64}$/);
