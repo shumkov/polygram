@@ -37,6 +37,10 @@ test('polygram.js boots through handler wiring without a ReferenceError', { time
       ...process.env,
       POLYGRAM_CLAUDE_BIN: '/usr/bin/echo',
       POLYGRAM_IPC_DIR: path.join(dir, '.ipc'),
+      // Never vendor into (and garbage-collect) the real
+      // ~/.local/share/polygram/claude-bin that a live bot spawns from.
+      ORCHESTRA_CLAUDE_BIN: '/usr/bin/true',
+      ORCHESTRA_CLAUDE_VENDOR_DIR: path.join(dir, 'claude-bin'),
     },
   });
   let out = '';
@@ -61,4 +65,10 @@ test('polygram.js boots through handler wiring without a ReferenceError', { time
     `boot threw a ReferenceError during handler wiring:\n${out.slice(-1200)}`);
   assert.ok(out.includes(MARKER),
     `boot did not reach the post-wiring marker "${MARKER}" — it crashed before handler wiring completed:\n${out.slice(-1200)}`);
+  // Boot vendors the pinned claude into the vendor dir and deletes every
+  // other version there. Run against the real home dir, it would delete the
+  // binary a live bot on this machine still needs whenever the test's pin
+  // differs from the deployed one. The boot must use the isolated binary.
+  assert.match(out, /pinned to claude CLI v[^:]+: \/usr\/bin\/true/,
+    `boot resolved a claude binary outside the test's isolation:\n${out.slice(-1200)}`);
 });
