@@ -1217,7 +1217,7 @@ test('nested Opus Workflow evidence must match the checked Workflow lifecycle ba
   }), false);
   const nestedResult = nestedResultFor(with283SessionRows(
     baseline,
-    { recordAfter: 'command_permissions' },
+    { recordAfter: 'skill_listing' },
   ));
   assert.equal(nestedWorkflowLifecycleMatches({
     result: nestedResult,
@@ -2530,7 +2530,7 @@ test('Workflow lifecycle comparison excludes only worker-internal volatility', a
         bashPairs: 4,
         subagentStops: 4,
       }),
-      { recordAfter: 'command_permissions' },
+      { recordAfter: 'skill_listing' },
     ), deliveryMode);
 
     assert.equal(evaluateMatrixEvidencePair({
