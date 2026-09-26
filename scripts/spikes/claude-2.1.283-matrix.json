@@ -12,6 +12,7 @@
         "autoBackground": "background",
         "default": "foreground"
       },
+      "projectedInsertions": {},
       "subagentTaskUpdated": 1,
       "taskReminderInsertions": 1,
       "resolvedOpus": "claude-opus-5",
@@ -27,6 +28,47 @@
       "delayedMcpModes": {
         "autoBackground": "background",
         "default": "foreground"
+      },
+      "projectedInsertions": {
+        "cli-contract-v1": {
+          "session": [
+            { "index": 0, "record": { "type": "attachment", "attachmentType": "instructions" } },
+            { "index": 1, "record": { "type": "attachment", "attachmentType": "session_context" } },
+            { "index": 2, "record": { "type": "attachment", "attachmentType": "date" } },
+            { "index": 3, "record": { "type": "attachment", "attachmentType": "credential_org" } },
+            { "index": 4, "record": { "type": "attachment", "attachmentType": "remote_session_change" } },
+            { "index": 8, "record": { "type": "attachment", "attachmentType": "environment" } },
+            { "index": 9, "record": { "type": "attachment", "attachmentType": "model" } },
+            { "index": 14, "record": { "type": "attachment", "attachmentType": "deferred_tools_record" } }
+          ],
+          "hooks": [
+            { "index": 9, "record": { "type": "hook", "hookEventName": "UserPromptSubmit" } }
+          ]
+        },
+        "workflow-direct-v1": {
+          "session": [
+            { "index": 0, "record": { "type": "attachment", "attachmentType": "instructions" } },
+            { "index": 1, "record": { "type": "attachment", "attachmentType": "session_context" } },
+            { "index": 2, "record": { "type": "attachment", "attachmentType": "date" } },
+            { "index": 3, "record": { "type": "attachment", "attachmentType": "credential_org" } },
+            { "index": 4, "record": { "type": "attachment", "attachmentType": "remote_session_change" } },
+            { "index": 8, "record": { "type": "attachment", "attachmentType": "environment" } },
+            { "index": 9, "record": { "type": "attachment", "attachmentType": "model" } },
+            { "index": 15, "record": { "type": "attachment", "attachmentType": "deferred_tools_record" } }
+          ]
+        },
+        "workflow-fallback-v1": {
+          "session": [
+            { "index": 0, "record": { "type": "attachment", "attachmentType": "instructions" } },
+            { "index": 1, "record": { "type": "attachment", "attachmentType": "session_context" } },
+            { "index": 2, "record": { "type": "attachment", "attachmentType": "date" } },
+            { "index": 3, "record": { "type": "attachment", "attachmentType": "credential_org" } },
+            { "index": 4, "record": { "type": "attachment", "attachmentType": "remote_session_change" } },
+            { "index": 8, "record": { "type": "attachment", "attachmentType": "environment" } },
+            { "index": 9, "record": { "type": "attachment", "attachmentType": "model" } },
+            { "index": 15, "record": { "type": "attachment", "attachmentType": "deferred_tools_record" } }
+          ]
+        }
       },
       "subagentTaskUpdated": 1,
       "taskReminderInsertions": 1,
@@ -70,6 +112,7 @@
         "crossVersion": "all-pairs",
         "lifecycle": {
           "mode": "projected-compatible",
+          "baselineId": "cli-contract-v1",
           "streams": {
             "session": {
               "projection": "session-pivotal-v1"
@@ -217,6 +260,7 @@
       "comparison": {
         "lifecycle": {
           "mode": "projected-compatible",
+          "baselineId": "workflow-direct-v1",
           "streams": {
             "session": {
               "projection": "session-pivotal-v1"
@@ -312,6 +356,7 @@
       "comparison": {
         "lifecycle": {
           "mode": "projected-compatible",
+          "baselineId": "workflow-fallback-v1",
           "streams": {
             "session": {
               "projection": "session-pivotal-v1"

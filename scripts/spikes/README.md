@@ -105,7 +105,19 @@ all four old/new pairings. Each run must first match the manifest's exact
 session-pivotal projection leaves out `total_tokens_reminder` attachments:
 the service injects these context-usage reminders a varying number of times
 even on an unchanged binary, and nothing downstream reads them. Every other
-attachment stays pivotal. Each run may then
+attachment stays pivotal.
+Rows a version adds at fixed places in a baseline are declared under that
+version's `projectedInsertions`, keyed by the policy's `baselineId`, as exact
+index and record pairs. Identical rows elsewhere (every turn has a
+`UserPromptSubmit`) make count-based removal ambiguous, so each declared row
+must sit at exactly its index before it is removed; a missing, moved, renamed,
+duplicated, or undeclared row fails. `2.1.283` declares its five session-start
+attachments, `environment` and `model` after the first prompt,
+`deferred_tools_record` after the first turn's context attachments, and the
+`UserPromptSubmit` it now fires for the prompt folded into the third CLI turn.
+`2.1.220` declares none. The CLI rows were observed in an authoritative run;
+the Workflow rows are inferred from them (with `deferred_tools_record` after
+`command_permissions`) and fail closed until a run confirms them. Each run may then
 remove exactly the number of reviewed `task_reminder` rows its version declares
 (one on both `2.1.220` and `2.1.283`); either version may also remove at most
 one interrupt-correlated `hook_cancelled`. One source-bound composite proof must

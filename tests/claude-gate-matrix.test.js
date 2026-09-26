@@ -279,6 +279,54 @@ function matrixResult(lifecycle, { taskReminder = false } = {}) {
   };
 }
 
+// Rows Claude Code 2.1.283 adds to the same flows, as observed in the
+// authoritative 2.1.220 -> 2.1.283 run: five attachments before the first
+// enqueue, environment and model right after the first channel prompt, and
+// deferred_tools_record after the first turn's context attachments.
+const SESSION_START_ATTACHMENTS_283 = [
+  'instructions',
+  'session_context',
+  'date',
+  'credential_org',
+  'remote_session_change',
+].map(attachment);
+
+function with283SessionRows(lifecycle, { recordAfter }) {
+  const session = structuredClone(lifecycle.session);
+  const firstPrompt = session.findIndex(
+    (record) => record.type === 'user' && record.hasParent === false,
+  );
+  session.splice(
+    firstPrompt + 1,
+    0,
+    attachment('environment'),
+    attachment('model'),
+  );
+  const contextEnd = session.findIndex(
+    (record) => record.attachmentType === recordAfter,
+  );
+  session.splice(contextEnd + 1, 0, attachment('deferred_tools_record'));
+  session.unshift(...structuredClone(SESSION_START_ATTACHMENTS_283));
+  return { ...lifecycle, session };
+}
+
+// 2.1.283 also fires UserPromptSubmit for the prompt folded into the third
+// turn, so that turn's transport hooks start with two of them.
+function with283FoldPromptHook(lifecycle) {
+  const hooks = structuredClone(lifecycle.hooks);
+  const promptHooks = hooks.flatMap((record, index) => (
+    record.hookEventName === 'UserPromptSubmit' ? [index] : []
+  ));
+  hooks.splice(promptHooks[2] + 1, 0, hook('UserPromptSubmit'));
+  return { ...lifecycle, hooks };
+}
+
+function cli283Lifecycle(lifecycle) {
+  return with283FoldPromptHook(
+    with283SessionRows(lifecycle, { recordAfter: 'skill_listing' }),
+  );
+}
+
 // Both pinned versions emit one task_reminder in the CLI contract flow; the
 // manifest declares that count per version and the comparator removes it.
 const CLI_LIFECYCLE_FIXTURES = {
@@ -298,17 +346,17 @@ const CLI_LIFECYCLE_FIXTURES = {
     extraToolPair: true,
     taskReminderIndex: 33,
   }), { taskReminder: true }),
-  candidate1: matrixResult(cliLifecycleFixture({
+  candidate1: matrixResult(cli283Lifecycle(cliLifecycleFixture({
     fileTool: 'Bash',
     subagentStops: 5,
     taskReminderIndex: 28,
-  }), { taskReminder: true }),
-  candidate2: matrixResult(cliLifecycleFixture({
+  })), { taskReminder: true }),
+  candidate2: matrixResult(cli283Lifecycle(cliLifecycleFixture({
     fileTool: 'Write',
     subagentStops: 4,
     extraToolPair: true,
     taskReminderIndex: 33,
-  }), { taskReminder: true }),
+  })), { taskReminder: true }),
 };
 
 function workflowLifecycleFixture({ deliveryMode, bashPairs, subagentStops }) {
@@ -544,6 +592,7 @@ test('every compared CLI version has reviewed per-version expectations', async (
       taskReminderInsertions: 1,
       resolvedOpus: 'claude-opus-5',
       workflowSizeGuideline: 'medium',
+      projectedInsertions: {},
     },
   );
   // 2.1.283 changes only the production Opus default and the Workflow
@@ -1143,23 +1192,33 @@ test('nested Opus Workflow evidence must match the checked Workflow lifecycle ba
     workflowScenario.comparison.lifecycle,
   );
 
-  const nestedResult = {
-    lifecycle: structuredClone(
-      workflowScenario.comparison.lifecycle.projectedBaseline,
-    ),
+  const nestedResultFor = (lifecycle) => ({
+    lifecycle,
     lifecycleSources: {
       session: {
         file: 'session.jsonl',
         stream: 'session',
         sha256: 'a'.repeat(64),
-        rawRecordCount:
-          workflowScenario.comparison.lifecycle.projectedBaseline.session.length,
-        normalizedRecordCount:
-          workflowScenario.comparison.lifecycle.projectedBaseline.session.length,
+        rawRecordCount: lifecycle.session.length,
+        normalizedRecordCount: lifecycle.session.length,
       },
     },
     lifecycleProofs: [],
-  };
+  });
+  const baseline = structuredClone(
+    workflowScenario.comparison.lifecycle.projectedBaseline,
+  );
+  // The nested Workflow runs on the candidate, so it is held to the
+  // candidate's declared session rows; the old-shaped transcript is not.
+  assert.equal(nestedWorkflowLifecycleMatches({
+    result: nestedResultFor(baseline),
+    policy: opusRun.nestedWorkflowLifecyclePolicy,
+    expectations: opusRun.expectations,
+  }), false);
+  const nestedResult = nestedResultFor(with283SessionRows(
+    baseline,
+    { recordAfter: 'command_permissions' },
+  ));
   assert.equal(nestedWorkflowLifecycleMatches({
     result: nestedResult,
     policy: opusRun.nestedWorkflowLifecyclePolicy,
@@ -2465,11 +2524,14 @@ test('Workflow lifecycle comparison excludes only worker-internal volatility', a
       bashPairs: 2,
       subagentStops: 3,
     }), deliveryMode);
-    const candidateResult = workflowMatrixResult(workflowLifecycleFixture({
-      deliveryMode,
-      bashPairs: 4,
-      subagentStops: 4,
-    }), deliveryMode);
+    const candidateResult = workflowMatrixResult(with283SessionRows(
+      workflowLifecycleFixture({
+        deliveryMode,
+        bashPairs: 4,
+        subagentStops: 4,
+      }),
+      { recordAfter: 'command_permissions' },
+    ), deliveryMode);
 
     assert.equal(evaluateMatrixEvidencePair({
       ...MANIFEST_EXPECTATIONS,
@@ -2858,6 +2920,185 @@ test('CLI lifecycle comparison accepts only a proved interrupt-correlated cancel
       oldResult: oldWithoutCancellation,
       candidateResult: invalid,
     }).pass, false);
+  }
+});
+
+// The projected CLI-contract sequences both authoritative 2.1.283 runs
+// produced, identical to each other (total_tokens_reminder already excluded).
+const OBSERVED_CLI_SESSION_283 = [
+  'a:instructions', 'a:session_context', 'a:date', 'a:credential_org',
+  'a:remote_session_change', 'q:enqueue', 'q:dequeue', 'u:root',
+  'a:environment', 'a:model', 'a:deferred_tools_delta',
+  'a:agent_listing_delta', 'a:mcp_instructions_delta', 'a:skill_listing',
+  'a:deferred_tools_record', 's:stop_hook_summary', 's:turn_duration',
+  'q:enqueue', 'q:dequeue', 'u:child', 's:stop_hook_summary',
+  's:turn_duration', 'q:enqueue', 'q:dequeue', 'u:child', 'q:enqueue',
+  'q:remove', 'a:queued_command', 's:stop_hook_summary', 's:turn_duration',
+  'q:enqueue', 'q:dequeue', 'u:child', 'a:task_reminder', 'q:enqueue',
+  'q:dequeue', 'u:child', 's:stop_hook_summary', 's:turn_duration',
+  'q:enqueue', 'q:dequeue', 'u:child', 's:stop_hook_summary',
+  's:turn_duration',
+];
+const OBSERVED_CLI_HOOKS_283 = [
+  'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop',
+  'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop',
+  'UserPromptSubmit', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop',
+  'UserPromptSubmit', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop',
+  'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop',
+];
+
+function decodeObservedSession(code) {
+  const [kind, value] = code.split(':');
+  if (kind === 'a') return attachment(value);
+  if (kind === 'q') return queue(value);
+  if (kind === 's') return system(value);
+  return channelUser(value === 'child');
+}
+
+function observedHooks(names) {
+  return names.map((name) => (
+    name === 'PreToolUse' || name === 'PostToolUse'
+      ? hook(name, REPLY_TOOL)
+      : hook(name)
+  ));
+}
+
+function observedCliResult({ session, hooks }) {
+  return matrixResult({ session, hooks }, { taskReminder: true });
+}
+
+test('2.1.283 CLI-contract rows are accepted only as declared, at their observed positions', async () => {
+  const {
+    evaluateMatrixScenarioEvidence,
+    evaluateMatrixVersionEvidence,
+  } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  const cliScenario = manifest.scenarios.find(({ id }) => id === 'cli-contract');
+  const observed = {
+    session: OBSERVED_CLI_SESSION_283.map(decodeObservedSession),
+    hooks: observedHooks(OBSERVED_CLI_HOOKS_283),
+  };
+  // The fixtures used elsewhere reproduce the observed projection; the
+  // count-removed task_reminder is the only row whose position may differ.
+  const withoutReminder = (session) => session.filter(
+    (record) => record.attachmentType !== 'task_reminder',
+  );
+  assert.deepEqual(
+    withoutReminder(CLI_LIFECYCLE_FIXTURES.candidate1.lifecycle.session.filter(
+      (record) => record.type !== 'assistant'
+        && !(record.type === 'user' && !record.originKind),
+    )),
+    withoutReminder(observed.session),
+  );
+  assert.equal(OBSERVED_CLI_HOOKS_283.length, CLI_TRANSPORT_HOOKS.length + 1);
+
+  const candidateResults = [observedCliResult(observed), observedCliResult(observed)];
+  const oldResults = [CLI_LIFECYCLE_FIXTURES.old1, CLI_LIFECYCLE_FIXTURES.old2];
+  const outcome = evaluateMatrixScenarioEvidence({
+    ...MANIFEST_EXPECTATIONS,
+    scenario: cliScenario,
+    oldResults,
+    candidateResults,
+  });
+  assert.equal(outcome.pass, true);
+  assert.ok(outcome.comparisons.every((comparison) => comparison.pass));
+
+  const judgeCandidate = (lifecycle, expectations = CANDIDATE_EXPECTATIONS) => (
+    evaluateMatrixVersionEvidence({
+      scenario: cliScenario,
+      versionKey: 'candidate',
+      expectations,
+      results: [observedCliResult(lifecycle), observedCliResult(observed)],
+    }).pass
+  );
+  const mutateSession = (mutate) => {
+    const session = structuredClone(observed.session);
+    mutate(session);
+    return { ...structuredClone(observed), session };
+  };
+  const mutateHooks = (mutate) => {
+    const hooks = structuredClone(observed.hooks);
+    mutate(hooks);
+    return { ...structuredClone(observed), hooks };
+  };
+  assert.equal(judgeCandidate(observed), true);
+  for (const [name, lifecycle] of Object.entries({
+    'declared row missing': mutateSession((session) => session.splice(9, 1)),
+    'declared row duplicated': mutateSession(
+      (session) => session.splice(9, 0, attachment('model')),
+    ),
+    'declared row moved': mutateSession((session) => {
+      const [environment] = session.splice(8, 1);
+      session.splice(5, 0, environment);
+    }),
+    'declared row renamed': mutateSession((session) => {
+      session[14] = attachment('deferred_tools_snapshot');
+    }),
+    'undeclared new attachment': mutateSession(
+      (session) => session.splice(5, 0, attachment('output_style_instructions')),
+    ),
+    'fold prompt hook missing': mutateHooks((hooks) => hooks.splice(9, 1)),
+    // An extra prompt hook on a turn other than the folded one is a
+    // different behaviour, even though the count matches.
+    'extra prompt hook on the first turn instead': mutateHooks((hooks) => {
+      hooks.splice(9, 1);
+      hooks.splice(1, 0, hook('UserPromptSubmit'));
+    }),
+    'second extra prompt hook': mutateHooks(
+      (hooks) => hooks.splice(9, 0, hook('UserPromptSubmit')),
+    ),
+  })) {
+    assert.equal(judgeCandidate(lifecycle), false, name);
+  }
+
+  // The rows are declared for 2.1.283 only: the same transcript attested as
+  // 2.1.220 fails, and a 2.1.220-shaped candidate fails the 2.1.283 entry.
+  assert.equal(judgeCandidate(observed, OLD_EXPECTATIONS), false);
+  assert.equal(evaluateMatrixVersionEvidence({
+    scenario: cliScenario,
+    versionKey: 'candidate',
+    expectations: CANDIDATE_EXPECTATIONS,
+    results: oldResults,
+  }).pass, false);
+
+  // A projected-compatible policy without a baseline id cannot be judged.
+  const anonymous = structuredClone(cliScenario);
+  delete anonymous.comparison.lifecycle.baselineId;
+  assert.equal(evaluateMatrixScenarioEvidence({
+    ...MANIFEST_EXPECTATIONS,
+    scenario: anonymous,
+    oldResults,
+    candidateResults,
+  }).pass, false);
+});
+
+test('positional insertion declarations are validated before any run', async () => {
+  const { expectationsFor } = await import(
+    '../scripts/spikes/claude-gate-matrix.mjs'
+  );
+  const declared = CANDIDATE_EXPECTATIONS.projectedInsertions['cli-contract-v1'];
+  for (const projectedInsertions of [
+    { 'cli-contract-v1': { session: [...declared.session].reverse() } },
+    { 'cli-contract-v1': { session: [] } },
+    { 'cli-contract-v1': { transcript: declared.session } },
+    { 'cli-contract-v1': { session: [{ index: -1, record: attachment('date') }] } },
+    { 'cli-contract-v1': { session: [{ index: 0, record: { type: 'unknown-row' } }] } },
+  ]) {
+    assert.throws(() => expectationsFor({
+      [CANDIDATE_VERSION]: { ...CANDIDATE_EXPECTATIONS, projectedInsertions },
+    }, CANDIDATE_VERSION), /malformed/);
+  }
+  assert.deepEqual(OLD_EXPECTATIONS.projectedInsertions, {});
+  // Every projected baseline the candidate declares rows for exists.
+  const baselineIds = manifest.scenarios
+    .map((scenario) => scenario.comparison?.lifecycle?.baselineId)
+    .filter(Boolean);
+  assert.deepEqual(baselineIds, [
+    'cli-contract-v1',
+    'workflow-direct-v1',
+    'workflow-fallback-v1',
+  ]);
+  for (const baselineId of Object.keys(CANDIDATE_EXPECTATIONS.projectedInsertions)) {
+    assert.ok(baselineIds.includes(baselineId), baselineId);
   }
 });
 

@@ -94,6 +94,7 @@ const EVIDENCE_SOURCE_REGISTRY = new Map([
 ]);
 const GATE_EXPECTATION_KEYS = [
   'delayedMcpModes',
+  'projectedInsertions',
   'resolvedOpus',
   'subagentTaskUpdated',
   'taskReminderInsertions',
@@ -108,9 +109,37 @@ const WORKFLOW_SIZE_GUIDELINES = new Set([
   'unrestricted',
 ]);
 
+const PROJECTED_INSERTION_STREAMS = new Set(['hooks', 'session']);
+
+function projectedInsertionsSchemaMatches(byBaseline) {
+  return (
+    byBaseline
+    && typeof byBaseline === 'object'
+    && !Array.isArray(byBaseline)
+    && Object.entries(byBaseline).every(([baselineId, streams]) => (
+      /^[a-z0-9-]+$/.test(baselineId)
+      && streams
+      && typeof streams === 'object'
+      && !Array.isArray(streams)
+      && Object.entries(streams).every(([stream, rows]) => (
+        PROJECTED_INSERTION_STREAMS.has(stream)
+        && Array.isArray(rows)
+        && rows.length > 0
+        && rows.every((row, index) => (
+          hasExactKeys(row, ['index', 'record'])
+          && isNonNegativeInteger(row.index)
+          && (index === 0 || row.index > rows[index - 1].index)
+          && normalizedGateLifecycleRecordSchemaMatches(row.record)
+        ))
+      ))
+    ))
+  );
+}
+
 export function gateExpectationsSchemaMatches(expectations) {
   return Boolean(
     hasExactKeys(expectations, GATE_EXPECTATION_KEYS)
+    && projectedInsertionsSchemaMatches(expectations.projectedInsertions)
     && typeof expectations.wrapperRequired === 'boolean'
     && hasExactKeys(expectations.delayedMcpModes, ['autoBackground', 'default'])
     && ['foreground', 'background'].includes(
@@ -900,9 +929,22 @@ function insertionEvidence({ result, policy, expectations }) {
   return { declarations, targetCounts };
 }
 
+// Rows a version adds at fixed positions of a projected baseline, such as
+// new session-start attachments or an extra UserPromptSubmit for a folded
+// prompt. Identical rows elsewhere in the stream (every turn has a
+// UserPromptSubmit) make count-based removal ambiguous, so these are pinned
+// by exact index and record. Positions refer to the version's projection
+// after the count-based insertions are removed.
+function positionalInsertionsFor(policy, expectations) {
+  if (!/^[a-z0-9-]+$/.test(policy?.baselineId || '')) return null;
+  return expectations.projectedInsertions[policy.baselineId] || {};
+}
+
 function adjustedProjectedLifecycle({ result, policy, expectations }) {
   const evidence = insertionEvidence({ result, policy, expectations });
   if (evidence === null) return null;
+  const positional = positionalInsertionsFor(policy, expectations);
+  if (positional === null) return null;
   const projection = projectLifecycle(result.lifecycle, policy);
   if (projection === null) return null;
   const adjusted = structuredClone(projection);
@@ -919,6 +961,17 @@ function adjustedProjectedLifecycle({ result, policy, expectations }) {
     for (const index of matchingIndices.reverse()) {
       adjusted[declaration.stream].splice(index, 1);
     }
+  }
+  for (const [stream, rows] of Object.entries(positional)) {
+    const records = adjusted[stream];
+    if (!Array.isArray(records)) return null;
+    if (rows.some(({ index, record }) => (
+      index >= records.length
+      || encoded(records[index]) !== encoded(record)
+    ))) {
+      return null;
+    }
+    for (const { index } of [...rows].reverse()) records.splice(index, 1);
   }
   return adjusted;
 }
