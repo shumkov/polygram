@@ -94,6 +94,7 @@ const EVIDENCE_SOURCE_REGISTRY = new Map([
 ]);
 const GATE_EXPECTATION_KEYS = [
   'delayedMcpModes',
+  'passiveSessionAttachmentCounts',
   'projectedInsertions',
   'resolvedOpus',
   'subagentTaskUpdated',
@@ -127,12 +128,8 @@ function projectedInsertionsSchemaMatches(byBaseline) {
         && rows.length > 0
         && rows.every((row, index) => (
           hasExactKeys(row, ['index', 'record'])
-          && insertionPositionsSchemaMatches(row.index)
-          && (
-            index === 0
-            || Math.min(...insertionPositions(row.index))
-              > Math.max(...insertionPositions(rows[index - 1].index))
-          )
+          && isNonNegativeInteger(row.index)
+          && (index === 0 || row.index > rows[index - 1].index)
           && normalizedGateLifecycleRecordSchemaMatches(row.record)
         ))
       ))
@@ -140,26 +137,24 @@ function projectedInsertionsSchemaMatches(byBaseline) {
   );
 }
 
-// A declared row sits at one exact index, or at either of two adjacent
-// indices when the version writes it in the same instant as its neighbour
-// and the two land in either order.
-function insertionPositions(index) {
-  return Array.isArray(index) ? index : [index];
-}
-
-function insertionPositionsSchemaMatches(index) {
-  if (isNonNegativeInteger(index)) return true;
+function passiveSessionAttachmentCountsSchemaMatches(counts) {
   return (
-    Array.isArray(index)
-    && index.length === 2
-    && index.every(isNonNegativeInteger)
-    && index[1] === index[0] + 1
+    counts
+    && typeof counts === 'object'
+    && !Array.isArray(counts)
+    && Object.entries(counts).every(([attachmentType, count]) => (
+      /^[a-z0-9_]+$/.test(attachmentType)
+      && isNonNegativeInteger(count)
+    ))
   );
 }
 
 export function gateExpectationsSchemaMatches(expectations) {
   return Boolean(
     hasExactKeys(expectations, GATE_EXPECTATION_KEYS)
+    && passiveSessionAttachmentCountsSchemaMatches(
+      expectations.passiveSessionAttachmentCounts,
+    )
     && projectedInsertionsSchemaMatches(expectations.projectedInsertions)
     && typeof expectations.wrapperRequired === 'boolean'
     && hasExactKeys(expectations.delayedMcpModes, ['autoBackground', 'default'])
@@ -378,6 +373,16 @@ export function buildClaudeMatrixRuns({
     if (!path.isAbsolute(binaries?.[versionKey] || '')) {
       throw new TypeError(`${versionKey} binary must be absolute`);
     }
+  }
+
+  const passiveTypes = ['old', 'candidate'].map((versionKey) => Object.keys(
+    expectationsFor(manifest.expectations, manifest.versions[versionKey])
+      .passiveSessionAttachmentCounts,
+  ).sort());
+  if (!isDeepStrictEqual(passiveTypes[0], passiveTypes[1])) {
+    throw new TypeError(
+      'both versions must declare counts for the same passive session attachments',
+    );
   }
 
   const runs = [];
@@ -950,12 +955,34 @@ function insertionEvidence({ result, policy, expectations }) {
   return { declarations, targetCounts };
 }
 
-// Rows a version adds at fixed positions of a projected baseline, such as
-// new session-start attachments or an extra UserPromptSubmit for a folded
-// prompt. Identical rows elsewhere in the stream (every turn has a
-// UserPromptSubmit) make count-based removal ambiguous, so these are pinned
-// by exact index and record. Positions refer to the version's projection
-// after the count-based insertions are removed.
+// Context attachments a version writes once per session transcript, such as
+// the date, model, and environment records. Claude writes them concurrently
+// with the first channel prompt, so their position races, but each type is
+// unique per session: every declared type must occur exactly its declared
+// count anywhere in the session stream and is then removed. They are passive
+// (no parser event is derived from them), so unlike the task-reminder and
+// cancellation insertions they need no removal proof. A type one version
+// declares with a positive count must be declared (usually as zero) by every
+// compared version, so an old transcript that grows one still fails.
+function removePassiveSessionAttachments(adjusted, expectations) {
+  const counts = expectations.passiveSessionAttachmentCounts;
+  if (Object.keys(counts).length === 0) return true;
+  if (!Array.isArray(adjusted.session)) return false;
+  for (const [attachmentType, expectedCount] of Object.entries(counts)) {
+    const matches = (record) => (
+      record?.type === 'attachment' && record.attachmentType === attachmentType
+    );
+    if (adjusted.session.filter(matches).length !== expectedCount) return false;
+    adjusted.session = adjusted.session.filter((record) => !matches(record));
+  }
+  return true;
+}
+
+// Rows a version adds at fixed positions of a projected baseline, such as an
+// extra UserPromptSubmit for a folded prompt. Identical rows elsewhere in the
+// stream (every turn has a UserPromptSubmit) make count-based removal
+// ambiguous, so these are pinned by exact index and record. Positions refer
+// to the version's projection after the count-based rows are removed.
 function positionalInsertionsFor(policy, expectations) {
   if (!/^[a-z0-9-]+$/.test(policy?.baselineId || '')) return null;
   return expectations.projectedInsertions[policy.baselineId] || {};
@@ -983,21 +1010,17 @@ function adjustedProjectedLifecycle({ result, policy, expectations }) {
       adjusted[declaration.stream].splice(index, 1);
     }
   }
+  if (!removePassiveSessionAttachments(adjusted, expectations)) return null;
   for (const [stream, rows] of Object.entries(positional)) {
     const records = adjusted[stream];
     if (!Array.isArray(records)) return null;
-    const chosen = [];
-    for (const { index, record } of rows) {
-      // The first allowed position holding the record is removed; a copy at
-      // the other position stays behind and fails the baseline comparison.
-      const position = insertionPositions(index).find((candidate) => (
-        candidate < records.length
-        && encoded(records[candidate]) === encoded(record)
-      ));
-      if (position === undefined) return null;
-      chosen.push(position);
+    if (rows.some(({ index, record }) => (
+      index >= records.length
+      || encoded(records[index]) !== encoded(record)
+    ))) {
+      return null;
     }
-    for (const position of chosen.reverse()) records.splice(position, 1);
+    for (const { index } of [...rows].reverse()) records.splice(index, 1);
   }
   return adjusted;
 }

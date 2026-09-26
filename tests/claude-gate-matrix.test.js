@@ -283,6 +283,16 @@ function matrixResult(lifecycle, { taskReminder = false } = {}) {
 // authoritative 2.1.220 -> 2.1.283 run: five attachments before the first
 // enqueue, environment and model right after the first channel prompt, and
 // deferred_tools_record after the first turn's context attachments.
+const CONTEXT_ATTACHMENTS_283 = [
+  'instructions',
+  'session_context',
+  'date',
+  'credential_org',
+  'remote_session_change',
+  'environment',
+  'model',
+  'deferred_tools_record',
+];
 const SESSION_START_ATTACHMENTS_283 = [
   'instructions',
   'session_context',
@@ -592,6 +602,10 @@ test('every compared CLI version has reviewed per-version expectations', async (
       taskReminderInsertions: 1,
       resolvedOpus: 'claude-opus-5',
       workflowSizeGuideline: 'medium',
+      // 2.1.220 writes none of 2.1.283's per-session context attachments.
+      passiveSessionAttachmentCounts: Object.fromEntries(
+        CONTEXT_ATTACHMENTS_283.map((type) => [type, 0]),
+      ),
       projectedInsertions: {},
     },
   );
@@ -2923,8 +2937,10 @@ test('CLI lifecycle comparison accepts only a proved interrupt-correlated cancel
   }
 });
 
-// The projected CLI-contract sequences both authoritative 2.1.283 runs
-// produced, identical to each other (total_tokens_reminder already excluded).
+// The projected CLI-contract session sequence of an authoritative 2.1.283
+// run (total_tokens_reminder already excluded). In other runs the five
+// context records before the first enqueue land after the first channel
+// prompt instead, because Claude writes them while that prompt arrives.
 const OBSERVED_CLI_SESSION_283 = [
   'a:instructions', 'a:session_context', 'a:date', 'a:credential_org',
   'a:remote_session_change', 'q:enqueue', 'q:dequeue', 'u:root',
@@ -2938,6 +2954,11 @@ const OBSERVED_CLI_SESSION_283 = [
   'q:dequeue', 'u:child', 's:stop_hook_summary', 's:turn_duration',
   'q:enqueue', 'q:dequeue', 'u:child', 's:stop_hook_summary',
   's:turn_duration',
+];
+const OBSERVED_CLI_SESSION_283_LATE_CONTEXT = [
+  ...OBSERVED_CLI_SESSION_283.slice(5, 8),
+  ...OBSERVED_CLI_SESSION_283.slice(0, 5),
+  ...OBSERVED_CLI_SESSION_283.slice(8),
 ];
 const OBSERVED_CLI_HOOKS_283 = [
   'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop',
@@ -2967,18 +2988,22 @@ function observedCliResult({ session, hooks }) {
   return matrixResult({ session, hooks }, { taskReminder: true });
 }
 
-test('2.1.283 CLI-contract rows are accepted only as declared, at their observed positions', async () => {
+test('2.1.283 context attachments count once each in either observed order', async () => {
   const {
     evaluateMatrixScenarioEvidence,
     evaluateMatrixVersionEvidence,
   } = await import('../scripts/spikes/claude-gate-matrix.mjs');
   const cliScenario = manifest.scenarios.find(({ id }) => id === 'cli-contract');
-  const observed = {
+  const hooks = observedHooks(OBSERVED_CLI_HOOKS_283);
+  const early = {
     session: OBSERVED_CLI_SESSION_283.map(decodeObservedSession),
-    hooks: observedHooks(OBSERVED_CLI_HOOKS_283),
+    hooks,
   };
-  // The fixtures used elsewhere reproduce the observed projection; the
-  // count-removed task_reminder is the only row whose position may differ.
+  const late = {
+    session: OBSERVED_CLI_SESSION_283_LATE_CONTEXT.map(decodeObservedSession),
+    hooks,
+  };
+  assert.equal(OBSERVED_CLI_HOOKS_283.length, CLI_TRANSPORT_HOOKS.length + 1);
   const withoutReminder = (session) => session.filter(
     (record) => record.attachmentType !== 'task_reminder',
   );
@@ -2987,17 +3012,15 @@ test('2.1.283 CLI-contract rows are accepted only as declared, at their observed
       (record) => record.type !== 'assistant'
         && !(record.type === 'user' && !record.originKind),
     )),
-    withoutReminder(observed.session),
+    withoutReminder(early.session),
   );
-  assert.equal(OBSERVED_CLI_HOOKS_283.length, CLI_TRANSPORT_HOOKS.length + 1);
 
-  const candidateResults = [observedCliResult(observed), observedCliResult(observed)];
   const oldResults = [CLI_LIFECYCLE_FIXTURES.old1, CLI_LIFECYCLE_FIXTURES.old2];
   const outcome = evaluateMatrixScenarioEvidence({
     ...MANIFEST_EXPECTATIONS,
     scenario: cliScenario,
     oldResults,
-    candidateResults,
+    candidateResults: [observedCliResult(early), observedCliResult(late)],
   });
   assert.equal(outcome.pass, true);
   assert.ok(outcome.comparisons.every((comparison) => comparison.pass));
@@ -3007,57 +3030,69 @@ test('2.1.283 CLI-contract rows are accepted only as declared, at their observed
       scenario: cliScenario,
       versionKey: 'candidate',
       expectations,
-      results: [observedCliResult(lifecycle), observedCliResult(observed)],
+      results: [observedCliResult(lifecycle), observedCliResult(early)],
     }).pass
   );
-  const mutateSession = (mutate) => {
-    const session = structuredClone(observed.session);
-    mutate(session);
-    return { ...structuredClone(observed), session };
+  const mutate = (base, stream, change) => {
+    const copy = structuredClone(base);
+    change(copy[stream]);
+    return copy;
   };
-  const mutateHooks = (mutate) => {
-    const hooks = structuredClone(observed.hooks);
-    mutate(hooks);
-    return { ...structuredClone(observed), hooks };
-  };
-  assert.equal(judgeCandidate(observed), true);
-  for (const [name, lifecycle] of Object.entries({
-    'declared row missing': mutateSession((session) => session.splice(9, 1)),
-    'declared row duplicated': mutateSession(
-      (session) => session.splice(9, 0, attachment('model')),
-    ),
-    'declared row moved': mutateSession((session) => {
-      const [environment] = session.splice(8, 1);
-      session.splice(5, 0, environment);
-    }),
-    'declared row renamed': mutateSession((session) => {
-      session[14] = attachment('deferred_tools_snapshot');
-    }),
-    'undeclared new attachment': mutateSession(
-      (session) => session.splice(5, 0, attachment('output_style_instructions')),
-    ),
-    'fold prompt hook missing': mutateHooks((hooks) => hooks.splice(9, 1)),
-    // An extra prompt hook on a turn other than the folded one is a
-    // different behaviour, even though the count matches.
-    'extra prompt hook on the first turn instead': mutateHooks((hooks) => {
-      hooks.splice(9, 1);
-      hooks.splice(1, 0, hook('UserPromptSubmit'));
-    }),
-    'second extra prompt hook': mutateHooks(
-      (hooks) => hooks.splice(9, 0, hook('UserPromptSubmit')),
-    ),
-  })) {
-    assert.equal(judgeCandidate(lifecycle), false, name);
+  const at = (session, type) => session.findIndex(
+    (record) => record.attachmentType === type,
+  );
+  assert.equal(judgeCandidate(late), true);
+  for (const base of [early, late]) {
+    for (const [name, lifecycle] of Object.entries({
+      'context row missing': mutate(base, 'session', (session) => {
+        session.splice(at(session, 'model'), 1);
+      }),
+      'context row duplicated': mutate(base, 'session', (session) => {
+        session.push(attachment('date'));
+      }),
+      'context row renamed': mutate(base, 'session', (session) => {
+        session[at(session, 'deferred_tools_record')] =
+          attachment('deferred_tools_snapshot');
+      }),
+      'undeclared new attachment': mutate(base, 'session', (session) => {
+        session.splice(1, 0, attachment('output_style_instructions'));
+      }),
+      'non-context rows reordered': mutate(base, 'session', (session) => {
+        const skill = at(session, 'skill_listing');
+        [session[skill - 1], session[skill]] = [session[skill], session[skill - 1]];
+      }),
+      'fold prompt hook missing': mutate(base, 'hooks', (list) => list.splice(9, 1)),
+      // An extra prompt hook on a turn other than the folded one is a
+      // different behaviour, even though the count matches.
+      'extra prompt hook on the first turn instead': mutate(base, 'hooks', (list) => {
+        list.splice(9, 1);
+        list.splice(1, 0, hook('UserPromptSubmit'));
+      }),
+      'second extra prompt hook': mutate(base, 'hooks', (list) => {
+        list.splice(9, 0, hook('UserPromptSubmit'));
+      }),
+    })) {
+      assert.equal(judgeCandidate(lifecycle), false, name);
+    }
   }
 
   // The rows are declared for 2.1.283 only: the same transcript attested as
-  // 2.1.220 fails, and a 2.1.220-shaped candidate fails the 2.1.283 entry.
-  assert.equal(judgeCandidate(observed, OLD_EXPECTATIONS), false);
+  // 2.1.220 fails, and a 2.1.220 transcript fails the 2.1.283 entry.
+  assert.equal(judgeCandidate(early, OLD_EXPECTATIONS), false);
   assert.equal(evaluateMatrixVersionEvidence({
     scenario: cliScenario,
     versionKey: 'candidate',
     expectations: CANDIDATE_EXPECTATIONS,
     results: oldResults,
+  }).pass, false);
+  const oldWithContext = withSessionRecords(CLI_LIFECYCLE_FIXTURES.old2, (session) => {
+    session.unshift(attachment('date'));
+  });
+  assert.equal(evaluateMatrixVersionEvidence({
+    scenario: cliScenario,
+    versionKey: 'old',
+    expectations: OLD_EXPECTATIONS,
+    results: [CLI_LIFECYCLE_FIXTURES.old1, oldWithContext],
   }).pass, false);
 
   // A projected-compatible policy without a baseline id cannot be judged.
@@ -3067,29 +3102,21 @@ test('2.1.283 CLI-contract rows are accepted only as declared, at their observed
     ...MANIFEST_EXPECTATIONS,
     scenario: anonymous,
     oldResults,
-    candidateResults,
+    candidateResults: [observedCliResult(early), observedCliResult(late)],
   }).pass, false);
 });
 
-test('2.1.283 Workflow accepts deferred_tools_record on either side of command_permissions only', async () => {
+test('2.1.283 Workflow accepts its context attachments in either observed order', async () => {
   const {
     evaluateMatrixScenarioEvidence,
     evaluateMatrixVersionEvidence,
     nestedWorkflowLifecycleMatches,
   } = await import('../scripts/spikes/claude-gate-matrix.mjs');
-  // Both orders were observed across six real 2.1.283 runs: the two passive
-  // attachments are written in the same instant and land in either order.
+  // Six real 2.1.283 runs wrote deferred_tools_record on either side of
+  // command_permissions, and the session-start records race the first prompt.
   const indexOf = (session, type) => session.findIndex(
     (record) => record.attachmentType === type,
   );
-  const withSession = (result, mutate) => {
-    const copy = structuredClone(result);
-    mutate(copy.lifecycle.session);
-    copy.lifecycleSources.session.rawRecordCount = copy.lifecycle.session.length;
-    copy.lifecycleSources.session.normalizedRecordCount =
-      copy.lifecycle.session.length;
-    return copy;
-  };
   for (const deliveryMode of ['direct', 'fallback']) {
     const scenario = manifest.scenarios.find(
       ({ id }) => id === `workflow-${deliveryMode}`,
@@ -3098,16 +3125,14 @@ test('2.1.283 Workflow accepts deferred_tools_record on either side of command_p
       workflowLifecycleFixture({ deliveryMode, bashPairs: 2, subagentStops: 3 }),
       { recordAfter: 'skill_listing' },
     ), deliveryMode);
-    const permissionsFirst = withSession(recordFirst, (session) => {
+    const permissionsFirst = withSessionRecords(recordFirst, (session) => {
       const record = indexOf(session, 'deferred_tools_record');
       [session[record], session[record + 1]] = [session[record + 1], session[record]];
     });
-    const order = (result) => result.lifecycle.session
-      .filter((record) => ['deferred_tools_record', 'command_permissions']
-        .includes(record.attachmentType))
-      .map((record) => record.attachmentType);
-    assert.deepEqual(order(recordFirst), ['deferred_tools_record', 'command_permissions']);
-    assert.deepEqual(order(permissionsFirst), ['command_permissions', 'deferred_tools_record']);
+    const lateContext = withSessionRecords(permissionsFirst, (session) => {
+      const context = session.splice(0, 5);
+      session.splice(indexOf(session, 'environment'), 0, ...context);
+    });
 
     const judge = (result) => evaluateMatrixVersionEvidence({
       scenario,
@@ -3115,8 +3140,9 @@ test('2.1.283 Workflow accepts deferred_tools_record on either side of command_p
       expectations: CANDIDATE_EXPECTATIONS,
       results: [result],
     }).pass;
-    assert.equal(judge(recordFirst), true);
-    assert.equal(judge(permissionsFirst), true);
+    for (const result of [recordFirst, permissionsFirst, lateContext]) {
+      assert.equal(judge(result), true);
+    }
     assert.equal(evaluateMatrixScenarioEvidence({
       ...MANIFEST_EXPECTATIONS,
       scenario,
@@ -3125,7 +3151,7 @@ test('2.1.283 Workflow accepts deferred_tools_record on either side of command_p
         bashPairs: 2,
         subagentStops: 3,
       }), deliveryMode)],
-      candidateResults: [permissionsFirst],
+      candidateResults: [lateContext],
     }).pass, true);
     if (deliveryMode === 'direct') {
       assert.equal(nestedWorkflowLifecycleMatches({
@@ -3135,81 +3161,84 @@ test('2.1.283 Workflow accepts deferred_tools_record on either side of command_p
       }), true);
     }
 
-    for (const [name, mutate] of Object.entries({
+    for (const [name, change] of Object.entries({
       missing: (session) => {
         session.splice(indexOf(session, 'deferred_tools_record'), 1);
       },
-      'duplicated on both sides': (session) => {
-        session.splice(
-          indexOf(session, 'command_permissions') + 1,
-          0,
-          attachment('deferred_tools_record'),
-        );
+      duplicated: (session) => {
+        session.push(attachment('deferred_tools_record'));
       },
-      'after the turn boundary': (session) => {
-        const [record] = session.splice(indexOf(session, 'deferred_tools_record'), 1);
-        session.splice(indexOf(session, 'command_permissions') + 2, 0, record);
-      },
-      'before skill_listing': (session) => {
-        const [record] = session.splice(indexOf(session, 'deferred_tools_record'), 1);
-        session.splice(indexOf(session, 'skill_listing'), 0, record);
-      },
-      'another adjacent pair swapped': (session) => {
+      'non-context rows reordered': (session) => {
         const skill = indexOf(session, 'skill_listing');
         [session[skill - 1], session[skill]] = [session[skill], session[skill - 1]];
       },
+      'command_permissions moved': (session) => {
+        const [permissions] = session.splice(indexOf(session, 'command_permissions'), 1);
+        session.splice(indexOf(session, 'skill_listing'), 0, permissions);
+      },
     })) {
       for (const base of [recordFirst, permissionsFirst]) {
-        assert.equal(judge(withSession(base, mutate)), false, `${deliveryMode}: ${name}`);
+        assert.equal(
+          judge(withSessionRecords(base, change)),
+          false,
+          `${deliveryMode}: ${name}`,
+        );
       }
     }
   }
-
-  // The CLI contract has no such race, so its row stays exact.
-  const cliScenario = manifest.scenarios.find(({ id }) => id === 'cli-contract');
-  const swappedCli = structuredClone(CLI_LIFECYCLE_FIXTURES.candidate1);
-  const session = swappedCli.lifecycle.session;
-  const record = indexOf(session, 'deferred_tools_record');
-  [session[record], session[record + 1]] = [session[record + 1], session[record]];
-  assert.equal(evaluateMatrixVersionEvidence({
-    scenario: cliScenario,
-    versionKey: 'candidate',
-    expectations: CANDIDATE_EXPECTATIONS,
-    results: [CLI_LIFECYCLE_FIXTURES.candidate1, swappedCli],
-  }).pass, false);
 });
 
-test('positional insertion declarations are validated before any run', async () => {
-  const { expectationsFor } = await import(
-    '../scripts/spikes/claude-gate-matrix.mjs'
-  );
+test('context-count and positional declarations are validated before any run', async () => {
+  const {
+    buildClaudeMatrixRuns,
+    expectationsFor,
+  } = await import('../scripts/spikes/claude-gate-matrix.mjs');
   const declared = CANDIDATE_EXPECTATIONS.projectedInsertions['cli-contract-v1'];
   for (const projectedInsertions of [
-    { 'cli-contract-v1': { session: [...declared.session].reverse() } },
-    { 'cli-contract-v1': { session: [] } },
-    { 'cli-contract-v1': { transcript: declared.session } },
-    { 'cli-contract-v1': { session: [{ index: -1, record: attachment('date') }] } },
-    // A position choice is bounded to two adjacent indices after the
-    // previous declared row.
-    { 'cli-contract-v1': { session: [{ index: [14, 16], record: attachment('date') }] } },
-    { 'cli-contract-v1': { session: [{ index: [14, 15, 16], record: attachment('date') }] } },
-    { 'cli-contract-v1': { session: [{ index: [15, 14], record: attachment('date') }] } },
-    {
-      'cli-contract-v1': {
-        session: [
-          { index: [3, 4], record: attachment('date') },
-          { index: 4, record: attachment('model') },
-        ],
-      },
-    },
+    { 'cli-contract-v1': { hooks: [...declared.hooks, ...declared.hooks] } },
+    { 'cli-contract-v1': { hooks: [] } },
+    { 'cli-contract-v1': { transcript: declared.hooks } },
+    { 'cli-contract-v1': { hooks: [{ index: -1, record: hook('UserPromptSubmit') }] } },
+    { 'cli-contract-v1': { hooks: [{ index: [9, 10], record: hook('UserPromptSubmit') }] } },
     { 'cli-contract-v1': { session: [{ index: 0, record: { type: 'unknown-row' } }] } },
   ]) {
     assert.throws(() => expectationsFor({
       [CANDIDATE_VERSION]: { ...CANDIDATE_EXPECTATIONS, projectedInsertions },
     }, CANDIDATE_VERSION), /malformed/);
   }
+  for (const passiveSessionAttachmentCounts of [
+    { date: -1 },
+    { date: 1.5 },
+    { 'Date Record': 1 },
+    [],
+  ]) {
+    assert.throws(() => expectationsFor({
+      [CANDIDATE_VERSION]: {
+        ...CANDIDATE_EXPECTATIONS,
+        passiveSessionAttachmentCounts,
+      },
+    }, CANDIDATE_VERSION), /malformed/);
+  }
+  assert.deepEqual(
+    CANDIDATE_EXPECTATIONS.passiveSessionAttachmentCounts,
+    Object.fromEntries(CONTEXT_ATTACHMENTS_283.map((type) => [type, 1])),
+  );
   assert.deepEqual(OLD_EXPECTATIONS.projectedInsertions, {});
-  // Every projected baseline the candidate declares rows for exists.
+
+  // A type counted for one version must be counted (as zero) for the other.
+  const onlyCandidate = structuredClone(manifest);
+  delete onlyCandidate.expectations[OLD_VERSION]
+    .passiveSessionAttachmentCounts.model;
+  assert.throws(() => buildClaudeMatrixRuns({
+    manifest: onlyCandidate,
+    binaries: {
+      old: '/private/bin/claude-old',
+      candidate: '/private/bin/claude-candidate',
+    },
+    artifactBaseDir: '/private/artifacts',
+    runPrefix: 'passive-types',
+  }), /same passive session attachments/);
+
   const baselineIds = manifest.scenarios
     .map((scenario) => scenario.comparison?.lifecycle?.baselineId)
     .filter(Boolean);

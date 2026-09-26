@@ -106,21 +106,21 @@ session-pivotal projection leaves out `total_tokens_reminder` attachments:
 the service injects these context-usage reminders a varying number of times
 even on an unchanged binary, and nothing downstream reads them. Every other
 attachment stays pivotal.
-Rows a version adds at fixed places in a baseline are declared under that
-version's `projectedInsertions`, keyed by the policy's `baselineId`, as exact
-index and record pairs. Identical rows elsewhere (every turn has a
-`UserPromptSubmit`) make count-based removal ambiguous, so each declared row
-must sit at exactly its index before it is removed; a missing, moved, renamed,
-duplicated, or undeclared row fails. A row the CLI writes in the same instant as
-its neighbour may instead declare two adjacent indices (`[14, 15]`) and is
-accepted at either one only; any other reordering still fails. `2.1.283` declares its five session-start
-attachments, `environment` and `model` after the first prompt,
-`deferred_tools_record` after the first turn's context attachments, and the
-`UserPromptSubmit` it now fires for the prompt folded into the third CLI turn.
-`2.1.220` declares none. The CLI rows were observed in an authoritative run.
-In six Workflow runs, `deferred_tools_record` and `command_permissions` landed
-in either order, so the Workflow baselines accept the record on either side of
-`command_permissions`; the CLI contract keeps one exact index. Each run may then
+Context attachments a version writes once per session are declared under
+that version's `passiveSessionAttachmentCounts`: each type must occur exactly
+its declared count anywhere in the session stream and is then removed, so a
+missing, duplicated, or renamed record fails while its racy position does not.
+Both versions must count the same types. `2.1.283` counts `instructions`,
+`session_context`, `date`, `credential_org`, `remote_session_change`,
+`environment`, `model`, and `deferred_tools_record` once each; Claude writes
+them while the first channel prompt arrives, so real runs place them before
+or after it. `2.1.220` counts each as zero. These rows are passive (no parser
+event comes from them), so they need no removal proof.
+Rows that are identical to others elsewhere in a stream are instead declared
+under `projectedInsertions`, keyed by the policy's `baselineId`, as exact
+index and record pairs that must sit at exactly that index before removal.
+`2.1.283` declares the `UserPromptSubmit` it now fires for the prompt folded
+into the third CLI turn; `2.1.220` declares none. Each run may then
 remove exactly the number of reviewed `task_reminder` rows its version declares
 (one on both `2.1.220` and `2.1.283`); either version may also remove at most
 one interrupt-correlated `hook_cancelled`. One source-bound composite proof must
