@@ -73,12 +73,15 @@ The matrix covers:
   inherited value, applies only the manifest's opt-in (which must be common
   to both sides), derives each driver's `--expected-mode` from the attested
   version's expectations, and correlates the task/tool-use lifecycle. A
-  version may declare the opt-in path `known-regression` with a one-line
-  reason: that cell is not scheduled, and every matrix summary lists it under
-  `knownRegressions`; acceptance requires that exact list plus every other
-  cell. `2.1.283` does so, because with the opt-in the backgrounded task fails
-  and retries report an interrupted tool call. Production never sets the
-  opt-in, so the default path stays gated and can never be waived;
+  version may waive the opt-in path, with a required one-line reason, as
+  `known-regression` (a deterministic upstream failure) or `not-gated` (too
+  unreliable to gate). A waived cell is not scheduled, and every matrix
+  summary lists it under `waivedCells`; acceptance requires that exact list
+  plus every other cell. Both pinned versions waive it: `2.1.283` fails the
+  backgrounded task deterministically, and on `2.1.220` Sonnet 4.6 sometimes
+  answers the completion notification with thinking only. Production never
+  sets the opt-in, so the default path runs on both versions and can never be
+  waived;
 - SDK PostToolBatch, subagent attribution, resume, compaction, and
   tool-less completion;
 - worker-wrapper provenance on both sides and the separate Opus 5.5

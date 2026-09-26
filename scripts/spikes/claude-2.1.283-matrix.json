@@ -9,8 +9,9 @@
     "2.1.220": {
       "wrapperRequired": true,
       "delayedMcpModes": {
-        "autoBackground": "background",
-        "default": "foreground"
+        "autoBackground": "not-gated",
+        "default": "foreground",
+        "waiverReason": "opt-in path unused in production; Sonnet 4.6 intermittently answers the completion notification with thinking only (~30%)"
       },
       "passiveSessionAttachmentCounts": {
         "instructions": 0,
@@ -38,7 +39,7 @@
       "delayedMcpModes": {
         "autoBackground": "known-regression",
         "default": "foreground",
-        "knownRegressionReason": "with CLAUDE_AUTO_BACKGROUND_TASKS=1 the backgrounded delayed MCP task fails and retries report the tool call interrupted; production never sets the opt-in, and the default path is gated by delayed-mcp-foreground"
+        "waiverReason": "with CLAUDE_AUTO_BACKGROUND_TASKS=1 the backgrounded delayed MCP task fails and retries report the tool call interrupted; production never sets the opt-in, and the default path is gated by delayed-mcp-foreground"
       },
       "passiveSessionAttachmentCounts": {
         "instructions": 1,

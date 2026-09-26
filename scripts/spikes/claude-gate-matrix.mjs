@@ -137,29 +137,29 @@ function projectedInsertionsSchemaMatches(byBaseline) {
   );
 }
 
-// The opt-in auto-background path may be declared a known upstream
-// regression, with a reason, so it is reported instead of run. The default
-// path is what production runs and must always be gated.
-const KNOWN_REGRESSION = 'known-regression';
+// The opt-in auto-background path may be waived per version, with a reason,
+// so it is reported instead of run: `known-regression` for a deterministic
+// upstream failure, `not-gated` for a path that is too unreliable to gate and
+// that production does not use. The default path is what production runs and
+// can never be waived.
+const DELAYED_MCP_WAIVERS = new Set(['known-regression', 'not-gated']);
 
 function delayedMcpModesSchemaMatches(modes) {
-  const knownRegression = modes?.autoBackground === KNOWN_REGRESSION;
+  const waived = DELAYED_MCP_WAIVERS.has(modes?.autoBackground);
   return (
     hasExactKeys(
       modes,
-      knownRegression
-        ? ['autoBackground', 'default', 'knownRegressionReason']
+      waived
+        ? ['autoBackground', 'default', 'waiverReason']
         : ['autoBackground', 'default'],
     )
-    && ['foreground', 'background', KNOWN_REGRESSION].includes(
-      modes.autoBackground,
-    )
+    && (waived || ['foreground', 'background'].includes(modes.autoBackground))
     && ['foreground', 'background'].includes(modes.default)
     && (
-      !knownRegression
+      !waived
       || (
-        typeof modes.knownRegressionReason === 'string'
-        && modes.knownRegressionReason.trim().length > 0
+        typeof modes.waiverReason === 'string'
+        && modes.waiverReason.trim().length > 0
       )
     )
   );
@@ -378,31 +378,29 @@ function versionSpecificLifecycleMatches(
   }
 }
 
-// Cells a version declares as known upstream regressions are not scheduled;
-// every authoritative summary lists them so they are never silently dropped.
-export function matrixKnownRegressions(manifest) {
-  const regressions = [];
+// Cells a version waives are not scheduled; every authoritative summary lists
+// them with the waiver and reason so they are never silently dropped.
+export function matrixWaivedCells(manifest) {
+  const waived = [];
   for (const versionKey of ['old', 'candidate']) {
     const version = manifest.versions[versionKey];
     const expectations = expectationsFor(manifest.expectations, version);
     for (const scenario of manifest.scenarios) {
       if (versionKey === 'old' && scenario.candidateOnly) continue;
-      if (
-        DELAYED_MCP_SCENARIOS.has(scenario.id)
-        && expectedDelayedMcpMode(
-          expectations,
-          delayedMcpAutoBackground(scenario),
-        ) === KNOWN_REGRESSION
-      ) {
-        regressions.push({
+      const mode = DELAYED_MCP_SCENARIOS.has(scenario.id)
+        ? expectedDelayedMcpMode(expectations, delayedMcpAutoBackground(scenario))
+        : null;
+      if (DELAYED_MCP_WAIVERS.has(mode)) {
+        waived.push({
           id: `${versionKey}:${scenario.id}`,
           version,
-          reason: expectations.delayedMcpModes.knownRegressionReason,
+          waiver: mode,
+          reason: expectations.delayedMcpModes.waiverReason,
         });
       }
     }
   }
-  return regressions;
+  return waived;
 }
 
 export function buildClaudeMatrixRuns({
@@ -475,7 +473,7 @@ export function buildClaudeMatrixRuns({
           delayedMcpAutoBackground(scenario),
         )
         : null;
-      if (delayedMcpMode === KNOWN_REGRESSION) continue;
+      if (DELAYED_MCP_WAIVERS.has(delayedMcpMode)) continue;
       const versionSpecificLifecycleOracle =
         VERSION_SPECIFIC_LIFECYCLE_ORACLES.get(scenario.id);
       if (
@@ -2642,7 +2640,7 @@ export function purgeAcceptedGateArtifacts({
   expectedRuns,
   expectedScenarios,
   expectedManifestSha256,
-  expectedKnownRegressions = [],
+  expectedWaivedCells = [],
   claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects'),
 }) {
   assertSafeRunPrefix(runPrefix);
@@ -2655,7 +2653,7 @@ export function purgeAcceptedGateArtifacts({
     'completedRunCount',
     'expectedAuthoritativeRunCount',
     'failCount',
-    'knownRegressions',
+    'waivedCells',
     'manifestSha256',
     'maxBridgeReadyToMcpReadyMs',
     'notApplicableCount',
@@ -2680,11 +2678,11 @@ export function purgeAcceptedGateArtifacts({
     'runId',
     'status',
   ];
-  const knownRegressionList = Array.isArray(expectedKnownRegressions)
-    ? expectedKnownRegressions
+  const waivedCellList = Array.isArray(expectedWaivedCells)
+    ? expectedWaivedCells
     : [];
   const authoritativeRunCount =
-    AUTHORITATIVE_RUN_COUNT - knownRegressionList.length;
+    AUTHORITATIVE_RUN_COUNT - waivedCellList.length;
   const expectedRunList = Array.isArray(expectedRuns) ? expectedRuns : [];
   const expectedIds = expectedRunList.map((run) => run?.id);
   const expectedRunIds = expectedRunList.map(
@@ -2758,8 +2756,8 @@ export function purgeAcceptedGateArtifacts({
   if (
     !hasExactKeys(summary, expectedSummaryKeys)
     || summary.schemaVersion !== 1
-    || !Array.isArray(expectedKnownRegressions)
-    || !isDeepStrictEqual(summary.knownRegressions, expectedKnownRegressions)
+    || !Array.isArray(expectedWaivedCells)
+    || !isDeepStrictEqual(summary.waivedCells, expectedWaivedCells)
     || summary?.authoritative !== true
     || summary?.status !== 'PASS'
     || summary?.runPrefix !== runPrefix
