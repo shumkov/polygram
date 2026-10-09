@@ -9,6 +9,8 @@
       "_comment_adminChatId": "Required when allowConfigCommands is true for pairing commands (/pair-code, /pairings, /unpair) to work. These grant cross-chat trust and are gated to the admin chat only.",
       "adminChatId": "123456789",
       "needsToken": false,
+      "_comment_claudeCliAuthSource": "native (default) checks the host Claude login before CLI turns. Set external only when the configured session launcher supplies proxy credentials. SDK retains native checks; Codex is unaffected. Requires a verified pinned CLI and an absolute session launcher. Restart after changes; restore native when disabling proxy routing.",
+      "claudeCliAuthSource": "native",
       "_comment_stream": "Streaming is always on. `streamMinChars` sets the initial-send debounce (default 30) — short responses below that stay idle until the final result. `streamThrottleMs` sets the edit cadence (default 1000ms, min 250).",
       "streamMinChars": 30,
       "streamThrottleMs": 1000,

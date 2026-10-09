@@ -61,6 +61,12 @@ const { filterAttachments, resolveFileCaps, resolveMaxFileOverride, MAX_TOTAL_BY
 const { ProcessManager } = require('@shumkov/orchestra');
 const { createProcessFactory, pickBackend } = require('@shumkov/orchestra');
 const { checkClaudeAuthHealth } = require('@shumkov/orchestra').claudeBin;
+const {
+  validateClaudeCliAuthSource,
+  needsNativeClaudeAuth,
+  hasNativeClaudeRuntime,
+  assertExternalClaudeCliReady,
+} = require('./lib/ops/claude-auth-health');
 const { extractAssistantText } = require('@shumkov/orchestra');
 // 0.11.0: channels backend tool dispatcher — adapts CliProcess's reply
 // tool callback into polygram's existing chunkText + deliverReplies primitives.
@@ -1411,7 +1417,7 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
     cmdUser, cmdUserId, label, sendReply,
   })) return;
 
-  // Claude-auth gate: if the CLI login has expired, every claude turn wedges
+  // Claude-auth gate: if the native CLI login has expired, its turns wedge
   // INVISIBLY — the 401 fires inside the subprocess, never reaches the
   // classifier, and the turn degrades to a silent "⏱ went quiet" across every
   // topic. Refuse up-front with a clear message + a loud log instead of
@@ -1424,7 +1430,9 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
   // read, and a token can expire between an original dispatch and its later
   // redelivery, so skipping it there would silently re-wedge exactly the
   // messages most likely to hit an expired-auth window (post-restart backlog).
-  if (selectedInboundProvider === 'claude') {
+  // An externally authenticated CLI uses its launcher's credentials instead;
+  // the host login says nothing about that route. SDK retains its native check.
+  if (needsNativeClaudeAuth(config.bot, selectedBackend)) {
     let auth;
     try {
       auth = checkClaudeAuthHealth();
@@ -3634,6 +3642,7 @@ async function main() {
     // `= config.bots[BOT_NAME]` silently dropped top-level shared fields and
     // orphaned apiRoot (both bots ran on cloud, not the 2GB local server).
     config.bot = activeBotConfig(config, BOT_NAME);
+    validateClaudeCliAuthSource(config.bot);
   } catch (err) {
     console.error(`[fatal] ${err.message}`);
     process.exit(2);
@@ -3929,18 +3938,19 @@ async function main() {
 
   // Claude-auth health monitor — a FREE credentials-file check (no API call, no
   // model spawn). An expired refresh token makes the CLI 401 silently and wedges
-  // every channels turn; the handleMessage gate refuses turns + tells the user,
+  // native CLI turns; the handleMessage gate refuses turns + tells the user,
   // and this surfaces the same state loudly in the operator logs at boot + every
   // 30 min, warning a few days ahead so re-login happens before it breaks.
   const runAuthCheck = (trigger) => {
     try {
+      if (!hasNativeClaudeRuntime(config)) return;
       const auth = checkClaudeAuthHealth();
       const expIso = auth.refreshTokenExpiresAt ? new Date(auth.refreshTokenExpiresAt).toISOString() : 'n/a';
       if (auth.state === 'expired') {
-        console.error(`[auth] (${trigger}) Claude login EXPIRED (refresh token ${expIso}) — turns are being refused; re-login on the host.`);
+        console.error(`[auth] (${trigger}) Native Claude login EXPIRED (refresh token ${expIso}) — native-auth turns are being refused; re-login on the host.`);
         logEvent('auth-expired', { source: 'monitor', trigger, refresh_token_expires_at: auth.refreshTokenExpiresAt });
       } else if (auth.state === 'expiring') {
-        console.warn(`[auth] (${trigger}) Claude login expires in ${auth.daysLeft}d (${expIso}) — re-login soon.`);
+        console.warn(`[auth] (${trigger}) Native Claude login expires in ${auth.daysLeft}d (${expIso}) — re-login soon.`);
         logEvent('auth-expiring', { source: 'monitor', trigger, days_left: auth.daysLeft, refresh_token_expires_at: auth.refreshTokenExpiresAt });
       } else if (auth.state === 'unknown') {
         console.warn(`[auth] (${trigger}) Claude credentials check inconclusive: ${auth.reason}`);
@@ -4320,6 +4330,7 @@ async function main() {
     logger: console,
   });
   const channelsClaudeBin = pinnedClaudeBin;
+  assertExternalClaudeCliReady(config.bot, { sessionLauncher, pinnedClaudeBin });
 
   const orchestraProcessFactory = createProcessFactory({
     config,
