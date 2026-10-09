@@ -96,7 +96,7 @@ describe('Codex main-loop steering wiring', () => {
     );
     assert.match(
       source,
-      /if \(selectedInboundProvider === 'claude'\) \{[\s\S]*?checkClaudeAuthHealth\(\)/,
+      /if \(needsNativeClaudeAuth\(config\.bot, selectedBackend\)\) \{[\s\S]*?checkClaudeAuthHealth\(\)/,
     );
     assert.match(
       source,
