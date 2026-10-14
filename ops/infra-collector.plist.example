@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.polygram.infra-collector</string>
+  <key>ProgramArguments</key><array>
+    <string>/ABSOLUTE/PATH/TO/node</string>
+    <string>/ABSOLUTE/PATH/TO/polygram/scripts/infra.js</string>
+    <string>--bot</string><string>shumorobot</string>
+    <string>--data-dir</string><string>/ABSOLUTE/PATH/TO/.polygram</string>
+    <string>collect</string>
+  </array>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>StandardOutPath</key><string>/ABSOLUTE/PATH/TO/.polygram/logs/infra-collector.log</string>
+  <key>StandardErrorPath</key><string>/ABSOLUTE/PATH/TO/.polygram/logs/infra-collector.log</string>
+</dict></plist>
