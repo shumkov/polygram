@@ -1,6 +1,7 @@
 # Infrastructure Admin agent
 
-Status: design draft for Ivan's alignment; no implementation or activation.
+Architecture superseded by [Infrastructure assistant separation](EXTERNAL_JOBS_SEPARATION_SPEC.md).
+This document records the earlier integrated design, implemented in PR #119 but not activated by this session.
 Date: 2026-10-14. Checkout: `admin`, base `5e3480f` (Polygram 0.39.1).
 
 ## Outcome
