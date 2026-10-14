@@ -109,3 +109,67 @@ test('pending report retries respect pause and frozen route without dispatching 
   f.config.bot.externalJobs.routes.review.chatId = '-1001'; await f.service.tick();
   assert.equal(attempts, 2); assert.equal(f.calls.length, 1);
 });
+
+test('failed pause persistence holds automatic admission until a successful human resume', async (t) => {
+  const f = fixture(t);
+  f.service.submit(input());
+  f.raw.exec("CREATE TRIGGER reject_pause BEFORE INSERT ON external_job_controls BEGIN SELECT RAISE(ABORT, 'disk full'); END");
+  assert.throws(() => f.service.pauseSession('-1001:2', true), /disk full/);
+  assert.equal(f.service.isPaused('-1001:2'), true);
+  assert.equal(f.service.status('review').paused, true);
+  assert.equal(f.service.get(input()).job.paused, true);
+  f.service.start(); await f.service.tick();
+  assert.equal(f.calls.length, 0);
+  assert.throws(() => f.service.pauseSession('-1001:2', false), /disk full/);
+  await f.service.tick(); assert.equal(f.calls.length, 0);
+  f.raw.exec('DROP TRIGGER reject_pause');
+  f.service.pauseSession('-1001:2', false);
+  await f.service.tick(); assert.equal(f.calls.length, 1);
+});
+
+test('failed pause persistence also holds pending report retries', async (t) => {
+  let sends = 0;
+  const f = fixture(t, { deliverPart: async () => { sends++; throw Object.assign(new Error('unavailable'), { definitelyNotSent: true }); } });
+  f.service.submit(input()); f.service.start(); await f.service.tick();
+  f.raw.exec("CREATE TRIGGER reject_pause BEFORE INSERT ON external_job_controls BEGIN SELECT RAISE(ABORT, 'disk full'); END");
+  assert.throws(() => f.service.pauseSession('-1001:2', true), /disk full/);
+  f.advance(); await f.service.tick();
+  assert.equal(sends, 1);
+});
+
+test('disk reopen preserves human pause and retries only the unsent report part', async (t) => {
+  const os = require('node:os');
+  const path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'job-pause-reopen-'));
+  const dbPath = path.join(dir, 'jobs.db');
+  let raw; let service; let turns = 0; let now = 1000;
+  const sent = [];
+  const config = { bot: { externalJobs: { enabled: true, routes: { review: { chatId: '-1001', threadId: '2' } } } } };
+  function open(failSecond) {
+    raw = new Database(dbPath);
+    raw.exec(fs.readFileSync(require.resolve('../lib/external-jobs/schema.sql'), 'utf8'));
+    service = createExternalJobService({ config, db: { raw }, botName: 'test', now: () => now,
+      resolveTarget: (route) => ({ ...route, sessionKey: '-1001:2' }),
+      dispatch: async () => { turns++; return { outcome: 'succeeded', text: 'Report', inactive: true }; },
+      checkInactive: async () => false, prepareReport: () => ['first', 'second'],
+      deliverPart: async (job, part) => {
+        if (failSecond && part.index === 1) throw Object.assign(new Error('unsent'), { definitelyNotSent: true });
+        sent.push(part.index); return { messageId: sent.length };
+      },
+    });
+  }
+  t.after(() => { service?.stop(); if (raw?.open) raw.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  open(true);
+  service.submit(input()); service.start(); await service.tick();
+  assert.equal(service.get(input()).job.reportState, 'pending');
+  service.pauseSession('-1001:2', true);
+  service.stop(); raw.close();
+  now += 61000;
+  open(false); service.start(); await service.tick();
+  assert.equal(service.status('review').paused, true);
+  assert.deepEqual(sent, [0]);
+  service.pauseSession('-1001:2', false); await service.tick();
+  assert.equal(service.get(input()).job.reportState, 'delivered');
+  assert.deepEqual(sent, [0, 1], 'persisted first receipt prevents a duplicate part');
+  assert.equal(turns, 1, 'report recovery does not repeat diagnosis');
+});

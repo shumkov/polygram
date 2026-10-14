@@ -545,3 +545,12 @@ test('operator stop pauses automation before checking even an idle process', asy
   await createHandleAbort(deps)(makeMsg('/stop'), '12345', {}, '/stop');
   assert.deepEqual(calls, ['pause', 'process']);
 });
+
+test('failed durable automation pause still interrupts human-stopped work and surfaces the failure', async () => {
+  const m = makeDeps({ pauseAutomation: async () => { throw new Error('disk full'); } });
+  const handled = await createHandleAbort(m.deps)(makeMsg('/stop'), '12345', {}, '/stop');
+  assert.equal(handled, true);
+  assert.ok(m.pmCalls.some(([method]) => method === 'interrupt'));
+  assert.ok(m.events.some(({ kind }) => kind === 'automation-pause-failed'));
+  assert.ok(m.tgCalls.some(({ method, params }) => method === 'sendMessage' && /pause.*could not be saved/i.test(params.text)));
+});

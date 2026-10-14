@@ -51,7 +51,10 @@ acknowledgement alone does not prove final-report completion.
 `/automation status`, `/automation pause` and `/automation resume` operate in
 configured destinations for the configured human operator. A stop also persists
 pause before interrupting current work, including while idle. Alias routes share
-pause by effective session. Human conversation continues while paused.
+pause by effective session. If pause persistence fails, the daemon keeps an
+in-memory hold, still attempts interruption and warns the operator. Repair
+storage before restarting: that emergency hold cannot survive process exit.
+Human conversation continues while paused.
 No IPC operation resumes automation.
 
 ## Compatibility and limitations
