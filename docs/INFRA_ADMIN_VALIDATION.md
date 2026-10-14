@@ -1,3 +1,5 @@
+> Historical evidence for the superseded integrated implementation. Current separation evidence is in `EXTERNAL_JOBS_VALIDATION.md`.
+
 # Infrastructure Admin implementation validation
 
 Date: 2026-10-15. Base: `5e3480fd82bcd8ee780b6edb939322dbb125f637`.

@@ -40,7 +40,8 @@ Payload plus task is bounded to 32 KiB. Queue capacity rejects before acceptance
 Completed identities remain retained. Unknown execution is never replayed by
 Polygram. Callers query or retry the original identity after a lost reply.
 
-Reports use the destination's normal Telegram/Channels routing. Ordinary
+Reports use the destination's Telegram/Channels routing. Ordinary report parts
+are sent as plain text to the frozen destination, without chat-root fallback. Ordinary
 reports are durably split into parts before sending; only definitively unsent
 parts may retry. Sending with a lost receipt becomes `unknown`. Channels
 acknowledgement alone does not prove final-report completion.

@@ -1,3 +1,9 @@
+# Historical integrated infrastructure runbook
+
+This unactivated design was extracted into the separate `infra-agent` project.
+Use its `docs/RUNBOOK.md`; Polygram now exposes only [external conversation jobs](EXTERNAL_JOBS_API.md).
+The commands below describe the superseded implementation and must not be used for activation.
+
 # Admin infrastructure automation
 
 This release implements automatic diagnosis and reporting for the existing

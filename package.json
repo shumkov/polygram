@@ -7,7 +7,6 @@
     "polygram": "polygram.js",
     "polygram-split-db": "scripts/split-db.js",
     "polygram-ipc": "scripts/ipc-smoke.js",
-    "polygram-infra": "scripts/infra.js",
     "polygram-doctor": "scripts/doctor.js",
     "polygram-codex-hook-artifacts": "scripts/codex-hook-artifacts.js",
     "polygram-build-codex-hook-bundle": "scripts/build-codex-hook-bundle.js"
@@ -18,7 +17,6 @@
     "migrations/",
     "scripts/split-db.js",
     "scripts/ipc-smoke.js",
-    "scripts/infra.js",
     "scripts/doctor.js",
     "scripts/build-codex-hook-bundle.js",
     "scripts/codex-hook-artifacts.js",
@@ -26,8 +24,7 @@
     "commands/",
     ".claude-plugin/",
     "ops/polygram.plist.example",
-    "ops/infra-collector.plist.example",
-    "docs/INFRA_ADMIN_RUNBOOK.md",
+    "docs/EXTERNAL_JOBS_API.md",
     "ops/README.md",
     "docs/2026-08-16-003-codex-protected-hook-artifact-runbook.md",
     "config.example.json"

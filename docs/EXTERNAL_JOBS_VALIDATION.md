@@ -1,0 +1,72 @@
+# External jobs separation validation
+
+## Scope and ownership
+
+The approved extraction is implemented in Polygram branch `admin` and the
+separate local repository `~/Projects/shumkov/infra-agent`, branch
+`separate-infra-agent`. The destination was approved before implementation.
+No remote repository was created for the new application.
+
+Polygram retains the generic job ledger, public IPC operations, CLI session
+admission, operator pause and report delivery. The separate application owns
+Netdata, maintenance spool, incident schema, diagnosis policy and follow-ups.
+The old integrated design and validation files are historical evidence only.
+
+Migration 022 was unpublished: the latest published release inspected was
+0.39.1. Its replacement creates generic tables. Opening the superseded
+development incident schema fails explicitly before the version early return;
+no old data is dropped or reset. Exporting such a development DB is a separate
+manual operation, not an automatic migration into the new application.
+
+## Offline verification checkpoint
+
+Runtime: Node 24.4.0. Orchestra, Agent SDK and Claude pins are unchanged.
+
+- Polygram full suite: 4480 tests, 4464 passed, 16 skipped, zero failed.
+  Skips are opt-in real-Claude scenarios; no real-Claude qualification is claimed.
+  Log: `/tmp/polygram-separation-full.log`.
+- infra-agent full suite: 148 passed, zero failed/skipped.
+  Log: `/tmp/infra-agent-separation-full.log`.
+- Two-process acceptance uses an actual authenticated Unix socket, Polygram's
+  public package entry point, the production handler map and generic service,
+  the standalone controller/store, and synthetic agent/delivery adapters.
+  A deliberately lost acceptance response is recovered with the exact same
+  envelope: one accepted request, one agent turn, one report delivery.
+  Run `node scripts/verify-polygram-boundary.js /absolute/polygram/checkout`
+  from infra-agent. No real Telegram sends occur.
+- `npm pack --dry-run --json` confirms no embedded infrastructure executable,
+  collector or domain module in the Polygram distribution.
+- Both repositories pass `git diff --check`. Neither package defines lint or
+  typecheck scripts.
+
+## Observed regression checks
+
+Tests were run failing before each correction, then passing afterward:
+
+- report retry during persistent pause;
+- report preparation failure erasing known execution outcome;
+- deleted topic redirecting a report to the chat root;
+- uncertain connection reset causing a hidden second send;
+- old development schema bypassing migration checks;
+- automation command reaching question capture;
+- unsupported runtime fabricating inactivity proof;
+- route removal during process creation;
+- incident DB failure losing an already accepted producer event;
+- asynchronous controller tick accessing a prematurely closed database.
+
+The extracted domain tests preserve missing-alarm/coverage UNKNOWN behavior,
+bounded cursor progression and spool draining, explicit maintenance CLEAR,
+recovery-report obligations and metadata-update retry preservation.
+
+## Operational boundaries
+
+This is source and synthetic integration validation. No production config,
+service, notification producer, installed skill or monitoring source was changed.
+No daemon was restarted, real agent turn launched or infrastructure repaired.
+
+Activation requires compatible Polygram and infra-agent artifacts, a configured
+isolated CLI destination, the standalone private data/config directories and an
+explicit deployment instruction. Older daemons fail protocol negotiation.
+Channels send acknowledgement alone is insufficient to prove final reporting;
+a succeeded diagnosis with an unknown report remains held for operator review.
+Read-only policy is an agent instruction, not an operating-system sandbox.
