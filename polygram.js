@@ -31,6 +31,8 @@ const {
 const { buildPrompt, resolvePromptBackend } = require('./lib/prompt');
 const { countInFlight } = require('./lib/queue-utils');
 const { createIpcHandlers } = require('./lib/ipc/handlers');
+const { createInfraService } = require('./lib/infra/service');
+const { createInfraRuntime, createInfraCommandHandler, isInfraOperator, isInfraDestination } = require('./lib/infra/runtime');
 const {
   buildQualificationEvent,
 } = require('./lib/ops/clean-restart-qualification');
@@ -1088,6 +1090,8 @@ function isSessionRecentlyAborted(sessionKey) { return abortGrace.isRecent(sessi
 const autoResumeTracker = createAutoResumeTracker();
 const contextHintShown = new Set();
 let dispatchHandleMessage = null;
+let dispatchExternalEvent = null;
+let infraService = null;
 let attemptAutoResume = null;
 let errorReplyText = null;
 let queueWarnThreshold = null;
@@ -3343,6 +3347,17 @@ function createBot(token) {
     pairings: { hasLivePairing: (args) => !!pairings?.hasLivePairing(args) },
     isAbortRequest,
     handleAbortIfRequested: (...a) => handleAbortIfRequested(...a),
+    handleInfraCommand: createInfraCommandHandler({
+      config,
+      getService: () => infraService,
+      reply: async (msg, chatId, text) => {
+        await tg(bot, 'sendMessage', {
+          chat_id: chatId, message_thread_id: msg.message_thread_id,
+          text, reply_parameters: { message_id: msg.message_id },
+        }, { source: 'infra-command', botName: BOT_NAME });
+        db.setInboundHandlerStatus({ chat_id: chatId, msg_id: msg.message_id, status: 'replied' });
+      },
+    }),
     getRewindHandler: () => rewindHandler,
     isRewindCommand,
     resolveRuntime: ({ chatId, threadId }) => resolvePromptBackend({
@@ -4490,6 +4505,9 @@ async function main() {
     pm, bot, tg, logEvent, isAbortRequest,
     markSessionAborted, clearAutosteeredReactions, getSessionKey,
     retireQuestionSession: (sessionKey) => questionHandlers?.retireSession(sessionKey),
+    pauseAutomation: ({ msg, chatId, threadId }) => {
+      if (isInfraDestination(config, chatId, threadId) && isInfraOperator(config, msg)) infraService?.pause(true);
+    },
     botName: BOT_NAME, logger: console,
   });
   autosteer = createAutosteerHandlers({
@@ -4506,6 +4524,7 @@ async function main() {
   });
   ({
     dispatchHandleMessage,
+    dispatchExternalEvent,
     attemptAutoResume,
     errorReplyText,
     queueWarnThreshold,
@@ -4537,6 +4556,36 @@ async function main() {
     authDisabledGate,
     logger: console,
   }));
+  const runInfraTurn = createInfraRuntime({
+    config, botName: BOT_NAME, pm, intentLock, getSessionKey,
+    resolveBackend: ({ chatId, threadId }) => resolvePromptBackend({ config, chatId, threadId }),
+    isPaused: () => infraService.status().paused,
+    isShuttingDown: () => isShuttingDown,
+    needsAuth: () => needsNativeClaudeAuth(config.bot, 'cli'),
+    checkAuth: checkClaudeAuthHealth,
+    getOrSpawnForChat, sendToProcess,
+    deliver: ({ text, chatId, threadId, sessionKey }) => processAndDeliverAgentText({
+      text, bot, tg, chatId, threadId, sessionKey,
+      replyToMessageId: null, source: 'infra-report',
+      meta: { botName: BOT_NAME, sessionKey, sourceMsgId: null },
+      parseResponse, sanitizeAssistantReply, chunkMarkdownText, deliverReplies,
+      chunkBudget: TG_CHUNK_BUDGET, logEvent, logger: console, redactInbound,
+    }),
+  });
+  infraService = createInfraService({
+    config, db, botName: BOT_NAME,
+    dispatch: (work) => {
+      const route = config.bot.infraAdmin;
+      return dispatchExternalEvent({
+        sessionKey: getSessionKey(String(route.chatId), String(route.threadId), config.chats[String(route.chatId)]),
+        chatId: String(route.chatId), threadId: String(route.threadId), eventId: work.token,
+      }, () => runInfraTurn(work));
+    },
+    notify: (text) => tg(bot, 'sendMessage', {
+      chat_id: config.bot.infraAdmin.chatId,
+      message_thread_id: config.bot.infraAdmin.threadId, text,
+    }, { source: 'infra-failure-notification', botName: BOT_NAME }),
+  });
   // 0.12.0 post-turn edit re-delivery: constructed AFTER dispatchHandleMessage is assigned (above).
   // Claude keeps its same-message fold behavior. Codex defers edits to the
   // exact live generation's idle boundary and then re-dispatches them as
@@ -4650,6 +4699,7 @@ async function main() {
     // idle, and cannot answer "how much work did this restart cost?".
     const inFlightAtSignal = countInFlight(inFlightHandlers);
     isShuttingDown = true;
+    infraService?.stop();
     console.log(`\nShutting down (${trigger})...`);
     // 1. Stop accepting new inbound first so nothing new queues behind the drain.
     stopPolling();
@@ -4973,6 +5023,7 @@ async function main() {
       path: ipcServer.socketPathFor(BOT_NAME),
       secret: ipcSecret,
       handlers: createIpcHandlers({
+        infra: infraService,
         botName: BOT_NAME,
         daemonIdentity,
         getInFlightHandlers: () => inFlightHandlers,
@@ -5626,6 +5677,7 @@ async function main() {
     console.error(`[compact-orphan-handler] failed: ${err.message}`);
   }
 
+  infraService.start();
   logEvent('polygram-admission-open', lifecycleDetail({
     bot: BOT_NAME,
   }, invocationId, daemonIdentity));

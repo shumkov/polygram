@@ -34,6 +34,8 @@ CREATE TABLE external_events (
   UNIQUE(bot_name, source, host, source_event_id)
 );
 CREATE INDEX external_events_pending ON external_events(bot_name, delivery, incident_id);
+CREATE INDEX external_events_incident ON external_events(incident_id, delivery, id);
+CREATE INDEX external_events_claim ON external_events(claim, bot_name);
 CREATE TABLE infra_controls (
   bot_name TEXT PRIMARY KEY,
   paused INTEGER NOT NULL DEFAULT 0,

@@ -406,3 +406,15 @@ describe('D4 redeliverAsFreshTurn — the ONE redelivery tail', () => {
     assert.deepEqual(result, { ok: false, reason: 'admin', terminal: true });
   });
 });
+
+test('infra controls precede open-question capture and cannot execute on redelivery', async () => {
+  let controls = 0; let answers = 0;
+  const { gate, calls } = makeGate({ deps: {
+    handleInfraCommand: async () => { controls++; return true; },
+    getQuestionHandlers: () => ({ isAwaitingOtherFrom: () => true, tryConsumeAsAnswer: async () => { answers++; return { consumed: true }; } }),
+  } });
+  assert.equal((await gate(groupMsg({ text: '/infra resume' }))).stage, 'infra');
+  assert.equal(controls, 1); assert.equal(answers, 0); assert.equal(calls.dispatched.length, 0);
+  assert.equal((await gate(groupMsg({ text: '/infra resume' }), { tier: 'redelivery' })).action, 'blocked');
+  assert.equal(controls, 1);
+});

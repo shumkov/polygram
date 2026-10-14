@@ -7,11 +7,11 @@ const { createInfraStore } = require('../lib/infra/store');
 
 const route = { enabled: true, chatId: '-1001', threadId: '2995', sources: { netdata: { hosts: ['mac'] } } };
 const alarm = (extra = {}) => ({ source: 'netdata', host: 'mac', eventId: 'epoch:1', resource: 'disk.root', state: 'WARNING', observedAt: 1000, evidence: { kind: 'snapshot', summary: 'Disk full' }, ...extra });
-function fixture(t) {
+function fixture(t, configuredRoute = route) {
   const { db, dbPath } = freshDb('infra');
   t.after(() => cleanupDb(dbPath, db));
   let time = 2000;
-  return { db, store: createInfraStore(db.raw, { botName: 'home', route, now: () => time }), advance: (n) => { time += n; } };
+  return { db, store: createInfraStore(db.raw, { botName: 'home', route: configuredRoute, now: () => time }), advance: (n) => { time += n; } };
 }
 
 test('externally posted alert is durable actionable work without a Telegram inbound row', (t) => {
@@ -101,4 +101,99 @@ test('older replay cannot overwrite current healthy observation', (t) => {
   const { incidentId } = store.ingest(alarm({ state: 'CLEAR', observedAt: 5000 }));
   store.ingest(alarm({ eventId: 'older', state: 'CRITICAL', observedAt: 1000 }));
   assert.equal(store.get(incidentId).latest_state, 'CLEAR');
+});
+
+for (const interrupted of [false, true]) {
+  test(`resolved eventless followup retains its ${interrupted ? 'interrupted' : 'failed'} report`, (t) => {
+    const { store, advance } = fixture(t);
+    const { incidentId } = store.ingest(alarm({ state: 'CLEAR' }));
+    const first = store.claim();
+    store.update({ incidentId, revision: 1, nextCheckAt: 3000 });
+    store.complete(first.token);
+    advance(1001);
+    const followup = store.claim();
+    assert.equal(followup.events.length, 0);
+    store.update({ incidentId, revision: 2, state: 'resolved', verification: 'Health checked' });
+    if (interrupted) store.recover();
+    else store.fail(followup.token, 'Telegram unavailable');
+    store.update({ incidentId, revision: 3, summary: 'Health still verified; report waiting', verification: 'Health checked' });
+    advance(60001);
+    const retry = store.claim();
+    assert.ok(retry, 'resolved health must not discard an undelivered report');
+    store.complete(retry.token, { messageIds: [1] });
+    advance(1800001);
+    assert.equal(store.claim(), null);
+  });
+}
+
+test('day-old CLEAR cannot close an incident until a fresh source snapshot arrives', (t) => {
+  const { store, advance } = fixture(t);
+  const { incidentId } = store.ingest(alarm({ state: 'CLEAR' }));
+  advance(86400000);
+  assert.throws(() => store.update({ incidentId, revision: 1, state: 'resolved', verification: 'Old evidence' }), /fresh|healthy/i);
+  store.ingest(alarm({ eventId: 'fresh', state: 'CLEAR', observedAt: 86402000 }));
+  store.update({ incidentId, revision: 2, state: 'resolved', verification: 'Read live health again' });
+  assert.equal(store.get(incidentId).state, 'resolved');
+});
+
+test('all retained incidents and transitions remain accessible through bounded cursors', (t) => {
+  const { store } = fixture(t);
+  const { incidentId } = store.ingest(alarm());
+  for (let n = 1; n <= 150; n++) {
+    store.ingest(alarm({ eventId: `history-${n}` }));
+    store.ingest(alarm({ eventId: `resource-${n}`, resource: `resource-${n}` }));
+  }
+  const first = store.get(incidentId);
+  assert.equal(first.events.length, 100);
+  assert.ok(first.nextBefore);
+  const second = store.get(incidentId, first.nextBefore);
+  assert.equal(second.events.length, 51);
+  assert.equal(second.nextBefore, null);
+  assert.equal(new Set([...first.events, ...second.events].map(e => e.eventId)).size, 151);
+  const incidents = store.list();
+  assert.equal(incidents.length, 100);
+  const older = store.list(incidents.at(-1).sequence);
+  assert.equal(older.length, 51);
+  assert.equal(new Set([...incidents, ...older].map(i => i.id)).size, 151);
+  assert.throws(() => store.list(-1), /cursor/i);
+});
+
+test('fresh unchanged health refreshes evidence without another agent wakeup', (t) => {
+  const { store, advance } = fixture(t);
+  const { incidentId } = store.ingest(alarm({ state: 'CLEAR' }));
+  store.complete(store.claim().token);
+  advance(86400000);
+  const receipt = store.observe(alarm({ state: 'CLEAR', eventId: 'live-check', observedAt: 86402000 }));
+  assert.equal(receipt.refreshed, true);
+  const current = store.get(incidentId);
+  store.update({ incidentId, revision: current.revision, state: 'resolved', verification: 'Live source checked' });
+  assert.equal(store.claim(), null);
+  store.observe(alarm({ state: 'CRITICAL', eventId: 'changed', observedAt: 86402000 }));
+  assert.equal(store.claim().events[0].state, 'CRITICAL');
+});
+
+test('producer maintenance recovery closes followups and can be refreshed after a delay', (t) => {
+  const { maintenanceEvent } = require('../scripts/infra');
+  const { store, advance } = fixture(t, { ...route, sources: { maintenance: { hosts: ['mac'] } } });
+  const producer = { host: 'mac', resource: 'cargo-sweep', state: 'WARNING' };
+  const { incidentId } = store.ingest(maintenanceEvent(producer, 'Disk pressure', 2000));
+  store.complete(store.claim().token);
+  store.ingest(maintenanceEvent({ ...producer, state: 'CLEAR' }, 'Fresh free-space check healthy', 2000));
+  store.complete(store.claim().token);
+  advance(86400000);
+  assert.throws(() => store.update({ incidentId, revision: 2, state: 'resolved', verification: 'Old producer check' }), /fresh/i);
+  store.observe(maintenanceEvent({ ...producer, state: 'CLEAR' }, 'Independent df check meets producer threshold', 86402000));
+  store.update({ incidentId, revision: 3, state: 'resolved', verification: 'Repeated read-only free-space check' });
+  advance(1800001);
+  assert.equal(store.claim(), null);
+});
+
+test('unresolved diagnosis gets a default followup only after thirty minutes', (t) => {
+  const { store, advance } = fixture(t);
+  store.ingest(alarm());
+  store.complete(store.claim().token);
+  advance(1799999);
+  assert.equal(store.claim(), null);
+  advance(2);
+  assert.ok(store.claim());
 });

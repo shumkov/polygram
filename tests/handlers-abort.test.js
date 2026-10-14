@@ -535,3 +535,13 @@ describe('handleAbortIfRequested — Codex verified stop', () => {
     const evt = m.events.find((e) => e.kind === 'abort-requested');
     assert.equal(evt.detail.kill_reason, 'probe-failed');
   });
+
+test('operator stop pauses automation before checking even an idle process', async () => {
+  const calls = [];
+  const { deps } = makeDeps({
+    pm: { has: () => { calls.push('process'); return false; }, drainQueue: () => {}, interrupt: async () => {} },
+    pauseAutomation: async (input) => { calls.push('pause'); assert.equal(input.msg.from.id, 99); },
+  });
+  await createHandleAbort(deps)(makeMsg('/stop'), '12345', {}, '/stop');
+  assert.deepEqual(calls, ['pause', 'process']);
+});

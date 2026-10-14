@@ -11,6 +11,21 @@
       "needsToken": false,
       "_comment_claudeCliAuthSource": "native (default) checks the host Claude login before CLI turns. Set external only when the configured session launcher supplies proxy credentials. SDK retains native checks; Codex is unaffected. Requires a verified pinned CLI and an absolute session launcher. Restart after changes; restore native when disabling proxy routing.",
       "claudeCliAuthSource": "native",
+      "_comment_infraAdmin": "Opt-in diagnosis-only event intake for one isolated Claude CLI topic. Automatic repairs remain disabled. See docs/INFRA_ADMIN_RUNBOOK.md; notificationCommand must call the original notifier directly, never this intake.",
+      "infraAdmin": {
+        "enabled": false,
+        "chatId": "REPLACE_WITH_CONFIGURED_CHAT_ID",
+        "threadId": "REPLACE_WITH_CONFIGURED_TOPIC_ID",
+        "sources": {
+          "netdata": { "hosts": ["shumabook", "umi-vps"] },
+          "maintenance": { "hosts": ["shumabook"] }
+        },
+        "hosts": [
+          { "name": "shumabook" },
+          { "name": "umi-vps", "ssh": "shumabit@umi-vps.tail8aaf04.ts.net" }
+        ],
+        "notificationCommand": "/usr/local/libexec/notify-telegram-direct.sh"
+      },
       "_comment_stream": "Streaming is always on. `streamMinChars` sets the initial-send debounce (default 30) — short responses below that stay idle until the final result. `streamThrottleMs` sets the edit cadence (default 1000ms, min 250).",
       "streamMinChars": 30,
       "streamThrottleMs": 1000,
