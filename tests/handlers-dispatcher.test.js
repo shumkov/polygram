@@ -1145,3 +1145,40 @@ describe('createDispatcher — AUTH_DISABLED handling (docs/AUTH_DISABLED_HANDLI
     assert.equal(chatReplies.length, 0);
   });
 });
+
+test('external jobs wait for recovery, count as busy and participate in shutdown settlement without Telegram replay targets', async () => {
+  let recover;
+  let finish;
+  const recovery = new Promise((resolve) => { recover = resolve; });
+  const completion = new Promise((resolve) => { finish = resolve; });
+  const waits = [];
+  const fx = fixture({ awaitSessionRecovery: (sessionKey, receipt) => { waits.push({ sessionKey, receipt }); return recovery; }, shuttingDown: true });
+  let runs = 0;
+  const task = fx.dispatcher.dispatchExternalEvent({ sessionKey: 'job-session', chatId: '100', threadId: '2', eventId: 'job' }, async () => { runs++; return completion; });
+  await nextTick();
+  assert.equal(runs, 0);
+  assert.deepEqual(waits, [{ sessionKey: 'job-session', receipt: null }]);
+  assert.equal(fx.dispatcher.inFlightHandlers.get('job-session'), 1);
+  assert.equal(fx.dispatcher.getActiveHandlerCount(), 1);
+  assert.deepEqual(fx.dispatcher.getActiveHandlerTargets(), []);
+  let settled = false;
+  const settlement = fx.dispatcher.awaitSettlement({ timeoutMs: 1000 }).then(() => { settled = true; });
+  recover(); await nextTick();
+  assert.equal(runs, 1); assert.equal(settled, false);
+  finish({ outcome: 'succeeded' }); await task; await settlement;
+  assert.equal(fx.dispatcher.getActiveHandlerCount(), 0);
+  assert.equal(fx.dispatcher.inFlightHandlers.has('job-session'), false);
+  assert.equal(fx.calls.setInboundStatus.length, 0);
+  assert.equal(fx.calls.tg.length, 0);
+});
+
+test('external job failure clears busy accounting without Telegram retry or automatic continuation', async () => {
+  const fx = fixture({ isAutoResumable: true });
+  await assert.rejects(fx.dispatcher.dispatchExternalEvent({ sessionKey: 'job-session', chatId: '100', eventId: 'job' }, async () => { throw new Error('uncertain turn'); }), /uncertain turn/);
+  await fx.dispatcher.awaitSettlement();
+  assert.equal(fx.dispatcher.getActiveHandlerCount(), 0);
+  assert.equal(fx.dispatcher.inFlightHandlers.has('job-session'), false);
+  assert.equal(fx.calls.tg.length, 0);
+  assert.equal(fx.calls.sendToProcess.length, 0);
+  assert.equal(fx.calls.autoResumeChecks.length, 0);
+});

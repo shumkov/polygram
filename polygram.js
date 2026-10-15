@@ -31,6 +31,9 @@ const {
 const { buildPrompt, resolvePromptBackend } = require('./lib/prompt');
 const { countInFlight } = require('./lib/queue-utils');
 const { createIpcHandlers } = require('./lib/ipc/handlers');
+const { createExternalJobService } = require('./lib/external-jobs/service');
+const { prepareReport, createReportDelivery } = require('./lib/external-jobs/delivery');
+const { createExternalJobRuntime, createExternalJobTargetResolver, createAutomationCommandHandler, isAutomationOperator, isAutomationDestination, pauseAutomationSession } = require('./lib/external-jobs/runtime');
 const {
   buildQualificationEvent,
 } = require('./lib/ops/clean-restart-qualification');
@@ -1088,6 +1091,8 @@ function isSessionRecentlyAborted(sessionKey) { return abortGrace.isRecent(sessi
 const autoResumeTracker = createAutoResumeTracker();
 const contextHintShown = new Set();
 let dispatchHandleMessage = null;
+let dispatchExternalEvent = null;
+let externalJobService = null;
 let attemptAutoResume = null;
 let errorReplyText = null;
 let queueWarnThreshold = null;
@@ -3343,6 +3348,18 @@ function createBot(token) {
     pairings: { hasLivePairing: (args) => !!pairings?.hasLivePairing(args) },
     isAbortRequest,
     handleAbortIfRequested: (...a) => handleAbortIfRequested(...a),
+    handleAutomationCommand: createAutomationCommandHandler({
+      getSessionKey, intentLock,
+      config,
+      getService: () => externalJobService,
+      reply: async (msg, chatId, text) => {
+        await tg(bot, 'sendMessage', {
+          chat_id: chatId, message_thread_id: msg.message_thread_id,
+          text, reply_parameters: { message_id: msg.message_id },
+        }, { source: 'automation-command', botName: BOT_NAME });
+        db.setInboundHandlerStatus({ chat_id: chatId, msg_id: msg.message_id, status: 'replied' });
+      },
+    }),
     getRewindHandler: () => rewindHandler,
     isRewindCommand,
     resolveRuntime: ({ chatId, threadId }) => resolvePromptBackend({
@@ -4490,6 +4507,11 @@ async function main() {
     pm, bot, tg, logEvent, isAbortRequest,
     markSessionAborted, clearAutosteeredReactions, getSessionKey,
     retireQuestionSession: (sessionKey) => questionHandlers?.retireSession(sessionKey),
+    pauseAutomation: ({ msg, chatId, threadId, sessionKey }) => {
+      if (externalJobService && isAutomationDestination({ config, getSessionKey }, chatId, threadId) && isAutomationOperator(config, msg)) {
+        return pauseAutomationSession({ service: externalJobService, intentLock, sessionKey, paused: true });
+      }
+    },
     botName: BOT_NAME, logger: console,
   });
   autosteer = createAutosteerHandlers({
@@ -4506,6 +4528,7 @@ async function main() {
   });
   ({
     dispatchHandleMessage,
+    dispatchExternalEvent,
     attemptAutoResume,
     errorReplyText,
     queueWarnThreshold,
@@ -4537,6 +4560,29 @@ async function main() {
     authDisabledGate,
     logger: console,
   }));
+  const resolveExternalTarget = createExternalJobTargetResolver({
+    config, getSessionKey,
+    resolveBackend: ({ chatId, threadId }) => resolvePromptBackend({ config, chatId, threadId }),
+  });
+  const externalRuntime = createExternalJobRuntime({
+    config, pm, intentLock, getSessionKey,
+    resolveBackend: ({ chatId, threadId }) => resolvePromptBackend({ config, chatId, threadId }),
+    isPaused: (sessionKey) => externalJobService.isPaused(sessionKey),
+    isShuttingDown: () => isShuttingDown,
+    needsAuth: () => needsNativeClaudeAuth(config.bot, 'cli'),
+    checkAuth: checkClaudeAuthHealth,
+    awaitSessionRecovery: (sessionKey) => cleanReplaySessionCoordinator.wait(sessionKey, null),
+    getOrSpawnForChat, sendToProcess,
+  });
+  externalJobService = createExternalJobService({
+    config, db, botName: BOT_NAME, resolveTarget: resolveExternalTarget,
+    dispatch: (job, hooks) => dispatchExternalEvent({
+      ...job.target, eventId: job.requestId,
+    }, () => externalRuntime.dispatch(job, hooks)),
+    checkInactive: externalRuntime.checkInactive,
+    prepareReport,
+    deliverPart: createReportDelivery({ bot, tg, botName: BOT_NAME }),
+  });
   // 0.12.0 post-turn edit re-delivery: constructed AFTER dispatchHandleMessage is assigned (above).
   // Claude keeps its same-message fold behavior. Codex defers edits to the
   // exact live generation's idle boundary and then re-dispatches them as
@@ -4650,6 +4696,7 @@ async function main() {
     // idle, and cannot answer "how much work did this restart cost?".
     const inFlightAtSignal = countInFlight(inFlightHandlers);
     isShuttingDown = true;
+    externalJobService?.stop();
     console.log(`\nShutting down (${trigger})...`);
     // 1. Stop accepting new inbound first so nothing new queues behind the drain.
     stopPolling();
@@ -4973,6 +5020,7 @@ async function main() {
       path: ipcServer.socketPathFor(BOT_NAME),
       secret: ipcSecret,
       handlers: createIpcHandlers({
+        externalJobs: externalJobService,
         botName: BOT_NAME,
         daemonIdentity,
         getInFlightHandlers: () => inFlightHandlers,
@@ -5626,6 +5674,7 @@ async function main() {
     console.error(`[compact-orphan-handler] failed: ${err.message}`);
   }
 
+  externalJobService.start();
   logEvent('polygram-admission-open', lifecycleDetail({
     bot: BOT_NAME,
   }, invocationId, daemonIdentity));
