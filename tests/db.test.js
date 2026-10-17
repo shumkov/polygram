@@ -41,7 +41,7 @@ describe('schema + migrations', () => {
 
     const migrated = open(legacyPath);
     try {
-      assert.equal(migrated.raw.pragma('user_version', { simple: true }), 22);
+      assert.equal(migrated.raw.pragma('user_version', { simple: true }), 23);
       const columns = migrated.raw.prepare('PRAGMA table_info(secret_redactions)')
         .all().map((c) => c.name);
       assert.ok(!columns.includes('sha256'), columns.join(','));
@@ -61,7 +61,7 @@ describe('schema + migrations', () => {
 
   test('user_version is at current schema after migration', () => {
     const v = db.raw.pragma('user_version', { simple: true });
-    assert.equal(v, 22);
+    assert.equal(v, 23);
   });
 
   test('WAL mode is enabled', () => {

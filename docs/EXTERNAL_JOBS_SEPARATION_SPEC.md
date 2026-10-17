@@ -9,6 +9,11 @@ execution: code
 
 # Infrastructure assistant separation - Plan
 
+> Superseded on 2026-10-17 by [Admin assistant with shared history and Netdata alerts](INFRA_ADMIN_AGENT_SPEC.md).
+> This document records the deployed 0.40.0 design and its original implementation plan.
+> Its incident ownership, claim/report completion and periodic fallback requirements are historical;
+> they must not be carried into the replacement. Production migration has not occurred.
+
 ## Goal Capsule
 
 Objective: Ivan's persistent Admin assistant receives infrastructure alerts and follows unresolved incidents, while infrastructure integrations evolve independently of Polygram releases.

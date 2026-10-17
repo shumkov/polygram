@@ -141,7 +141,7 @@ describe('clean restart resume intents', () => {
 
     assert.equal(
       migrated.raw.pragma('user_version', { simple: true }),
-      22,
+      23,
     );
     const auditColumns = migrated.raw
       .prepare('PRAGMA table_info(secret_redactions)')
