@@ -146,6 +146,7 @@ const {
   approvalCardText,
 } = require('./lib/approvals/ui');
 const { buildHistoryBlock } = require('./lib/history-preload');
+const { createNotificationService } = require('./lib/external-jobs/notifications');
 const { formatContextReply, maybeContextFullHint } = require('./lib/context-format');
 // appendDisplayHint moved with buildSdkOptions extraction (commit 18) —
 // only consumer of that import is now lib/sdk/build-options.js itself.
@@ -615,7 +616,7 @@ function formatPrompt(msg, sessionCtx, attachments = [], { sessionKey = null } =
     sessionCtx,
     attachments,
     replyTo: resolveReplyTo(msg),
-    polygramHistory,
+    polygramHistory: polygramHistory + (notificationService?.context(sessionKey, msg.reply_to_message?.message_id) || '') + (notificationService?.instructions(sessionKey) || ''),
     backend: resolvePromptBackend({ config, chatId, threadId }),
     // Only advertise stickers this bot actually has — empty for a bot with no
     // sticker set, so its prompt never mentions stickers.
@@ -1093,6 +1094,7 @@ const contextHintShown = new Set();
 let dispatchHandleMessage = null;
 let dispatchExternalEvent = null;
 let externalJobService = null;
+let notificationService = null;
 let attemptAutoResume = null;
 let errorReplyText = null;
 let queueWarnThreshold = null;
@@ -3352,6 +3354,7 @@ function createBot(token) {
       getSessionKey, intentLock,
       config,
       getService: () => externalJobService,
+      getNotificationStatus: (sessionKey) => notificationService?.statusForSession(sessionKey) || [],
       reply: async (msg, chatId, text) => {
         await tg(bot, 'sendMessage', {
           chat_id: chatId, message_thread_id: msg.message_thread_id,
@@ -4578,10 +4581,13 @@ async function main() {
     config, db, botName: BOT_NAME, resolveTarget: resolveExternalTarget,
     dispatch: (job, hooks) => dispatchExternalEvent({
       ...job.target, eventId: job.requestId,
-    }, () => externalRuntime.dispatch(job, hooks)),
+    }, () => externalRuntime.dispatch({ ...job, task: job.task + (notificationService?.instructions(job.target.sessionKey) || '') }, hooks)),
     checkInactive: externalRuntime.checkInactive,
     prepareReport,
     deliverPart: createReportDelivery({ bot, tg, botName: BOT_NAME }),
+  });
+  notificationService = createNotificationService({
+    config, db, botName: BOT_NAME, jobs: externalJobService, resolveTarget: resolveExternalTarget, bot, tg,
   });
   // 0.12.0 post-turn edit re-delivery: constructed AFTER dispatchHandleMessage is assigned (above).
   // Claude keeps its same-message fold behavior. Codex defers edits to the
@@ -4696,6 +4702,7 @@ async function main() {
     // idle, and cannot answer "how much work did this restart cost?".
     const inFlightAtSignal = countInFlight(inFlightHandlers);
     isShuttingDown = true;
+    notificationService?.stop();
     externalJobService?.stop();
     console.log(`\nShutting down (${trigger})...`);
     // 1. Stop accepting new inbound first so nothing new queues behind the drain.
@@ -5021,6 +5028,7 @@ async function main() {
       secret: ipcSecret,
       handlers: createIpcHandlers({
         externalJobs: externalJobService,
+        notifications: notificationService,
         botName: BOT_NAME,
         daemonIdentity,
         getInFlightHandlers: () => inFlightHandlers,
@@ -5675,6 +5683,7 @@ async function main() {
   }
 
   externalJobService.start();
+  notificationService.start();
   logEvent('polygram-admission-open', lifecycleDetail({
     bot: BOT_NAME,
   }, invocationId, daemonIdentity));

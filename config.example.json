@@ -22,6 +22,20 @@
           }
         }
       },
+      "_comment_notifications": "Opt-in recorded source intake, unread conversation processing and durable due checks. Reuse an externalJobs route; set generation/baseline deliberately at cutover. See docs/RECORDED_NOTIFICATIONS_API.md.",
+      "notifications": {
+        "enabled": false,
+        "maxPending": 1000,
+        "sources": {
+          "shumabook": { "routeId": "scheduled-review", "eligible": true },
+          "shumabook-coverage": { "routeId": "scheduled-review", "eligible": false },
+          "shumabook-cargo-sweep": { "routeId": "scheduled-review", "eligible": true },
+          "shumabook-orphan-sweep": { "routeId": "scheduled-review", "eligible": true }
+        },
+        "consumers": {
+          "admin": { "routeId": "scheduled-review", "generation": "netdata-v1", "baseline": 0 }
+        }
+      },
       "_comment_stream": "Streaming is always on. `streamMinChars` sets the initial-send debounce (default 30) — short responses below that stay idle until the final result. `streamThrottleMs` sets the edit cadence (default 1000ms, min 250).",
       "streamMinChars": 30,
       "streamThrottleMs": 1000,
