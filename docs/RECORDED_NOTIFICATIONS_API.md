@@ -105,3 +105,39 @@ A blocked host retains its current owner. Rollback stops the new route first.
 Still required live: one authorized same-topic notification/reply canary, resumed
 and paused visibility, autonomous timed execution/restart, finite-retention/cap
 behavior, and notification-owner cutover. Offline tests do not prove these gates.
+
+## Explicit inspection after unknown execution
+
+A privileged local caller can request one fresh diagnostic inspection of a held
+batch through authenticated IPC operation `notification_reinspect`:
+
+```json
+{"consumerId":"admin","generation":"recorded-v1","requestId":"notifications:<held-uuid>","recoveryRequestId":"inspection:<new-uuid>","acknowledgeUnknown":true}
+```
+
+This mutation requires deliberate operator authorization. The IPC boundary is the
+existing same-user secret/socket boundary; it does not distinguish the operator
+from agent processes running as that user. It is absent from the agent-facing
+notification helper. It is never invoked by status reads, startup, or a timer.
+
+The exact current generation and held request must match an original `unknown`
+execution. Polygram first recovers the session without sending a task and proves
+it idle under its admission lock. Inconclusive evidence leaves the batch held.
+It then freezes a separate inspection input and identity in the existing batch.
+The original job, outcome, input, report and frozen batch fields remain intact;
+only its inactivity marker can change after positive runtime evidence.
+
+The fresh task receives the original notifications/checks, the unknown receipt,
+and a bounded current history snapshot. It asks for current evidence and warns
+against replaying actions or reports. These are task instructions, not technical
+read-only restrictions: a new execution can still duplicate effects. It grants
+no additional repair authority.
+
+Repeating the same request returns the same inspection identity even while it is
+running or after completion. A competing identity conflicts. Normal dispatch
+independently rechecks destination, pause and process readiness. Only successful
+inspection advances the original batch bound and original wake revisions; later
+notifications remain unread. An unknown or failed inspection stays held and
+cannot create a second inspection chain. Original report parts are not replayed
+by this mutation. Status includes the original batch state and nested `recovery`
+receipt; successful processing history points to the new successful job.
