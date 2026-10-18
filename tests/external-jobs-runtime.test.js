@@ -141,3 +141,28 @@ test('route removal while spawning holds the accepted job instead of sending', a
   assert.equal((await createExternalJobRuntime(f.deps).dispatch(job)).deferred, true);
   assert.equal(f.calls.length, 0);
 });
+
+test('lost CLI recovery starts and probes the expected session without resending any task', async () => {
+  let current; let starts = 0; let confirms = 0;
+  const f = fixture({ pm: { get: () => current }, getOrSpawnForChat: async () => { starts++; current = f.entry; return current; } });
+  assert.equal(await f.runtime.recoverInactive(job, () => { confirms++; }), true);
+  assert.equal(starts, 1); assert.equal(confirms, 1); assert.equal(f.calls.length, 0);
+  f.entry.probeBusyState = async () => { current = { ...f.entry }; return { busy: false }; };
+  assert.equal(await f.runtime.recoverInactive(job, () => { confirms++; }), false);
+  assert.equal(confirms, 1);
+});
+
+test('recovery idle proof rejects human admission, pause, route drift and inconclusive probes', async () => {
+  for (const change of ['human', 'pause', 'route', 'probe']) {
+    let paused = false; let confirms = 0;
+    const f = fixture({ isPaused: () => paused });
+    f.entry.probeBusyState = async () => {
+      if (change === 'human') f.entry.inFlight = true;
+      if (change === 'pause') paused = true;
+      if (change === 'route') f.deps.config.bot.externalJobs.routes.daily.chatId = '-2000';
+      return change === 'probe' ? {} : { busy: false };
+    };
+    assert.equal(await f.runtime.recoverInactive(job, () => { confirms++; }), false);
+    assert.equal(confirms, 0); assert.equal(f.calls.length, 0);
+  }
+});

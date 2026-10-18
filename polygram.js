@@ -4583,6 +4583,7 @@ async function main() {
       ...job.target, eventId: job.requestId,
     }, () => externalRuntime.dispatch({ ...job, task: job.task + (notificationService?.instructions(job.target.sessionKey) || '') }, hooks)),
     checkInactive: externalRuntime.checkInactive,
+    recoverInactive: externalRuntime.recoverInactive,
     prepareReport,
     deliverPart: createReportDelivery({ bot, tg, botName: BOT_NAME }),
   });

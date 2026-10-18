@@ -195,3 +195,136 @@ test('secret redaction expansion is rejected before acceptance and legacy oversi
   assert.equal(f.calls.length, 0); assert.equal(f.notifications.status('admin').unread, 1);
   assert.match(f.notifications.status('admin').error, /size|budget/i);
 });
+
+test('lost CLI process holds notification until one explicit fresh inspection succeeds', async (t) => {
+  let turns = 0;
+  const f = fixture(t, { jobs: {
+    dispatch: async (job) => { f.calls.push(job); turns++; return { outcome: turns === 1 ? 'unknown' : 'succeeded', inactive: false, channelsAcknowledged: true }; },
+    recoverInactive: async (job, confirm) => { confirm(); return true; },
+  } });
+  f.notifications.notify(alert()); f.advance(); f.jobs.start(); f.notifications.start(); await f.notifications.tick(); await f.jobs.tick();
+  const original = f.calls[0]; const originalRow = f.db.raw.prepare('SELECT * FROM external_jobs WHERE id=?').get(original.id);
+  const before = JSON.parse(f.db.raw.prepare('SELECT active_batch FROM notification_consumers').get().active_batch);
+  const input = { consumerId: 'admin', generation: 'test-v1', requestId: original.requestId, recoveryRequestId: 'inspection-1', acknowledgeUnknown: true };
+  await f.notifications.reinspect(input);
+  assert.equal(f.notifications.status('admin').unread, 1);
+  assert.equal((await f.notifications.reinspect(input)).recovery.requestId, 'inspection-1');
+  await assert.rejects(f.notifications.reinspect({ ...input, recoveryRequestId: 'different' }), /conflict/i);
+  const persisted = JSON.parse(f.db.raw.prepare('SELECT active_batch FROM notification_consumers').get().active_batch);
+  assert.deepEqual(persisted.input, before.input); assert.equal(persisted.maxId, before.maxId);
+  f.notifications.notify(alert('later'));
+  await f.notifications.tick(); await f.jobs.tick(); await f.notifications.tick();
+  assert.equal(turns, 2); assert.equal(f.notifications.status('admin').processedId, 1); assert.equal(f.notifications.status('admin').unread, 1);
+  assert.equal(f.calls[1].payload.recovery.requestId, original.requestId);
+  assert.match(f.calls[1].task, /unknown/i); assert.match(f.calls[1].task, /do not replay/i);
+  const after = f.db.raw.prepare('SELECT * FROM external_jobs WHERE id=?').get(original.id);
+  for (const key of ['state', 'turn_id', 'task', 'payload', 'report_state', 'report_receipt', 'error']) assert.equal(after[key], originalRow[key]);
+  assert.equal((await f.notifications.reinspect(input)).recovery.state, 'succeeded');
+});
+
+test('fresh inspection requires exact held identity and acknowledgement before probing', async (t) => {
+  let probes = 0;
+  const f = fixture(t, { jobs: { dispatch: async () => ({ outcome: 'unknown' }), recoverInactive: async (_, confirm) => { probes++; confirm(); return true; } } });
+  f.notifications.notify(alert()); f.advance(); f.jobs.start(); f.notifications.start(); await f.notifications.tick(); await f.jobs.tick();
+  const requestId = f.notifications.status('admin').batch.requestId;
+  const input = { consumerId: 'admin', generation: 'test-v1', requestId, recoveryRequestId: 'inspection-1', acknowledgeUnknown: true };
+  for (const change of [{ acknowledgeUnknown: false }, { generation: 'other' }, { requestId: 'other' }, { recoveryRequestId: requestId }, { unexpected: true }]) {
+    await assert.rejects(f.notifications.reinspect({ ...input, ...change }));
+  }
+  assert.equal(probes, 0);
+  assert.equal(f.notifications.status('admin').batch.state, 'unknown');
+});
+
+test('an unknown inspection stays held and repeated requests never create a recovery chain', async (t) => {
+  let probes = 0; const f = fixture(t, { jobs: {
+    dispatch: async (job) => { f.calls.push(job); return { outcome: 'unknown', inactive: false }; },
+    recoverInactive: async (_, confirm) => { probes++; confirm(); return true; },
+  } });
+  f.notifications.notify(alert()); f.advance(); f.jobs.start(); f.notifications.start(); await f.notifications.tick(); await f.jobs.tick();
+  const input = { consumerId: 'admin', generation: 'test-v1', requestId: f.calls[0].requestId, recoveryRequestId: 'inspection-1', acknowledgeUnknown: true };
+  await f.notifications.reinspect(input); await f.notifications.tick(); await f.jobs.tick(); await f.notifications.tick();
+  assert.equal(f.notifications.status('admin').batch.recovery.state, 'unknown');
+  assert.equal(f.notifications.status('admin').processedId, 0);
+  for (let n = 0; n < 3; n++) { await f.notifications.reinspect(input); f.advance(61000); await f.notifications.tick(); await f.jobs.tick(); }
+  assert.equal(f.calls.length, 2); assert.equal(probes, 1);
+  await assert.rejects(f.notifications.reinspect({ ...input, recoveryRequestId: 'inspection-2' }), /conflict/i);
+  assert.equal(f.calls.length, 2);
+});
+
+test('reinspection refuses inconclusive idle proof and concurrent batch or generation changes', async (t) => {
+  for (const change of ['probe', 'batch', 'generation']) {
+    let confirm; const f = fixture(t, { jobs: {
+      dispatch: async () => ({ outcome: 'unknown' }),
+      recoverInactive: async (_, mark) => { if (change === 'probe') return false; confirm = mark; return new Promise((resolve) => { f.finishRecovery = resolve; }); },
+    } });
+    f.notifications.notify(alert()); f.advance(); f.jobs.start(); f.notifications.start(); await f.notifications.tick(); await f.jobs.tick();
+    const input = { consumerId: 'admin', generation: 'test-v1', requestId: f.notifications.status('admin').batch.requestId, recoveryRequestId: 'inspection-1', acknowledgeUnknown: true };
+    const recovery = f.notifications.reinspect(input);
+    if (change !== 'probe') {
+      await new Promise(setImmediate);
+      if (change === 'generation') f.config.bot.notifications.consumers.admin.generation = 'new-generation';
+      else f.db.raw.prepare('UPDATE notification_consumers SET active_batch=NULL').run();
+      confirm(); f.finishRecovery(true);
+    }
+    await assert.rejects(recovery);
+    assert.equal(f.db.raw.prepare("SELECT count(*) n FROM external_jobs WHERE request_id='inspection-1'").get().n, 0);
+  }
+});
+
+test('restarting after recovery is frozen submits the same immutable inspection input', async (t) => {
+  let turns = 0; const f = fixture(t, { jobs: {
+    dispatch: async (job) => { f.calls.push(job); return { outcome: ++turns === 1 ? 'unknown' : 'succeeded', inactive: true }; },
+    recoverInactive: async (_, confirm) => { confirm(); return true; },
+  } });
+  f.notifications.notify(alert()); f.advance(); f.jobs.start(); f.notifications.start(); await f.notifications.tick(); await f.jobs.tick();
+  const input = { consumerId: 'admin', generation: 'test-v1', requestId: f.calls[0].requestId, recoveryRequestId: 'inspection-1', acknowledgeUnknown: true };
+  await f.notifications.reinspect(input);
+  const frozen = JSON.parse(f.db.raw.prepare('SELECT active_batch FROM notification_consumers').get().active_batch).recovery.input;
+  f.notifications.stop(); f.jobs.stop(); f.db.raw.close();
+  const db = require('../lib/db').open(f.dbPath);
+  const jobs = createExternalJobService({ ...f.jobOptions, db });
+  const notifications = createNotificationService({ ...f.notificationOptions, db, jobs, tg: createSender(db) });
+  t.after(() => { notifications.stop(); jobs.stop(); db.raw.close(); });
+  insertInbound(db, { chat_id: '-1001', thread_id: '2995', text: 'Newer history must not alter the frozen attempt', msg_id: 111 });
+  assert.equal((await notifications.reinspect(input)).recovery.state, 'not-submitted');
+  jobs.start(); notifications.start(); await notifications.tick(); await jobs.tick(); await notifications.tick();
+  assert.deepEqual({ routeId: f.calls[1].routeId, requestId: f.calls[1].requestId, task: f.calls[1].task, payload: f.calls[1].payload }, frozen);
+  assert.equal(notifications.status('admin').processedId, 1);
+  assert.equal((await notifications.reinspect(input)).recovery.state, 'succeeded');
+});
+
+test('authenticated reinspection IPC preserves the held original and exposes the linked attempt', async (t) => {
+  const f = fixture(t, { jobs: { dispatch: async () => ({ outcome: 'unknown' }), recoverInactive: async (_, confirm) => { confirm(); return true; } } });
+  f.notifications.notify(alert()); f.advance(); f.jobs.start(); f.notifications.start(); await f.notifications.tick(); await f.jobs.tick();
+  const server = require('../lib/ipc/server'); const client = require('../lib/ipc/client');
+  const socket = require('node:path').join(require('node:os').tmpdir(), `inspect-${process.pid}-${Date.now()}.sock`);
+  const ipc = await server.start({ path: socket, secret: 'test-secret', handlers: require('../lib/ipc/handlers').createIpcHandlers({ notifications: f.notifications }), logger: { error() {}, log() {} } });
+  t.after(() => ipc.close());
+  const payload = { consumerId: 'admin', generation: 'test-v1', requestId: f.notifications.status('admin').batch.requestId, recoveryRequestId: 'inspection-1', acknowledgeUnknown: true };
+  const call = (secret) => client.call({ path: socket, secret, op: 'notification_reinspect', payload });
+  assert.equal((await call('wrong')).ok, false);
+  const accepted = await call('test-secret'); assert.equal(accepted.ok, true); assert.equal(accepted.recovery.requestId, 'inspection-1');
+  assert.equal((await call('test-secret')).recovery.requestId, 'inspection-1');
+  assert.equal(f.notifications.status('admin').batch.state, 'unknown');
+});
+
+test('concurrent recovery requests persist exactly one identity and preserve newer wake revisions', async (t) => {
+  const waiting = []; let turns = 0;
+  const f = fixture(t, { jobs: {
+    dispatch: async (job) => { f.calls.push(job); return { outcome: ++turns === 1 ? 'unknown' : 'succeeded', inactive: true }; },
+    recoverInactive: async (_, confirm) => new Promise((resolve) => waiting.push(() => { confirm(); resolve(true); })),
+  } });
+  const scope = f.notifications.scope('-1001:2995');
+  f.notifications.schedule(scope, { key: 'disk', dueAt: 101000, context: 'Old check', notificationIds: [] });
+  f.advance(); f.jobs.start(); f.notifications.start(); await f.notifications.tick(); await f.jobs.tick();
+  const input = { consumerId: 'admin', generation: 'test-v1', requestId: f.calls[0].requestId, recoveryRequestId: 'inspection-1', acknowledgeUnknown: true };
+  const first = f.notifications.reinspect(input); const duplicate = f.notifications.reinspect(input);
+  const conflict = f.notifications.reinspect({ ...input, recoveryRequestId: 'inspection-2' });
+  const rejected = assert.rejects(conflict, /changed|conflict/i);
+  await new Promise(setImmediate); for (const finish of waiting) finish();
+  assert.equal((await first).recovery.requestId, 'inspection-1'); assert.equal((await duplicate).recovery.requestId, 'inspection-1'); await rejected;
+  f.notifications.schedule(scope, { key: 'disk', dueAt: 200000, context: 'New check', notificationIds: [] });
+  await f.notifications.tick(); await f.jobs.tick(); await f.notifications.tick();
+  assert.equal(f.calls.length, 2); assert.equal(f.notifications.status('admin').wakes[0].dueAt, 200000);
+  assert.equal(f.notifications.status('admin').wakes[0].revision, 2);
+});
