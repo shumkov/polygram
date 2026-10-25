@@ -189,6 +189,7 @@ const MEDIA_ONLY_FALLBACK_TEXT = '(media unavailable)';
 const { createRichSender, sendRichWithStylingRetry } = require('./lib/telegram/rich-send');
 const { createRichDeliveryFactory } = require('./lib/telegram/rich-dispatch');
 const { createRichEditStrategy } = require('./lib/telegram/rich-edit-dispatch');
+const { normalizeRichInbound } = require('./lib/telegram/rich-inbound');
 const { composeDeliverTextFactories } = require('./lib/telegram/deliver-strategy');
 const { composingMarker } = require('./lib/telegram/composing-marker');
 const { buildPolygramDisplayHint } = require('./lib/telegram/display-hint');
@@ -3464,6 +3465,10 @@ function createBot(token) {
     }
     if (!chatConfig) return;
 
+    // A rich message has no text of its own; give it one before anything
+    // (the stored row, the gate, the prompt) reads it.
+    normalizeRichInbound(ctx.message);
+
     // Record every inbound msg, even unaddressed ones — needed for reply-to
     // lookups and the transcript skill.
     recordInbound(ctx.message);
@@ -3519,6 +3524,9 @@ function createBot(token) {
     }
     const chatId = ctx.editedMessage.chat.id.toString();
     if (!knownChat(chatId)) return;
+    // Same rendering as a fresh message, or the upsert below would blank the
+    // stored text of an edited rich message.
+    normalizeRichInbound(ctx.editedMessage);
     // 0.12.0 spec §3 (HARD): read the OLD text BEFORE recordInbound overwrites the row — the
     // post-turn changed-guard compares it, and the re-dispatch quotes it in reply_to so claude sees
     // the before/after. Reading after recordInbound would yield the new text (useless).

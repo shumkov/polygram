@@ -173,6 +173,18 @@ describe('createPollLoop — pollBot', () => {
     assert.equal(events.filter((m) => m.startsWith('[testbot] ←')).length, 0);
   });
 
+  test('a rich message shows as (rich message) in the journal, not (media)', async () => {
+    // A blocked rich message leaves no other trace, so the journal line is how
+    // an operator can tell one arrived.
+    const bot = makeBot({
+      updates: [{ update_id: 1, message: { message_id: 1, chat: { id: 100 }, rich_message: { blocks: [] } } }],
+    });
+    const fx = makePoll();
+    await fx.loop.pollBot(bot);
+    assert.ok(fx.events.some((e) => e.kind === 'log' && e.m === '[testbot] ← TestChat: (rich message)'),
+      JSON.stringify(fx.events));
+  });
+
   test('deploy admission fence closes before pollBot starts', async () => {
     const bot = makeBot({ autoStopAfter: Number.POSITIVE_INFINITY });
     let initCalls = 0;
