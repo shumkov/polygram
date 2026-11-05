@@ -11,6 +11,12 @@
  * 'api-error' event goes through Polygram's real onApiError callback, wired
  * the way ProcessManager forwards it. What is asserted is what the user would
  * receive: exactly one message per waiting message, quoting it, in its topic.
+ *
+ * handleMessage is reduced to the CliProcess send, so its own error exit (the
+ * preview's "stream interrupted" handling) is not on this path; that exit is
+ * run in tests/cli-api-error-surfacing.test.js and its wiring is checked in
+ * tests/polygram-streamer-exits.test.js. The dispatcher's error reply sets no
+ * message_thread_id: quoting the message is what keeps it in the topic.
  */
 
 const { test } = require('node:test');
