@@ -559,6 +559,41 @@ describe('createDispatcher — replay-failure user reply (rc.55)', () => {
   });
 });
 
+describe('createDispatcher — a CLI turn that ended in an API error (CLAUDE_API_ERROR)', () => {
+  const apiErr = () => Object.assign(new Error('Claude ended this turn with an API error'), {
+    code: 'CLAUDE_API_ERROR', apiError: 'server_error',
+  });
+
+  test('a live turn\'s error reply is the classified copy, and the class is recorded', async () => {
+    const fx = fixture({ classifyError: realClassify });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, baseMsg, {});
+    await nextTick();
+    fx.getResolver().reject(apiErr());
+    await nextTick(); await nextTick(); await nextTick();
+
+    assert.equal(fx.calls.tg.length, 1, 'the dispatcher sends one error-class message');
+    assert.equal(fx.calls.tg[0].params.text, realClassify(apiErr()).userMessage);
+    assert.equal(fx.calls.tg[0].params.reply_parameters.message_id, baseMsg.message_id);
+    assert.equal(fx.calls.setInboundStatus[0]?.status, 'failed', 'not replayed at the next boot');
+    const handlerError = fx.calls.events.find((e) => e.kind === 'handler-error');
+    assert.equal(handlerError.detail.code, 'CLAUDE_API_ERROR');
+    assert.equal(handlerError.detail.api_error_code, 'server_error',
+      'the class survives into telemetry (the message carries none)');
+  });
+
+  test('a boot replay that hits the failing API says so instead of "rephrase or simplify"', async () => {
+    const fx = fixture({ classifyError: realClassify });
+    fx.dispatcher.dispatchHandleMessage('sk', 100, { ...baseMsg, _isReplay: true }, {});
+    await nextTick();
+    fx.getResolver().reject(apiErr());
+    await nextTick(); await nextTick();
+
+    assert.equal(fx.calls.tg.length, 1);
+    assert.equal(fx.calls.tg[0].params.text, realClassify(apiErr()).userMessage);
+    assert.doesNotMatch(fx.calls.tg[0].params.text, /rephrase or simplify/);
+  });
+});
+
 describe('createDispatcher — auto-resume gating', () => {
   test('resumable + not in cooldown → markAttempt + sendToProcess called', async () => {
     const fx = fixture({ isAutoResumable: true });

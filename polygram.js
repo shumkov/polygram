@@ -3127,10 +3127,12 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
     // exit" beats §3.2.3's literal wording). With nothing delivered, the old
     // direct finalize is still exactly right — it is what carries the error
     // suffix onto the partial bubble.
-    const settleErrorExit = async (errorSuffix) => {
+    const settleErrorExit = async (errorSuffix, { suffixMessage = true } = {}) => {
       if (deliveredTexts.length > 0) {
         await finishStreamer().catch(() => {});
-        if (errorSuffix) {
+        // suffixMessage:false — the error reply the dispatcher sends next is
+        // already this turn's one error message.
+        if (errorSuffix && suffixMessage) {
           await tg(bot, 'sendMessage', {
             chat_id: chatId,
             text: `⚠️ ${errorSuffix}`,
@@ -3171,10 +3173,10 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
       // `turn timeout (...)`, which does NOT match the legacy regex — branch on
       // code, not text). TURN_TIMEOUT (went quiet) / TURN_MAX_EXCEEDED (hit hard
       // cap) → TIMEOUT reactor; anything else → ERROR.
-      const { errorSuffix, reactorState } = classifyTurnEndError(err);
+      const { errorSuffix, reactorState, suffixMessage } = classifyTurnEndError(err);
       // null keeps the drafted body so the suffix APPENDS to what the user was
       // reading instead of replacing it with a bare "⚠️ …".
-      await settleErrorExit(errorSuffix);
+      await settleErrorExit(errorSuffix, { suffixMessage });
       reactor.setState(reactorState);
     }
     if (deliverySettlementError) throw deliverySettlementError;
