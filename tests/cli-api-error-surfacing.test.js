@@ -38,7 +38,7 @@ describe('the message a user gets when claude gave up on a failing API', () => {
 
   test('each class maps to copy the user can act on', () => {
     const temporary = classify(apiError('server_error')).userMessage;
-    for (const kind of ['overloaded', 'rate_limit', 'unknown', 'a_class_from_a_newer_cli']) {
+    for (const kind of ['overloaded', 'unknown', 'a_class_from_a_newer_cli']) {
       assert.equal(classify(apiError(kind)).userMessage, temporary, kind);
     }
     const account = classify(apiError('authentication_failed')).userMessage;
@@ -50,8 +50,16 @@ describe('the message a user gets when claude gave up on a failing API', () => {
     assert.match(classify(apiError('max_output_tokens')).userMessage, /output limit/);
   });
 
+  test('a rate limit does not promise a quick retry: a subscription usage cap can last hours', () => {
+    const text = classify(apiError('rate_limit')).userMessage;
+    assert.notEqual(text, classify(apiError('server_error')).userMessage);
+    assert.match(text, /limit/);
+    assert.doesNotMatch(text, /minute/i, 'telling the user to retry in minutes sends them into the same wall');
+    assert.match(text, /hours/);
+  });
+
   test('the copy never promises an operator was notified and never names billing details', () => {
-    for (const kind of ['server_error', 'authentication_failed', 'billing_error', 'invalid_request', 'max_output_tokens']) {
+    for (const kind of ['server_error', 'rate_limit', 'authentication_failed', 'billing_error', 'invalid_request', 'max_output_tokens']) {
       const text = classify(apiError(kind)).userMessage;
       assert.doesNotMatch(text, /notified|operator/i, kind);
       assert.doesNotMatch(text, /credit|payment|billing/i, kind);
