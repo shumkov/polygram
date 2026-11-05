@@ -146,6 +146,16 @@ describe('what the chat gets from the turn-end exit when a turn fails', () => {
     assert.deepEqual(exit.sent, []);
   });
 
+  test('an org-disabled account (AUTH_DISABLED) puts nothing in the chat from this exit; the operator path is the dispatcher\'s', async () => {
+    const authDisabled = Object.assign(new Error('Claude subscription access has been disabled for this account'), { code: 'AUTH_DISABLED' });
+    const afterReplies = turnErrorExit({ delivered: true });
+    assert.equal(await settleTurnEndError(authDisabled, afterReplies.settle), 'ERROR');
+    assert.deepEqual(afterReplies.sent, [], 'no "⚠️ stream interrupted" message: the chat is told nothing');
+    const nothingDelivered = turnErrorExit({ delivered: false });
+    await settleTurnEndError(authDisabled, nothingDelivered.settle);
+    assert.deepEqual(nothingDelivered.finalized, [{ text: null, opts: {} }], 'no in-bubble suffix either');
+  });
+
   test('a timeout gets the calm TIMEOUT reactor through the same exit', async () => {
     const exit = turnErrorExit({ delivered: true });
     const err = Object.assign(new Error('turn timeout (600000ms, reason=idle)'), { code: 'TURN_TIMEOUT' });
