@@ -15,10 +15,9 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
 
 const { classify, classifyTurnEndError } = require('../lib/error/classify');
+const { createTurnErrorExit, settleTurnEndError } = require('../lib/telegram/turn-error-exit');
 const { isAutoResumable } = require('../lib/db/auto-resume');
 const { createSdkCallbacks } = require('../lib/sdk/callbacks');
 
@@ -95,18 +94,63 @@ describe('the message a user gets when claude gave up on a failing API', () => {
       'every other error keeps its separate suffix message');
   });
 
-  test('the turn-end exit honours suffixMessage (source tripwire: handleMessage has no seam)', () => {
-    const src = fs.readFileSync(path.join(__dirname, '..', 'polygram.js'), 'utf8');
-    const start = src.indexOf('const settleErrorExit = async (');
-    assert.notEqual(start, -1);
-    assert.match(src.slice(start, start + 700), /if \(errorSuffix && suffixMessage\)/);
-    assert.match(src, /settleErrorExit\(errorSuffix, \{ suffixMessage \}\)/);
-  });
-
   test('no automatic continuation: the failed turn is the user\'s to resend', () => {
     assert.equal(isAutoResumable({
       error: apiError('server_error'), aborted: false, replay: false, shuttingDown: false,
     }), false);
+  });
+});
+
+// The exit handleMessage's catch takes, with the chat and the preview faked.
+function turnErrorExit({ delivered }) {
+  const sent = [];
+  const finalized = [];
+  const persisted = [];
+  let settledThroughTurn = 0;
+  const settle = createTurnErrorExit({
+    hasDeliveredReplies: () => delivered,
+    finishStreamer: async () => { settledThroughTurn += 1; },
+    streamer: {
+      finalize: async (text, opts) => {
+        finalized.push({ text, opts });
+        return { finalEditOk: true, msgId: 9, finalText: 'partial answer' };
+      },
+    },
+    sendSuffixMessage: async (text) => { sent.push(text); },
+    persistBubbleText: (msgId, text) => persisted.push([msgId, text]),
+  });
+  return { settle, sent, finalized, persisted, settledThroughTurn: () => settledThroughTurn };
+}
+
+describe('what the chat gets from the turn-end exit when a turn fails', () => {
+  test('after delivered replies, an API-error turn sends no "⚠️ stream interrupted" message: the classified reply is the one error message', async () => {
+    const exit = turnErrorExit({ delivered: true });
+    assert.equal(await settleTurnEndError(apiError('server_error'), exit.settle), 'ERROR');
+    assert.deepEqual(exit.sent, []);
+    assert.equal(exit.settledThroughTurn(), 1, 'the delivered answer is not restated');
+    assert.deepEqual(exit.finalized, []);
+  });
+
+  test('after delivered replies, any other failure still says the stream was interrupted', async () => {
+    const exit = turnErrorExit({ delivered: true });
+    assert.equal(await settleTurnEndError(new Error('bridge went away'), exit.settle), 'ERROR');
+    assert.deepEqual(exit.sent, ['⚠️ stream interrupted']);
+  });
+
+  test('with nothing delivered, a partial preview keeps its in-bubble suffix so it does not read as finished', async () => {
+    const exit = turnErrorExit({ delivered: false });
+    await settleTurnEndError(apiError('server_error'), exit.settle);
+    assert.deepEqual(exit.finalized, [{ text: null, opts: { errorSuffix: 'stream interrupted' } }],
+      'null keeps the drafted body; the suffix is appended');
+    assert.deepEqual(exit.persisted, [[9, 'partial answer']]);
+    assert.deepEqual(exit.sent, []);
+  });
+
+  test('a timeout gets the calm TIMEOUT reactor through the same exit', async () => {
+    const exit = turnErrorExit({ delivered: true });
+    const err = Object.assign(new Error('turn timeout (600000ms, reason=idle)'), { code: 'TURN_TIMEOUT' });
+    assert.equal(await settleTurnEndError(err, exit.settle), 'TIMEOUT');
+    assert.deepEqual(exit.sent, ['⚠️ stream interrupted']);
   });
 });
 
