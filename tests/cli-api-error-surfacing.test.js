@@ -132,7 +132,7 @@ function callbacks(extra = {}) {
 describe('a follow-up whose own cycle failed (no pending turn) is answered, not swallowed', () => {
   test('the follow-up gets one reply with the same copy, in its thread, and the cycle visuals end', () => {
     const { cbs, sent, events, ended } = callbacks();
-    cbs.onApiError('-100123:77', { apiError: 'server_error', anchorMsgId: '42', sessionId: 's', backend: 'cli' });
+    cbs.onApiError('-100123:77', { apiError: 'server_error', anchorMsgIds: ['42'], sessionId: 's', backend: 'cli' });
     assert.deepEqual(ended, ['-100123:77'], 'typing and the anchor 🤔 stop');
     assert.equal(sent.length, 1);
     const { params, meta } = sent[0];
@@ -146,9 +146,23 @@ describe('a follow-up whose own cycle failed (no pending turn) is answered, not 
     assert.ok(events.some((e) => e.kind === 'cli-cycle-api-error' && e.detail.outcome === 'replied'));
   });
 
+  test('every follow-up claude ran in the failed query gets its own reply, quoting it, in the session\'s thread', () => {
+    const { cbs, sent, events, ended } = callbacks();
+    cbs.onApiError('-100123:77', { apiError: 'server_error', anchorMsgIds: ['41', '42'], sessionId: 's', backend: 'cli' });
+    assert.deepEqual(ended, ['-100123:77'], 'the cycle visuals end once');
+    assert.deepEqual(sent.map((m) => m.params.reply_parameters.message_id), [41, 42],
+      'each waiting message is answered; claude merged them into one query, the user sent them separately');
+    for (const { params } of sent) {
+      assert.equal(params.chat_id, '-100123');
+      assert.equal(params.message_thread_id, 77);
+      assert.equal(params.text, classify(apiError('server_error')).userMessage);
+    }
+    assert.equal(events.filter((e) => e.kind === 'cli-cycle-api-error' && e.detail.outcome === 'replied').length, 2);
+  });
+
   test('a cycle no user is waiting on (a wakeup) only ends its visuals', () => {
     const { cbs, sent, ended } = callbacks();
-    cbs.onApiError('100', { apiError: 'server_error', anchorMsgId: null });
+    cbs.onApiError('100', { apiError: 'server_error', anchorMsgIds: [] });
     assert.deepEqual(ended, ['100']);
     assert.equal(sent.length, 0);
   });
@@ -157,17 +171,19 @@ describe('a follow-up whose own cycle failed (no pending turn) is answered, not 
     const { cbs, sent } = callbacks({
       sessionFeedback: { endCycle: () => { throw new Error('feedback bug'); } },
     });
-    cbs.onApiError('100', { apiError: 'server_error', anchorMsgId: '7' });
+    cbs.onApiError('100', { apiError: 'server_error', anchorMsgIds: ['7'] });
     assert.equal(sent.length, 1);
   });
 
   test('stays quiet during shutdown, right after /stop, and for the AUTH_DISABLED class', () => {
     for (const [extra, payload, outcome] of [
-      [{ getIsShuttingDown: () => true }, { apiError: 'server_error', anchorMsgId: '5' }, 'shutting-down'],
-      [{ isSessionRecentlyAborted: () => true }, { apiError: 'server_error', anchorMsgId: '5' }, 'aborted'],
-      [{}, { apiError: 'oauth_org_not_allowed', anchorMsgId: '5' }, 'auth-disabled'],
-      [{}, { apiError: 'server_error', anchorMsgId: 'not-a-message-id' }, 'bad-anchor'],
-      [{ bot: null }, { apiError: 'server_error', anchorMsgId: '5' }, 'no-bot'],
+      [{ getIsShuttingDown: () => true }, { apiError: 'server_error', anchorMsgIds: ['5'] }, 'shutting-down'],
+      [{ isSessionRecentlyAborted: () => true }, { apiError: 'server_error', anchorMsgIds: ['5'] }, 'aborted'],
+      [{}, { apiError: 'oauth_org_not_allowed', anchorMsgIds: ['5'] }, 'auth-disabled'],
+      [{}, { apiError: 'server_error', anchorMsgIds: ['not-a-message-id'] }, 'bad-anchor'],
+      [{}, { apiError: 'server_error', anchorMsgIds: [null] }, 'bad-anchor'],
+      [{}, { apiError: 'server_error', anchorMsgIds: ['0'] }, 'bad-anchor'],
+      [{ bot: null }, { apiError: 'server_error', anchorMsgIds: ['5'] }, 'no-bot'],
     ]) {
       const { cbs, sent, events, ended } = callbacks(extra);
       cbs.onApiError('100', payload);
