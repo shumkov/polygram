@@ -8,7 +8,7 @@ const lockfile = require('../package-lock.json');
 const orchestra = require('@shumkov/orchestra');
 const orchestraPackage = require('@shumkov/orchestra/package.json');
 
-const REQUIRED_ORCHESTRA_VERSION = '0.11.1';
+const REQUIRED_ORCHESTRA_VERSION = '0.11.2';
 
 test('installed Orchestra exactly matches the reviewed Codex contract', () => {
   assert.equal(
@@ -58,6 +58,9 @@ test('installed Orchestra exactly matches the reviewed Codex contract', () => {
     },
   );
   assert.equal(typeof orchestra.codexProtocolSchema, 'object');
+  // A failed claude cycle with no pending turn (a follow-up that ran after a
+  // failed turn) reaches lib/sdk/callbacks.js onApiError only through this row.
+  assert.equal(orchestra.CALLBACK_TO_EVENT.onApiError, 'api-error');
   assert.deepEqual(
     orchestra.codexProtocolSchema.clientRequests['hooks/list'],
     {
