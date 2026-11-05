@@ -32,6 +32,20 @@ describe('enforceEventDetailSchema', () => {
     assert.deepEqual(dropped, []);
   });
 
+  test('Orchestra\'s API-error telemetry for merged queries survives', () => {
+    // cli-stop-failure-unattributed and cli-open-prompt-evicted: how many
+    // prompts one failed query closed, which follow-ups it named, and what an
+    // eviction lost. Without these an outage that leaves messages silent
+    // cannot be reconstructed from the events table.
+    const unattributed = {
+      reason: 'own-cycle', api_error_code: 'server_error', pending_count: 0,
+      closed_prompt_count: 3, anchor_msg_ids: ['2', '3', '4'],
+    };
+    assert.deepEqual(enforceEventDetailSchema(unattributed).detail, unattributed);
+    const evicted = { turn_owned: false, follow_up_count: 2 };
+    assert.deepEqual(enforceEventDetailSchema(evicted).detail, evicted);
+  });
+
   test('a value of the wrong type is dropped even under an approved name', () => {
     // The whole point of typing: `reason` is a legitimate field name, so a
     // name-only allowlist would have persisted this sentence verbatim.
