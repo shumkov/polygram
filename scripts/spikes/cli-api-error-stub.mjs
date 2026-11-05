@@ -64,6 +64,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
 
 const require = createRequire(import.meta.url);
 
@@ -106,6 +107,11 @@ const { ensureVendoredClaudeBin, CLAUDE_CLI_PINNED_VERSION } = orchestra.claudeB
 const VENDOR_DIR_OVERRIDE = process.env.ORCHESTRA_CLAUDE_VENDOR_DIR || null;
 if (VENDOR_DIR_OVERRIDE && !path.isAbsolute(VENDOR_DIR_OVERRIDE)) {
   console.error(`ORCHESTRA_CLAUDE_VENDOR_DIR must be an absolute path (got ${VENDOR_DIR_OVERRIDE})`);
+  process.exit(2);
+}
+if (VENDOR_DIR_OVERRIDE
+    && path.resolve(VENDOR_DIR_OVERRIDE) === path.join(os.homedir(), '.local', 'share', 'polygram', 'claude-bin')) {
+  console.error('ORCHESTRA_CLAUDE_VENDOR_DIR must not be the daemon\'s live vendor dir');
   process.exit(2);
 }
 
@@ -279,7 +285,12 @@ if (PROBE_HOOK && !hookSettings.HOOK_EVENTS.includes('StopFailure')) {
 }
 
 const binResult = ensureVendoredClaudeBin(CLAUDE_CLI_PINNED_VERSION, { logger: { warn: () => {}, log: () => {}, error: log } });
-if (!binResult.ok) { log(`pinned claude unavailable: ${binResult.reason}`); process.exit(2); }
+if (!binResult.ok) {
+  log(`pinned claude unavailable: ${binResult.reason}`);
+  stub.close();
+  fs.rmSync(work, { recursive: true, force: true });
+  process.exit(2);
+}
 log(`claude binary: ${binResult.path}`);
 
 const events = [];
@@ -499,7 +510,21 @@ try {
   log(`spike failed: ${err.stack || err.message}`);
   log('FAIL');
 } finally {
+  // claude writes its session file as it exits, which can be after the tmux
+  // session is gone; removing the project entry before then leaves it behind.
+  // The launcher execs claude, so the pane's pid is claude's.
+  let claudePid = null;
+  try {
+    const out = execFileSync('tmux', ['-L', SOCKET, 'list-panes', '-t', proc.tmuxSession, '-F', '#{pane_pid}'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    claudePid = Number(out.trim().split('\n')[0]) || null;
+  } catch {}
   try { await proc.kill('spike-done'); } catch {}
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  for (const deadline = Date.now() + 15_000; claudePid && alive(claudePid) && Date.now() < deadline;) {
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  if (claudePid && alive(claudePid)) log(`claude (pid ${claudePid}) still running; its project entry may be left behind`);
   stub.close();
   try {
     const encoded = cwd.replace(/[^a-zA-Z0-9]/g, '-');
