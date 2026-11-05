@@ -172,6 +172,8 @@ checks that a turn whose model request keeps failing ends promptly with
 behaviour that is not a compatibility contract:
 - the `StopFailure` hook and its `error` enum;
 - `prompt_id` shared across a turn and its folds but new for a queued prompt;
+- several queued prompts run as one query, ended under the last `prompt_id`,
+  with their UserPromptSubmit lines written in order;
 - `agent_id` only on sub-agent events;
 - no `StopFailure` on a recovered retry or a C-c.
 
@@ -182,7 +184,8 @@ in that directory, so a run against a candidate pin would delete the deployed
 binary.
 
 Modes and flags are listed in its header. Cover at least
-`--mode fail --max-retries 5 --inject --followup`, `--mode flaky`,
+`--mode fail --max-retries 5 --inject --followup`,
+`--mode fail --max-retries 5 --inject --inject-count 3`, `--mode flaky`,
 `--mode subagent` and `--mode fail --interrupt-after 5000`. See
 `docs/0.41-cli-api-error-surfacing-spec.md`.
 

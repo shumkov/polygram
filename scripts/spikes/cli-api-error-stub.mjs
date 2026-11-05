@@ -30,6 +30,7 @@
  * the Agent SDK package or ~/.local/share/claude/versions):
  *   node scripts/spikes/cli-api-error-stub.mjs --mode fail --max-retries 2
  *   node scripts/spikes/cli-api-error-stub.mjs --mode fail --followup --inject
+ *   node scripts/spikes/cli-api-error-stub.mjs --mode fail --max-retries 5 --inject --inject-count 3
  *   node scripts/spikes/cli-api-error-stub.mjs --mode flaky --fail-count 2
  *   node scripts/spikes/cli-api-error-stub.mjs --mode 401
  * Options:
@@ -43,6 +44,9 @@
  *   --followup           after the first turn settles, send a second message.
  *   --inject             while the first turn is retrying, autosteer a second
  *                        message into it (the production overnight shape).
+ *   --inject-count <n>   with --inject: autosteer n follow-ups (default 1), to
+ *                        see whether claude runs queued follow-ups as one
+ *                        prompt or one each.
  *   --interrupt-after <ms> send C-c (the /stop path) this long after the first
  *                        message, while the CLI is still retrying.
  *   --agent              run the main thread as a project agent (`--agent`), as
@@ -77,6 +81,10 @@ const WAIT_MS = Number(arg('wait-ms', 240_000));
 const PROBE_HOOK = arg('probe-hook', false) === true;
 const FOLLOWUP = arg('followup', false) === true;
 const INJECT = arg('inject', false) === true;
+const INJECT_COUNT = INJECT ? Math.max(1, Number(arg('inject-count', 1))) : 0;
+// The autosteered follow-ups are messages 2..INJECT_COUNT+1; turn-2 comes after.
+const INJECTED_MSG_IDS = Array.from({ length: INJECT_COUNT }, (_, i) => String(2 + i));
+const TURN2_MSG_ID = 2 + INJECT_COUNT;
 const ORCHESTRA_PATH = arg('orchestra', null);
 const INTERRUPT_AFTER_MS = arg('interrupt-after', null);
 const WITH_AGENT = arg('agent', false) === true;
@@ -358,8 +366,12 @@ try {
   }
   if (INJECT) {
     await new Promise((r) => setTimeout(r, 4000));
-    const ok = proc.injectUserMessage({ content: 'Also reply with the word FOLLOWUP.', msgId: 2, source: 'autosteer' });
-    log(`${ts()} injected follow-up into the in-flight turn: ${ok}`);
+    for (let i = 0; i < INJECT_COUNT; i += 1) {
+      if (i > 0) await new Promise((r) => setTimeout(r, 1500));
+      const msgId = 2 + i;
+      const ok = proc.injectUserMessage({ content: `Also reply with the word FOLLOWUP${msgId}.`, msgId, source: 'autosteer' });
+      log(`${ts()} injected follow-up msg ${msgId} into the in-flight turn: ${ok}`);
+    }
   }
   report(first.label, first.started, await first.promise);
 
@@ -374,17 +386,31 @@ try {
     // still retrying the autosteered follow-up as its own cycle.
     await waitFor(() => procEvents.some((e) => e.name === 'turn-start' && e.payload?.hasPending === false));
     log(`${ts()} [inject] the follow-up runs as its own cycle; sending turn-2 while it retries`);
-    second = await runTurn('turn-2', 'Reply with the single word PING.', 3);
+    second = await runTurn('turn-2', 'Reply with the single word PING.', TURN2_MSG_ID);
   } else if (FOLLOWUP) {
-    second = await runTurn('turn-2', 'Reply with the single word PING.', 3);
+    second = await runTurn('turn-2', 'Reply with the single word PING.', TURN2_MSG_ID);
   }
   if (INJECT) {
-    await waitFor(() => procEvents.some((e) => e.name === 'api-error') || replies.length > 0);
-    const apiErr = procEvents.find((e) => e.name === 'api-error');
-    log(`${ts()} [inject] follow-up cycle outcome: ${apiErr ? `api-error ${JSON.stringify(apiErr.payload)}` : (replies.length ? 'replied' : 'NOTHING (silent)')}`);
-    if (apiErr) {
+    // Wait until every injected follow-up has been named by an api-error event
+    // (claude may run queued follow-ups as one query or one each), then a few
+    // seconds more so a duplicate notice would show up.
+    const named = () => new Set(procEvents.filter((e) => e.name === 'api-error')
+      .flatMap((e) => e.payload?.anchorMsgIds || []));
+    let coveredSince = null;
+    await waitFor(() => {
+      if (replies.length > 0) return true;
+      if (!INJECTED_MSG_IDS.every((id) => named().has(id))) return false;
+      coveredSince ??= Date.now();
+      return Date.now() - coveredSince > 5000;
+    });
+    const ownCycles = procEvents.filter((e) => e.name === 'turn-start' && e.payload?.hasPending === false).length;
+    const apiErrs = procEvents.filter((e) => e.name === 'api-error');
+    log(`${ts()} [inject] own cycles started: ${ownCycles}, api-error events: ${apiErrs.length}${replies.length ? `, replies: ${replies.length}` : ''}`);
+    if (!apiErrs.length) log(`${ts()} [inject] follow-up cycle outcome: ${replies.length ? 'replied' : 'NOTHING (silent)'}`);
+    for (const apiErr of apiErrs) {
       const cls = classify({ code: 'CLAUDE_API_ERROR', apiError: apiErr.payload.apiError });
-      log(`        follow-up would see (reply to msg ${apiErr.payload.anchorMsgId}): ${JSON.stringify(cls.userMessage)}`);
+      log(`        api-error ${JSON.stringify(apiErr.payload)}`);
+      log(`        each follow-up would see (reply to msg ${JSON.stringify(apiErr.payload.anchorMsgIds)}): ${JSON.stringify(cls.userMessage)}`);
     }
   }
   if (second) report(second.label, second.started, await second.promise);
@@ -396,10 +422,17 @@ try {
   log('\n--- hook events (name, prompt_id, StopFailure fields) ---');
   for (const line of ndjson) {
     let ev; try { ev = JSON.parse(line); } catch { continue; }
-    const extra = ev.hook_event_name === 'StopFailure'
-      ? ` error=${ev.error} error_details=${JSON.stringify(String(ev.error_details ?? '').slice(0, 160))} last_assistant_message=${JSON.stringify(String(ev.last_assistant_message ?? '').slice(0, 160))} agent_id=${ev.agent_id ?? '-'}`
-      : '';
-    log(`  ${ev.hook_event_name} prompt_id=${ev.prompt_id ?? '-'} agent_id=${ev.agent_id ?? '-'} agent_type=${ev.agent_type ?? '-'}${extra}`);
+    let extra = '';
+    if (ev.hook_event_name === 'StopFailure') {
+      extra = ` error=${ev.error} error_details=${JSON.stringify(String(ev.error_details ?? '').slice(0, 160))} last_assistant_message=${JSON.stringify(String(ev.last_assistant_message ?? '').slice(0, 160))} agent_id=${ev.agent_id ?? '-'}`;
+    } else if (ev.hook_event_name === 'UserPromptSubmit') {
+      // Which of our messages this prompt carries (ids only, no content).
+      const msgIds = [...String(ev.prompt ?? '').matchAll(/<channel\s[^>]*turn_id="([0-9a-f-]{36})"/g)]
+        .map((m) => proc.inputLedger.get(m[1])?.msgId ?? '?');
+      extra = ` carries_msg_ids=[${msgIds.join(',')}]`;
+    }
+    const recv = typeof ev.polygram_received_at_ms === 'number' ? `+${((ev.polygram_received_at_ms - t0) / 1000).toFixed(3)}s ` : '';
+    log(`  ${recv}${ev.hook_event_name} prompt_id=${ev.prompt_id ?? '-'} agent_id=${ev.agent_id ?? '-'} agent_type=${ev.agent_type ?? '-'}${extra}`);
   }
 
   const encoded = cwd.replace(/[^a-zA-Z0-9]/g, '-');
@@ -446,9 +479,9 @@ try {
       'the failed turn rejects with CLAUDE_API_ERROR (not left pending)');
   }
   if (INJECT && MODE === 'fail') {
-    const apiErr = procEvents.filter((e) => e.name === 'api-error');
-    expect(apiErr.length === 1 && apiErr[0].payload.anchorMsgId === '2',
-      'the autosteered follow-up\'s own failed cycle is reported once, naming its message');
+    const namedIds = procEvents.filter((e) => e.name === 'api-error').flatMap((e) => e.payload.anchorMsgIds || []);
+    expect([...namedIds].sort().join(',') === [...INJECTED_MSG_IDS].sort().join(','),
+      `every autosteered follow-up is named exactly once across api-error events (named ${JSON.stringify(namedIds)}, injected ${JSON.stringify(INJECTED_MSG_IDS)})`);
   }
   if (FOLLOWUP) {
     expect(rejectedWith(outcomes['turn-2']), 'a message after the failure runs as a fresh turn and fails on its own');
