@@ -164,6 +164,31 @@ node scripts/spikes/auth-expired.mjs  # DESTRUCTIVE: revokes OAuth
 node scripts/spikes/boot-replay.mjs   # DAEMON ONLY: kill mid-turn + restart
 ```
 
+`cli-api-error-stub.mjs` runs the pinned CLI under `CliProcess` against a
+local HTTP stub (500 / 401 / 500-then-success), pointed at it through the
+same launcher seam production uses for CLIProxy. It makes no paid call. It
+checks that a turn whose model request keeps failing ends promptly with
+`CLAUDE_API_ERROR`. Re-run it on every pin bump, because it depends on CLI
+behaviour that is not a compatibility contract:
+- the `StopFailure` hook and its `error` enum;
+- `prompt_id` shared across a turn and its folds but new for a queued prompt;
+- several queued prompts run as one query, ended under the last `prompt_id`,
+  with their UserPromptSubmit lines written in order;
+- `agent_id` only on sub-agent events;
+- no `StopFailure` on a recovered retry or a C-c.
+
+It copies the pinned binary into its own temp dir, removed at exit. Never
+point `ORCHESTRA_CLAUDE_VENDOR_DIR` at the daemon's live
+`~/.local/share/polygram/claude-bin`: vendoring deletes every other version
+in that directory, so a run against a candidate pin would delete the deployed
+binary.
+
+Modes and flags are listed in its header. Cover at least
+`--mode fail --max-retries 5 --inject --followup`,
+`--mode fail --max-retries 5 --inject --inject-count 3`, `--mode flaky`,
+`--mode subagent` and `--mode fail --interrupt-after 5000`. See
+`docs/0.41-cli-api-error-surfacing-spec.md`.
+
 `clean-restart-resume.mjs` is the opt-in, authenticated gate for the
 clean-restart resume-plus-`continue` rollout. It verifies the exact installed
 Orchestra contract, retires a live eight-step CLI turn after step five, strictly

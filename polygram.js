@@ -208,7 +208,8 @@ const { startTyping } = require('./lib/telegram/typing');
 const { createReactionManager, classifyToolName } = require('./lib/telegram/reactions');
 const { createMediaGroupBuffer } = require('./lib/media-group-buffer');
 const { applyReactionToMessages } = require('./lib/telegram/album-reactions');
-const { classify: classifyError, classifyTurnEndError, detectWedgedSessionError, isTransientHttpError } = require('./lib/error/classify');
+const { classify: classifyError, detectWedgedSessionError, isTransientHttpError } = require('./lib/error/classify');
+const { createTurnErrorExit, settleTurnEndError } = require('./lib/telegram/turn-error-exit');
 const { createAutoResumeTracker, isAutoResumable } = require('./lib/db/auto-resume');
 const { createAuthDisabledGate } = require('./lib/ops/auth-disabled-gate');
 const { createHeartbeat } = require('./lib/ops/heartbeat');
@@ -3120,35 +3121,20 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
     const abortedByUser = isSessionRecentlyAborted(sessionKey);
     const quietFinalize = abortedByUser || isShuttingDown;
     // A turn that already delivered replies and THEN failed must not restate
-    // them: finalize(null) publishes whatever the draft holds, which on a CLI
-    // turn is usually the answer a reply already sent. That is precisely the
-    // duplicate the shared rule exists to prevent, so when this turn delivered
-    // anything, the error paths settle through it instead (spec §3.3's "every
-    // exit" beats §3.2.3's literal wording). With nothing delivered, the old
-    // direct finalize is still exactly right — it is what carries the error
-    // suffix onto the partial bubble.
-    const settleErrorExit = async (errorSuffix) => {
-      if (deliveredTexts.length > 0) {
-        await finishStreamer().catch(() => {});
-        if (errorSuffix) {
-          await tg(bot, 'sendMessage', {
-            chat_id: chatId,
-            text: `⚠️ ${errorSuffix}`,
-            ...(threadId && { message_thread_id: threadId }),
-          }, { ...outMetaBase, source: 'turn-error-suffix' }).catch(() => {});
-        }
-        return;
-      }
-      // null, not '': finalize falls back to the drafted body. Passing ''
-      // REPLACED whatever had streamed with an empty bubble — the user watched
-      // a partial answer appear and then get wiped by the very failure that
-      // was supposed to leave it standing.
-      const fin = await streamer.finalize(null, errorSuffix ? { errorSuffix } : {})
-        .catch(() => null);
-      // The bubble now shows the drafted body; bring its transcript row along,
-      // or the row keeps the ~30-character stub the initial send wrote.
-      if (fin?.finalEditOk) persistBubbleText(chatId, fin.msgId, fin.finalText);
-    };
+    // them, so the error paths settle through the turn settler then (see
+    // lib/telegram/turn-error-exit.js); with nothing delivered, the direct
+    // finalize carries the error suffix onto the partial bubble.
+    const settleErrorExit = createTurnErrorExit({
+      hasDeliveredReplies: () => deliveredTexts.length > 0,
+      finishStreamer,
+      streamer,
+      sendSuffixMessage: (text) => tg(bot, 'sendMessage', {
+        chat_id: chatId,
+        text,
+        ...(threadId && { message_thread_id: threadId }),
+      }, { ...outMetaBase, source: 'turn-error-suffix' }),
+      persistBubbleText: (msgId, text) => persistBubbleText(chatId, msgId, text),
+    });
     if (quietFinalize) {
       await settleErrorExit(null);
       if (abortedByUser) {
@@ -3171,11 +3157,7 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
       // `turn timeout (...)`, which does NOT match the legacy regex — branch on
       // code, not text). TURN_TIMEOUT (went quiet) / TURN_MAX_EXCEEDED (hit hard
       // cap) → TIMEOUT reactor; anything else → ERROR.
-      const { errorSuffix, reactorState } = classifyTurnEndError(err);
-      // null keeps the drafted body so the suffix APPENDS to what the user was
-      // reading instead of replacing it with a bare "⚠️ …".
-      await settleErrorExit(errorSuffix);
-      reactor.setState(reactorState);
+      reactor.setState(await settleTurnEndError(err, settleErrorExit));
     }
     if (deliverySettlementError) throw deliverySettlementError;
     throw err;
@@ -4088,6 +4070,10 @@ async function main() {
     // 0.12 interactive questions: 'question-asked' (claude called the ask tool)
     // → render the Telegram keyboard. Late-bound; questionHandlers is assigned below.
     renderQuestion: (payload) => questionHandlers?.renderAsk(payload),
+    // The API-error notice for a cycle with no pending turn stays quiet during
+    // shutdown and right after the user's /stop.
+    getIsShuttingDown: () => isShuttingDown,
+    isSessionRecentlyAborted,
     logger: console,
   });
   sdkCallbacks.onAbnormalTermination = (_sessionKey, evidence) => {

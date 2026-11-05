@@ -195,12 +195,14 @@ describe('every turn-completion exit routes through the settler', () => {
     // finalize(null) publishes whatever the draft holds. On a turn that already
     // sent a reply that is the answer AGAIN — the duplicate the rule exists to
     // prevent. Only a turn that delivered nothing takes the direct finalize.
-    const start = SRC.indexOf('const settleErrorExit = async (');
+    // The helper's behaviour is executed in tests/cli-api-error-surfacing.test.js;
+    // this holds that handleMessage wires it to this turn's state.
+    const start = SRC.indexOf('const settleErrorExit = createTurnErrorExit({');
     assert.notEqual(start, -1, 'the error exits must share one settlement helper');
-    const body = SRC.slice(start, start + 1400);
-    assert.match(body, /deliveredTexts\.length > 0/);
-    assert.match(body, /await finishStreamer\(\)/);
-    assert.match(body, /streamer\.finalize\(null, errorSuffix/);
+    const body = SRC.slice(start, start + 700);
+    assert.match(body, /hasDeliveredReplies: \(\) => deliveredTexts\.length > 0/);
+    assert.match(body, /finishStreamer,/);
+    assert.match(body, /streamer,/);
     assert.doesNotMatch(SRC, /streamer\.finalize\(''/, "'' blanks the bubble the user was reading");
   });
 

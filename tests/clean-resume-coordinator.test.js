@@ -657,6 +657,29 @@ describe('clean resume boot coordinator', () => {
     }
   });
 
+  test('a continuation that ends in a Claude API error tells the user the API failed, not that resume was unsafe', async () => {
+    const { classify } = require('../lib/error/classify');
+    const error = Object.assign(new Error('Claude ended this turn with an API error'), {
+      code: 'CLAUDE_API_ERROR',
+      apiError: 'server_error',
+    });
+    const { deps, calls } = fixture({ sendError: error });
+    const result = await executeCleanResumeClaim(claim, deps);
+
+    assert.equal(calls.send.length, 1, 'nothing is retried');
+    assert.equal(calls.notice.length, 1);
+    assert.equal(calls.notice[0].text, classify(error).userMessage,
+      'the resume worked and Claude\'s API failed; the user hears that, not "couldn\'t safely resume"');
+    assert.equal(calls.notice[0].ambiguous, false);
+    assert.equal(calls.complete[0].status, 'replay-skipped');
+    assert.equal(result.reason, 'continuation-api-error');
+    assert.ok(calls.events.some((event) => (
+      event.kind === 'clean-resume-failed'
+      && event.detail.reason === 'continuation-api-error'
+      && event.detail.api_error_code === 'server_error'
+    )));
+  });
+
   test('ambiguous continuation delivery uses the uncertainty notice and never retries answer work', async () => {
     const error = Object.assign(new Error('Telegram response lost'), {
       deliveryAmbiguous: true,
