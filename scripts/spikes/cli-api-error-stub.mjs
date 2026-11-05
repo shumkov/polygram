@@ -17,15 +17,17 @@
  *   - what Polygram's classifier would tell the Telegram user.
  *
  * Side-effects: a dedicated tmux server (`tmux -L pgapierr`), a mode-0700 temp
- * dir (removed at exit), and the session's ~/.claude/projects entry for that
- * temp cwd (removed at exit). Model traffic goes only to the local stub, so no
+ * dir (removed at exit) that also holds this run's copy of the pinned claude
+ * binary, and the session's ~/.claude/projects entry for that temp cwd
+ * (removed at exit). Model traffic goes only to the local stub, so no
  * paid or authenticated inference call is made; the CLI's own startup traffic
  * (feature flags) still runs, because Channels depends on it. The CLI's
  * auto-updater is disabled for the run.
  *
  * Ends with PASS or FAIL (exit 0 / 1) against the mode's expected outcome.
  *
- * Usage (from the polygram package root; needs tmux and the vendored pin):
+ * Usage (from the polygram package root; needs tmux and the pinned claude from
+ * the Agent SDK package or ~/.local/share/claude/versions):
  *   node scripts/spikes/cli-api-error-stub.mjs --mode fail --max-retries 2
  *   node scripts/spikes/cli-api-error-stub.mjs --mode fail --followup --inject
  *   node scripts/spikes/cli-api-error-stub.mjs --mode flaky --fail-count 2
@@ -45,6 +47,12 @@
  *                        message, while the CLI is still retrying.
  *   --agent              run the main thread as a project agent (`--agent`), as
  *                        production chats do, to check which hook fields that adds.
+ * Environment:
+ *   ORCHESTRA_CLAUDE_BIN         run this claude binary as is (no vendoring).
+ *   ORCHESTRA_CLAUDE_VENDOR_DIR  absolute dir to vendor the pin into instead of
+ *                                the run's temp dir. Never the daemon's live
+ *                                ~/.local/share/polygram/claude-bin: vendoring
+ *                                deletes every other version there.
  */
 
 import http from 'node:http';
@@ -82,10 +90,16 @@ const orchestra = require(ORCHESTRA_PATH ? path.resolve(ORCHESTRA_PATH) : '@shum
 const { CliProcess, createTmuxRunner, hookSettings } = orchestra;
 const { classify } = require('../../lib/error/classify.js');
 
-if (!process.env.ORCHESTRA_CLAUDE_VENDOR_DIR) {
-  process.env.ORCHESTRA_CLAUDE_VENDOR_DIR = path.join(os.homedir(), '.local', 'share', 'polygram', 'claude-bin');
-}
 const { ensureVendoredClaudeBin, CLAUDE_CLI_PINNED_VERSION } = orchestra.claudeBin;
+// Vendoring deletes every other version in its directory. The daemon's live
+// ~/.local/share/polygram/claude-bin must therefore never be the default: a run
+// against a candidate pin would delete the deployed binary. An override has to
+// be an absolute path; without one the copy goes to this run's temp dir.
+const VENDOR_DIR_OVERRIDE = process.env.ORCHESTRA_CLAUDE_VENDOR_DIR || null;
+if (VENDOR_DIR_OVERRIDE && !path.isAbsolute(VENDOR_DIR_OVERRIDE)) {
+  console.error(`ORCHESTRA_CLAUDE_VENDOR_DIR must be an absolute path (got ${VENDOR_DIR_OVERRIDE})`);
+  process.exit(2);
+}
 
 const log = (...a) => process.stderr.write(`${a.join(' ')}\n`);
 const t0 = Date.now();
@@ -226,6 +240,7 @@ const stubPort = stub.address().port;
 // ─── isolated session scaffolding ───────────────────────────────────────────
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'pgapierr-'));
 fs.chmodSync(work, 0o700);
+if (!VENDOR_DIR_OVERRIDE) process.env.ORCHESTRA_CLAUDE_VENDOR_DIR = path.join(work, 'claude-bin');
 const cwd = fs.realpathSync(fs.mkdtempSync(path.join(work, 'cwd-')));
 if (WITH_AGENT) {
   fs.mkdirSync(path.join(cwd, '.claude', 'agents'), { recursive: true });
@@ -257,6 +272,7 @@ if (PROBE_HOOK && !hookSettings.HOOK_EVENTS.includes('StopFailure')) {
 
 const binResult = ensureVendoredClaudeBin(CLAUDE_CLI_PINNED_VERSION, { logger: { warn: () => {}, log: () => {}, error: log } });
 if (!binResult.ok) { log(`pinned claude unavailable: ${binResult.reason}`); process.exit(2); }
+log(`claude binary: ${binResult.path}`);
 
 const events = [];
 const procEvents = [];

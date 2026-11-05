@@ -175,6 +175,12 @@ behaviour that is not a compatibility contract:
 - `agent_id` only on sub-agent events;
 - no `StopFailure` on a recovered retry or a C-c.
 
+It copies the pinned binary into its own temp dir, removed at exit. Never
+point `ORCHESTRA_CLAUDE_VENDOR_DIR` at the daemon's live
+`~/.local/share/polygram/claude-bin`: vendoring deletes every other version
+in that directory, so a run against a candidate pin would delete the deployed
+binary.
+
 Modes and flags are listed in its header. Cover at least
 `--mode fail --max-retries 5 --inject --followup`, `--mode flaky`,
 `--mode subagent` and `--mode fail --interrupt-after 5000`. See
