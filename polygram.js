@@ -4090,6 +4090,10 @@ async function main() {
     // 0.12 interactive questions: 'question-asked' (claude called the ask tool)
     // → render the Telegram keyboard. Late-bound; questionHandlers is assigned below.
     renderQuestion: (payload) => questionHandlers?.renderAsk(payload),
+    // The API-error notice for a cycle with no pending turn stays quiet during
+    // shutdown and right after the user's /stop.
+    getIsShuttingDown: () => isShuttingDown,
+    isSessionRecentlyAborted,
     logger: console,
   });
   sdkCallbacks.onAbnormalTermination = (_sessionKey, evidence) => {

@@ -8,7 +8,9 @@
  * server_error and fired StopFailure; users heard nothing for hours).
  *
  * Orchestra ends such a turn with err.code CLAUDE_API_ERROR (claude's error
- * class on err.apiError). These tests pin what Polygram then tells the user.
+ * class on err.apiError), and reports a failed cycle that no pending turn ran
+ * in — a follow-up autosteered into the failed turn — through onApiError.
+ * These tests pin what Polygram then tells the user.
  */
 
 const { test, describe } = require('node:test');
@@ -18,6 +20,7 @@ const path = require('node:path');
 
 const { classify, classifyTurnEndError } = require('../lib/error/classify');
 const { isAutoResumable } = require('../lib/db/auto-resume');
+const { createSdkCallbacks } = require('../lib/sdk/callbacks');
 
 function apiError(kind, message = 'Claude ended this turn with an API error') {
   return Object.assign(new Error(message), { code: 'CLAUDE_API_ERROR', apiError: kind });
@@ -99,3 +102,70 @@ describe('the message a user gets when claude gave up on a failing API', () => {
   });
 });
 
+function callbacks(extra = {}) {
+  const sent = [];
+  const events = [];
+  const ended = [];
+  const cbs = createSdkCallbacks({
+    db: {}, dbWrite: () => {}, config: { chats: {} }, bot: {}, botName: 'b',
+    tg: async (bot, method, params, meta) => { sent.push({ method, params, meta }); return {}; },
+    logEvent: (kind, detail) => events.push({ kind, detail }),
+    classifyToolName: () => 'TOOL', announce: () => {}, shouldAnnounce: () => false,
+    contextHintShown: new Set(), extractAssistantText: () => '',
+    getChatIdFromKey: (sk) => sk.split(':')[0],
+    getThreadIdFromKey: (sk) => sk.split(':')[1] || null,
+    sessionFeedback: { endCycle: (sk) => ended.push(sk), startAutonomousCycle: () => {}, stopCycleTyping: () => {} },
+    logger: { error: () => {}, log: () => {} },
+    ...extra,
+  });
+  return { cbs, sent, events, ended };
+}
+
+describe('a follow-up whose own cycle failed (no pending turn) is answered, not swallowed', () => {
+  test('the follow-up gets one reply with the same copy, in its thread, and the cycle visuals end', () => {
+    const { cbs, sent, events, ended } = callbacks();
+    cbs.onApiError('-100123:77', { apiError: 'server_error', anchorMsgId: '42', sessionId: 's', backend: 'cli' });
+    assert.deepEqual(ended, ['-100123:77'], 'typing and the anchor 🤔 stop');
+    assert.equal(sent.length, 1);
+    const { params, meta } = sent[0];
+    assert.equal(params.chat_id, '-100123');
+    assert.equal(params.message_thread_id, 77);
+    assert.deepEqual(params.reply_parameters, { message_id: 42, allow_sending_without_reply: true });
+    assert.equal(params.text, classify(apiError('server_error')).userMessage);
+    assert.equal(meta.source, 'error-reply');
+    assert.equal(meta.sessionKey, '-100123:77');
+    assert.equal(meta.sourceMsgId, 42);
+    assert.ok(events.some((e) => e.kind === 'cli-cycle-api-error' && e.detail.outcome === 'replied'));
+  });
+
+  test('a cycle no user is waiting on (a wakeup) only ends its visuals', () => {
+    const { cbs, sent, ended } = callbacks();
+    cbs.onApiError('100', { apiError: 'server_error', anchorMsgId: null });
+    assert.deepEqual(ended, ['100']);
+    assert.equal(sent.length, 0);
+  });
+
+  test('a failing visuals teardown does not cost the user the notice', () => {
+    const { cbs, sent } = callbacks({
+      sessionFeedback: { endCycle: () => { throw new Error('feedback bug'); } },
+    });
+    cbs.onApiError('100', { apiError: 'server_error', anchorMsgId: '7' });
+    assert.equal(sent.length, 1);
+  });
+
+  test('stays quiet during shutdown, right after /stop, and for the AUTH_DISABLED class', () => {
+    for (const [extra, payload, outcome] of [
+      [{ getIsShuttingDown: () => true }, { apiError: 'server_error', anchorMsgId: '5' }, 'shutting-down'],
+      [{ isSessionRecentlyAborted: () => true }, { apiError: 'server_error', anchorMsgId: '5' }, 'aborted'],
+      [{}, { apiError: 'oauth_org_not_allowed', anchorMsgId: '5' }, 'auth-disabled'],
+      [{}, { apiError: 'server_error', anchorMsgId: 'not-a-message-id' }, 'bad-anchor'],
+      [{ bot: null }, { apiError: 'server_error', anchorMsgId: '5' }, 'no-bot'],
+    ]) {
+      const { cbs, sent, events, ended } = callbacks(extra);
+      cbs.onApiError('100', payload);
+      assert.equal(sent.length, 0, outcome);
+      assert.deepEqual(ended, ['100'], `${outcome}: typing and the anchor 🤔 must still stop`);
+      assert.ok(events.some((e) => e.kind === 'cli-cycle-api-error' && e.detail.outcome === outcome), outcome);
+    }
+  });
+});
