@@ -7,11 +7,12 @@ const target = { chatId: '-1001', threadId: '12', sessionKey: '-1001:12' };
 const job = { id: 7, routeId: 'marketing', requestId: 'mailbox:m_0000000000000001', task: 'Envelope', payload: { body: 'x' }, target };
 
 function fixture({ mailbox = null, notifications = null } = {}) {
-  const calls = { events: [], runtime: [] };
+  const calls = { events: [], runtime: [], warnings: [], logged: [] };
   const dispatch = createExternalJobDispatch({
     dispatchExternalEvent: (origin, run) => { calls.events.push(origin); return run(); },
     runtime: { dispatch: async (j, hooks) => { calls.runtime.push({ job: j, hooks }); hooks.onSend?.(); hooks.onTurnId?.('turn-1'); return { outcome: 'succeeded' }; } },
     getNotifications: () => notifications, getMailbox: () => mailbox,
+    logger: { warn: (line) => calls.warnings.push(line) }, logEvent: (kind, detail) => calls.logged.push([kind, detail]),
   });
   return { dispatch, calls };
 }
@@ -59,4 +60,15 @@ test('kill switch: other jobs and an enabled mailbox dispatch normally', async (
   const g = fixture({ mailbox: { enabled: true, instructions: () => '', noteJobSend() {} } });
   assert.equal((await g.dispatch(job, {})).outcome, 'succeeded');
   assert.equal(g.calls.events.length, 1);
+});
+
+test('kill switch: every withdrawal is logged and recorded as an event', async () => {
+  const f = fixture({ mailbox: { enabled: false, instructions: () => '', noteJobSend() {} } });
+  await f.dispatch(job, {});
+  assert.equal(f.calls.warnings.length, 1);
+  assert.match(f.calls.warnings[0], /mailbox:m_0000000000000001/);
+  assert.deepEqual(f.calls.logged, [['mailbox-withdrawn', { request_id: job.requestId, route_id: 'marketing', session_key: '-1001:12' }]]);
+  const g = fixture({ mailbox: { enabled: true, instructions: () => '', noteJobSend() {} } });
+  await g.dispatch(job, {});
+  assert.deepEqual([g.calls.warnings, g.calls.logged], [[], []], 'normal dispatch records nothing');
 });

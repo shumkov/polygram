@@ -4582,6 +4582,7 @@ async function main() {
       runtime: externalRuntime,
       getNotifications: () => notificationService,
       getMailbox: () => mailboxService,
+      logger: console, logEvent,
     }),
     checkInactive: externalRuntime.checkInactive,
     recoverInactive: externalRuntime.recoverInactive,

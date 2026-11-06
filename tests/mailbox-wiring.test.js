@@ -21,7 +21,7 @@ test('every human prompt resets the session depth and carries the mailbox instru
 });
 
 test('external jobs dispatch through the shared wrapper with both services', () => {
-  assert.match(src, /dispatch: createExternalJobDispatch\(\{[\s\S]*?getNotifications: \(\) => notificationService,[\s\S]*?getMailbox: \(\) => mailboxService,/);
+  assert.match(src, /dispatch: createExternalJobDispatch\(\{[\s\S]*?getNotifications: \(\) => notificationService,[\s\S]*?getMailbox: \(\) => mailboxService,\s*logger: console, logEvent,/);
   assert.doesNotMatch(src, /externalRuntime\.dispatch\(\{ \.\.\.job, task: job\.task/, 'no second, unwrapped dispatch path remains');
 });
 

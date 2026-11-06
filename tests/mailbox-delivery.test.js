@@ -35,7 +35,7 @@ function fixture(t, { mailbox = {}, jobs: jobSettings = {}, turn, recoverInactiv
     return (turn || (async () => ({ outcome: 'succeeded', text: '', inactive: true })))(job, f);
   } };
   f.jobs = createExternalJobService({ config, db, botName: 'test', resolveTarget, now: () => clock,
-    dispatch: createExternalJobDispatch({ dispatchExternalEvent: (origin, run) => run(), runtime, getMailbox: () => f.mailbox }),
+    dispatch: createExternalJobDispatch({ dispatchExternalEvent: (origin, run) => run(), runtime, getMailbox: () => f.mailbox, logger: quiet }),
     checkInactive: async () => false,
     recoverInactive: async (job, confirm) => { f.recoveries.push(job.requestId); return (recoverInactive || (async () => false))(job, confirm, f); },
     deliverPart: async () => ({ messageId: 1 }), logger: quiet });
