@@ -160,3 +160,11 @@ test('the config.example.json mailbox block is disabled and valid once enabled',
   assert.deepEqual([...cfg.roles.keys()], ['orchestrator', 'marketing']);
   assert.equal(cfg.allowed('marketing', 'orchestrator'), true);
 });
+
+test('an unknown top-level mailbox key fails boot instead of being ignored', () => {
+  for (const key of ['limit', 'allowed', 'mirrors', 'systemSenders']) {
+    assert.throws(() => read({ ...base(), [key]: {} }), new RegExp(`mailbox key ${key}`), key);
+  }
+  assert.ok(read({ ...base(), mirror: false }), 'every documented key is accepted');
+  assert.equal(read({ enabled: false, limit: {} }), null, 'a disabled block changes nothing and is not validated');
+});
