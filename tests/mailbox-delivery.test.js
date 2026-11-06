@@ -243,7 +243,7 @@ test('a reply whose delivery fails leaves the ask open and gives the asker one n
   assert.equal(notices.length, 1);
   assert.equal(notices[0].request_id, `mailbox-notice:${reply.id}`, 'a notice about a reply is keyed on the reply');
   assert.match(notices[0].task, new RegExp(`about=${question.id}`));
-  assert.match(notices[0].task, /role:marketing replied but delivery of the reply failed; ask again if you still need it/);
+  assert.match(notices[0].task, /role:marketing replied, but the reply was not delivered; ask again if you still need it/);
   assert.deepEqual(JSON.parse(notices[0].payload).reply, { id: reply.id, state: 'failed', error: 'provider rejected' });
   await f.jobs.tick(); await f.mailbox.tick();
   assert.equal(f.notices().length, 1, 'still exactly one notice');
@@ -323,7 +323,7 @@ test('retry state is dropped once an ask is answered, so a later notice is not d
   await f.jobs.tick();
   await f.mailbox.tick();
   assert.equal(f.notices().length, 1, 'the failed reply delivery is reported without waiting out a stale backoff');
-  assert.match(f.notices()[0].task, /replied but delivery of the reply failed/);
+  assert.match(f.notices()[0].task, /replied, but the reply was not delivered/);
 });
 
 test('after a notice about an ask, the same ask sent again is a new message, not a duplicate', async (t) => {
@@ -364,4 +364,25 @@ test('a late reply that fails after a no-reply notice is still reported, exactly
   assert.equal(f.notices().length, 2);
   await f.jobs.tick(); await f.mailbox.tick();
   assert.equal(f.notices().length, 2, 'no further notices');
+});
+
+test('the reply notice says "may not have been delivered" only when the reply delivery is uncertain', async (t) => {
+  for (const [result, wording] of [
+    [{ outcome: 'failed', inactive: true }, /the reply was not delivered/],
+    [{ outcome: 'interrupted', inactive: true }, /the reply was not delivered/],
+    [null, /the reply may not have been delivered/],
+  ]) {
+    const f = fixture(t, { turn: async (job, fx) => {
+      if (job.routeId === 'marketing') {
+        fx.mailbox.reply(fx.mailbox.scope(session('marketing')), { inReplyTo: job.payload.message.id, body: 'Budget is 10k' });
+        return { outcome: 'succeeded', inactive: true };
+      }
+      if (job.requestId.startsWith('mailbox:')) { if (!result) throw new Error('Lost turn receipt'); return result; }
+      return { outcome: 'succeeded', inactive: true };
+    } });
+    f.mailbox.send(f.human('orchestrator'), ask('marketing'));
+    await f.jobs.tick(); await f.jobs.tick(); await f.mailbox.tick();
+    const [notice] = f.notices();
+    assert.match(notice.task, wording, result?.outcome ?? 'unknown');
+  }
 });

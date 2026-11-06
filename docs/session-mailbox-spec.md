@@ -274,7 +274,9 @@ reason is one of:
 A reply whose own delivery job ends `failed`, `interrupted` or `unknown` gets
 one notice of its own, keyed on the reply:
 `requestId = 'mailbox-notice:' || replyId`. This covers a late reply that
-fails after a "no reply" notice. The ask already has its one reply, so the
+fails after a "no reply" notice. It says the reply was not delivered
+(`failed`, `interrupted`) or may not have been delivered (`unknown`, which
+may in fact have reached the asker). The ask already has its one reply, so the
 asker must ask again if it still needs the answer. Either kind of notice sets
 the ask's `notice_sent`, which also ends its duplicate window (rule 5).
 
