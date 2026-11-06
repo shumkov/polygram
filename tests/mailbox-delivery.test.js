@@ -407,3 +407,13 @@ test('a held notice names a stable reason for queue and route refusals, never me
   assert.equal(gone.logs.length, 1, gone.logs.join('\n'));
   assert.match(gone.logs[0], new RegExp(`ask ${question.id} held: EXTERNAL_JOB_ROUTE_UNAVAILABLE$`));
 });
+
+test('a failed poll is logged by code, never by message text', async (t) => {
+  const f = fixture(t);
+  await new Promise(setImmediate); // let the poll started by start() settle
+  f.db.raw.exec('ALTER TABLE mailbox_messages RENAME TO mailbox_messages_moved');
+  await f.mailbox.tick();
+  assert.equal(f.logs.length, 1, f.logs.join('\n'));
+  assert.match(f.logs[0], /^\[mailbox\] polling failed: SQLITE_ERROR$/);
+  f.db.raw.exec('ALTER TABLE mailbox_messages_moved RENAME TO mailbox_messages');
+});
