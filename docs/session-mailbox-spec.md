@@ -168,7 +168,10 @@ node <abs>/skills/mailbox/scripts/msg.js <bot> <token> reply '{"id":"m_…","bod
 ```
 
 The path is absolute: `process.execPath` plus the resolved script path, as
-`notifications.instructions()` builds it.
+`notifications.instructions()` builds it. The command is prefixed with
+`POLYGRAM_IPC_DIR=<the daemon's IPC directory>`: a CLI session inherits its
+environment from whoever started the tmux server, often not the daemon, so
+`msg.js` could not otherwise find the socket or the 0600 secret file.
 
 **One token per session, plus the session's current depth.**
 

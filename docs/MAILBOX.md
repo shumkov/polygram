@@ -58,11 +58,14 @@ Role sessions get instructions in every prompt: their role, the roles they may
 message, and two commands from the `mailbox` skill:
 
 ```
-node …/skills/mailbox/scripts/msg.js <bot> <token> send  '{"to":"marketing","kind":"ask","body":"…"}'
-node …/skills/mailbox/scripts/msg.js <bot> <token> reply '{"id":"m_…","body":"…"}'
+POLYGRAM_IPC_DIR="…" node …/skills/mailbox/scripts/msg.js <bot> <token> send  '{"to":"marketing","kind":"ask","body":"…"}'
+POLYGRAM_IPC_DIR="…" node …/skills/mailbox/scripts/msg.js <bot> <token> reply '{"id":"m_…","body":"…"}'
 ```
 
-The token identifies the session. It lives in memory, so a restart issues new
+The command names the daemon's IPC directory itself, because a CLI session
+inherits its environment from whoever started the tmux server, which is often
+not the daemon; `msg.js` reads the socket and the 0600 secret file there, so the
+sessions must run as the daemon's user. The token identifies the session. It lives in memory, so a restart issues new
 ones. Both commands return `{id, state}` right away, where `state` is the
 message's delivery state: `queued` or `paused` for a new message; a duplicate
 reports where its original delivery stands (`running`, `succeeded`, `failed`,

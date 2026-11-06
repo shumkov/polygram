@@ -78,3 +78,33 @@ test('stray transport keys in the agent JSON cannot reroute the call or replace 
   assert.deepEqual(sent.input, { to: 'ops', kind: 'ask', body: 'Q' });
   assert.deepEqual(replied.input, { inReplyTo: 'm_1', body: 'A' });
 });
+
+test('the injected command reaches the daemon from a session whose environment lacks the IPC location', async (t) => {
+  // A CLI session gets its environment from whoever started the tmux server,
+  // which is often not the daemon, so the command must carry the IPC location.
+  const { freshDb, cleanupDb } = require('./helpers/db-fixture');
+  const { createExternalJobService } = require('../lib/external-jobs/service');
+  const { createMailboxService } = require('../lib/mailbox/service');
+  const dir = fs.mkdtempSync(path.join(process.cwd(), '.mbx-'));
+  const elsewhere = fs.mkdtempSync(path.join(process.cwd(), '.mbx-cwd-'));
+  const { db, dbPath } = freshDb('mailbox-command');
+  t.after(() => { cleanupDb(dbPath, db); fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(elsewhere, { recursive: true, force: true }); });
+  const routes = { orchestrator: { chatId: '-1001', threadId: '11' }, marketing: { chatId: '-1001', threadId: '12' } };
+  const resolveTarget = (route) => ({ chatId: route.chatId, threadId: route.threadId, sessionKey: `${route.chatId}:${route.threadId}` });
+  const config = { bot: { externalJobs: { enabled: true, routes }, mailbox: { enabled: true,
+    roles: { orchestrator: { about: 'Strategy' }, marketing: { about: 'Campaigns' } }, allow: { orchestrator: ['*'] } } } };
+  const jobs = createExternalJobService({ config, db, botName: 'testbot', resolveTarget, dispatch: async () => ({}), deliverPart: async () => ({}), logger: { error() {} } });
+  const mailbox = createMailboxService({ config, db, botName: 'testbot', jobs, resolveTarget, ipcDir: dir, logger: { error() {}, warn() {} } });
+  const ipcOptions = { env: { POLYGRAM_IPC_DIR: dir } };
+  const secret = server.writeSecret('testbot', ipcOptions);
+  const ipc = await server.start({ path: server.socketPathFor('testbot', ipcOptions), secret, logger: { error() {}, log() {} }, handlers: createIpcHandlers({ mailbox }) });
+  t.after(() => ipc.close());
+
+  mailbox.noteHumanPrompt('-1001:11');
+  const command = /Ask or tell another role: run (.+?) send '/.exec(mailbox.instructions('-1001:11'))[1];
+  const env = { ...process.env }; delete env.POLYGRAM_IPC_DIR; delete env.POLYGRAM_IPC_SECRET;
+  const { stdout } = await promisify(execFile)('/bin/sh', ['-c', `${command} send '{"to":"marketing","kind":"ask","body":"Launch date?"}'`], { env, cwd: elsewhere });
+  const receipt = JSON.parse(stdout);
+  assert.equal(receipt.ok, true);
+  assert.equal(db.raw.prepare('SELECT from_addr FROM mailbox_messages WHERE id=?').get(receipt.id).from_addr, 'role:orchestrator');
+});
