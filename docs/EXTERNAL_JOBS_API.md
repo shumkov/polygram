@@ -7,7 +7,12 @@ allowlisting does not isolate clients sharing the bot's IPC credential.
 ## Configuration
 
 `bots.<bot>.externalJobs` contains `enabled`, optional `maxPending` (default
-1000), and `routes`, an object whose keys identify configured destinations.
+1000), optional `maxConcurrent` (default 4), and `routes`, an object whose keys
+identify configured destinations. Jobs for different conversations run
+concurrently, up to `maxConcurrent` dispatched turns at once; each
+conversation still runs one job at a time, in submission order. A busy
+conversation keeps its job queued until the next scheduling pass (a submit, a
+resume, a finished turn or the 60-second timer).
 Each route has `chatId` and optional `threadId`. Forum destinations require an
 explicit configured isolated topic. Version 1 dispatch supports Claude CLI only.
 Route names and request IDs are nonempty bounded strings; request IDs must be
