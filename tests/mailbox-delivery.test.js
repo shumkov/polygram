@@ -28,7 +28,8 @@ function fixture(t, { mailbox = {}, jobs: jobSettings = {}, turn, recoverInactiv
     allow: { orchestrator: ['*'], marketing: ['orchestrator'] },
     ...mailbox,
   } } };
-  const f = { db, config, turns: [], recoveries: [], advance(ms) { clock += ms; }, now: () => clock };
+  const f = { db, config, turns: [], recoveries: [], logs: [], advance(ms) { clock += ms; }, now: () => clock };
+  const record = { error: (line) => f.logs.push(line), warn: (line) => f.logs.push(line), log() {} };
   const runtime = { dispatch: async (job, hooks) => {
     hooks.onSend?.();
     f.turns.push(job);
@@ -40,7 +41,7 @@ function fixture(t, { mailbox = {}, jobs: jobSettings = {}, turn, recoverInactiv
     recoverInactive: async (job, confirm) => { f.recoveries.push(job.requestId); return (recoverInactive || (async () => false))(job, confirm, f); },
     deliverPart: async () => ({ messageId: 1 }), logger: quiet });
   f.make = (overrides = {}) => createMailboxService({ config: { bot: { ...config.bot, mailbox: { ...config.bot.mailbox, ...overrides } } },
-    db, botName: 'test', jobs: f.jobs, resolveTarget, now: () => clock, logger: quiet });
+    db, botName: 'test', jobs: f.jobs, resolveTarget, now: () => clock, logger: record });
   f.mailbox = f.make();
   f.jobs.start(); f.mailbox.start();
   t.after(() => { f.mailbox.stop(); f.jobs.stop(); cleanupDb(dbPath, db); });
@@ -269,4 +270,57 @@ test('a retried message reports the real state of its first delivery', async (t)
   f.mailbox.noteHumanPrompt(session('orchestrator'));
   assert.equal(f.mailbox.send(f.mailbox.scope(session('orchestrator')), { to: 'marketing', kind: 'tell', body: 'Held message' }).state, 'failed', 'a withdrawn delivery is not reported as queued');
   assert.notEqual(later.id, uncertain.id);
+});
+
+test('a missing delivery job is logged with its ids and retried with backoff, not every poll', async (t) => {
+  const f = fixture(t);
+  const question = f.mailbox.send(f.human('orchestrator'), ask('marketing'));
+  f.db.raw.prepare('DELETE FROM external_jobs WHERE request_id=?').run(`mailbox:${question.id}`);
+  await f.mailbox.tick(); await f.mailbox.tick();
+  assert.equal(f.logs.length, 1, f.logs.join('\n'));
+  assert.match(f.logs[0], new RegExp(`ask ${question.id}.*MAILBOX_DELIVERY_MISSING`));
+  f.advance(61000); await f.mailbox.tick();
+  assert.equal(f.logs.length, 2, 'retried once its backoff expired');
+});
+
+test('only a missing notice job is treated as not yet submitted; other lookup errors hold the notice', async (t) => {
+  const f = fixture(t);
+  const question = f.mailbox.send(f.human('orchestrator'), ask('marketing'));
+  await f.jobs.tick();
+  const realGet = f.jobs.get;
+  f.jobs.get = (input) => {
+    if (input.requestId.startsWith('mailbox-notice:')) throw Object.assign(new Error('database is locked: /private/detail'), { code: 'SQLITE_BUSY' });
+    return realGet(input);
+  };
+  await f.mailbox.tick();
+  assert.deepEqual(f.notices(), [], 'an unreadable notice state must not be guessed as unsent');
+  assert.equal(f.row(question.id).notice_sent, 0);
+  assert.equal(f.logs.length, 1);
+  assert.match(f.logs[0], new RegExp(`ask ${question.id}.*SQLITE_BUSY`));
+  assert.doesNotMatch(f.logs[0], /private/, 'mailbox logs ids and codes, not message text');
+  f.jobs.get = realGet;
+  f.advance(61000); await f.mailbox.tick();
+  assert.equal(f.notices().length, 1);
+});
+
+test('retry state is dropped once an ask is answered, so a later notice is not delayed', async (t) => {
+  const f = fixture(t, { turn: async (job) => (job.routeId === 'orchestrator' && job.requestId.startsWith('mailbox:')
+    ? { outcome: 'failed', inactive: true } : { outcome: 'succeeded', inactive: true }) });
+  const question = f.mailbox.send(f.human('orchestrator'), ask('marketing'));
+  await f.jobs.tick();
+  const realSubmit = f.jobs.submit;
+  f.jobs.submit = (input) => {
+    if (input.requestId.startsWith('mailbox-notice:')) throw Object.assign(new Error('disk full'), { code: 'SQLITE_FULL' });
+    return realSubmit(input);
+  };
+  await f.mailbox.tick();
+  assert.deepEqual(f.notices(), []);
+  assert.equal(f.logs.length, 1, 'the failed notice is in backoff');
+  f.jobs.submit = realSubmit;
+  f.mailbox.reply(f.mailbox.scope(session('marketing')), { inReplyTo: question.id, body: 'Late answer' });
+  await f.mailbox.tick();
+  await f.jobs.tick();
+  await f.mailbox.tick();
+  assert.equal(f.notices().length, 1, 'the failed reply delivery is reported without waiting out a stale backoff');
+  assert.match(f.notices()[0].task, /replied but delivery of the reply failed/);
 });

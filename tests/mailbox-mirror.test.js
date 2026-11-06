@@ -83,12 +83,12 @@ test('deferred dispatch never mirrors again', async (t) => {
 });
 
 test('a failed mirror is logged and never blocks delivery', async (t) => {
-  const f = fixture(t, { send: async () => { throw Object.assign(new Error('Bad Request: message thread not found'), { error_code: 400 }); } });
+  const f = fixture(t, { send: async () => { throw Object.assign(new Error('Call to sendMessage failed!'), { error_code: 400, description: 'Bad Request: message thread not found' }); } });
   const sent = f.mailbox.send(f.token('orchestrator'), { to: 'marketing', kind: 'ask', body: 'Q' });
   assert.equal(sent.state, 'queued');
   await settle();
   assert.equal(f.errors.length, 1);
-  assert.match(f.errors[0], new RegExp(`mirror of ${sent.id} failed`));
+  assert.match(f.errors[0], new RegExp(`mirror of ${sent.id} failed: 400 Bad Request: message thread not found`), 'Telegram API text is logged; it is not user content');
   await f.jobs.tick();
   assert.deepEqual(f.turns, [`mailbox:${sent.id}`]);
   const g = fixture(t, { send: () => { throw new Error('synchronous transport failure'); } });
