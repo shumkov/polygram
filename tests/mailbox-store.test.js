@@ -66,15 +66,17 @@ test('the pair count covers asks and tells since a cutoff, never replies or othe
   assert.equal(store.countPair('role:orchestrator', 'role:marketing', 0), 2);
 });
 
-test('a duplicate is the latest same-pair, same-hash ask or tell since the cutoff', (t) => {
+test('a duplicate is the latest same-pair, same-kind, same-hash message since the cutoff', (t) => {
   const { store, advance, now } = fixture(t);
   store.insert(message({ id: 'm_1' }));
   advance(10);
   store.insert(message({ id: 'm_2' }));
-  assert.equal(store.findDuplicate('role:orchestrator', 'role:marketing', 'h1', 0).id, 'm_2');
-  assert.equal(store.findDuplicate('role:orchestrator', 'role:marketing', 'h1', now() + 1), null);
-  assert.equal(store.findDuplicate('role:orchestrator', 'role:marketing', 'other', 0), null);
-  assert.equal(store.findDuplicate('role:orchestrator', 'role:ops', 'h1', 0), null);
+  store.insert(message({ id: 'm_3', kind: 'tell' }));
+  assert.equal(store.findDuplicate('role:orchestrator', 'role:marketing', 'ask', 'h1', 0).id, 'm_2');
+  assert.equal(store.findDuplicate('role:orchestrator', 'role:marketing', 'tell', 'h1', 0).id, 'm_3');
+  assert.equal(store.findDuplicate('role:orchestrator', 'role:marketing', 'ask', 'h1', now() + 1), null);
+  assert.equal(store.findDuplicate('role:orchestrator', 'role:marketing', 'ask', 'other', 0), null);
+  assert.equal(store.findDuplicate('role:orchestrator', 'role:ops', 'ask', 'h1', 0), null);
 });
 
 test('notice candidates are unanswered asks without a notice, oldest first', (t) => {

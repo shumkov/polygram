@@ -315,7 +315,7 @@ into the target role's topic:
    (default 2). A reply carries its ask's depth.
 4. **Rate:** at most `perPairPerHour` (default 10) asks and tells per (from,
    to) pair.
-5. **Duplicates:** the same (from, to, body hash) within 10 minutes returns
+5. **Duplicates:** the same (from, to, kind, body hash) within 10 minutes returns
    the existing message with `duplicate: true`.
 6. **Size and secrets:** the body must be within `maxBodyBytes` and is
    redacted before it is persisted, hashed or mirrored.

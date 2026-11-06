@@ -137,13 +137,24 @@ test('a duplicate within ten minutes returns the existing message', (t) => {
   const token = f.human('orchestrator');
   const first = f.service.send(token, ask('marketing'));
   f.advance(10 * MINUTE);
-  const again = f.service.send(token, { ...ask('marketing'), kind: 'tell' });
+  const again = f.service.send(token, ask('marketing'));
   assert.deepEqual(again, { id: first.id, state: 'queued', duplicate: true });
   f.advance(1);
   const later = f.service.send(token, ask('marketing'));
   assert.notEqual(later.id, first.id);
   assert.equal(later.duplicate, undefined);
   assert.equal(f.db.raw.prepare('SELECT count(*) n FROM mailbox_messages').get().n, 2);
+});
+
+test('the same body as a different kind is a new message, not a duplicate', (t) => {
+  const f = fixture(t);
+  const token = f.human('orchestrator');
+  const tell = f.service.send(token, { to: 'marketing', kind: 'tell', body: 'Launch is Monday' });
+  const question = f.service.send(token, { to: 'marketing', kind: 'ask', body: 'Launch is Monday' });
+  assert.notEqual(question.id, tell.id, 'an ask after a tell must not die as the tell');
+  assert.equal(question.duplicate, undefined);
+  assert.equal(f.row(question.id).kind, 'ask');
+  assert.equal(f.service.send(token, { to: 'marketing', kind: 'tell', body: 'Launch is Monday' }).id, tell.id);
 });
 
 test('bodies are bounded and redacted before they are persisted or hashed', (t) => {

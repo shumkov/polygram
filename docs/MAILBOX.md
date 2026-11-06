@@ -84,7 +84,7 @@ text lands in its own topic through the normal job report.
   message's depth. Any other automation turn (notifications, notices) is at
   `maxDepth`, so it can reply but not start a chain.
 - Rate: at most `perPairPerHour` asks and tells per pair.
-- The same (from, to, body) within ten minutes returns the existing message
+- The same (from, to, kind, body) within ten minutes returns the existing message
   with `duplicate: true`.
 - Bodies are redacted before they are stored, hashed or mirrored.
 
