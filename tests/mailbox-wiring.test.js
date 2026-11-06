@@ -26,7 +26,7 @@ test('external jobs dispatch through the shared wrapper with both services', () 
 });
 
 test('the mailbox service is built from the external-jobs resolver and served over IPC', () => {
-  assert.match(src, /mailboxService = createMailboxService\(\{[\s\S]*?jobs: externalJobService, resolveTarget: resolveExternalTarget/);
+  assert.match(src, /mailboxService = createMailboxService\(\{[\s\S]*?jobs: externalJobService, resolveTarget: resolveExternalTarget, bot, tg,/);
   assert.match(src, /createIpcHandlers\(\{[\s\S]*?mailbox: mailboxService,/);
 });
 

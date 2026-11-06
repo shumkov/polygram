@@ -4592,7 +4592,7 @@ async function main() {
     config, db, botName: BOT_NAME, jobs: externalJobService, resolveTarget: resolveExternalTarget, bot, tg,
   });
   mailboxService = createMailboxService({
-    config, db, botName: BOT_NAME, jobs: externalJobService, resolveTarget: resolveExternalTarget,
+    config, db, botName: BOT_NAME, jobs: externalJobService, resolveTarget: resolveExternalTarget, bot, tg,
   });
   // 0.12.0 post-turn edit re-delivery: constructed AFTER dispatchHandleMessage is assigned (above).
   // Claude keeps its same-message fold behavior. Codex defers edits to the
