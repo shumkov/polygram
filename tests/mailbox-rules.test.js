@@ -150,3 +150,13 @@ test('addresses carry their prefix', () => {
   assert.equal(rules.roleFromAddress('role:ops'), 'ops');
   assert.equal(rules.roleFromAddress('system:polygram'), null);
 });
+
+test('the config.example.json mailbox block is disabled and valid once enabled', () => {
+  const example = JSON.parse(require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'config.example.json'), 'utf8'));
+  const exampleBot = example.bots['admin-bot'];
+  assert.equal(rules.readMailboxConfig(exampleBot, resolve), null, 'the shipped example changes nothing');
+  const enabled = { ...exampleBot, externalJobs: { ...exampleBot.externalJobs, enabled: true }, mailbox: { ...exampleBot.mailbox, enabled: true } };
+  const cfg = rules.readMailboxConfig(enabled, resolve);
+  assert.deepEqual([...cfg.roles.keys()], ['orchestrator', 'marketing']);
+  assert.equal(cfg.allowed('marketing', 'orchestrator'), true);
+});

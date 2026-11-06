@@ -26,6 +26,7 @@
     "ops/polygram.plist.example",
     "docs/EXTERNAL_JOBS_API.md",
     "docs/RECORDED_NOTIFICATIONS_API.md",
+    "docs/MAILBOX.md",
     "ops/README.md",
     "docs/2026-08-16-003-codex-protected-hook-artifact-runbook.md",
     "config.example.json"
