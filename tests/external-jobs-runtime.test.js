@@ -166,3 +166,25 @@ test('recovery idle proof rejects human admission, pause, route drift and inconc
     assert.equal(confirms, 0); assert.equal(f.calls.length, 0);
   }
 });
+
+test('the send hook fires once after admission and never for a deferred or refused job', async () => {
+  // Fresh route objects: earlier tests in this file mutate the shared route.
+  const fresh = (overrides) => {
+    const f = fixture(overrides);
+    f.deps.config.bot.externalJobs.routes = { daily: { chatId: '-1001', threadId: '2995' } };
+    return f;
+  };
+  const order = [];
+  const f = fresh({ sendToProcess: async (...args) => { order.push('send'); args[3].onDispatched(); return { text: 'ok' }; } });
+  assert.equal((await f.runtime.dispatch(job, { onSend: () => order.push('hook') })).outcome, 'succeeded');
+  assert.deepEqual(order, ['hook', 'send'], 'state the prompt depends on is set before the prompt is sent');
+  for (const overrides of [{ isPaused: () => true }, { pm: { get: () => ({ backend: 'cli', inFlight: true }) } }, { resolveBackend: () => 'sdk' }]) {
+    let hooked = 0; const g = fresh(overrides);
+    await g.runtime.dispatch(job, { onSend: () => hooked++ });
+    assert.equal(hooked, 0, JSON.stringify(Object.keys(overrides)));
+  }
+  const g = fresh();
+  const result = await g.runtime.dispatch(job, { onSend: () => { throw new Error('depth store unavailable'); } });
+  assert.equal(result.deferred, true, 'a failing hook defers the job without sending');
+  assert.equal(g.calls.length, 0);
+});
