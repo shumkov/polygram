@@ -300,6 +300,31 @@ describe('buildSdkOptions — permissionMode + canUseTool', () => {
   });
 });
 
+// Claude Code binds a cross-session inbox in every session, SDK engines
+// included, and with no explicit setting delivers a message from any
+// same-user session in the same permission-mode class. A bot session must
+// take input only from polygram, so both the bypass and the prompting
+// (gatedTools) configurations refuse that traffic.
+describe('buildSdkOptions — cross-session inbound', () => {
+  test('bypass session refuses messages from other Claude sessions', () => {
+    const out = createBuildSdkOptions(baseDeps())('chat-1', baseCtx());
+    assert.equal(out.settings?.crossSessionInbound, 'refuse');
+  });
+
+  test('prompting (gatedTools) session refuses them too', () => {
+    const fn = createBuildSdkOptions(baseDeps({
+      config: {
+        defaults: { model: 'sonnet', effort: 'high' },
+        bot: { approvals: { adminChatId: '99999', gatedTools: ['Bash(rm *)'] } },
+        chats: {},
+      },
+    }));
+    const out = fn('chat-1', baseCtx());
+    assert.equal(out.permissionMode, 'default');
+    assert.equal(out.settings?.crossSessionInbound, 'refuse');
+  });
+});
+
 describe('buildSdkOptions — resume', () => {
   test('existingSessionId passes through as resume option', () => {
     const fn = createBuildSdkOptions(baseDeps());
