@@ -72,24 +72,30 @@ The change (step 0):
 - **Settling.**
   - A dispatch's continuation does the work the loop body does today:
     `finish` and the report.
-  - It re-schedules only after a terminal `finish`.
+  - It re-schedules only after a terminal `finish` and its report delivery.
+  - A session stays busy until its continuation ends, so a pass skips the
+    session instead of claiming its next job while the previous report is
+    still being delivered.
   - A deferral waits for the 60 s tick, a submit or a resume, so a busy target
     never spins.
 - **Dirty flag.** Every `schedule()` call made during a drain sets it (not
   just submits), and the drain runs one more pass.
 - **Probing.** The `unsettled()` inactivity probe skips jobs that are in flight
   in this process.
-- **`tick()` contract.** `tick()` awaits the drain pass plus its in-flight
-  continuations, so the existing tests (`external-jobs-service`,
-  `notification-consumer`) keep meaning "`tick` done = job settled and
-  reported".
+- **`tick()` contract.** `tick()` awaits the drain pass plus the
+  continuations in flight when it ends, so the existing tests
+  (`external-jobs-service`, `notification-consumer`) keep meaning "`tick` done
+  = the claimed jobs are settled and reported". Jobs those settlements unblock
+  run in later passes.
+- **Reports.** `reports()` can now run from the pass and from several
+  continuations at once. Each part is still claimed atomically, so a part is
+  sent once and a job's parts stay in order.
 
 Unchanged:
 
 - the idle proof, `intentLock`, pause, and the rule that `unknown` is never
   replayed;
-- shutdown, which already waits for in-flight turns through `trackTask`;
-- parallel `reports()`, which claim each part atomically.
+- shutdown, which already waits for in-flight turns through `trackTask`.
 
 ## Design
 

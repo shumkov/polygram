@@ -186,3 +186,38 @@ test('an invalid concurrency cap fails loudly instead of silently stopping autom
   const off = createExternalJobService({ config: { bot: { externalJobs: { enabled: false, maxConcurrent: 0 } } }, botName: 'test' });
   assert.equal(off.info().enabled, false, 'a disabled feature does not validate its tuning');
 });
+
+test('a session runs its next job only after the previous job has settled and its report is delivered', async (t) => {
+  const held = heldTurns(); const events = [];
+  let releaseReport;
+  const reportGate = new Promise((resolve) => { releaseReport = resolve; });
+  const f = fixture(t, {
+    dispatch: (j) => { events.push(`dispatch:${j.requestId}`); return held.dispatch(j); },
+    deliverPart: async (j) => {
+      if (j.requestId === 'a1') { events.push('report:a1:start'); await reportGate; events.push('report:a1:end'); }
+      return { messageId: events.length };
+    },
+  });
+  f.service.submit(job('a', 'a1')); f.service.submit(job('a', 'a2'));
+  f.service.start();
+  const ticking = f.service.tick();
+  try {
+    await turns();
+    assert.deepEqual(held.calls, ['a1']);
+    f.service.submit(job('b'));
+    await turns();
+    assert.equal(f.state('a2', 'a').error, null, 'a pass skips a busy session instead of marking its next job blocked');
+    held.release('a1');
+    await turns();
+    assert.ok(events.includes('report:a1:start'), 'the first job is delivering its report');
+    f.service.submit(job('c'));
+    await turns();
+    assert.ok(!held.calls.includes('a2'), 'the next job must not overlap the previous report');
+    releaseReport();
+    await turns();
+    assert.ok(held.calls.includes('a2'));
+    assert.ok(events.indexOf('report:a1:end') < events.indexOf('dispatch:a2'), events.join(', '));
+  } finally { releaseReport(); held.releaseAll(); }
+  await ticking; await f.service.tick();
+  assert.equal(f.state('a2', 'a').state, 'succeeded');
+});
