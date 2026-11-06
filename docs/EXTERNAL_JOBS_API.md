@@ -16,7 +16,10 @@ resume, a finished turn or the 60-second timer).
 Each route has `chatId` and optional `threadId`. Forum destinations require an
 explicit configured isolated topic. Version 1 dispatch supports Claude CLI only.
 Route names and request IDs are nonempty bounded strings; request IDs must be
-stable across transport retries. Destinations are frozen at acceptance.
+stable across transport retries. The `mailbox:` and `mailbox-notice:` request
+ID prefixes are reserved for the [session mailbox](./MAILBOX.md); jobs using
+them are withdrawn unsent while the mailbox is off. Destinations are frozen at
+acceptance.
 
 ## Operations
 
