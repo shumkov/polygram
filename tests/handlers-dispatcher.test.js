@@ -1217,3 +1217,30 @@ test('external job failure clears busy accounting without Telegram retry or auto
   assert.equal(fx.calls.sendToProcess.length, 0);
   assert.equal(fx.calls.autoResumeChecks.length, 0);
 });
+
+test('an external job whose session recovery fails is deferred unsent, never left uncertain', async () => {
+  const fx = fixture({ awaitSessionRecovery: () => Promise.reject(Object.assign(new Error('replay coordinator lost'), { code: 'RECOVERY_LOST' })) });
+  let runs = 0;
+  const result = await fx.dispatcher.dispatchExternalEvent({ sessionKey: 'job-session', chatId: '100', eventId: 'job' }, async () => { runs++; return { outcome: 'succeeded' }; });
+  assert.equal(runs, 0, 'nothing was sent');
+  assert.deepEqual(result, { deferred: true, reason: 'Session recovery is unavailable' });
+  assert.equal(fx.dispatcher.getActiveHandlerCount(), 0);
+
+  const Database = require('better-sqlite3');
+  const raw = new Database(':memory:');
+  raw.exec(require('node:fs').readFileSync(require.resolve('../lib/external-jobs/schema.sql'), 'utf8'));
+  const { createExternalJobService } = require('../lib/external-jobs/service');
+  const jobs = createExternalJobService({
+    config: { bot: { externalJobs: { enabled: true, routes: { r: { chatId: '100' } } } } }, db: { raw }, botName: 'test',
+    resolveTarget: (route) => ({ chatId: route.chatId, threadId: null, sessionKey: 'job-session' }),
+    dispatch: (job) => fx.dispatcher.dispatchExternalEvent({ ...job.target, eventId: job.requestId }, async () => { runs++; return { outcome: 'succeeded' }; }),
+    deliverPart: async () => ({}), logger: { error() {} },
+  });
+  try {
+    jobs.submit({ routeId: 'r', requestId: 'never-sent', task: 'Work', payload: {} });
+    jobs.start(); await jobs.tick();
+    const job = jobs.get({ routeId: 'r', requestId: 'never-sent' }).job;
+    assert.equal(job.state, 'queued', 'a job that never reached the session stays queued for a later attempt');
+    assert.equal(runs, 0);
+  } finally { jobs.stop(); raw.close(); }
+});
