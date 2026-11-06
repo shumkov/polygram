@@ -77,6 +77,10 @@ test('a duplicate is the latest same-pair, same-kind, same-hash message since th
   assert.equal(store.findDuplicate('role:orchestrator', 'role:marketing', 'ask', 'h1', now() + 1), null);
   assert.equal(store.findDuplicate('role:orchestrator', 'role:marketing', 'ask', 'other', 0), null);
   assert.equal(store.findDuplicate('role:orchestrator', 'role:ops', 'ask', 'h1', 0), null);
+  store.markNoticeSent('m_2');
+  assert.equal(store.findDuplicate('role:orchestrator', 'role:marketing', 'ask', 'h1', 0).id, 'm_1', 'a message with a notice no longer matches');
+  store.markNoticeSent('m_1');
+  assert.equal(store.findDuplicate('role:orchestrator', 'role:marketing', 'ask', 'h1', 0), null);
 });
 
 test('notice candidates are unanswered asks without a notice, oldest first', (t) => {

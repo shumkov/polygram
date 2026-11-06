@@ -87,7 +87,8 @@ text lands in its own topic through the normal job report.
   `maxDepth`, so it can reply but not start a chain.
 - Rate: at most `perPairPerHour` asks and tells per pair.
 - The same (from, to, kind, body) within ten minutes returns the existing message
-  with `duplicate: true`.
+  with `duplicate: true`, unless the sender already had a notice about it; then
+  it is a deliberate re-ask and creates a new message.
 - Bodies are redacted before they are stored, hashed or mirrored.
 
 ## Notices and recovery

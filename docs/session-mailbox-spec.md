@@ -318,7 +318,9 @@ into the target role's topic:
 4. **Rate:** at most `perPairPerHour` (default 10) asks and tells per (from,
    to) pair.
 5. **Duplicates:** the same (from, to, kind, body hash) within 10 minutes returns
-   the existing message with `duplicate: true`.
+   the existing message with `duplicate: true`, unless the sender has already
+   had a notice about that message; then the send is a deliberate re-ask and
+   creates a new message.
 6. **Size and secrets:** the body must be within `maxBodyBytes` and is
    redacted before it is persisted, hashed or mirrored.
 7. **Kill switch.** Before `dispatchExternalEvent`, the dispatch wrapper

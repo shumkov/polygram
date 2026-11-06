@@ -324,3 +324,23 @@ test('retry state is dropped once an ask is answered, so a later notice is not d
   assert.equal(f.notices().length, 1, 'the failed reply delivery is reported without waiting out a stale backoff');
   assert.match(f.notices()[0].task, /replied but delivery of the reply failed/);
 });
+
+test('after a notice about an ask, the same ask sent again is a new message, not a duplicate', async (t) => {
+  const f = fixture(t, { turn: async (job, fx) => {
+    if (job.routeId === 'marketing') {
+      fx.mailbox.reply(fx.mailbox.scope(session('marketing')), { inReplyTo: job.payload.message.id, body: 'Budget is 10k' });
+      return { outcome: 'succeeded', inactive: true };
+    }
+    if (job.requestId.startsWith('mailbox:')) return { outcome: 'failed', error: 'provider rejected', inactive: true };
+    return { outcome: 'succeeded', inactive: true };
+  } });
+  const token = f.human('orchestrator');
+  const first = f.mailbox.send(token, ask('marketing'));
+  await f.jobs.tick(); await f.jobs.tick(); await f.mailbox.tick();
+  assert.equal(f.notices().length, 1, 'the asker was told the reply did not arrive');
+  f.advance(3 * 60000);
+  const again = f.mailbox.send(token, ask('marketing'));
+  assert.notEqual(again.id, first.id, 'a deliberate re-ask must not collapse into the answered ask');
+  assert.equal(again.duplicate, undefined);
+  assert.equal(f.job('marketing', `mailbox:${again.id}`).state, 'queued');
+});
