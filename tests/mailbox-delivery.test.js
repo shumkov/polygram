@@ -386,3 +386,24 @@ test('the reply notice says "may not have been delivered" only when the reply de
     assert.match(notice.task, wording, result?.outcome ?? 'unknown');
   }
 });
+
+test('a held notice names a stable reason for queue and route refusals, never message text', async (t) => {
+  const full = fixture(t, { jobs: { maxPending: 2 } });
+  const first = full.mailbox.send(full.human('orchestrator'), ask('marketing'));
+  await full.jobs.tick();
+  full.jobs.pauseSession(session('ops'), true);
+  const token = full.mailbox.scope(session('orchestrator'));
+  full.mailbox.send(token, { to: 'ops', kind: 'tell', body: 'one' });
+  full.mailbox.send(token, { to: 'ops', kind: 'tell', body: 'two' });
+  await full.mailbox.tick();
+  assert.equal(full.logs.length, 1, full.logs.join('\n'));
+  assert.match(full.logs[0], new RegExp(`ask ${first.id} held: EXTERNAL_JOB_QUEUE_FULL$`));
+
+  const gone = fixture(t);
+  const question = gone.mailbox.send(gone.human('orchestrator'), ask('marketing'));
+  await gone.jobs.tick();
+  delete gone.config.bot.externalJobs.routes.orchestrator;
+  await gone.mailbox.tick();
+  assert.equal(gone.logs.length, 1, gone.logs.join('\n'));
+  assert.match(gone.logs[0], new RegExp(`ask ${question.id} held: EXTERNAL_JOB_ROUTE_UNAVAILABLE$`));
+});
