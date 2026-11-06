@@ -230,8 +230,8 @@ CREATE INDEX mailbox_by_pair ON mailbox_messages(bot_name, from_addr, to_addr, c
 - **Delivery state is read from external jobs,** not copied. The key is
   `(route_id, 'mailbox:' || id)`.
 - **An open ask is an ask with no reply row.** There are no deadlines, and
-  late replies are accepted. For notices, an ask also counts as unanswered
-  when its reply's delivery job ended `failed`, `interrupted` or `unknown`.
+  late replies are accepted. A reply whose own delivery job ended `failed`,
+  `interrupted` or `unknown` gets a notice of its own (see Notices).
 - **Row and job go in one SQLite transaction.** A refusal rolls back both and
   reaches the agent synchronously. A test pins the nested-transaction
   behaviour.
@@ -269,17 +269,23 @@ reason is one of:
   still arrive;
 - delivery failed;
 - delivery was interrupted;
-- delivery is uncertain;
-- the target replied but delivery of the reply failed (the ask already has
-  its one reply, so the asker must ask again if it still needs the answer).
+- delivery is uncertain.
+
+A reply whose own delivery job ends `failed`, `interrupted` or `unknown` gets
+one notice of its own, keyed on the reply:
+`requestId = 'mailbox-notice:' || replyId`. This covers a late reply that
+fails after a "no reply" notice. The ask already has its one reply, so the
+asker must ask again if it still needs the answer. Either kind of notice sets
+the ask's `notice_sent`, which also ends its duplicate window (rule 5).
 
 How notices are produced:
 
 - **Polling.** The mailbox polls on its tick, and once at start, for asks that
-  have `notice_sent = 0`, no reply whose delivery is still pending or
-  succeeded, and a terminal delivery job. It looks
-  the job up with `jobs.get({routeId: route_id, requestId})`, which works even
-  after the route has been removed.
+  have `notice_sent = 0`, no reply, and a terminal delivery job, and for
+  replies whose delivery ended `failed`, `interrupted` or `unknown` and that
+  have no notice job yet. It looks jobs up with
+  `jobs.get({routeId: route_id, requestId})`, which works even after the route
+  has been removed.
 - **Notice turns carry `maxDepth`.** Notices never produce notices.
 - **Recovering from `unknown`.**
   - Any mailbox-owned job (`mailbox:%` or `mailbox-notice:%`) that ends

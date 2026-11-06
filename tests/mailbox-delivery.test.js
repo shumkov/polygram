@@ -241,7 +241,8 @@ test('a reply whose delivery fails leaves the ask open and gives the asker one n
   await f.mailbox.tick(); await f.mailbox.tick();
   const notices = f.notices();
   assert.equal(notices.length, 1);
-  assert.equal(notices[0].request_id, `mailbox-notice:${question.id}`);
+  assert.equal(notices[0].request_id, `mailbox-notice:${reply.id}`, 'a notice about a reply is keyed on the reply');
+  assert.match(notices[0].task, new RegExp(`about=${question.id}`));
   assert.match(notices[0].task, /role:marketing replied but delivery of the reply failed; ask again if you still need it/);
   assert.deepEqual(JSON.parse(notices[0].payload).reply, { id: reply.id, state: 'failed', error: 'provider rejected' });
   await f.jobs.tick(); await f.mailbox.tick();
@@ -343,4 +344,24 @@ test('after a notice about an ask, the same ask sent again is a new message, not
   assert.notEqual(again.id, first.id, 'a deliberate re-ask must not collapse into the answered ask');
   assert.equal(again.duplicate, undefined);
   assert.equal(f.job('marketing', `mailbox:${again.id}`).state, 'queued');
+});
+
+test('a late reply that fails after a no-reply notice is still reported, exactly once', async (t) => {
+  const f = fixture(t, { turn: async (job) => (job.routeId === 'orchestrator' && job.requestId.startsWith('mailbox:')
+    ? { outcome: 'failed', error: 'provider rejected', inactive: true } : { outcome: 'succeeded', inactive: true }) });
+  const question = f.mailbox.send(f.human('orchestrator'), ask('marketing'));
+  await f.jobs.tick(); await f.mailbox.tick();
+  assert.match(f.notices()[0].task, /turn ended without a reply/, 'the asker was promised that a late reply still arrives');
+  await f.jobs.tick();
+  const late = f.mailbox.reply(f.mailbox.scope(session('marketing')), { inReplyTo: question.id, body: 'Sorry, 10k' });
+  await f.jobs.tick();
+  assert.equal(f.job('orchestrator', `mailbox:${late.id}`).state, 'failed');
+  await f.mailbox.tick(); await f.mailbox.tick();
+  const replyNotices = f.notices().filter((job) => job.request_id === `mailbox-notice:${late.id}`);
+  assert.equal(replyNotices.length, 1, 'the failed late reply gets its own notice');
+  assert.match(replyNotices[0].task, /role:marketing replied/);
+  assert.equal(replyNotices[0].route_id, 'orchestrator');
+  assert.equal(f.notices().length, 2);
+  await f.jobs.tick(); await f.mailbox.tick();
+  assert.equal(f.notices().length, 2, 'no further notices');
 });

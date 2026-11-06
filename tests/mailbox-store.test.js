@@ -83,26 +83,37 @@ test('a duplicate is the latest same-pair, same-kind, same-hash message since th
   assert.equal(store.findDuplicate('role:orchestrator', 'role:marketing', 'ask', 'h1', 0), null);
 });
 
-test('notice candidates are unanswered asks without a notice, oldest first', (t) => {
+const job = (db, routeId, requestId, state) => db.raw.prepare(`INSERT INTO external_jobs(bot_name,route_id,request_id,content_hash,task,payload,target,session_key,state,created_at,updated_at)
+  VALUES ('test',?,?,'h','t','{}','{}','s',?,1,1)`).run(routeId, requestId, state);
+
+test('notice candidates are asks with no reply and no notice, oldest first', (t) => {
   const { db, store } = fixture(t);
-  const delivery = (routeId, id, state) => db.raw.prepare(`INSERT INTO external_jobs(bot_name,route_id,request_id,content_hash,task,payload,target,session_key,state,created_at,updated_at)
-    VALUES ('test',?,?,'h','t','{}','{}','s',?,1,1)`).run(routeId, `mailbox:${id}`, state);
   store.insert(message({ id: 'm_1' }));
   store.insert(message({ id: 'm_2' }));
   store.insert(message({ id: 'm_3', kind: 'tell' }));
   store.insert(message({ id: 'm_4' }));
   store.insert(message({ id: 'm_r', kind: 'reply', inReplyTo: 'm_2', routeId: 'orchestrator' }));
-  delivery('orchestrator', 'm_r', 'queued');
+  job(db, 'orchestrator', 'mailbox:m_r', 'failed');
   store.markNoticeSent('m_4');
-  assert.deepEqual(store.noticeCandidates().map((row) => row.id), ['m_1'], 'a reply on its way answers the ask');
-  for (const state of ['running', 'succeeded']) {
+  assert.deepEqual(store.noticeCandidates().map((row) => row.id), ['m_1'], 'an ask with a reply is reported through its reply');
+  store.markNoticeSent('m_1');
+  assert.deepEqual(store.noticeCandidates(), []);
+});
+
+test('undelivered replies are failed, interrupted or uncertain replies without their own notice', (t) => {
+  const { db, store } = fixture(t);
+  store.insert(message({ id: 'm_1' }));
+  store.insert(message({ id: 'm_r', kind: 'reply', inReplyTo: 'm_1', routeId: 'orchestrator' }));
+  store.markNoticeSent('m_1');
+  job(db, 'orchestrator', 'mailbox:m_r', 'queued');
+  for (const state of ['queued', 'running', 'succeeded']) {
     db.raw.prepare("UPDATE external_jobs SET state=? WHERE request_id='mailbox:m_r'").run(state);
-    assert.deepEqual(store.noticeCandidates().map((row) => row.id), ['m_1'], state);
+    assert.deepEqual(store.undeliveredReplies(), [], state);
   }
   for (const state of ['failed', 'interrupted', 'unknown']) {
     db.raw.prepare("UPDATE external_jobs SET state=? WHERE request_id='mailbox:m_r'").run(state);
-    assert.deepEqual(store.noticeCandidates().map((row) => row.id), ['m_1', 'm_2'], `a reply whose delivery is ${state} does not answer the ask`);
+    assert.deepEqual(store.undeliveredReplies().map((row) => row.id), ['m_r'], `${state}, even after the ask had a notice`);
   }
-  store.markNoticeSent('m_1'); store.markNoticeSent('m_2');
-  assert.deepEqual(store.noticeCandidates(), []);
+  job(db, 'orchestrator', 'mailbox-notice:m_r', 'queued');
+  assert.deepEqual(store.undeliveredReplies(), [], 'a reply with its own notice is done');
 });
