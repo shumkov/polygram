@@ -238,3 +238,20 @@ test('a failed settle is logged with its ids and still frees its slot for the ne
   assert.doesNotMatch(errors[0], /disk full|private/, 'external-jobs logs codes, never message text');
   assert.ok(dispatched.includes('b'), 'the failed continuation released its slot and scheduled the next pass');
 });
+
+test('spin guard: a deferral never schedules another pass by itself', async (t) => {
+  let attempts = 0;
+  const f = fixture(t, { dispatch: async () => {
+    attempts++;
+    // A spinning scheduler would retry forever; a terminal result after a
+    // bounded number of attempts ends the loop so this test fails fast
+    // instead of hanging the suite.
+    if (attempts > 25) return { outcome: 'failed', inactive: true };
+    return { deferred: true, reason: 'Session is busy' };
+  } });
+  f.service.submit(job('a'));
+  f.service.start();
+  await f.service.tick(); await turns(50);
+  assert.ok(attempts <= 2, `deferred dispatch must wait for a real wake-up; saw ${attempts} attempts`);
+  assert.equal(f.state('a').state, 'queued');
+});
