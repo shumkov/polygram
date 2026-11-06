@@ -246,3 +246,27 @@ test('a reply whose delivery fails leaves the ask open and gives the asker one n
   await f.jobs.tick(); await f.mailbox.tick();
   assert.equal(f.notices().length, 1, 'still exactly one notice');
 });
+
+test('a retried message reports the real state of its first delivery', async (t) => {
+  const f = fixture(t, { turn: async (job) => (job.routeId === 'marketing'
+    ? { outcome: 'failed', error: 'provider rejected', inactive: true }
+    : (() => { throw new Error('Lost turn receipt'); })()) });
+  const token = f.human('orchestrator');
+  const first = f.mailbox.send(token, ask('marketing'));
+  assert.equal(first.state, 'queued');
+  await f.jobs.tick();
+  assert.deepEqual(f.mailbox.send(token, ask('marketing')), { id: first.id, state: 'failed', duplicate: true }, 'a failed delivery is not reported as queued');
+
+  const uncertain = f.mailbox.send(token, ask('ops', 'Status?'));
+  await f.jobs.tick();
+  assert.equal(f.mailbox.send(token, ask('ops', 'Status?')).state, 'unknown');
+
+  const later = f.mailbox.send(token, { to: 'marketing', kind: 'tell', body: 'Held message' });
+  f.mailbox.stop();
+  f.mailbox = f.make({ enabled: false });
+  await f.jobs.tick();
+  f.mailbox = f.make();
+  f.mailbox.noteHumanPrompt(session('orchestrator'));
+  assert.equal(f.mailbox.send(f.mailbox.scope(session('orchestrator')), { to: 'marketing', kind: 'tell', body: 'Held message' }).state, 'failed', 'a withdrawn delivery is not reported as queued');
+  assert.notEqual(later.id, uncertain.id);
+});

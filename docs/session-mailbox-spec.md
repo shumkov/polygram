@@ -200,7 +200,9 @@ The path is absolute: `process.execPath` plus the resolved script path, as
   - replies arrive after your turn ends, so never wait or poll for them.
 
 **Results:** `send` and `reply` return `{id, state}` right away. The state is
-`queued`, or `paused` when the target role is paused.
+the message's delivery job state: `queued`, or `paused` when the target role
+is paused, for a new message; a duplicate reports its original delivery's
+current state.
 
 ### Data model
 

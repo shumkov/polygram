@@ -13,7 +13,9 @@ An `ask` expects exactly one reply; a `tell` expects none. `reply` takes
 `{"id":"<message id of the ask>","body":"..."}`. Both return `{"id","state"}`
 right away; `state` is `queued`, or `paused` while the target role is paused.
 A repeated identical send (same target, kind and body) within ten minutes
-returns the existing message with `duplicate: true`.
+returns the existing message with `duplicate: true` and its current delivery
+state, which may already be `running`, `succeeded`, `failed`, `interrupted` or
+`unknown`.
 
 An ask states the answer you need. Send summaries and file paths, never
 transcripts. Reply exactly once to every ask you receive; if you can't answer,

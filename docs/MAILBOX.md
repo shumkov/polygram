@@ -63,8 +63,10 @@ node …/skills/mailbox/scripts/msg.js <bot> <token> reply '{"id":"m_…","body"
 ```
 
 The token identifies the session. It lives in memory, so a restart issues new
-ones. Both commands return `{id, state}` right away, where `state` is `queued`
-or `paused`.
+ones. Both commands return `{id, state}` right away, where `state` is the
+message's delivery state: `queued` or `paused` for a new message; a duplicate
+reports where its original delivery stands (`running`, `succeeded`, `failed`,
+`interrupted` or `unknown`).
 
 The target receives a new turn when it is idle. The trusted header reads
 `[Inter-session message] from=role:… to=role:… kind=… id=… isUser=false`,
