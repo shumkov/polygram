@@ -12,10 +12,10 @@ const session = (role) => `${routes[role].chatId}:${routes[role].threadId}`;
 const resolveTarget = (route) => ({ chatId: route.chatId, threadId: route.threadId, sessionKey: `${route.chatId}:${route.threadId}` });
 const settle = async () => { for (let n = 0; n < 10; n++) await new Promise(setImmediate); };
 
-function fixture(t, { mirror, send, turn } = {}) {
+function fixture(t, { mirror, send, turn, jobs: jobSettings = {} } = {}) {
   const { db, dbPath } = freshDb('mailbox-mirror');
   const posts = []; const errors = []; const turns = [];
-  const config = { bot: { externalJobs: { enabled: true, routes: structuredClone(routes) }, mailbox: {
+  const config = { bot: { externalJobs: { enabled: true, routes: structuredClone(routes), ...jobSettings }, mailbox: {
     enabled: true, roles: { orchestrator: { about: 'Strategy' }, marketing: { about: 'Campaigns' } },
     allow: { orchestrator: ['*'] }, ...(mirror === undefined ? {} : { mirror }),
   } } };
@@ -106,4 +106,13 @@ test('mirror: false posts nothing', async (t) => {
 
 test('the mirror line is rendered from the stored row', () => {
   assert.equal(envelope.renderMirror({ id: 'm_1', kind: 'tell', from_addr: 'role:a', to_addr: 'role:b', body: 'hi' }), '📨 role:a → role:b (tell m_1)\nhi');
+});
+
+test('a send refused by its job submit posts no mirror', async (t) => {
+  const f = fixture(t, { jobs: { maxPending: 1 } });
+  const token = f.token('orchestrator');
+  f.mailbox.send(token, { to: 'marketing', kind: 'ask', body: 'first' });
+  assert.throws(() => f.mailbox.send(token, { to: 'marketing', kind: 'tell', body: 'second' }), /queue full/);
+  await settle();
+  assert.deepEqual(f.posts.map((post) => post.params.text.split('\n')[1]), ['first'], 'only a committed message is mirrored');
 });
