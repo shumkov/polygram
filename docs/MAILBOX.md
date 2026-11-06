@@ -93,7 +93,10 @@ text lands in its own topic through the normal job report.
 When the job delivering an ask settles and the ask still has no reply, the
 asker gets one notice from `system:polygram`. The reason is one of: the turn
 ended without a reply, delivery failed, the turn was interrupted, or delivery
-is uncertain. The ask stays open, and a late reply still arrives.
+is uncertain. The ask stays open, and a late reply still arrives. If the
+target replied but the reply's own delivery failed, was interrupted or became
+uncertain, the asker gets one notice saying so; the ask already has its one
+reply, so the asker must ask again.
 
 A mailbox job left `unknown` (for example after a restart mid-turn) is never
 replayed. The mailbox runs the same respawn-and-probe recovery that

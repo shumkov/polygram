@@ -46,3 +46,9 @@ test('a notice names the ask, the reason and that it comes from polygram', () =>
   assert.deepEqual(envelope.renderNoticePayload(ask, { state: 'failed', error: 'withdrawn' }), { ask: { id: ask.id, to: 'role:marketing', body: ask.body }, delivery: { state: 'failed', error: 'withdrawn' } });
   assert.deepEqual(envelope.renderNoticePayload(ask, { state: 'succeeded', error: 'Report part failed' }).delivery, { state: 'succeeded' }, 'report errors are not delivery errors');
 });
+
+test('a failed reply delivery has its own notice reason and quotes the reply outcome', () => {
+  const task = envelope.renderNoticeTask(ask, 'reply-failed');
+  assert.match(task, /Your ask m_00000000000000a1 to role:marketing: role:marketing replied but delivery of the reply failed; ask again if you still need it\./);
+  assert.deepEqual(envelope.renderNoticePayload(ask, { state: 'succeeded' }, { id: reply.id, state: 'interrupted' }).reply, { id: reply.id, state: 'interrupted' });
+});

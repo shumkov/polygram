@@ -223,3 +223,26 @@ test('the poller runs once at start', async (t) => {
   for (let n = 0; n < 20 && !f.notices().length; n++) await new Promise(setImmediate);
   assert.equal(f.notices()[0]?.request_id, `mailbox-notice:${question.id}`);
 });
+
+test('a reply whose delivery fails leaves the ask open and gives the asker one notice', async (t) => {
+  const f = fixture(t, { turn: async (job, fx) => {
+    if (job.routeId === 'marketing') {
+      fx.mailbox.reply(fx.mailbox.scope(session('marketing')), { inReplyTo: job.payload.message.id, body: 'Budget is 10k' });
+      return { outcome: 'succeeded', inactive: true };
+    }
+    if (job.requestId.startsWith('mailbox:')) return { outcome: 'failed', error: 'provider rejected', inactive: true };
+    return { outcome: 'succeeded', inactive: true };
+  } });
+  const question = f.mailbox.send(f.human('orchestrator'), ask('marketing'));
+  await f.jobs.tick(); await f.jobs.tick();
+  const reply = f.db.raw.prepare("SELECT * FROM mailbox_messages WHERE kind='reply'").get();
+  assert.equal(f.job('orchestrator', `mailbox:${reply.id}`).state, 'failed');
+  await f.mailbox.tick(); await f.mailbox.tick();
+  const notices = f.notices();
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].request_id, `mailbox-notice:${question.id}`);
+  assert.match(notices[0].task, /role:marketing replied but delivery of the reply failed; ask again if you still need it/);
+  assert.deepEqual(JSON.parse(notices[0].payload).reply, { id: reply.id, state: 'failed', error: 'provider rejected' });
+  await f.jobs.tick(); await f.mailbox.tick();
+  assert.equal(f.notices().length, 1, 'still exactly one notice');
+});

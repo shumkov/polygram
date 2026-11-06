@@ -228,7 +228,8 @@ CREATE INDEX mailbox_by_pair ON mailbox_messages(bot_name, from_addr, to_addr, c
 - **Delivery state is read from external jobs,** not copied. The key is
   `(route_id, 'mailbox:' || id)`.
 - **An open ask is an ask with no reply row.** There are no deadlines, and
-  late replies are accepted.
+  late replies are accepted. For notices, an ask also counts as unanswered
+  when its reply's delivery job ended `failed`, `interrupted` or `unknown`.
 - **Row and job go in one SQLite transaction.** A refusal rolls back both and
   reaches the agent synchronously. A test pins the nested-transaction
   behaviour.
@@ -266,12 +267,15 @@ reason is one of:
   still arrive;
 - delivery failed;
 - delivery was interrupted;
-- delivery is uncertain.
+- delivery is uncertain;
+- the target replied but delivery of the reply failed (the ask already has
+  its one reply, so the asker must ask again if it still needs the answer).
 
 How notices are produced:
 
 - **Polling.** The mailbox polls on its tick, and once at start, for asks that
-  have `notice_sent = 0`, no reply row, and a terminal delivery job. It looks
+  have `notice_sent = 0`, no reply whose delivery is still pending or
+  succeeded, and a terminal delivery job. It looks
   the job up with `jobs.get({routeId: route_id, requestId})`, which works even
   after the route has been removed.
 - **Notice turns carry `maxDepth`.** Notices never produce notices.
