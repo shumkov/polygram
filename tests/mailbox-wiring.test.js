@@ -36,3 +36,17 @@ test('the notice poller starts after external-job recovery and stops with the ot
   assert.ok(jobsStart >= 0 && mailboxStart > jobsStart, 'unknown jobs are marked before the first poll');
   assert.match(src, /notificationService\?\.stop\(\);\s*mailboxService\?\.stop\(\);\s*externalJobService\?\.stop\(\);/);
 });
+
+test('the depth reset runs for every human prompt, not only when a fresh session preloads history', () => {
+  const format = body('formatPrompt');
+  const blockStart = format.indexOf('if (sessionKey && db) {');
+  assert.ok(blockStart >= 0, 'the fresh-session history block exists');
+  let depth = 0; let blockEnd = -1;
+  for (let i = format.indexOf('{', blockStart); i < format.length; i++) {
+    if (format[i] === '{') depth++;
+    else if (format[i] === '}' && --depth === 0) { blockEnd = i; break; }
+  }
+  assert.ok(blockEnd > blockStart, 'the block closes');
+  const reset = format.indexOf('mailboxService?.noteHumanPrompt(sessionKey)');
+  assert.ok(reset > blockEnd, 'noteHumanPrompt must sit after the fresh-session block, where every prompt passes');
+});
