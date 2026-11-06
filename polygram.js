@@ -4573,7 +4573,7 @@ async function main() {
     needsAuth: () => needsNativeClaudeAuth(config.bot, 'cli'),
     checkAuth: checkClaudeAuthHealth,
     awaitSessionRecovery: (sessionKey) => cleanReplaySessionCoordinator.wait(sessionKey, null),
-    getOrSpawnForChat, sendToProcess,
+    getOrSpawnForChat, sendToProcess, logger: console,
   });
   externalJobService = createExternalJobService({
     config, db, botName: BOT_NAME, resolveTarget: resolveExternalTarget,

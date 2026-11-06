@@ -188,3 +188,19 @@ test('the send hook fires once after admission and never for a deferred or refus
   assert.equal(result.deferred, true, 'a failing hook defers the job without sending');
   assert.equal(g.calls.length, 0);
 });
+
+test('a failed recovery attempt logs its cause by code before reporting no idle proof', async () => {
+  const warnings = [];
+  const f = fixture({
+    getOrSpawnForChat: async () => { throw Object.assign(new Error('spawn failed: /private/path'), { code: 'SPAWN_FAILED' }); },
+    pm: { get: () => undefined }, logger: { warn: (line) => warnings.push(line) },
+  });
+  // Fresh route objects: earlier tests in this file mutate the shared route.
+  f.deps.config.bot.externalJobs.routes = { daily: { chatId: '-1001', threadId: '2995' } };
+  let confirms = 0;
+  assert.equal(await createExternalJobRuntime(f.deps).recoverInactive(job, () => { confirms++; }), false);
+  assert.equal(confirms, 0);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /job-one.*request-one.*SPAWN_FAILED/);
+  assert.doesNotMatch(warnings[0], /private/, 'codes only, never message text');
+});
