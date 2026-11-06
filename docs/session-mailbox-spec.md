@@ -72,10 +72,14 @@ The change (step 0):
 - **Settling.**
   - A dispatch's continuation does the work the loop body does today:
     `finish` and the report.
-  - It re-schedules only after a terminal `finish` and its report delivery.
+  - It re-schedules after a terminal `finish` and its report attempt. A
+    continuation that fails also re-schedules; its job stays `running`, so
+    the claim rule keeps it from being dispatched again.
   - A session stays busy until its continuation ends, so a pass skips the
-    session instead of claiming its next job while the previous report is
-    still being delivered.
+    session instead of claiming its next job while the previous report
+    attempt is still running. The hold covers the attempt, not delivery: a
+    part that fails with `definitelyNotSent` is retried after 60 s, and in
+    the meantime the session's next job can start.
   - A deferral waits for the 60 s tick, a submit or a resume, so a busy target
     never spins.
 - **Dirty flag.** Every `schedule()` call made during a drain sets it (not
