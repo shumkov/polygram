@@ -29,3 +29,10 @@ test('the mailbox service is built from the external-jobs resolver and served ov
   assert.match(src, /mailboxService = createMailboxService\(\{[\s\S]*?jobs: externalJobService, resolveTarget: resolveExternalTarget/);
   assert.match(src, /createIpcHandlers\(\{[\s\S]*?mailbox: mailboxService,/);
 });
+
+test('the notice poller starts after external-job recovery and stops with the other services', () => {
+  const jobsStart = src.indexOf('externalJobService.start();');
+  const mailboxStart = src.indexOf('mailboxService.start();');
+  assert.ok(jobsStart >= 0 && mailboxStart > jobsStart, 'unknown jobs are marked before the first poll');
+  assert.match(src, /notificationService\?\.stop\(\);\s*mailboxService\?\.stop\(\);\s*externalJobService\?\.stop\(\);/);
+});

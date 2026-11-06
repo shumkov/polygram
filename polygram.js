@@ -4708,6 +4708,7 @@ async function main() {
     const inFlightAtSignal = countInFlight(inFlightHandlers);
     isShuttingDown = true;
     notificationService?.stop();
+    mailboxService?.stop();
     externalJobService?.stop();
     console.log(`\nShutting down (${trigger})...`);
     // 1. Stop accepting new inbound first so nothing new queues behind the drain.
@@ -5690,6 +5691,7 @@ async function main() {
 
   externalJobService.start();
   notificationService.start();
+  mailboxService.start();
   logEvent('polygram-admission-open', lifecycleDetail({
     bot: BOT_NAME,
   }, invocationId, daemonIdentity));
