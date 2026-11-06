@@ -53,3 +53,28 @@ test('the skill script sends over the authenticated socket and maps the reply id
   await assert.rejects(run('testbot', 'tok', 'forward', '{}'), (error) => /Usage/.test(error.stderr));
   await assert.rejects(run('testbot', 'tok', 'send', '[1]'), (error) => /JSON object/.test(error.stderr));
 });
+
+test('stray transport keys in the agent JSON cannot reroute the call or replace the request id', async (t) => {
+  const dir = fs.mkdtempSync(path.join(process.cwd(), '.mbx-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = { ...process.env, POLYGRAM_IPC_DIR: dir, POLYGRAM_IPC_SECRET: 'synthetic-secret' };
+  const requests = []; const submitted = [];
+  const handlers = createIpcHandlers({
+    mailbox: { send: (token, input) => ({ id: 'm_1', state: 'queued', input }), reply: (token, input) => ({ id: 'm_2', state: 'queued', input }) },
+    externalJobs: { submit: (input) => { submitted.push(input); return { accepted: true }; } },
+  });
+  const spy = (op) => (req) => { requests.push({ op, req }); return handlers[op](req); };
+  const ipc = await server.start({
+    path: server.socketPathFor('testbot', { env }), secret: 'synthetic-secret', logger: { error() {}, log() {} },
+    handlers: { ...handlers, mailbox_send: spy('mailbox_send'), mailbox_reply: spy('mailbox_reply') },
+  });
+  t.after(() => ipc.close());
+  const run = (...args) => promisify(execFile)(process.execPath, [SCRIPT, ...args], { env });
+  const sent = JSON.parse((await run('testbot', 'tok', 'send', '{"to":"ops","kind":"ask","body":"Q","op":"external_job_submit","id":"forged","secret":"forged"}')).stdout);
+  const replied = JSON.parse((await run('testbot', 'tok', 'reply', '{"id":"m_1","body":"A","op":"external_job_submit","secret":"forged"}')).stdout);
+  assert.deepEqual(submitted, [], 'the call was never rerouted to another op');
+  assert.deepEqual(requests.map((r) => r.op), ['mailbox_send', 'mailbox_reply']);
+  for (const { req } of requests) { assert.equal(req.id, null, 'the transport id is the client\'s, not the agent\'s'); assert.equal(req.secret, 'synthetic-secret'); }
+  assert.deepEqual(sent.input, { to: 'ops', kind: 'ask', body: 'Q' });
+  assert.deepEqual(replied.input, { inReplyTo: 'm_1', body: 'A' });
+});
