@@ -221,3 +221,20 @@ test('a session runs its next job only after the previous job has settled and it
   await ticking; await f.service.tick();
   assert.equal(f.state('a2', 'a').state, 'succeeded');
 });
+
+test('a failed settle is logged with its ids and still frees its slot for the next job', async (t) => {
+  const errors = []; const dispatched = [];
+  const f = fixture(t, {
+    dispatch: async (j) => { dispatched.push(j.requestId); return { outcome: 'succeeded', text: 'Done.', inactive: true }; },
+    logger: { error: (line) => errors.push(line) },
+  }, { maxConcurrent: 1 });
+  f.raw.exec("CREATE TRIGGER refuse_finish BEFORE UPDATE OF state ON external_jobs WHEN NEW.state='succeeded' AND OLD.request_id='a' BEGIN SELECT RAISE(ABORT, 'disk full at /private/path'); END");
+  f.service.submit(job('a')); f.service.submit(job('b'));
+  f.service.start();
+  await turns(30);
+  const failed = f.raw.prepare("SELECT id FROM external_jobs WHERE request_id='a'").get().id;
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], new RegExp(`job ${failed} \\(a\\).*SQLITE_CONSTRAINT`));
+  assert.doesNotMatch(errors[0], /disk full|private/, 'external-jobs logs codes, never message text');
+  assert.ok(dispatched.includes('b'), 'the failed continuation released its slot and scheduled the next pass');
+});
