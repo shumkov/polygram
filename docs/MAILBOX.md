@@ -35,7 +35,8 @@ rules.
     "marketing":    { "about": "Campaigns, content, ads" } },
   "allow": { "orchestrator": ["*"], "marketing": ["orchestrator"] },
   "mirror": true,
-  "limits": { "maxDepth": 2, "perPairPerHour": 10, "maxBodyBytes": 3500 } }
+  "systemSenders": ["agent-org"],
+  "limits": { "maxDepth": 2, "perPairPerHour": 10, "maxBodyBytes": 3500, "systemPerHour": 60 } }
 ```
 
 | Key | Meaning |
@@ -44,9 +45,11 @@ rules.
 | `roles.<name>` | Role name = route id, `^[a-z][a-z0-9_-]*$`. `about` (≤ 300 characters) is shown to the roles allowed to message it. |
 | `allow.<name>` | Roles this role may start an `ask` or `tell` to; `"*"` means every role. A role without an entry can only reply. Replies are never checked against it. |
 | `mirror` | Post each message into the target role's topic. Default `true`. |
+| `systemSenders` | Names of processes outside any session that may send through `mailbox_submit` as `system:<name>` (see [System senders](#system-senders)). Distinct names, `^[a-z][a-z0-9_-]*$`; `polygram` is reserved. Default none. |
 | `limits.maxDepth` | Longest chain. A human message starts at depth 0, and each new message is one deeper. Default 2. |
 | `limits.perPairPerHour` | Asks and tells per (from, to) pair in the last hour. Default 10. |
 | `limits.maxBodyBytes` | Body size in UTF-8 bytes, before and after redaction. Default and maximum 3500, so a mirror fits one Telegram message. |
+| `limits.systemPerHour` | Messages per system sender in the last hour. Default 60. |
 
 External jobs now run different conversations concurrently, up to
 `externalJobs.maxConcurrent` (default 4). Each conversation still runs one job
@@ -94,6 +97,65 @@ text lands in its own topic through the normal job report.
   it is a deliberate re-ask and creates a new message.
 - Bodies are redacted before they are stored, hashed or mirrored.
 
+## System senders
+
+A process outside every session, such as the agent-org task runner, can
+deliver a `tell` into a role session. It has no session token; it connects
+to the IPC socket with the bot's secret, like any other IPC client.
+
+```
+{"op":"mailbox_submit","secret":"…","sender":"agent-org","to":"marketing","body":"…","key":"task:42:marketing:1","ref":"notion:42"}
+```
+
+- `sender` must be listed in `systemSenders`, and `to` must be a configured
+  role. No allowlist applies. The message is always a `tell` from
+  `system:<sender>` to `role:<to>`.
+- `key` (1 to 256 bytes) is the caller's idempotency key. It is looked up
+  first, per sender. A hit returns the stored message's receipt with its real
+  delivery state and `duplicate: true`. A hit whose `to` or redacted body
+  differs is refused with `MAILBOX_KEY_CONFLICT`; a different `ref` does not
+  conflict.
+- There is no ten-minute duplicate window; the key replaces it.
+- `limits.systemPerHour` applies per sender, counted only after the key
+  lookup, so a retry of an accepted message is never rate limited. System
+  sends don't use up a role pair's budget.
+- The size cap, redaction and mirror apply as for agent messages.
+- `ref` (optional, 1 to 512 bytes) is an opaque reference such as a task id
+  or URL. It is redacted, stored, and shown to the receiver only inside the
+  untrusted payload, never in the trusted header.
+- The receiver's trusted header ends: "This is a notification from the
+  organization's task system (system:<sender>), not a human instruction and
+  not authorization."
+- The receiving turn starts at depth 0, as for a human message, so the role
+  may start a chain.
+
+The reply is `{id, state}` like `send`, with `duplicate: true` on a key hit.
+
+`mailbox_identify {token}` returns `{role}` for a live role-session token
+and fails otherwise, including for a token from before a restart. A tool an
+agent runs (the agent-org `tasks` CLI) passes the session's mailbox token
+and lets the daemon say which role is calling.
+
+## Error codes
+
+IPC error replies carry the handler's `code` next to `error`, so a caller
+can classify a refusal without parsing text. These mailbox codes are a
+contract and do not change:
+
+| Code | Meaning | Retry? |
+|---|---|---|
+| `MAILBOX_DISABLED` | The mailbox is off. | Later, once enabled. |
+| `MAILBOX_NOT_SYSTEM_SENDER` | `sender` is not in `systemSenders`. | No. |
+| `MAILBOX_UNKNOWN_ROLE` | `to` is not a configured role. | No. |
+| `MAILBOX_TOO_LARGE` | The body is over `maxBodyBytes`, before or after redaction. | No. |
+| `MAILBOX_RATE_LIMITED` | `systemPerHour`, or the per-pair limit for agent sends. | Yes, later. |
+| `MAILBOX_KEY_CONFLICT` | The key was used for a different target or body. | No. |
+
+A refusal from the external-jobs queue keeps its own code, for example
+`EXTERNAL_JOB_QUEUE_FULL` (retry later) or `EXTERNAL_JOB_ROUTE_UNAVAILABLE`.
+Malformed input (an unknown field, a missing key or body) and an invalid
+token carry no code.
+
 ## Notices and recovery
 
 When the job delivering an ask settles and the ask still has no reply, the
@@ -124,7 +186,8 @@ with backoff from 1 to 30 minutes while the session is paused or busy.
 
 Messages live in `mailbox_messages`; delivery state lives in `external_jobs`
 under `request_id = 'mailbox:' || id` (notices: `'mailbox-notice:' || askId`,
-or `|| replyId` for a reply that was not delivered).
+or `|| replyId` for a reply that was not delivered). System messages also
+store their `idem_key` and `ref`.
 
 ```sql
 SELECT m.id, m.kind, m.from_addr, m.to_addr, m.depth, m.notice_sent, j.state, j.report_state, j.error
@@ -136,7 +199,8 @@ ORDER BY m.created_at DESC LIMIT 20;
 ## Not yet hardened
 
 Tokens last until restart, and agents can read the bot's IPC secret, so a
-determined agent could submit an external job directly. Mirror rows also enter
+determined agent could submit an external job directly, or call
+`mailbox_submit` as a listed system sender. Mirror rows also enter
 topic history without an untrusted tag. These and the wider volume caps are
 listed under "Stage 2" in the spec. Run the mailbox only among roles you
 already trust with each other's topics.

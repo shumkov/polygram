@@ -172,6 +172,8 @@ test('the config.example.json mailbox block is disabled and valid once enabled',
   const cfg = rules.readMailboxConfig(enabled, resolve);
   assert.deepEqual([...cfg.roles.keys()], ['orchestrator', 'marketing']);
   assert.equal(cfg.allowed('marketing', 'orchestrator'), true);
+  assert.deepEqual([...cfg.systemSenders], ['agent-org'], 'the example shows the agent-org system sender');
+  assert.equal(cfg.limits.systemPerHour, 60);
 });
 
 test('an unknown top-level mailbox key fails boot instead of being ignored', () => {
