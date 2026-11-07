@@ -29,11 +29,19 @@ test('mailbox_submit passes the sender fields and strips transport metadata', as
   assert.deepEqual(seen, [{ sender: 'agent-org', to: 'ops', body: 'B', key: 'k', ref: 'r' }]);
 });
 
+test('mailbox_identify passes only the token and strips transport metadata', async () => {
+  const seen = [];
+  const handlers = createIpcHandlers({ mailbox: { identify: (input) => { seen.push(input); return { role: 'ops' }; } } });
+  assert.deepEqual(await handlers.mailbox_identify({ op: 'mailbox_identify', id: 'req-1', secret: 's', token: 'tok' }), { role: 'ops' });
+  assert.deepEqual(seen, [{ token: 'tok' }]);
+});
+
 test('without a mailbox the ops refuse', async () => {
   const handlers = createIpcHandlers();
   await assert.rejects(async () => handlers.mailbox_send({ token: 't', to: 'x', kind: 'ask', body: 'y' }), /mailbox is disabled/i);
   await assert.rejects(async () => handlers.mailbox_reply({ token: 't', inReplyTo: 'm', body: 'y' }), /mailbox is disabled/i);
   await assert.rejects(async () => handlers.mailbox_submit({ sender: 's', to: 'x', body: 'y', key: 'k' }), /mailbox is disabled/i);
+  await assert.rejects(async () => handlers.mailbox_identify({ token: 't' }), /mailbox is disabled/i);
 });
 
 test('the skill script sends over the authenticated socket and maps the reply id', async (t) => {
