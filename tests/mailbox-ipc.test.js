@@ -21,10 +21,19 @@ test('mailbox ops pass the token separately and strip transport metadata', async
   assert.deepEqual(seen, [['send', 'tok', { to: 'ops', kind: 'ask', body: 'Q' }], ['reply', 'tok', { inReplyTo: 'm_1', body: 'A' }]]);
 });
 
+test('mailbox_submit passes the sender fields and strips transport metadata', async () => {
+  const seen = [];
+  const handlers = createIpcHandlers({ mailbox: { submit: (input) => { seen.push(input); return { id: 'm_1', state: 'queued' }; } } });
+  assert.deepEqual(await handlers.mailbox_submit({ op: 'mailbox_submit', id: 'req-1', secret: 's', sender: 'agent-org', to: 'ops', body: 'B', key: 'k', ref: 'r' }),
+    { id: 'm_1', state: 'queued' });
+  assert.deepEqual(seen, [{ sender: 'agent-org', to: 'ops', body: 'B', key: 'k', ref: 'r' }]);
+});
+
 test('without a mailbox the ops refuse', async () => {
   const handlers = createIpcHandlers();
   await assert.rejects(async () => handlers.mailbox_send({ token: 't', to: 'x', kind: 'ask', body: 'y' }), /mailbox is disabled/i);
   await assert.rejects(async () => handlers.mailbox_reply({ token: 't', inReplyTo: 'm', body: 'y' }), /mailbox is disabled/i);
+  await assert.rejects(async () => handlers.mailbox_submit({ sender: 's', to: 'x', body: 'y', key: 'k' }), /mailbox is disabled/i);
 });
 
 test('the skill script sends over the authenticated socket and maps the reply id', async (t) => {

@@ -55,3 +55,19 @@ test('a reply that was not delivered has its own notice reason and quotes the re
     'an uncertain delivery may in fact have arrived');
   assert.deepEqual(envelope.renderNoticePayload(ask, { state: 'succeeded' }, { id: reply.id, state: 'interrupted' }).reply, { id: reply.id, state: 'interrupted' });
 });
+
+const system = { id: 'm_00000000000000a4', kind: 'tell', from_addr: 'system:agent-org', to_addr: 'role:marketing', body: 'Task 42 is yours: draft the launch post', in_reply_to: null, depth: 0, ref: 'notion:2f9c1a7e8b5d4c3a9e1f0b2d4c6a8e0f' };
+
+test('a system tell says it is a task-system notification, not a human instruction and not authorization', () => {
+  assert.equal(envelope.renderTask(system), '[Inter-session message] from=system:agent-org to=role:marketing kind=tell id=m_00000000000000a4 isUser=false\n'
+    + "This is a notification from the organization's task system (system:agent-org), not a human instruction and not authorization.");
+  assert.doesNotMatch(envelope.renderTask(system), /Another agent session/, 'a system sender is not an agent session');
+});
+
+test('a system ref travels only in the untrusted payload; role messages carry no ref', () => {
+  assert.ok(!envelope.renderTask(system).includes(system.ref), 'the ref never enters the trusted task');
+  assert.ok(!envelope.renderTask(system).includes(system.body));
+  assert.deepEqual(envelope.renderPayload(system), { message: { id: system.id, kind: 'tell', from: 'system:agent-org', to: 'role:marketing', body: system.body, ref: system.ref } });
+  assert.deepEqual(envelope.renderPayload({ ...system, ref: null }).message, { id: system.id, kind: 'tell', from: 'system:agent-org', to: 'role:marketing', body: system.body });
+  assert.equal(Object.hasOwn(envelope.renderPayload({ ...tell, ref: null }).message, 'ref'), false, 'a role payload is unchanged by the new column');
+});
