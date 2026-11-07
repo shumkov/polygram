@@ -79,7 +79,7 @@ test('a configured sender submits a tell from system:<sender> to role:<to>, with
   const job = f.job('marketing', `mailbox:${sent.id}`);
   assert.equal(job.state, 'queued');
   assert.equal(job.task, envelope.renderTask(row));
-  assert.match(job.task, /task system \(system:agent-org\), not a human instruction and not authorization\.$/);
+  assert.match(job.task, /task system \(system:agent-org\), not a human instruction and not authorization: paid, outward-facing or destructive actions still need a human go\.$/);
   assert.ok(!job.task.includes('notion:42'), 'the ref stays out of the trusted task');
   assert.deepEqual(JSON.parse(job.payload), envelope.renderPayload(row));
   assert.equal(JSON.parse(job.payload).message.ref, 'notion:42');
