@@ -1,6 +1,11 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const Database = require('better-sqlite3');
+const { open } = require('../lib/db');
 const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 const { createMailboxStore } = require('../lib/mailbox/store');
 
@@ -14,13 +19,65 @@ function fixture(t) {
 const message = (over = {}) => ({ id: 'm_0000000000000001', kind: 'ask', from: 'role:orchestrator', to: 'role:marketing',
   routeId: 'marketing', body: 'What is the campaign budget?', inReplyTo: null, depth: 1, bodyHash: 'h1', ...over });
 
-test('migration 024 creates the mailbox table and bumps the schema version', (t) => {
+test('migration 024 creates the mailbox table', (t) => {
   const { db } = fixture(t);
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 24);
   const columns = db.raw.prepare('PRAGMA table_info(mailbox_messages)').all().map((c) => c.name);
-  assert.deepEqual(columns, ['id', 'bot_name', 'kind', 'from_addr', 'to_addr', 'route_id', 'body', 'in_reply_to', 'depth', 'body_hash', 'notice_sent', 'created_at']);
+  assert.deepEqual(columns.slice(0, 12), ['id', 'bot_name', 'kind', 'from_addr', 'to_addr', 'route_id', 'body', 'in_reply_to', 'depth', 'body_hash', 'notice_sent', 'created_at']);
   assert.throws(() => db.raw.prepare(`INSERT INTO mailbox_messages(id,bot_name,kind,from_addr,to_addr,route_id,body,depth,body_hash,created_at)
     VALUES ('m_x','test','forward','role:a','role:b','b','x',1,'h',1)`).run(), /CHECK/);
+});
+
+test('migration 025 adds the idempotency key and ref columns and bumps the schema version', (t) => {
+  const { db } = fixture(t);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 25);
+  const columns = db.raw.prepare('PRAGMA table_info(mailbox_messages)').all().map((c) => c.name);
+  assert.deepEqual(columns.slice(12), ['idem_key', 'ref']);
+});
+
+test('a database at version 24 upgrades to 25 and keeps its messages, with no key or ref', (t) => {
+  const dbPath = path.join(os.tmpdir(), `mailbox-v24-${process.pid}-${Date.now()}.db`);
+  const legacy = new Database(dbPath);
+  const migrations = path.join(__dirname, '..', 'migrations');
+  for (const file of fs.readdirSync(migrations).filter((name) => name.endsWith('.sql')).sort()) {
+    const version = Number.parseInt(file.slice(0, 3), 10);
+    if (version > 24) continue;
+    legacy.exec(fs.readFileSync(path.join(migrations, file), 'utf8'));
+    legacy.pragma(`user_version = ${version}`);
+  }
+  legacy.prepare(`INSERT INTO mailbox_messages(id,bot_name,kind,from_addr,to_addr,route_id,body,depth,body_hash,created_at)
+    VALUES ('m_old','test','ask','role:a','role:b','b','x',1,'h',1)`).run();
+  legacy.close();
+  const db = open(dbPath);
+  t.after(() => cleanupDb(dbPath, db));
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 25);
+  const row = createMailboxStore(db.raw, { botName: 'test' }).get('m_old');
+  assert.equal(row.body, 'x');
+  assert.equal(row.idem_key, null);
+  assert.equal(row.ref, null);
+});
+
+test('an idempotency key is unique per sender within a bot; messages without a key are unconstrained', (t) => {
+  const { db, store } = fixture(t);
+  const system = (over) => message({ kind: 'tell', from: 'system:agent-org', depth: 0, idemKey: 'task:1:marketing:1', ref: 'notion:abc', ...over });
+  store.insert(system({ id: 'm_1' }));
+  assert.throws(() => store.insert(system({ id: 'm_2', to: 'role:ops', bodyHash: 'other' })), /UNIQUE/, 'a reused key is refused whatever it carries');
+  assert.doesNotThrow(() => store.insert(system({ id: 'm_3', from: 'system:other' })), 'each sender has its own keys');
+  assert.doesNotThrow(() => createMailboxStore(db.raw, { botName: 'other', now: () => 1 }).insert(system({ id: 'm_4' })), 'each bot has its own keys');
+  store.insert(message({ id: 'm_5' }));
+  store.insert(message({ id: 'm_6' }));
+  assert.equal(store.get('m_5').idem_key, null, 'role messages carry no key');
+});
+
+test('a message is found by its sender and key, scoped to the bot', (t) => {
+  const { db, store } = fixture(t);
+  store.insert(message({ id: 'm_1', kind: 'tell', from: 'system:agent-org', depth: 0, idemKey: 'k1', ref: 'notion:abc' }));
+  const found = store.findByKey('system:agent-org', 'k1');
+  assert.equal(found.id, 'm_1');
+  assert.equal(found.idem_key, 'k1');
+  assert.equal(found.ref, 'notion:abc');
+  assert.equal(store.findByKey('system:agent-org', 'k2'), null);
+  assert.equal(store.findByKey('system:other', 'k1'), null);
+  assert.equal(createMailboxStore(db.raw, { botName: 'other' }).findByKey('system:agent-org', 'k1'), null);
 });
 
 test('a stored message reads back with every field', (t) => {
@@ -29,6 +86,7 @@ test('a stored message reads back with every field', (t) => {
   assert.deepEqual(store.get('m_0000000000000001'), {
     id: 'm_0000000000000001', bot_name: 'test', kind: 'ask', from_addr: 'role:orchestrator', to_addr: 'role:marketing',
     route_id: 'marketing', body: 'What is the campaign budget?', in_reply_to: null, depth: 1, body_hash: 'h1', notice_sent: 0, created_at: now(),
+    idem_key: null, ref: null,
   });
   assert.equal(store.get('m_missing'), null);
 });
