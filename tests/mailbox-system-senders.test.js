@@ -49,6 +49,15 @@ function fixture(t, { mailbox = {}, jobs: jobSettings = {}, turn } = {}) {
   f.row = (id) => db.raw.prepare('SELECT * FROM mailbox_messages WHERE id=?').get(id);
   f.job = (routeId, requestId) => db.raw.prepare('SELECT * FROM external_jobs WHERE route_id=? AND request_id=?').get(routeId, requestId);
   f.count = () => db.raw.prepare('SELECT count(*) n FROM mailbox_messages').get().n;
+  // A daemon restart on the same database with an edited configuration.
+  f.restart = (edit) => {
+    const next = structuredClone(config);
+    edit(next.bot);
+    const jobs = createExternalJobService({ config: next, db, botName: 'test', resolveTarget, now: () => clock, dispatch: async () => ({}), deliverPart: async () => ({}), logger: quiet });
+    const mailbox = createMailboxService({ config: next, db, botName: 'test', jobs, resolveTarget, now: () => clock, logger: quiet });
+    t.after(() => { mailbox.stop(); jobs.stop(); });
+    return mailbox;
+  };
   return f;
 }
 const submit = (over = {}) => ({ sender: 'agent-org', to: 'marketing', body: 'Task 42 is yours: draft the launch post', key: 'task:42:marketing:1', ref: 'notion:42', ...over });
@@ -141,6 +150,31 @@ test('a retried key reports a failed delivery instead of queueing a second one',
   f.jobs.start();
   await f.jobs.tick();
   assert.deepEqual(f.mailbox.submit(submit()), { id: first.id, state: 'failed', duplicate: true });
+});
+
+// The task runner retries after a crash or a timeout, possibly across a
+// daemon restart with new configuration. A retry of a message that was
+// already accepted must get that message back, never a refusal a new
+// message would get, or the runner would record a delivered task as
+// undeliverable.
+test('a retried key returns the stored receipt after maxBodyBytes drops below its body', (t) => {
+  const f = fixture(t);
+  const body = `Task 42 is yours: ${'draft the launch post. '.repeat(10)}`;
+  assert.ok(Buffer.byteLength(body) > 100 && Buffer.byteLength(body) < 3500);
+  const first = f.mailbox.submit(submit({ body }));
+  const restarted = f.restart((bot) => { bot.mailbox.limits = { maxBodyBytes: 100 }; });
+  assert.throws(() => restarted.submit(submit({ body, key: 'task:43:marketing:1' })), coded('MAILBOX_TOO_LARGE'), 'the lower cap is in force for new messages');
+  assert.deepEqual(restarted.submit(submit({ body })), { id: first.id, state: 'queued', duplicate: true });
+  assert.equal(f.count(), 1);
+});
+
+test('a retried key returns the stored receipt after its target role is removed', (t) => {
+  const f = fixture(t);
+  const first = f.mailbox.submit(submit());
+  const restarted = f.restart((bot) => { delete bot.mailbox.roles.marketing; delete bot.externalJobs.routes.marketing; });
+  assert.throws(() => restarted.submit(submit({ key: 'task:43:marketing:1' })), coded('MAILBOX_UNKNOWN_ROLE'), 'the role is gone for new messages');
+  assert.deepEqual(restarted.submit(submit()), { id: first.id, state: 'queued', duplicate: true });
+  assert.equal(f.count(), 1);
 });
 
 test('a key reused for a different target or body is MAILBOX_KEY_CONFLICT', (t) => {
