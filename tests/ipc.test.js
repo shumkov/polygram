@@ -416,6 +416,20 @@ describe('ipc round-trip', () => {
     const res = await ipcClient.call({ path: sockPath, op: 'kaboom' });
     assert.equal(res.ok, false);
     assert.match(res.error, /bang/);
+    assert.equal(Object.hasOwn(res, 'code'), false, 'an error without a code adds no code key');
+  });
+
+  test('a handler error code reaches the client, so callers can classify refusals without parsing text', async () => {
+    // A caller such as an external task runner retries a rate limit and
+    // gives up on an oversized body; only a stable code tells them apart.
+    await startServer({
+      refuse: async () => { throw Object.assign(new Error('Rate limit reached'), { code: 'MAILBOX_RATE_LIMITED' }); },
+      numbered: async () => { throw Object.assign(new Error('odd'), { code: 42 }); },
+    });
+    const res = await ipcClient.call({ path: sockPath, op: 'refuse' });
+    assert.deepEqual({ ok: res.ok, error: res.error, code: res.code }, { ok: false, error: 'Rate limit reached', code: 'MAILBOX_RATE_LIMITED' });
+    const numbered = await ipcClient.call({ path: sockPath, op: 'numbered' });
+    assert.equal(Object.hasOwn(numbered, 'code'), false, 'only string codes are forwarded');
   });
 
   test('multiple concurrent calls are handled independently', async () => {
