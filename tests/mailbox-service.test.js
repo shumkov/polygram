@@ -55,6 +55,18 @@ test('a restart issues new tokens; an old or invented token is refused', (t) => 
   assert.throws(() => f.service.send(undefined, ask('marketing')), /token/i);
 });
 
+test('identify resolves a live role-session token to its role, so an outside tool can stamp identity', (t) => {
+  const f = fixture(t);
+  assert.deepEqual(f.service.identify({ token: f.service.scope(session('marketing')) }), { role: 'marketing' },
+    'a session never prompted still identifies; depth is irrelevant here');
+  assert.deepEqual(f.service.identify({ token: f.human('orchestrator') }), { role: 'orchestrator' });
+  const old = f.service.scope(session('ops'));
+  assert.throws(() => f.make().identify({ token: old }), /token/i, 'a token from before a restart is not live');
+  for (const token of ['invented', undefined, 42, '']) assert.throws(() => f.service.identify({ token }), /token/i, String(token));
+  assert.throws(() => f.service.identify({ token: old, role: 'orchestrator' }), /unknown mailbox field: role/i);
+  assert.throws(() => f.service.identify(null), /object/i);
+});
+
 test('the daemon stamps the sender; the agent cannot assert identity', (t) => {
   const f = fixture(t);
   const token = f.human('marketing');
@@ -231,6 +243,7 @@ test('with no mailbox key nothing is exposed and nothing is required', (t) => {
   service.noteJobSend({ routeId: 'x', requestId: 'mailbox:m_1', target: { sessionKey: '-1001:11' } });
   assert.throws(() => service.send('t', ask('x')), /disabled/i);
   assert.throws(() => service.reply('t', { inReplyTo: 'm_1', body: 'x' }), /disabled/i);
+  assert.throws(() => service.identify({ token: 't' }), (error) => error.code === 'MAILBOX_DISABLED');
 });
 
 test('invalid configuration fails at construction', (t) => {
