@@ -147,6 +147,8 @@ const {
 } = require('./lib/approvals/ui');
 const { buildHistoryBlock } = require('./lib/history-preload');
 const { createNotificationService } = require('./lib/external-jobs/notifications');
+const { createExternalJobDispatch } = require('./lib/external-jobs/dispatch');
+const { createMailboxService } = require('./lib/mailbox/service');
 const { formatContextReply, maybeContextFullHint } = require('./lib/context-format');
 // appendDisplayHint moved with buildSdkOptions extraction (commit 18) —
 // only consumer of that import is now lib/sdk/build-options.js itself.
@@ -612,13 +614,14 @@ function formatPrompt(msg, sessionCtx, attachments = [], { sessionKey = null } =
     }
   }
 
+  mailboxService?.noteHumanPrompt(sessionKey);
   return buildPrompt({
     msg,
     topicName,
     sessionCtx,
     attachments,
     replyTo: resolveReplyTo(msg),
-    polygramHistory: polygramHistory + (notificationService?.context(sessionKey, msg.reply_to_message?.message_id) || '') + (notificationService?.instructions(sessionKey) || ''),
+    polygramHistory: polygramHistory + (notificationService?.context(sessionKey, msg.reply_to_message?.message_id) || '') + (notificationService?.instructions(sessionKey) || '') + (mailboxService?.instructions(sessionKey) || ''),
     backend: resolvePromptBackend({ config, chatId, threadId }),
     // Only advertise stickers this bot actually has — empty for a bot with no
     // sticker set, so its prompt never mentions stickers.
@@ -1097,6 +1100,7 @@ let dispatchHandleMessage = null;
 let dispatchExternalEvent = null;
 let externalJobService = null;
 let notificationService = null;
+let mailboxService = null;
 let attemptAutoResume = null;
 let errorReplyText = null;
 let queueWarnThreshold = null;
@@ -4569,13 +4573,17 @@ async function main() {
     needsAuth: () => needsNativeClaudeAuth(config.bot, 'cli'),
     checkAuth: checkClaudeAuthHealth,
     awaitSessionRecovery: (sessionKey) => cleanReplaySessionCoordinator.wait(sessionKey, null),
-    getOrSpawnForChat, sendToProcess,
+    getOrSpawnForChat, sendToProcess, logger: console,
   });
   externalJobService = createExternalJobService({
     config, db, botName: BOT_NAME, resolveTarget: resolveExternalTarget,
-    dispatch: (job, hooks) => dispatchExternalEvent({
-      ...job.target, eventId: job.requestId,
-    }, () => externalRuntime.dispatch({ ...job, task: job.task + (notificationService?.instructions(job.target.sessionKey) || '') }, hooks)),
+    dispatch: createExternalJobDispatch({
+      dispatchExternalEvent: (origin, run) => dispatchExternalEvent(origin, run),
+      runtime: externalRuntime,
+      getNotifications: () => notificationService,
+      getMailbox: () => mailboxService,
+      logger: console, logEvent,
+    }),
     checkInactive: externalRuntime.checkInactive,
     recoverInactive: externalRuntime.recoverInactive,
     prepareReport,
@@ -4583,6 +4591,10 @@ async function main() {
   });
   notificationService = createNotificationService({
     config, db, botName: BOT_NAME, jobs: externalJobService, resolveTarget: resolveExternalTarget, bot, tg,
+  });
+  mailboxService = createMailboxService({
+    config, db, botName: BOT_NAME, jobs: externalJobService, resolveTarget: resolveExternalTarget, bot, tg,
+    ipcDir: ipcRuntimeDir,
   });
   // 0.12.0 post-turn edit re-delivery: constructed AFTER dispatchHandleMessage is assigned (above).
   // Claude keeps its same-message fold behavior. Codex defers edits to the
@@ -4698,6 +4710,7 @@ async function main() {
     const inFlightAtSignal = countInFlight(inFlightHandlers);
     isShuttingDown = true;
     notificationService?.stop();
+    mailboxService?.stop();
     externalJobService?.stop();
     console.log(`\nShutting down (${trigger})...`);
     // 1. Stop accepting new inbound first so nothing new queues behind the drain.
@@ -5024,6 +5037,7 @@ async function main() {
       handlers: createIpcHandlers({
         externalJobs: externalJobService,
         notifications: notificationService,
+        mailbox: mailboxService,
         botName: BOT_NAME,
         daemonIdentity,
         getInFlightHandlers: () => inFlightHandlers,
@@ -5679,6 +5693,7 @@ async function main() {
 
   externalJobService.start();
   notificationService.start();
+  mailboxService.start();
   logEvent('polygram-admission-open', lifecycleDetail({
     bot: BOT_NAME,
   }, invocationId, daemonIdentity));

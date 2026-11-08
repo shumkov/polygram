@@ -11,14 +11,23 @@
       "needsToken": false,
       "_comment_claudeCliAuthSource": "native (default) checks the host Claude login before CLI turns. Set external only when the configured session launcher supplies proxy credentials. SDK retains native checks; Codex is unaffected. Requires a verified pinned CLI and an absolute session launcher. Restart after changes; restore native when disabling proxy routing.",
       "claudeCliAuthSource": "native",
-      "_comment_externalJobs": "Opt-in external conversation jobs. Routes reference configured destinations; forum topics must be isolated. Protocol v1 supports Claude CLI. See docs/EXTERNAL_JOBS_API.md.",
+      "_comment_externalJobs": "Opt-in external conversation jobs. Routes reference configured destinations; forum topics must be isolated. maxConcurrent caps turns running at once across conversations (default 4). Protocol v1 supports Claude CLI. See docs/EXTERNAL_JOBS_API.md.",
       "externalJobs": {
         "enabled": false,
         "maxPending": 1000,
+        "maxConcurrent": 4,
         "routes": {
           "scheduled-review": {
             "chatId": "REPLACE_WITH_CONFIGURED_CHAT_ID",
             "threadId": "REPLACE_WITH_CONFIGURED_TOPIC_ID"
+          },
+          "orchestrator": {
+            "chatId": "REPLACE_WITH_ORGANIZATION_FORUM_ID",
+            "threadId": "REPLACE_WITH_ISOLATED_TOPIC_ID"
+          },
+          "marketing": {
+            "chatId": "REPLACE_WITH_ORGANIZATION_FORUM_ID",
+            "threadId": "REPLACE_WITH_ANOTHER_ISOLATED_TOPIC_ID"
           }
         }
       },
@@ -35,6 +44,17 @@
         "consumers": {
           "admin": { "routeId": "scheduled-review", "generation": "netdata-v1", "baseline": 0 }
         }
+      },
+      "_comment_mailbox": "Opt-in messages between role sessions (ask, tell, reply). Each role key is an externalJobs route id for its own isolated topic on the Claude CLI backend; no two roles may share a session. allow lists who may start an ask or tell to whom (\"*\" = every role); replies are never checked against it. mirror posts each message into the target role's topic (default true). Limits default to maxDepth 2, perPairPerHour 10, maxBodyBytes 3500 (also the ceiling). Setting enabled false withdraws queued mailbox jobs unsent. See docs/MAILBOX.md.",
+      "mailbox": {
+        "enabled": false,
+        "roles": {
+          "orchestrator": { "about": "Owns strategy; routes work" },
+          "marketing": { "about": "Campaigns, content, ads" }
+        },
+        "allow": { "orchestrator": ["*"], "marketing": ["orchestrator"] },
+        "mirror": true,
+        "limits": { "maxDepth": 2, "perPairPerHour": 10, "maxBodyBytes": 3500 }
       },
       "_comment_stream": "Streaming is always on. `streamMinChars` sets the initial-send debounce (default 30) — short responses below that stay idle until the final result. `streamThrottleMs` sets the edit cadence (default 1000ms, min 250).",
       "streamMinChars": 30,

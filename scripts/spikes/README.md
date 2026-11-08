@@ -189,6 +189,28 @@ Modes and flags are listed in its header. Cover at least
 `--mode subagent` and `--mode fail --interrupt-after 5000`. See
 `docs/0.41-cli-api-error-surfacing-spec.md`.
 
+`mailbox-two-roles.mjs` runs two role sessions as pinned CLIs under
+`CliProcess` against the real mailbox, external-jobs and IPC stack over a temp
+SQLite DB. Its dedicated tmux server (`tmux -L pgmbx`) starts without
+`POLYGRAM_IPC_DIR` / `POLYGRAM_IPC_SECRET`, as when the daemon does not own the
+tmux server, so the agent's injected `msg.js` command must work on its own.
+- `--model stub` (default, no paid call) scripts every turn through a local
+  `/v1/messages` stub that runs the exact injected command. It checks:
+  the envelope reaching the target, role stamping, ask → reply → a quoting
+  asker turn, one notice for a silent target, the `maxDepth` refusal, one
+  mirror post per message, and overlapping turns in two sessions.
+- `--model real` uses the machine's Claude login with haiku and synthetic
+  prompts. It checks one ask, exactly one reply, no acknowledgement
+  ping-pong, and prints turn and token counts. It exits 2 (skipped) when the
+  login is unavailable.
+
+It keeps the pinned binary, cwds, hook files, the DB and the bridge's log
+mirror (via the bridge's HOME) in a mode-0700 temp dir. The IPC directory lives
+under the home directory, because Polygram's IPC refuses temporary
+directories. Both are removed at exit, together with the sessions'
+`~/.claude/projects` entries. Run it before deploying mailbox changes and on
+every pin bump. See `docs/session-mailbox-spec.md`.
+
 `clean-restart-resume.mjs` is the opt-in, authenticated gate for the
 clean-restart resume-plus-`continue` rollout. It verifies the exact installed
 Orchestra contract, retires a live eight-step CLI turn after step five, strictly
