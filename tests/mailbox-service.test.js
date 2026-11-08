@@ -57,9 +57,9 @@ test('a restart issues new tokens; an old or invented token is refused', (t) => 
 
 test('identify resolves a live role-session token to its role, so an outside tool can stamp identity', (t) => {
   const f = fixture(t);
-  assert.deepEqual(f.service.identify({ token: f.service.scope(session('marketing')) }), { role: 'marketing' },
-    'a session never prompted still identifies; depth is irrelevant here');
-  assert.deepEqual(f.service.identify({ token: f.human('orchestrator') }), { role: 'orchestrator' });
+  assert.deepEqual(f.service.identify({ token: f.service.scope(session('marketing')) }), { role: 'marketing', depth: 2 },
+    'a session never prompted since boot still identifies, at maxDepth');
+  assert.deepEqual(f.service.identify({ token: f.human('orchestrator') }), { role: 'orchestrator', depth: 0 });
   const old = f.service.scope(session('ops'));
   assert.throws(() => f.make().identify({ token: old }), /token/i, 'a token from before a restart is not live');
   for (const token of ['invented', undefined, 42, '']) assert.throws(() => f.service.identify({ token }), /token/i, String(token));
@@ -102,6 +102,26 @@ test('depth: a human prompt is 0, a mailbox delivery is the message depth, any o
 
   f.service.noteHumanPrompt(session('orchestrator'));
   assert.equal(f.row(f.service.send(orchestrator, ask('ops')).id).depth, 1, 'a human prompt resets depth to 0');
+});
+
+// The agent-org layer applies "a human asked in this turn" rules from
+// identify's depth, so it must be exactly the depth send() would use: 0 only
+// while the last prompt polygram sent the session was a human message.
+test('identify reports the session depth that send would use, 0 only after a human prompt', (t) => {
+  const f = fixture(t);
+  const depthOf = (role) => f.service.identify({ token: f.service.scope(session(role)) }).depth;
+  const first = f.service.send(f.human('orchestrator'), ask('marketing'));
+  assert.equal(depthOf('orchestrator'), 0, 'a human asked in this turn');
+  f.service.noteJobSend({ routeId: 'marketing', requestId: `mailbox:${first.id}`, target: { sessionKey: session('marketing') } });
+  assert.equal(depthOf('marketing'), 1, 'a mailbox delivery carries its message depth');
+  f.service.noteJobSend({ routeId: 'orchestrator', requestId: `mailbox-notice:${first.id}`, target: { sessionKey: session('orchestrator') } });
+  assert.equal(depthOf('orchestrator'), 2, 'a notice turn is automation, at maxDepth');
+  f.service.noteJobSend({ routeId: 'orchestrator', requestId: 'notifications:abc', target: { sessionKey: session('orchestrator') } });
+  assert.equal(depthOf('orchestrator'), 2, 'any other job turn is at maxDepth');
+  f.service.noteHumanPrompt(session('orchestrator'));
+  assert.equal(depthOf('orchestrator'), 0, 'the next human message resets it');
+  const deeper = fixture(t, { limits: { maxDepth: 5 } });
+  assert.equal(deeper.service.identify({ token: deeper.service.scope(session('ops')) }).depth, 5, 'unprompted means the configured maxDepth');
 });
 
 test('depth: a session with no prompt since boot is treated as maxDepth', (t) => {
