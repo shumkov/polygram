@@ -12,12 +12,15 @@ Phase 1 delivers only to Claude CLI sessions of one bot on one host.
 
 - [External jobs](./EXTERNAL_JOBS_API.md) are enabled. Messages travel as
   external jobs, so pause, idle-only admission and job reports apply.
-- Each role is an existing session: a non-forum chat, or an isolated topic
-  (`isolateTopics: true`) on the CLI backend. Groups that run with
-  `isolateTopics: false` don't qualify; give the organization its own forum
-  group.
+- Each role is an existing session on the CLI backend: a non-forum chat, an
+  isolated topic (`isolateTopics: true`), or a forum's General topic. Topics
+  in groups that run with `isolateTopics: false` don't qualify; give the
+  organization its own forum group.
 - Each role key is also an `externalJobs.routes` key that points at that
-  session. No two roles may share a session.
+  session. No two roles may share a session. A General role's route is
+  `{ "chatId": "…", "general": true }` with no `threadId`. Its session is
+  the bare chat id, distinct from every topic's session, and its mirror,
+  reports and `/automation` all use General.
 
 Boot fails on any configuration error, so a typo can't silently weaken the
 rules.
@@ -26,7 +29,7 @@ rules.
 
 ```json
 "externalJobs": { "enabled": true, "maxConcurrent": 4, "routes": {
-  "orchestrator": { "chatId": "-100…", "threadId": "11" },
+  "orchestrator": { "chatId": "-100…", "general": true },
   "marketing":    { "chatId": "-100…", "threadId": "12" } } },
 "mailbox": {
   "enabled": true,
@@ -132,10 +135,20 @@ to the IPC socket with the bot's secret, like any other IPC client.
 
 The reply is `{id, state}` like `send`, with `duplicate: true` on a key hit.
 
-`mailbox_identify {token}` returns `{role}` for a live role-session token
-and fails otherwise, including for a token from before a restart. A tool an
-agent runs (the agent-org `tasks` CLI) passes the session's mailbox token
-and lets the daemon say which role is calling.
+`mailbox_identify {token}` returns `{role, depth}` for a live role-session
+token and fails otherwise, including for a token from before a restart. A
+tool an agent runs (the agent-org `tasks` CLI) passes the session's mailbox
+token and lets the daemon say which role is calling. `depth` is the
+session's current depth, the one `send` would use:
+
+- 0 when the last prompt polygram sent the session was a human message or a
+  system tell;
+- the message's depth after a mailbox delivery;
+- `limits.maxDepth` after any other automation turn, or before the
+  session's first prompt since boot.
+
+So `depth: 0` means a human asked in this turn (or a system sender started
+it).
 
 ## Error codes
 

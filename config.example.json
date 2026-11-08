@@ -11,7 +11,7 @@
       "needsToken": false,
       "_comment_claudeCliAuthSource": "native (default) checks the host Claude login before CLI turns. Set external only when the configured session launcher supplies proxy credentials. SDK retains native checks; Codex is unaffected. Requires a verified pinned CLI and an absolute session launcher. Restart after changes; restore native when disabling proxy routing.",
       "claudeCliAuthSource": "native",
-      "_comment_externalJobs": "Opt-in external conversation jobs. Routes reference configured destinations; forum topics must be isolated. maxConcurrent caps turns running at once across conversations (default 4). Protocol v1 supports Claude CLI. See docs/EXTERNAL_JOBS_API.md.",
+      "_comment_externalJobs": "Opt-in external conversation jobs. Routes reference configured destinations; forum topics must be isolated, and {chatId, general: true} with no threadId names a forum's General topic. maxConcurrent caps turns running at once across conversations (default 4). Protocol v1 supports Claude CLI. See docs/EXTERNAL_JOBS_API.md.",
       "externalJobs": {
         "enabled": false,
         "maxPending": 1000,
@@ -45,7 +45,7 @@
           "admin": { "routeId": "scheduled-review", "generation": "netdata-v1", "baseline": 0 }
         }
       },
-      "_comment_mailbox": "Opt-in messages between role sessions (ask, tell, reply). Each role key is an externalJobs route id for its own isolated topic on the Claude CLI backend; no two roles may share a session. allow lists who may start an ask or tell to whom (\"*\" = every role); replies are never checked against it. mirror posts each message into the target role's topic (default true). systemSenders names processes outside any session (such as the agent-org task runner) that may send tells as system:<name> through the IPC op mailbox_submit; default none, and polygram is reserved. Limits default to maxDepth 2, perPairPerHour 10, maxBodyBytes 3500 (also the ceiling), systemPerHour 60 (per system sender). Setting enabled false withdraws queued mailbox jobs unsent. See docs/MAILBOX.md.",
+      "_comment_mailbox": "Opt-in messages between role sessions (ask, tell, reply). Each role key is an externalJobs route id for its own isolated topic or a forum's General topic on the Claude CLI backend; no two roles may share a session. allow lists who may start an ask or tell to whom (\"*\" = every role); replies are never checked against it. mirror posts each message into the target role's topic (default true). systemSenders names processes outside any session (such as the agent-org task runner) that may send tells as system:<name> through the IPC op mailbox_submit; default none, and polygram is reserved. Limits default to maxDepth 2, perPairPerHour 10, maxBodyBytes 3500 (also the ceiling), systemPerHour 60 (per system sender). Setting enabled false withdraws queued mailbox jobs unsent. See docs/MAILBOX.md.",
       "mailbox": {
         "enabled": false,
         "roles": {
