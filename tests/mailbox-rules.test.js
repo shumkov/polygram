@@ -34,14 +34,27 @@ test('a valid configuration resolves every role to its frozen session', () => {
   assert.equal(cfg.roles.get('marketing').about, 'Campaigns, content, ads');
   assert.equal(cfg.roleForSession('-1001:11'), 'orchestrator');
   assert.equal(cfg.roleForSession('-1001:99'), null);
-  assert.deepEqual(cfg.limits, { maxDepth: 2, perPairPerHour: 10, maxBodyBytes: 3500 });
+  assert.deepEqual(cfg.limits, { maxDepth: 2, perPairPerHour: 10, maxBodyBytes: 3500, systemPerHour: 60 });
   assert.equal(cfg.mirror, true, 'every message is visible in Telegram unless explicitly turned off');
   assert.equal(read({ ...base(), mirror: false }).mirror, false);
 });
 
 test('limits default to the documented values', () => {
   const { limits, ...rest } = base();
-  assert.deepEqual(read(rest).limits, { maxDepth: 2, perPairPerHour: 10, maxBodyBytes: 3500 });
+  assert.deepEqual(read(rest).limits, { maxDepth: 2, perPairPerHour: 10, maxBodyBytes: 3500, systemPerHour: 60 });
+});
+
+test('systemSenders names the processes that may submit as system:<name>; none by default', () => {
+  assert.deepEqual([...read(base()).systemSenders], [], 'no system sender unless configured');
+  assert.deepEqual([...read({ ...base(), systemSenders: ['agent-org', 'crm_sync'] }).systemSenders], ['agent-org', 'crm_sync']);
+  assert.equal(read({ ...base(), systemSenders: ['agent-org'] }).systemSenders.has('agent-org'), true);
+  assert.equal(read({ ...base(), limits: { systemPerHour: 5 } }).limits.systemPerHour, 5);
+  for (const bad of ['agent-org', {}, [''], ['Agent'], ['agent org'], ['a:b'], [7], ['agent-org', 'agent-org']]) {
+    assert.throws(() => read({ ...base(), systemSenders: bad }), /systemSenders/, JSON.stringify(bad));
+  }
+  // system:polygram is the daemon's own notice address; no sender may impersonate it.
+  assert.throws(() => read({ ...base(), systemSenders: ['polygram'] }), /systemSenders.*polygram/);
+  assert.throws(() => read({ ...base(), limits: { systemPerHour: 0 } }), /systemPerHour/);
 });
 
 test('mailbox requires enabled external jobs', () => {
@@ -159,12 +172,14 @@ test('the config.example.json mailbox block is disabled and valid once enabled',
   const cfg = rules.readMailboxConfig(enabled, resolve);
   assert.deepEqual([...cfg.roles.keys()], ['orchestrator', 'marketing']);
   assert.equal(cfg.allowed('marketing', 'orchestrator'), true);
+  assert.deepEqual([...cfg.systemSenders], ['agent-org'], 'the example shows the agent-org system sender');
+  assert.equal(cfg.limits.systemPerHour, 60);
 });
 
 test('an unknown top-level mailbox key fails boot instead of being ignored', () => {
-  for (const key of ['limit', 'allowed', 'mirrors', 'systemSenders']) {
+  for (const key of ['limit', 'allowed', 'mirrors', 'systemSender']) {
     assert.throws(() => read({ ...base(), [key]: {} }), new RegExp(`mailbox key ${key}`), key);
   }
-  assert.ok(read({ ...base(), mirror: false }), 'every documented key is accepted');
+  assert.ok(read({ ...base(), mirror: false, systemSenders: [] }), 'every documented key is accepted');
   assert.equal(read({ enabled: false, limit: {} }), null, 'a disabled block changes nothing and is not validated');
 });
