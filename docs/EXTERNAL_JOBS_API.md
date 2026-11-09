@@ -14,7 +14,12 @@ conversation still runs one job at a time, in submission order. A busy
 conversation keeps its job queued until the next scheduling pass (a submit, a
 resume, a finished turn or the 60-second timer).
 Each route has `chatId` and optional `threadId`. Forum destinations require an
-explicit configured isolated topic. Version 1 dispatch supports Claude CLI only.
+explicit configured isolated topic, or `"general": true` with no `threadId` for
+the forum's General topic. General is the session polygram keys by the bare
+chat id, and its reports post without `message_thread_id`. The flag must be
+exactly `true`, and a route may not combine it with a `threadId`. In a forum
+without `isolateTopics`, every topic shares that session, but `/automation`
+only works when sent in General. Version 1 dispatch supports Claude CLI only.
 Route names and request IDs are nonempty bounded strings; request IDs must be
 stable across transport retries. The `mailbox:` and `mailbox-notice:` request
 ID prefixes are reserved for the [session mailbox](./MAILBOX.md); jobs using

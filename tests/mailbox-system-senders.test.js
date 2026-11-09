@@ -233,6 +233,7 @@ test('the receiving turn starts at depth 0, so the role may start a chain', (t) 
   const token = f.mailbox.scope(session('orchestrator'));
   assert.throws(() => f.mailbox.send(token, { to: 'ops', kind: 'ask', body: 'Q' }), /depth/i, 'a session never prompted is at maxDepth');
   f.mailbox.noteJobSend({ routeId: 'orchestrator', requestId: `mailbox:${sent.id}`, target: { sessionKey: session('orchestrator') } });
+  assert.deepEqual(f.mailbox.identify({ token }), { role: 'orchestrator', depth: 0 }, 'identify reports the tell turn at depth 0, as for a human');
   const asked = f.mailbox.send(token, { to: 'ops', kind: 'ask', body: 'Q' });
   assert.equal(f.row(asked.id).depth, 1);
 });

@@ -382,9 +382,11 @@ uses two IPC ops; the operator docs are in [`MAILBOX.md`](./MAILBOX.md).
   unique partial index on `(bot_name, from_addr, idem_key)` where `idem_key
   IS NOT NULL`. `SCHEMA_VERSION` is 25.
 
-**`mailbox_identify {token}`** returns `{role}` for a live role-session token
-and throws otherwise. agent-org's `tasks` CLI uses it so the daemon, not the
-agent, says which role is calling.
+**`mailbox_identify {token}`** returns `{role, depth}` for a live
+role-session token and throws otherwise. agent-org's `tasks` CLI uses it so
+the daemon, not the agent, says which role is calling. `depth` is the depth
+`send` would use; 0 means the last prompt was a human message or a system
+tell.
 
 **Error codes.** IPC error replies carry the handler error's `code`. The
 mailbox refusals a caller must classify have fixed codes:
