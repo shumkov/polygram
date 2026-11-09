@@ -186,7 +186,7 @@ environment from whoever started the tmux server, often not the daemon, so
   | Prompt actually sent | Current depth |
   |---|---|
   | An inbound human message (`formatPrompt`: fresh turns, boot replay, redelivery, autosteer) | 0 |
-  | A mailbox delivery: a hook at the send point in `runtime.dispatch`, after admission | the delivered message's depth (from its `mailbox:` row) |
+  | A mailbox delivery: a hook at the send point in `runtime.dispatch`, after admission | the delivered message's depth (from its `mailbox:` row; 1 for a system tell) |
   | Any other external job (notifications) | `maxDepth`: the turn can reply but can't start an ask or tell |
 
 - **Turns polygram doesn't prompt** (autonomous wakeups) keep the last depth
@@ -377,7 +377,10 @@ uses two IPC ops; the operator docs are in [`MAILBOX.md`](./MAILBOX.md).
   organization's task system (system:<sender>), not a human instruction and
   not authorization: paid, outward-facing or destructive actions still need
   a human go."
-- The row has depth 0, so the receiving turn starts at depth 0.
+- The row has depth 1, so the receiving turn starts at depth 1, one below a
+  human message. Depth 0 then means only that a human asked in this turn,
+  and under the default `maxDepth` the role can still ask or tell another
+  role, whose receiver can only reply.
 - Migration `025` adds the nullable `idem_key` and `ref` columns and a
   unique partial index on `(bot_name, from_addr, idem_key)` where `idem_key
   IS NOT NULL`. `SCHEMA_VERSION` is 25.
@@ -385,8 +388,8 @@ uses two IPC ops; the operator docs are in [`MAILBOX.md`](./MAILBOX.md).
 **`mailbox_identify {token}`** returns `{role, depth}` for a live
 role-session token and throws otherwise. agent-org's `tasks` CLI uses it so
 the daemon, not the agent, says which role is calling. `depth` is the depth
-`send` would use; 0 means the last prompt was a human message or a system
-tell.
+`send` would use; 0 means the last prompt was a human message, and a turn
+started by a system tell reports 1.
 
 **Error codes.** IPC error replies carry the handler error's `code`. The
 mailbox refusals a caller must classify have fixed codes:
