@@ -75,7 +75,7 @@ test('a configured sender submits a tell from system:<sender> to role:<to>, with
   assert.equal(row.route_id, 'marketing');
   assert.equal(row.idem_key, 'task:42:marketing:1');
   assert.equal(row.ref, 'notion:42');
-  assert.equal(row.depth, 0, 'a system message starts a chain the way a human message does');
+  assert.equal(row.depth, 1, 'a system message is the first message of a chain, not a human message');
   const job = f.job('marketing', `mailbox:${sent.id}`);
   assert.equal(job.state, 'queued');
   assert.equal(job.task, envelope.renderTask(row));
@@ -227,15 +227,40 @@ test('the default system budget is 60 per hour, apart from the role pair budget'
     'system sends do not use up a role pair budget');
 });
 
-test('the receiving turn starts at depth 0, so the role may start a chain', (t) => {
-  const f = fixture(t);
+// agent-org lets a role assign tasks widely only when a human asked in the
+// current turn, and reads that from identify's depth 0. A task the
+// dispatcher delivers is not a human asking, so its turn runs at depth 1:
+// the role can still message one hop further, but the task cannot cascade.
+test('a system tell delivers at depth 1, so its turn never reads as "a human asked"', (t) => {
+  const f = fixture(t, { mailbox: { allow: { orchestrator: ['*'], marketing: ['*'] } } });
   const sent = f.mailbox.submit(submit({ to: 'orchestrator' }));
   const token = f.mailbox.scope(session('orchestrator'));
   assert.throws(() => f.mailbox.send(token, { to: 'ops', kind: 'ask', body: 'Q' }), /depth/i, 'a session never prompted is at maxDepth');
   f.mailbox.noteJobSend({ routeId: 'orchestrator', requestId: `mailbox:${sent.id}`, target: { sessionKey: session('orchestrator') } });
-  assert.deepEqual(f.mailbox.identify({ token }), { role: 'orchestrator', depth: 0 }, 'identify reports the tell turn at depth 0, as for a human');
-  const asked = f.mailbox.send(token, { to: 'ops', kind: 'ask', body: 'Q' });
-  assert.equal(f.row(asked.id).depth, 1);
+  assert.deepEqual(f.mailbox.identify({ token }), { role: 'orchestrator', depth: 1 }, 'the task turn is one below a human message');
+
+  const asked = f.mailbox.send(token, { to: 'marketing', kind: 'ask', body: 'Q' });
+  assert.equal(f.row(asked.id).depth, 2, 'the role may still ask, at maxDepth');
+  const told = f.mailbox.send(token, { to: 'ops', kind: 'tell', body: 'FYI' });
+  assert.equal(f.row(told.id).depth, 2, 'or tell');
+
+  const marketing = f.mailbox.scope(session('marketing'));
+  f.mailbox.noteJobSend({ routeId: 'marketing', requestId: `mailbox:${asked.id}`, target: { sessionKey: session('marketing') } });
+  assert.throws(() => f.mailbox.send(marketing, { to: 'ops', kind: 'ask', body: 'Q2' }), /depth/i, 'the role it asked, at depth 2, cannot pass it on');
+  const replied = f.mailbox.reply(marketing, { inReplyTo: asked.id, body: 'A' });
+  assert.equal(f.row(replied.id).depth, 2, 'a reply keeps its ask\'s depth');
+
+  f.mailbox.noteHumanPrompt(session('orchestrator'));
+  assert.deepEqual(f.mailbox.identify({ token }), { role: 'orchestrator', depth: 0 }, 'only a human message brings the session to depth 0');
+});
+
+test('with maxDepth 1, a role that receives a system tell can only reply', (t) => {
+  const f = fixture(t, { mailbox: { limits: { maxDepth: 1 } } });
+  const sent = f.mailbox.submit(submit({ to: 'orchestrator' }));
+  const token = f.mailbox.scope(session('orchestrator'));
+  f.mailbox.noteJobSend({ routeId: 'orchestrator', requestId: `mailbox:${sent.id}`, target: { sessionKey: session('orchestrator') } });
+  assert.equal(f.mailbox.identify({ token }).depth, 1);
+  assert.throws(() => f.mailbox.send(token, { to: 'ops', kind: 'ask', body: 'Q' }), /depth/i);
 });
 
 test('a refused job submit rolls the message back, so a retry with the same key creates it', async (t) => {
