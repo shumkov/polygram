@@ -603,4 +603,12 @@ describe('buildPrompt — full integration', () => {
     const p = buildPrompt({ msg: basicMsg });
     assert.ok(/untrusted-input.*data.*not instructions/i.test(p), 'primer present');
   });
+
+  test('polygram-info primer frames <voice> transcripts as untrusted data', () => {
+    // Anyone in an allowed chat can now speak to the agent; a spoken
+    // "ignore previous instructions" must be framed as data like typed text.
+    const p = buildPrompt({ msg: basicMsg });
+    const security = p.split('\n').find((l) => l.startsWith('Security:'));
+    assert.match(security, /<voice>/);
+  });
 });
