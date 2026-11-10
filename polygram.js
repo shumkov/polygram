@@ -160,7 +160,7 @@ const { createAsyncLock } = require('@shumkov/orchestra');
 const { sweepInbox } = require('./lib/db/inbox');
 const { parseBotArg, parseDbArg, filterConfigToBot, activeBotConfig } = require('./lib/config-scope');
 const { createStore: createPairingsStore, parseTtl: parsePairingTtl } = require('./lib/db/pairings');
-const { transcribe: transcribeVoice, isVoiceAttachment } = require('./lib/telegram/voice');
+const { transcribe: transcribeVoice, isVoiceAttachment, OPENAI_DEFAULT_MODEL } = require('./lib/telegram/voice');
 const { createStreamer, DEFAULT_THROTTLE_MS } = require('./lib/telegram/streamer');
 const {
   createStreamerRegistry, createDeliverTextFactory, createTurnSettler,
@@ -4165,6 +4165,14 @@ async function main() {
     transcribeVoice, isVoiceAttachment,
     botName: BOT_NAME, logger: console,
   });
+  {
+    const voiceCfg = config.bot?.voice || config.voice;
+    if (voiceCfg?.enabled) {
+      const provider = voiceCfg.provider || 'openai';
+      const model = provider === 'openai' ? `/${voiceCfg.openai?.model || OPENAI_DEFAULT_MODEL}` : '';
+      console.log(`[polygram] voice: ${provider}${model} enabled`);
+    }
+  }
   downloadAttachments = createDownloadAttachments({
     config, db, dbWrite, inboxDir: INBOX_DIR, logger: console,
   });
