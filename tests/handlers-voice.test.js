@@ -247,3 +247,34 @@ describe('voice handler — failure codes', () => {
     }
   });
 });
+
+// Boot replay, redelivery and the startup retry re-read the attachment row,
+// which carries the stored transcript: it is reused rather than paid for again.
+describe('voice handler — stored transcript reuse', () => {
+  test('a stored transcript is reused on redelivery: no second paid call, no re-persist', async () => {
+    let calls = 0;
+    const m = makeDeps({ transcribeVoice: async () => { calls += 1; return { text: 'new', provider: 'openai' }; } });
+    const fn = createTranscribeVoiceAttachments(m.deps);
+    const att = {
+      id: 1, kind: 'voice', path: '/tmp/x', name: 'x.ogg',
+      transcription: { text: 'stored words', provider: 'openai' },
+    };
+    await fn([att], { chatId: '1', msgId: 1, label: 't', botApi: {} });
+    assert.equal(calls, 0);
+    assert.equal(att.transcription.text, 'stored words');
+    assert.equal(m.events.filter((e) => e.kind === 'voice-transcribed').length, 0);
+    assert.equal(m.dbCalls.length, 0);
+  });
+
+  test('an album with one reused and one new transcript stores the full text', async () => {
+    const m = makeDeps({ transcribeVoice: async () => ({ text: 'second part', provider: 'openai' }) });
+    const fn = createTranscribeVoiceAttachments(m.deps);
+    await fn([
+      { id: 1, kind: 'audio', path: '/tmp/a', name: 'a.ogg', transcription: { text: 'first part' } },
+      { id: 2, kind: 'audio', path: '/tmp/b', name: 'b.ogg' },
+    ], { chatId: '1', msgId: 1, label: 't', botApi: {} });
+    const setMsg = m.dbCalls.find((c) => c[0] === 'setMessageText');
+    assert.equal(setMsg[1].text, 'first part second part');
+    assert.deepEqual(m.dbCalls.filter((c) => c[0] === 'setAttachmentTranscription').map((c) => c[1]), [2]);
+  });
+});
