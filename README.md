@@ -273,8 +273,12 @@ Per-bot flags:
   `streamThrottleMs × (live previews in the chat)` — several busy forum
   topics cost the chat what one does. Off, the cadence is
   `streamThrottleMs` unchanged.
-- `voice: { enabled, provider: "openai"|"local", ... }` — Whisper
-  transcription settings.
+- `voice: { enabled, provider: "openai"|"local", openai: { apiKeyFile,
+  model }, language, timeoutMs, maxFileBytes, ... }` — transcription
+  settings. `openai.apiKeyFile` holds the key outside the daemon's
+  environment (CLI-backed sessions inherit that environment). For the
+  OpenAI provider `timeoutMs` defaults to 120000 and `maxFileBytes` to
+  OpenAI's 25 MB upload limit.
 - `approvals: { adminChatId, timeoutMs, gatedTools, ... }` — which tool
   calls require an inline-keyboard approval and where to post the card.
 - `attachmentConcurrency` (default 6) — parallel Telegram file

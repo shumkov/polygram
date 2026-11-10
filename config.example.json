@@ -81,9 +81,10 @@
       "voice": {
         "enabled": true,
         "provider": "openai",
+        "_comment_openai": "apiKeyFile (one key, mode 0600) is preferred over apiKeyEnv: the daemon environment reaches CLI-backed agent sessions. When apiKeyFile is set there is no fallback to the environment. model defaults to gpt-transcribe.",
         "openai": {
-          "apiKeyEnv": "OPENAI_API_KEY",
-          "model": "whisper-1"
+          "apiKeyFile": "/Users/you/.config/polygram/openai-stt.key",
+          "model": "gpt-transcribe"
         },
         "language": "auto",
         "maxDurationSec": 600,

@@ -190,3 +190,18 @@ describe('voice handler — failure paths', () => {
     assert.equal(m.dbCalls.length, 0);
   });
 });
+
+describe('voice handler — provider settings', () => {
+  test('timeoutMs and maxFileBytes from the voice config reach the provider', async () => {
+    let seen;
+    const m = makeDeps({
+      config: { bot: { voice: { enabled: true, timeoutMs: 5000, maxFileBytes: 1234 } } },
+      transcribeVoice: async (_p, opts) => { seen = opts; return { text: 'ok', provider: 'openai' }; },
+    });
+    const fn = createTranscribeVoiceAttachments(m.deps);
+    await fn([{ id: 1, kind: 'voice', path: '/tmp/x', name: 'x.ogg' }],
+      { chatId: '1', msgId: 1, label: 't', botApi: {} });
+    assert.equal(seen.timeoutMs, 5000);
+    assert.equal(seen.maxFileBytes, 1234);
+  });
+});
