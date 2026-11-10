@@ -205,3 +205,45 @@ describe('voice handler — provider settings', () => {
     assert.equal(seen.maxFileBytes, 1234);
   });
 });
+
+// A failed transcription must reach the agent as a closed reason code, so it
+// can tell the user what went wrong. The code is also the telemetry field,
+// and both are content-free: never a provider body, a path or an errno.
+describe('voice handler — failure codes', () => {
+  test('a coded failure is recorded as error_code and set on the attachment', async () => {
+    const m = makeDeps({
+      transcribeVoice: async () => { throw Object.assign(new Error('openai transcription timed out'), { code: 'timeout' }); },
+    });
+    const fn = createTranscribeVoiceAttachments(m.deps);
+    const att = { id: 1, kind: 'voice', path: '/tmp/x', name: 'x.ogg' };
+    await fn([att], { chatId: '1', msgId: 1, label: 't', botApi: {} });
+    const failEvt = m.events.find((e) => e.kind === 'voice-transcribe-failed');
+    assert.equal(failEvt.detail.error_code, 'timeout');
+    assert.equal(att.transcriptionError, 'timeout');
+  });
+
+  test('http-<status> passes the allowlist', async () => {
+    const m = makeDeps({
+      transcribeVoice: async () => { throw Object.assign(new Error('x'), { code: 'http-503' }); },
+    });
+    const fn = createTranscribeVoiceAttachments(m.deps);
+    const att = { id: 1, kind: 'voice', path: '/tmp/x', name: 'x.ogg' };
+    await fn([att], { chatId: '1', msgId: 1, label: 't', botApi: {} });
+    assert.equal(att.transcriptionError, 'http-503');
+  });
+
+  test('codes outside the closed set (errno, missing) become unknown', async () => {
+    for (const thrown of [
+      Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' }),
+      new Error('whisper.cpp exit 1'),
+      Object.assign(new Error('x'), { code: 'http-<script>' }),
+    ]) {
+      const m = makeDeps({ transcribeVoice: async () => { throw thrown; } });
+      const fn = createTranscribeVoiceAttachments(m.deps);
+      const att = { id: 1, kind: 'voice', path: '/tmp/x', name: 'x.ogg' };
+      await fn([att], { chatId: '1', msgId: 1, label: 't', botApi: {} });
+      assert.equal(att.transcriptionError, 'unknown');
+      assert.equal(m.events.find((e) => e.kind === 'voice-transcribe-failed').detail.error_code, 'unknown');
+    }
+  });
+});

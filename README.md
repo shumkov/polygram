@@ -51,9 +51,10 @@ ergonomics while running on top of `claude` CLI.
   is the only writer to its own DB.
 - **Inline-keyboard approvals.** Destructive tool calls gate on operator
   click via Claude Code's `PreToolUse` hook; 5-minute auto-deny.
-- **Voice transcription.** OpenAI Whisper API or local `whisper.cpp`,
-  selectable per bot. Transcriptions land in `messages.text` so FTS
-  finds them.
+- **Voice transcription.** OpenAI (`gpt-transcribe` by default) or local
+  `whisper.cpp`, selectable per bot. Transcriptions land in
+  `messages.text` so FTS finds them; a failed one reaches the agent as
+  `<voice-transcription-failed reason="…">` with a closed reason code.
 - **Per-attachment table** (`attachments`, since 0.6.0) with download
   lifecycle (`pending` → `downloaded` | `failed`), per-attachment
   transcription, and `chat_id`/`kind`/`status` indexes for ops queries.
