@@ -190,3 +190,91 @@ describe('voice handler — failure paths', () => {
     assert.equal(m.dbCalls.length, 0);
   });
 });
+
+describe('voice handler — provider settings', () => {
+  test('timeoutMs and maxFileBytes from the voice config reach the provider', async () => {
+    let seen;
+    const m = makeDeps({
+      config: { bot: { voice: { enabled: true, timeoutMs: 5000, maxFileBytes: 1234 } } },
+      transcribeVoice: async (_p, opts) => { seen = opts; return { text: 'ok', provider: 'openai' }; },
+    });
+    const fn = createTranscribeVoiceAttachments(m.deps);
+    await fn([{ id: 1, kind: 'voice', path: '/tmp/x', name: 'x.ogg' }],
+      { chatId: '1', msgId: 1, label: 't', botApi: {} });
+    assert.equal(seen.timeoutMs, 5000);
+    assert.equal(seen.maxFileBytes, 1234);
+  });
+});
+
+// A failed transcription must reach the agent as a closed reason code, so it
+// can tell the user what went wrong. The code is also the telemetry field,
+// and both are content-free: never a provider body, a path or an errno.
+describe('voice handler — failure codes', () => {
+  test('a coded failure is recorded as error_code and set on the attachment', async () => {
+    const m = makeDeps({
+      transcribeVoice: async () => { throw Object.assign(new Error('openai transcription timed out'), { code: 'timeout' }); },
+    });
+    const fn = createTranscribeVoiceAttachments(m.deps);
+    const att = { id: 1, kind: 'voice', path: '/tmp/x', name: 'x.ogg' };
+    await fn([att], { chatId: '1', msgId: 1, label: 't', botApi: {} });
+    const failEvt = m.events.find((e) => e.kind === 'voice-transcribe-failed');
+    assert.equal(failEvt.detail.error_code, 'timeout');
+    assert.equal(att.transcriptionError, 'timeout');
+  });
+
+  test('http-<status> passes the allowlist', async () => {
+    const m = makeDeps({
+      transcribeVoice: async () => { throw Object.assign(new Error('x'), { code: 'http-503' }); },
+    });
+    const fn = createTranscribeVoiceAttachments(m.deps);
+    const att = { id: 1, kind: 'voice', path: '/tmp/x', name: 'x.ogg' };
+    await fn([att], { chatId: '1', msgId: 1, label: 't', botApi: {} });
+    assert.equal(att.transcriptionError, 'http-503');
+  });
+
+  test('codes outside the closed set (errno, missing) become unknown', async () => {
+    for (const thrown of [
+      Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' }),
+      new Error('whisper.cpp exit 1'),
+      Object.assign(new Error('x'), { code: 'http-<script>' }),
+    ]) {
+      const m = makeDeps({ transcribeVoice: async () => { throw thrown; } });
+      const fn = createTranscribeVoiceAttachments(m.deps);
+      const att = { id: 1, kind: 'voice', path: '/tmp/x', name: 'x.ogg' };
+      await fn([att], { chatId: '1', msgId: 1, label: 't', botApi: {} });
+      assert.equal(att.transcriptionError, 'unknown');
+      assert.equal(m.events.find((e) => e.kind === 'voice-transcribe-failed').detail.error_code, 'unknown');
+    }
+  });
+});
+
+// Boot replay, redelivery and the startup retry re-read the attachment row,
+// which carries the stored transcript: it is reused rather than paid for again.
+describe('voice handler — stored transcript reuse', () => {
+  test('a stored transcript is reused on redelivery: no second paid call, no re-persist', async () => {
+    let calls = 0;
+    const m = makeDeps({ transcribeVoice: async () => { calls += 1; return { text: 'new', provider: 'openai' }; } });
+    const fn = createTranscribeVoiceAttachments(m.deps);
+    const att = {
+      id: 1, kind: 'voice', path: '/tmp/x', name: 'x.ogg',
+      transcription: { text: 'stored words', provider: 'openai' },
+    };
+    await fn([att], { chatId: '1', msgId: 1, label: 't', botApi: {} });
+    assert.equal(calls, 0);
+    assert.equal(att.transcription.text, 'stored words');
+    assert.equal(m.events.filter((e) => e.kind === 'voice-transcribed').length, 0);
+    assert.equal(m.dbCalls.length, 0);
+  });
+
+  test('an album with one reused and one new transcript stores the full text', async () => {
+    const m = makeDeps({ transcribeVoice: async () => ({ text: 'second part', provider: 'openai' }) });
+    const fn = createTranscribeVoiceAttachments(m.deps);
+    await fn([
+      { id: 1, kind: 'audio', path: '/tmp/a', name: 'a.ogg', transcription: { text: 'first part' } },
+      { id: 2, kind: 'audio', path: '/tmp/b', name: 'b.ogg' },
+    ], { chatId: '1', msgId: 1, label: 't', botApi: {} });
+    const setMsg = m.dbCalls.find((c) => c[0] === 'setMessageText');
+    assert.equal(setMsg[1].text, 'first part second part');
+    assert.deepEqual(m.dbCalls.filter((c) => c[0] === 'setAttachmentTranscription').map((c) => c[1]), [2]);
+  });
+});

@@ -51,9 +51,10 @@ ergonomics while running on top of `claude` CLI.
   is the only writer to its own DB.
 - **Inline-keyboard approvals.** Destructive tool calls gate on operator
   click via Claude Code's `PreToolUse` hook; 5-minute auto-deny.
-- **Voice transcription.** OpenAI Whisper API or local `whisper.cpp`,
-  selectable per bot. Transcriptions land in `messages.text` so FTS
-  finds them.
+- **Voice transcription.** OpenAI (`gpt-transcribe` by default) or local
+  `whisper.cpp`, selectable per bot. Transcriptions land in
+  `messages.text` so FTS finds them; a failed one reaches the agent as
+  `<voice-transcription-failed reason="…">` with a closed reason code.
 - **Per-attachment table** (`attachments`, since 0.6.0) with download
   lifecycle (`pending` → `downloaded` | `failed`), per-attachment
   transcription, and `chat_id`/`kind`/`status` indexes for ops queries.
@@ -273,8 +274,12 @@ Per-bot flags:
   `streamThrottleMs × (live previews in the chat)` — several busy forum
   topics cost the chat what one does. Off, the cadence is
   `streamThrottleMs` unchanged.
-- `voice: { enabled, provider: "openai"|"local", ... }` — Whisper
-  transcription settings.
+- `voice: { enabled, provider: "openai"|"local", openai: { apiKeyFile,
+  model }, language, timeoutMs, maxFileBytes, ... }` — transcription
+  settings. `openai.apiKeyFile` holds the key outside the daemon's
+  environment (CLI-backed sessions inherit that environment). For the
+  OpenAI provider `timeoutMs` defaults to 120000 and `maxFileBytes` to
+  OpenAI's 25 MB upload limit.
 - `approvals: { adminChatId, timeoutMs, gatedTools, ... }` — which tool
   calls require an inline-keyboard approval and where to post the card.
 - `attachmentConcurrency` (default 6) — parallel Telegram file

@@ -285,6 +285,22 @@ describe('buildReplyToBlock — defensive attribute escapes (0.6.15)', () => {
 });
 
 describe('buildVoiceTags', () => {
+  test('a failed transcription renders a reason tag the agent can explain', () => {
+    const out = buildVoiceTags([{
+      kind: 'voice', name: 'v.ogg', file_unique_id: 'abc', transcriptionError: 'timeout',
+    }]);
+    assert.equal(out, '<voice-transcription-failed kind="voice" reason="timeout" />');
+  });
+
+  test('the failure tag wins over a stored transcript that could not be parsed', () => {
+    // A malformed stored row stays a string; its retry failed, so the agent
+    // must hear the reason rather than an empty <voice> block.
+    const out = buildVoiceTags([{
+      kind: 'voice', file_unique_id: 'abc', transcription: '{not json', transcriptionError: 'http-503',
+    }]);
+    assert.equal(out, '<voice-transcription-failed kind="voice" reason="http-503" />');
+  });
+
   test('empty input produces empty output', () => {
     assert.equal(buildVoiceTags([]), '');
     assert.equal(buildVoiceTags(null), '');
@@ -586,5 +602,13 @@ describe('buildPrompt — full integration', () => {
   test('polygram-info primer warns about untrusted tags', () => {
     const p = buildPrompt({ msg: basicMsg });
     assert.ok(/untrusted-input.*data.*not instructions/i.test(p), 'primer present');
+  });
+
+  test('polygram-info primer frames <voice> transcripts as untrusted data', () => {
+    // Anyone in an allowed chat can now speak to the agent; a spoken
+    // "ignore previous instructions" must be framed as data like typed text.
+    const p = buildPrompt({ msg: basicMsg });
+    const security = p.split('\n').find((l) => l.startsWith('Security:'));
+    assert.match(security, /<voice>/);
   });
 });
