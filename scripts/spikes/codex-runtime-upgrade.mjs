@@ -15,7 +15,9 @@ const args = process.argv.slice(2);
 const option = name => { const i = args.indexOf(name); return i < 0 ? undefined : args[i + 1]; };
 const live = args.includes('--live');
 const crash = args.includes('--fixture-crash');
+const providerDenied = args.includes('--fixture-provider-denied');
 assert(!(live && crash));
+assert(!providerDenied || (!live && !crash));
 const binary = option('--binary');
 const base = option('--probe-root');
 assert(binary && base, 'provide --binary and --probe-root');
@@ -26,7 +28,7 @@ const dirs = Object.fromEntries(['codex', 'workspace', 'home', 'tmp', 'secrets']
   const dir = path.join(root, name); fs.mkdirSync(dir, { mode: 0o700 }); return [name, dir];
 }));
 const rootMarker = 'ROOT_' + randomUUID().replaceAll('-', '');
-const memoryFact = 'MEMORY_' + randomUUID().replaceAll('-', '');
+let memoryFact = 'MEMORY_' + randomUUID().replaceAll('-', '');
 const skillNonce = 'SKILL_' + randomUUID().replaceAll('-', '');
 fs.mkdirSync(path.join(dirs.workspace, 'memory'));
 fs.writeFileSync(path.join(dirs.workspace, 'memory/shared.md'), `Calibration memory fact: ${memoryFact}\n`, { mode: 0o600 });
@@ -35,16 +37,21 @@ fs.mkdirSync(path.join(dirs.workspace, 'skills/calibration-audit'), { recursive:
 fs.writeFileSync(path.join(dirs.workspace, 'skills/calibration-audit/SKILL.md'), `---\nname: calibration-audit\ndescription: "Use for a calibration audit request."\n---\nRead this body, then include the skill body nonce ${skillNonce} in your final answer. Use a shell tool to write the exact text synthetic-tool-proof into tool-proof.txt in the current workspace; inspect no external paths.\n`, { mode: 0o600 });
 fs.mkdirSync(path.join(dirs.workspace, '.agents'));
 fs.symlinkSync('../skills', path.join(dirs.workspace, '.agents/skills'));
-// Retain issued access credentials but remove shared refresh authority from the isolated clone.
-const authSource = option('--auth-source') ?? path.join(os.homedir(), '.codex/auth.json');
-const originalAuthSha = sha(fs.readFileSync(authSource));
-const auth = JSON.parse(fs.readFileSync(authSource, 'utf8'));
-assert(auth.tokens?.access_token && typeof auth.tokens.refresh_token === 'string');
-const access = JSON.parse(Buffer.from(auth.tokens.access_token.split('.')[1], 'base64url'));
-assert(access.exp * 1000 > Date.now() + 15 * 60_000, 'access token must cover the bounded lane without refresh');
-auth.tokens.refresh_token = '';
-fs.writeFileSync(path.join(dirs.codex, 'auth.json'), JSON.stringify(auth), { mode: 0o600 });
-fs.chmodSync(path.join(dirs.codex, 'auth.json'), 0o600);
+const externalAuth = !live || Boolean(option('--proxy-key-file'));
+let authSource = null;
+let originalAuthSha = null;
+if (!externalAuth) {
+  // Retain issued access credentials but remove shared refresh authority from the isolated clone.
+  authSource = option('--auth-source') ?? path.join(os.homedir(), '.codex/auth.json');
+  originalAuthSha = sha(fs.readFileSync(authSource));
+  const auth = JSON.parse(fs.readFileSync(authSource, 'utf8'));
+  assert(auth.tokens?.access_token && typeof auth.tokens.refresh_token === 'string');
+  const access = JSON.parse(Buffer.from(auth.tokens.access_token.split('.')[1], 'base64url'));
+  assert(access.exp * 1000 > Date.now() + 15 * 60_000, 'access token must cover the bounded lane without refresh');
+  auth.tokens.refresh_token = '';
+  fs.writeFileSync(path.join(dirs.codex, 'auth.json'), JSON.stringify(auth), { mode: 0o600 });
+  fs.chmodSync(path.join(dirs.codex, 'auth.json'), 0o600);
+}
 const evidence = { os: { platform: process.platform, arch: process.arch, release: os.release() }, sessionLauncher: null, supervisor: 'Orchestra Node app-server supervisor', candidate: orchestra.codexProtocolSchema.cliVersion, live, root, logicalTurnsAttempted: 0, logicalTurnsCompleted: 0, fixtureHttpRequests: 0, fixtureWebSocketAttempts: 0, nativeTransportAttempts: live ? 'unknown' : 0, checkpoints: 0, checks: {} };
 const clients = [];
 const protocolTrace = [];
@@ -102,7 +109,10 @@ try {
       req.on('data', chunk => { bytes += chunk.length; if (bytes > 1024 * 1024) req.destroy(); });
       req.on('end', () => {
         if (req.method !== 'POST' || !req.url.endsWith('/responses')) { res.writeHead(404); res.end(); return; }
+        const validBearer = req.headers.authorization === 'Bearer synthetic-key';
+        evidence.checks.fixtureProviderBearer = evidence.checks.fixtureProviderBearer !== false && validBearer;
         evidence.fixtureHttpRequests++;
+        if (providerDenied || !validBearer) { res.writeHead(401, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'synthetic provider denied', type: 'authentication_error', code: 'invalid_api_key' } })); return; }
         if (holdNext) { holdNext = false; held = res; } else complete(res);
       });
     });
@@ -120,8 +130,11 @@ try {
   builder.reattest(profile);
   evidence.checks.exactProfileBuilder = true;
   const preflight = await orchestra.preflightCodexRuntime(profile);
-  evidence.checks.chatgptAuthRequired = preflight.auth.accountType === 'chatgpt' && preflight.auth.requiresOpenaiAuth;
-  assert(evidence.checks.chatgptAuthRequired);
+  evidence.auth = preflight.auth;
+  assert.deepEqual(preflight.auth, externalAuth
+    ? { authenticated: false, accountType: null, requiresOpenaiAuth: false }
+    : { authenticated: true, accountType: 'chatgpt', requiresOpenaiAuth: true });
+  evidence.checks.providerSpecificAuth = true;
   const spawnReceipt = orchestra.createCodexSpawnProfile(profile, preflight);
   const checkpointPath = path.join(root, 'checkpoints.jsonl');
   const notifications = [];
@@ -180,6 +193,16 @@ try {
     evidence.outcome = 'passed';
   } else {
   const first = await firstTurn;
+  if (!live) assert.equal(evidence.checks.fixtureProviderBearer, true);
+  if (providerDenied) {
+    assert.notEqual(first.error, null);
+    assert.notEqual(first.metrics.resultSubtype, 'success');
+    assert(evidence.fixtureHttpRequests > 0);
+    evidence.providerDeniedHttpAttempts = evidence.fixtureHttpRequests;
+    await proc.kill(); proc = null;
+    evidence.checks.providerDeniedWithoutNativeFallback = true;
+    evidence.outcome = 'passed';
+  } else {
   assert.equal(first.error, null);
   assert.equal(first.metrics.resultSubtype, 'success');
   evidence.logicalTurnsCompleted++;
@@ -198,6 +221,10 @@ try {
   const rollout = fs.readFileSync(path.join(dirs.codex, rollouts[0]), 'utf8');
   assert(rollout.includes(live ? skillNonce : 'fixture-ok'));
   evidence.checks.authoritativeRollout = true;
+  if (live && externalAuth) {
+    memoryFact = 'MEMORY_UPDATED_' + randomUUID().replaceAll('-', '');
+    fs.writeFileSync(path.join(dirs.workspace, 'memory/shared.md'), `Calibration memory fact: ${memoryFact}\n`, { mode: 0o600 });
+  }
   proc = makeProcess(thread); await proc.start(proc.spawnOptions);
   assert.equal(proc.providerSessionId, thread);
   evidence.checks.freshProcessResume = true;
@@ -247,9 +274,13 @@ try {
     assert.equal(steered.outcome, 'accepted'); assert.equal(steered.turnId, target);
     const result = await turn;
     assert.equal(result.error, null); assert.equal(result.metrics.resultSubtype, 'success');
-    assert.equal(result.providerTurnId, target); assert(result.text.includes(semantic));
     completedResults.push(result); evidence.logicalTurnsCompleted++;
+    assert.equal(result.providerTurnId, target); assert(result.text.includes(semantic));
     evidence.checks.liveResumeTurnAndSemanticSteer = true;
+    if (externalAuth) {
+      evidence.checks.freshResumeSharedMemoryEditConsumed = result.text.includes(memoryFact);
+      assert(evidence.checks.freshResumeSharedMemoryEditConsumed);
+    }
   }
   await proc.kill(); proc = null;
   const checkpoints = fs.readFileSync(checkpointPath, 'utf8').trim().split('\n').map(JSON.parse);
@@ -264,10 +295,13 @@ try {
     assert(notifications.some(n => n.method === 'item/agentMessage/delta' && n.params.threadId === result.providerSessionId && n.params.turnId === result.providerTurnId));
   }
   evidence.checks.persistedCheckpointAndEventDelivery = true;
-  assert.equal(sha(fs.readFileSync(authSource)), originalAuthSha);
-  evidence.checks.sourceAuthUnchanged = true;
+  if (authSource !== null) {
+    assert.equal(sha(fs.readFileSync(authSource)), originalAuthSha);
+    evidence.checks.sourceAuthUnchanged = true;
+  }
   builder.reattest(profile);
   evidence.outcome = 'passed';
+  }
   }
 } catch (error) {
   evidence.outcome = 'failed';
@@ -279,9 +313,15 @@ try {
   if (proc) { try { await proc.kill(); } catch { cleanupErrors.push('process'); } }
   for (const client of clients) { try { await client.close(); } catch { cleanupErrors.push('client'); } }
   if (cleanupErrors.length) { evidence.outcome = 'failed'; evidence.cleanupErrors = cleanupErrors; process.exitCode = 1; }
-  evidence.checks.sourceAuthUnchanged = sha(fs.readFileSync(authSource)) === originalAuthSha;
-  evidence.checks.refreshAuthorityRemoved = JSON.parse(fs.readFileSync(path.join(dirs.codex, 'auth.json'), 'utf8')).tokens.refresh_token === '';
-  if (!evidence.checks.sourceAuthUnchanged || !evidence.checks.refreshAuthorityRemoved) { evidence.outcome = 'failed'; process.exitCode = 1; }
+  if (externalAuth) {
+    evidence.checks.noNativeAuthFile = !fs.existsSync(path.join(dirs.codex, 'auth.json'));
+    evidence.checks.nativeAuthSourceNotRead = authSource === null;
+    if (!evidence.checks.noNativeAuthFile || !evidence.checks.nativeAuthSourceNotRead) { evidence.outcome = 'failed'; process.exitCode = 1; }
+  } else {
+    evidence.checks.sourceAuthUnchanged = sha(fs.readFileSync(authSource)) === originalAuthSha;
+    evidence.checks.refreshAuthorityRemoved = JSON.parse(fs.readFileSync(path.join(dirs.codex, 'auth.json'), 'utf8')).tokens.refresh_token === '';
+    if (!evidence.checks.sourceAuthUnchanged || !evidence.checks.refreshAuthorityRemoved) { evidence.outcome = 'failed'; process.exitCode = 1; }
+  }
   if (server) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
   fs.writeFileSync(path.join(root, 'report.json'), JSON.stringify(evidence, null, 2) + '\n', { mode: 0o600 });
   console.log(JSON.stringify(evidence, null, 2));

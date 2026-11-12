@@ -1166,7 +1166,7 @@ function trustedProjection(f, { proxyKey = null, overrides = {} } = {}) {
   if (proxyKey !== null) {
     config.model_provider = 'cliproxyapi';
     config.model_providers = { cliproxyapi: { name: 'CLIProxyAPI', base_url: 'http://127.0.0.1:8318/v1',
-      wire_api: 'responses', requires_openai_auth: true, experimental_bearer_token: proxyKey, supports_websockets: true } };
+      wire_api: 'responses', requires_openai_auth: false, experimental_bearer_token: proxyKey, supports_websockets: true } };
   }
   const filesystem = { glob_scan_max_depth: null, ':root': 'write' };
   const projection = projectedConfig(f, {
@@ -1203,7 +1203,7 @@ test('trusted profile advertises full filesystem, network and web with real HOME
   assert.equal(clients[0].options.env.TELEGRAM_BOT_TOKEN, undefined);
 });
 
-test('trusted proxy renders the explicit Responses provider privately and pins its config layer', async (t) => {
+test('CLIProxy needs no native auth and renders the explicit Responses provider privately', async (t) => {
   const f = fixture(t);
   const key = 'test-proxy-secret';
   const keyFile = path.join(f.root, 'proxy.key');
@@ -1217,7 +1217,8 @@ test('trusted proxy renders the explicit Responses provider privately and pins i
   const raw = readFileSync(path.join(f.codexHome, 'config.toml'), 'utf8');
   assert.match(raw, /model_provider = "cliproxyapi"/);
   assert.match(raw, /wire_api = "responses"/);
-  assert.match(raw, /requires_openai_auth = true/);
+  assert.match(raw, /requires_openai_auth = false/);
+  assert.equal(require('node:fs').existsSync(path.join(f.codexHome, 'auth.json')), false);
   assert.match(raw, /supports_websockets = true/);
   assert.match(raw, /experimental_bearer_token = "test-proxy-secret"/);
   writeFileSync(keyFile, 'changed-secret', { mode: 0o600 });
@@ -1268,7 +1269,7 @@ test('proxy can be selected independently while the beta command policy remains 
   const config = ownedConfig(f);
   config.model_provider = 'cliproxyapi';
   config.model_providers = { cliproxyapi: { name: 'CLIProxyAPI', base_url: 'http://127.0.0.1:8318/v1',
-    wire_api: 'responses', requires_openai_auth: true, experimental_bearer_token: key, supports_websockets: true } };
+    wire_api: 'responses', requires_openai_auth: false, experimental_bearer_token: key, supports_websockets: true } };
   const results = projectedResults(f, { config: { modelProvider: 'cliproxyapi',
     modelProviders: { count: 1, keySha256: [digest('cliproxyapi')] } }, layers: [{
     type: 'user', version: 'user-v1', disabled: false, configSha256: digest(config),

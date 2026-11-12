@@ -2538,7 +2538,7 @@ for (const { trusted, proxy } of [
       securityConfig.model_provider = modelProvider;
       securityConfig.model_providers = { cliproxyapi: {
         name: 'CLIProxyAPI', base_url: config.codex.proxy.baseUrl, wire_api: 'responses',
-        requires_openai_auth: true, experimental_bearer_token: fakeKey, supports_websockets: true,
+        requires_openai_auth: false, experimental_bearer_token: fakeKey, supports_websockets: true,
       } };
     }
     const effectiveConfig = {
@@ -2555,6 +2555,10 @@ for (const { trusted, proxy } of [
     thread.activePermissionProfile.id = profileId;
     if (trusted) thread.sandbox = { type: 'dangerFullAccess' };
     writeScenario(fixture, { methods: {
+      'account/read': { result: {
+        account: proxy ? null : { type: 'chatgpt', email: null, planType: 'pro' },
+        requiresOpenaiAuth: !proxy,
+      } },
       'config/read': { result: { config: effectiveConfig, layers: [{
         name: 'user', version: 'user-v1', config: securityConfig,
       }], origins: {} } },
