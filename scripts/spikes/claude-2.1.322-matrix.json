@@ -115,7 +115,7 @@
         "auto_mode": 1
       },
       "passiveSessionAttachmentCounts": {
-        "instructions": 0,
+        "instructions": 1,
         "session_context": 1,
         "date": 1,
         "credential_org": 1,

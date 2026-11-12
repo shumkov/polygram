@@ -51,6 +51,7 @@
  *   node scripts/spikes/mailbox-two-roles.mjs
  *   node scripts/spikes/mailbox-two-roles.mjs --model real
  * Options:
+ *   --native-auth       preserve native auth inside a marked private HOME (stub only).
  *   --keep-artifacts    retain private fixture files and pre-shutdown hook snapshots.
  *   --orchestra <path>  load CliProcess from this orchestra checkout.
  *   --wait-ms <ms>      how long to wait for the scenario to settle
@@ -69,7 +70,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
-import { rejectUnavailableChannels, writeFixtureConsent } from './cli-fixture-prerequisites.mjs';
+import { localStubAuthLines, rejectUnavailableChannels, writeFixtureConsent } from './cli-fixture-prerequisites.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -81,6 +82,7 @@ function arg(name, fallback = null) {
 }
 
 const MODEL = arg('model', 'stub');
+const NATIVE_AUTH = arg('native-auth', false) === true;
 const KEEP_ARTIFACTS = arg('keep-artifacts', false) === true;
 const WAIT_MS = Number(arg('wait-ms', 300_000));
 const ORCHESTRA_PATH = arg('orchestra', null);
@@ -88,6 +90,11 @@ if (!['stub', 'real'].includes(MODEL)) {
   console.error(`unknown --model ${MODEL}`);
   process.exit(2);
 }
+
+const stubAuthLines = localStubAuthLines({
+  nativeAuth: NATIVE_AUTH, home: os.homedir(),
+  isolatedHome: process.env.CLAUDE_GATE_ISOLATED_HOME, model: MODEL,
+});
 
 const orchestra = require(ORCHESTRA_PATH ? path.resolve(ORCHESTRA_PATH) : '@shumkov/orchestra');
 const { CliProcess, createTmuxRunner, createAsyncLock } = orchestra;
@@ -273,11 +280,9 @@ const launcher = path.join(work, 'launcher.sh');
 fs.writeFileSync(launcher, [
   '#!/bin/sh',
   ...(stub ? [
-    // Model traffic goes only to the local stub; the token is a dummy.
-    'unset CLAUDE_CODE_OAUTH_TOKEN',
-    'export ANTHROPIC_API_KEY=',
+    // Model traffic stays local; auth is dummy unless native mode is explicit.
+    ...stubAuthLines,
     `export ANTHROPIC_BASE_URL=http://127.0.0.1:${stub.address().port}`,
-    'export ANTHROPIC_AUTH_TOKEN=stub-token-not-a-secret',
   ] : []),
   'export DISABLE_AUTOUPDATER=1',
   'exec "$@"',

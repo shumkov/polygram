@@ -1,6 +1,6 @@
 /**
  * Real-CLI reproduction of a Claude turn that ends in an API error, without any
- * paid or authenticated call.
+ * paid model inference. Optional native auth enables account-backed startup.
  *
  * The pinned claude CLI runs under orchestra's CliProcess exactly as in
  * production (tmux + channels bridge + hook ndjson). A session launcher points
@@ -20,7 +20,7 @@
  * dir (removed at exit) that also holds this run's copy of the pinned claude
  * binary, and the session's ~/.claude/projects entry for that temp cwd
  * (removed at exit). Model traffic goes only to the local stub, so no
- * paid or authenticated inference call is made; the CLI's own startup traffic
+ * paid model inference call is made; the CLI's own startup traffic
  * (feature flags) still runs, because Channels depends on it. The CLI's
  * auto-updater is disabled for the run.
  *
@@ -37,6 +37,7 @@
  *   node scripts/spikes/cli-api-error-stub.mjs --mode flaky --fail-count 2
  *   node scripts/spikes/cli-api-error-stub.mjs --mode 401
  * Options:
+ *   --native-auth       preserve native auth inside a marked private HOME (stub only).
  *   --keep-artifacts    retain private fixture files and a pre-shutdown hook snapshot.
  *   --orchestra <path>   load CliProcess from this orchestra checkout instead of
  *                        node_modules (to run a candidate fix).
@@ -69,7 +70,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
-import { rejectUnavailableChannels, writeFixtureConsent } from './cli-fixture-prerequisites.mjs';
+import { localStubAuthLines, rejectUnavailableChannels, writeFixtureConsent } from './cli-fixture-prerequisites.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -81,6 +82,7 @@ function arg(name, fallback = null) {
 }
 
 const MODE = arg('mode', 'fail');
+const NATIVE_AUTH = arg('native-auth', false) === true;
 const KEEP_ARTIFACTS = arg('keep-artifacts', false) === true;
 const FAIL_COUNT = Number(arg('fail-count', 2));
 const MAX_RETRIES = arg('max-retries', null);
@@ -100,6 +102,11 @@ if (!['fail', 'flaky', '401', 'fold', 'subagent'].includes(MODE)) {
   console.error(`unknown --mode ${MODE}`);
   process.exit(2);
 }
+
+const stubAuthLines = localStubAuthLines({
+  nativeAuth: NATIVE_AUTH, home: os.homedir(),
+  isolatedHome: process.env.CLAUDE_GATE_ISOLATED_HOME, model: 'stub',
+});
 
 const orchestra = require(ORCHESTRA_PATH ? path.resolve(ORCHESTRA_PATH) : '@shumkov/orchestra');
 const { CliProcess, createTmuxRunner, hookSettings } = orchestra;
@@ -271,16 +278,11 @@ if (WITH_AGENT) {
 const launcher = path.join(work, 'launcher.sh');
 fs.writeFileSync(launcher, [
   '#!/bin/sh',
-  // Same shape as the VPS proxy launcher: replace competing auth with a
-  // base URL + bearer token. The token is a dummy; inference never leaves the
-  // host. Nonessential traffic stays ON: with it disabled the CLI cannot read
-  // the feature flag that enables Channels, so the bridge would never deliver.
-  // The auto-updater is off so the run cannot move the operator's own
-  // `claude` symlink (the vendored pin is a separate copy either way).
-  'unset CLAUDE_CODE_OAUTH_TOKEN',
-  'export ANTHROPIC_API_KEY=',
+  // Keep model traffic local. Optional native auth retains the account needed
+  // for Channels startup; default mode uses a dummy token. Normal feature
+  // evaluation stays enabled, and the updater cannot move the user's binary.
+  ...stubAuthLines,
   `export ANTHROPIC_BASE_URL=http://127.0.0.1:${stubPort}`,
-  'export ANTHROPIC_AUTH_TOKEN=stub-token-not-a-secret',
   'export DISABLE_AUTOUPDATER=1',
   MAX_RETRIES != null ? `export CLAUDE_CODE_MAX_RETRIES=${Number(MAX_RETRIES)}` : '',
   'exec "$@"',

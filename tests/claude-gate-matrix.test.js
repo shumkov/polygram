@@ -4449,7 +4449,6 @@ test('283/322 manifest preserves exact first-channel assertions for both version
     assert.equal(judge(oldResult, '2.1.283'), true, `${id} equivalent factored old baseline`);
     const candidate = withSessionRecords(oldResult, (session) => {
       session.find((row) => row.type === 'user' && row.originKind === 'channel').hasParent = true;
-      session.splice(session.findIndex((row) => row.attachmentType === 'instructions'), 1);
     });
     assert.equal(judge(candidate, '2.1.322'), true, `${id} observed candidate shape`);
     for (const [name, mutate] of Object.entries({

@@ -254,3 +254,87 @@ Then independent code/manifest review and a signed recorded gate commit precede
 one full old/new attempt. Keep pins unchanged even if this matrix passes: the
 unpublished tracking issue, actual-pair attribution blocker and mandatory soaks
 remain unresolved. Do not change runtime queue semantics in this gate commit.
+
+## Neutral owned instructions input after failed full attempt
+
+The unfiltered full attempt gate-b10cdb3-full-a on signed b10cdb3 stopped after
+two old CLI behavior PASS results. Absolute comparison fails only because old
+.283 instructions attachment count is0, while its preserved expectation is1.
+Old root channel parent isfalse and remaining pivotal rows match. Candidate's
+previously observed count0 therefore does not establish version-specific removal:
+both clean profiles lack the attachment observed in the historical baseline.
+A missing instruction-file input is a testable fixture hypothesis; the original
+historical instruction source is not established. Do not silently lower the checked old count or import real instructions.
+
+Official memory docs specify project CLAUDE.md as an included instruction source.
+Add a separate writeFixtureInstructions helper in cli-fixture-prerequisites.mjs,
+using the same canonical cwd/strict fixture-root containment as consent, exclusive
+creation and0600mode. Its entire fixed neutral text is:
+`This is a synthetic compatibility fixture.\n`.
+No behavior policy, secrets, user instructions or account data enter the file.
+Call it explicitly alongside consent before the first launch in CLI contract,
+Workflow direct/fallback and each fresh snapshot leg, never during snapshot
+resume. Keep the Workflow skill/hash and policy untouched. The helper must fail
+if CLAUDE.md already exists or is a symlink; never replace existing instructions.
+
+Preserve old count1. Restore candidate provisional instructions count1 until the
+owned input is observed under both binaries; the earlier zero observation is
+clearly attributed to clean fixture context and retained as history. All other
+reviewed exact root-parent, listing, hook, task and model expectations stay intact.
+No relaxation of MCP or attribution blockers. Unit coverage must show the missing
+helper/input red before correction, then green for neutral exact bytes, private
+mode, containment, refusal to overwrite and CLI driver prelaunch wiring. Run one
+focused old/new CLI observation on the prepared fixtures, review actual counts
+and replay, then new signed gate commit and full unfiltered attempt on that one
+commit. Prior b10cdb3 failed evidence remains immutable. Do not edit pins.
+
+## Native-auth presentation for existing local stubs
+
+Two no-turn startup probes now changed only ANTHROPIC_BASE_URL to an unused
+loopback port, retaining the genuine isolated native credential file and no
+dummy ANTHROPIC_AUTH_TOKEN. Both start successfully; old shows the Channels
+experimental notice and candidate has no known rejection. toolCalls0 and no
+turn sender are recorded. This supports testing a changed auth presentation,
+not a claim of enrollment/delivery or API-error gate success. Prior blocked
+stub attempts remain immutable; the exact old rejection branch is unrecorded.
+
+Add explicit --native-auth to the two checked local stubs. In this mode the
+launcher unsets ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN, preserves supported
+native OAuth presentation, and keeps the exact loopback ANTHROPIC_BASE_URL.
+Default dummy-token behavior stays unchanged. Require a dedicated isolated HOME
+marker supplied by the private wrapper, equal to canonical HOME, private mode
+0700, a non-symlink .claude parent directory, and an existing regular
+non-symlink0600 native credential file whose canonical path equals its expected
+path inside that HOME, before starting. This mode is permitted only for mailbox --model stub, never real.
+No refresh material is provided; 401 effects stay inside synthetic HOME. The
+parent finally still removes only its owned credential file. The native token
+may reach the trusted loopback fixture HTTP handler; source inspection verifies
+handlers do not log/persist authorization headers or proxy requests. Retain
+private evidence without credentials, and whole-output redaction remains active.
+
+Use small pure launcher-policy helper functions to keep shell construction and
+native-auth preconditions testable without credentials/providers. Cover default
+dummy mode, native mode with no literal credentials, refusal for real mailbox,
+wrong HOME marker, broad modes, absent/symlink/nonprivate credential file. Model
+traffic is intended to remain local; confirm actual local request counts from
+the fixture. No new proxy/service, enrollment override, feature cache or model
+endpoint fallback is introduced. Review the actual diff before the first local
+model turn. Run fail/401/flaky and mailbox stub old/new only after the changed
+presentation demonstrates the prerequisite; stop and classify definite errors
+without blindly retrying unchanged failures. Preserve hooks/work/session evidence.
+
+
+Neutral instruction observations completed 2026-11-12: instructions-old-cli-a
+and instructions-candidate-cli-a each PASS 2/2, with all four exact instruction
+attachment counts equal1 and neutral private file bytes verified. Both remain
+filtered supplemental observations, independently reviewed by compatibility,
+isolation and scope reviewers; no full matrix success is inferred. Native-auth
+spec and code likewise received three independent CLEAN receipts after adding
+the parent-directory symlink guard; its two new regressions failed before code,
+then all106 focused tests passed with zero skips. The refreshed existing dash
+context was re-read after prior observations completed: profile403, then one
+supported environment-token actual-SDK smoke returned a definite weekly limit
+isApiErrorMessage/rate_limit, not an unknown provider outcome or compatibility
+finding. No repeat of that context is justified without changed quota evidence.
+The earlier eligible native context is re-read at invocation, profile200; usage
+readback429 is inconclusive about quota. No real credentials are refreshed.
