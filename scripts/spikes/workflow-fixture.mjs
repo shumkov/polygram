@@ -59,10 +59,10 @@ function readWorkflowReplyReceiptEvidence({
       ? record.message.content
       : [];
     for (const block of blocks) {
-      if (block?.type === 'tool_use' && block.id === toolUseId) {
+      if (record.type === 'assistant' && block?.type === 'tool_use' && block.id === toolUseId) {
         toolUses.push({ block, recordIndex });
       }
-      if (block?.type === 'tool_result' && block.tool_use_id === toolUseId) {
+      if (record.type === 'user' && block?.type === 'tool_result' && block.tool_use_id === toolUseId) {
         toolResults.push({ block, recordIndex });
       }
     }

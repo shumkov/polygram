@@ -33,6 +33,8 @@
  *
  * Output is content-free: PASS/FAIL per check, ids, counts and timings. Exit
  * 0 when every check passes, 1 on any failure, 2 when the run could not start.
+ * Disposable local settings supply bypass consent. An explicit Channels
+ * prerequisite rejection reports BLOCKED before either role receives a prompt.
  *
  * Side-effects: a dedicated tmux server (`tmux -L pgmbx`), a mode-0700 temp
  * dir (removed at exit) that holds this run's copy of the pinned claude
@@ -49,6 +51,8 @@
  *   node scripts/spikes/mailbox-two-roles.mjs
  *   node scripts/spikes/mailbox-two-roles.mjs --model real
  * Options:
+ *   --native-auth       preserve native auth inside a marked private HOME (stub only).
+ *   --keep-artifacts    retain private fixture files and pre-shutdown hook snapshots.
  *   --orchestra <path>  load CliProcess from this orchestra checkout.
  *   --wait-ms <ms>      how long to wait for the scenario to settle
  *                       (default 300000).
@@ -66,6 +70,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
+import { localStubAuthLines, rejectUnavailableChannels, writeFixtureConsent } from './cli-fixture-prerequisites.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -77,12 +82,19 @@ function arg(name, fallback = null) {
 }
 
 const MODEL = arg('model', 'stub');
+const NATIVE_AUTH = arg('native-auth', false) === true;
+const KEEP_ARTIFACTS = arg('keep-artifacts', false) === true;
 const WAIT_MS = Number(arg('wait-ms', 300_000));
 const ORCHESTRA_PATH = arg('orchestra', null);
 if (!['stub', 'real'].includes(MODEL)) {
   console.error(`unknown --model ${MODEL}`);
   process.exit(2);
 }
+
+const stubAuthLines = localStubAuthLines({
+  nativeAuth: NATIVE_AUTH, home: os.homedir(),
+  isolatedHome: process.env.CLAUDE_GATE_ISOLATED_HOME, model: MODEL,
+});
 
 const orchestra = require(ORCHESTRA_PATH ? path.resolve(ORCHESTRA_PATH) : '@shumkov/orchestra');
 const { CliProcess, createTmuxRunner, createAsyncLock } = orchestra;
@@ -263,15 +275,14 @@ if (!VENDOR_DIR_OVERRIDE) process.env.ORCHESTRA_CLAUDE_VENDOR_DIR = path.join(wo
 const ipcDir = fs.mkdtempSync(path.join(os.homedir(), '.pgmbx-ipc-'));
 fs.chmodSync(ipcDir, 0o700);
 const cwds = Object.fromEntries(Object.keys(ROLES).map((role) => [role, fs.realpathSync(fs.mkdtempSync(path.join(work, `${role}-`)))]));
+for (const cwd of Object.values(cwds)) writeFixtureConsent({ cwd, fixtureRoot: work });
 const launcher = path.join(work, 'launcher.sh');
 fs.writeFileSync(launcher, [
   '#!/bin/sh',
   ...(stub ? [
-    // Model traffic goes only to the local stub; the token is a dummy.
-    'unset CLAUDE_CODE_OAUTH_TOKEN',
-    'export ANTHROPIC_API_KEY=',
+    // Model traffic stays local; auth is dummy unless native mode is explicit.
+    ...stubAuthLines,
     `export ANTHROPIC_BASE_URL=http://127.0.0.1:${stub.address().port}`,
-    'export ANTHROPIC_AUTH_TOKEN=stub-token-not-a-secret',
   ] : []),
   'export DISABLE_AUTOUPDATER=1',
   'exec "$@"',
@@ -284,6 +295,10 @@ let db; let ipc; let jobs; let mailbox; let pump; let exitCode = 0;
 const sessionKeyOf = (role) => getSessionKey(ROLES[role].chatId, null, {});
 
 function cleanupPaths() {
+  if (KEEP_ARTIFACTS) {
+    log(`retained fixture: ${work}; IPC: ${ipcDir}; projects: ${path.join(os.homedir(), '.claude', 'projects')}`);
+    return;
+  }
   for (const cwd of Object.values(cwds)) {
     try { fs.rmSync(path.join(os.homedir(), '.claude', 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-')), { recursive: true, force: true }); } catch {}
   }
@@ -412,6 +427,9 @@ try {
     throw err;
   }
   log(`${ts()} both role sessions started`);
+  for (const proc of procs.values()) {
+    rejectUnavailableChannels(await proc.runner.captureWide(proc.tmuxSession));
+  }
   jobs.start(); mailbox.start();
   // The production timer runs every 60 s; a faster pump keeps a deferred job
   // from stretching the run.
@@ -520,9 +538,10 @@ try {
   log(`\n${exitCode === 0 ? 'PASS' : 'FAIL'} (${checks.filter((c) => c.ok).length}/${checks.length} checks)`);
 } catch (err) {
   if (err !== null) {
-    exitCode = 1;
-    log(`spike failed: ${err?.stack || err?.message || err}`);
-    log('FAIL');
+    const blocked = err?.code === 'CHANNELS_FIXTURE_UNAVAILABLE';
+    exitCode = blocked ? 2 : 1;
+    log(`spike ${blocked ? 'blocked' : 'failed'}: ${err?.stack || err?.message || err}`);
+    log(blocked ? 'BLOCKED' : 'FAIL');
   }
 } finally {
   clearInterval(pump);
@@ -530,6 +549,7 @@ try {
   // claude writes its session file as it exits, which can be after the tmux
   // session is gone; removing the project entry before then leaves it behind.
   const pids = [];
+  let hookIndex = 0;
   for (const proc of procs.values()) {
     try {
       const out = execFileSync('tmux', ['-L', SOCKET, 'list-panes', '-t', proc.tmuxSession, '-F', '#{pane_pid}'],
@@ -537,6 +557,14 @@ try {
       const pid = Number(out.trim().split('\n')[0]);
       if (pid) pids.push(pid);
     } catch {}
+    if (KEEP_ARTIFACTS) {
+      try {
+        const hookPresent = Boolean(proc._hookNdjsonPath && fs.existsSync(proc._hookNdjsonPath));
+        const prefix = `role-${hookIndex++}`;
+        if (hookPresent) fs.writeFileSync(path.join(work, `${prefix}-raw-hooks-before-shutdown.ndjson`), fs.readFileSync(proc._hookNdjsonPath), { flag: 'wx', mode: 0o600 });
+        fs.writeFileSync(path.join(work, `${prefix}-hook-snapshot.json`), JSON.stringify({ capturedAt: new Date().toISOString(), hookPresent }), { flag: 'wx', mode: 0o600 });
+      } catch (error) { exitCode = 1; log(`hook snapshot failed: ${error.message}`); }
+    }
     try { await proc.kill('spike-done'); } catch {}
   }
   const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };

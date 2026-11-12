@@ -553,9 +553,9 @@ test('Claude 2.1.283 matrix declares every mandatory old/new gate', () => {
   assert.equal(manifest.comparator.effort, 'medium');
 });
 
-test('matrix holds the Agent SDK constant at the installed exact version', () => {
-  // Both sides drive the same SDK and vary only pathToClaudeCodeExecutable,
-  // so an SDK bump must be reviewed together with the manifest.
+test('legacy and matched matrices retain their reviewed SDK identities', () => {
+  // The legacy comparison retains its historical SDK while the installed
+  // consumer must match the separately reviewed candidate, including source.
   const sdkEntry = require.resolve('@anthropic-ai/claude-agent-sdk');
   let sdkDir = path.dirname(sdkEntry);
   while (!fs.existsSync(path.join(sdkDir, 'package.json'))) {
@@ -565,7 +565,22 @@ test('matrix holds the Agent SDK constant at the installed exact version', () =>
     fs.readFileSync(path.join(sdkDir, 'package.json'), 'utf8'),
   );
   assert.equal(sdkPackage.name, '@anthropic-ai/claude-agent-sdk');
-  assert.equal(manifest.sdkVersion, sdkPackage.version);
+  const matched = JSON.parse(fs.readFileSync(
+    path.join(repoRoot, 'scripts/spikes/claude-2.1.322-matrix.json'), 'utf8',
+  ));
+  assert.equal(manifest.sdkVersion, matched.sdkRuntimes.old.version);
+  assert.equal(manifest.versions.candidate, matched.sdkRuntimes.old.claudeCodeVersion);
+  assert.equal(sdkPackage.version, matched.sdkRuntimes.candidate.version);
+  assert.equal(sdkPackage.claudeCodeVersion, matched.sdkRuntimes.candidate.claudeCodeVersion);
+  assert.equal(sdkPackage.claudeCodeVersion, matched.versions.candidate);
+  assert.equal(
+    crypto.createHash('sha256').update(fs.readFileSync(sdkEntry)).digest('hex'),
+    matched.sdkRuntimes.candidate.entrySha256,
+  );
+  assert.equal(
+    crypto.createHash('sha256').update(fs.readFileSync(path.join(sdkDir, 'package.json'))).digest('hex'),
+    matched.sdkRuntimes.candidate.packageSha256,
+  );
 });
 
 test('every compared CLI version has reviewed per-version expectations', async () => {
@@ -4423,4 +4438,105 @@ test('accepted matrix cleanup rejects a session project outside its run', async 
   }), /escapes the dedicated artifact base/);
 
   assert.equal(fs.existsSync(path.join(runDir, 'run-metadata.json')), true);
+});
+
+
+test('283/322 manifest preserves exact first-channel assertions for both versions', async () => {
+  const { evaluateMatrixVersionEvidence, buildClaudeMatrixRuns } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  const accepted = JSON.parse(fs.readFileSync(path.join(repoRoot, 'scripts/spikes/claude-2.1.322-matrix.json'), 'utf8'));
+  assert.equal(accepted.validationStage, 'acceptance');
+  assert.equal(accepted.expectations['2.1.322'].delayedMcpModes.autoBackground, 'background');
+  assert.equal(Object.hasOwn(accepted.expectations['2.1.322'].delayedMcpModes, 'waiverReason'), false);
+  assert.equal(buildClaudeMatrixRuns({ manifest: accepted, binaries: { old: '/private/old', candidate: '/private/candidate' }, artifactBaseDir: '/private/artifacts', runPrefix: 'exact-parent-contract' }).length, 23);
+  for (const id of ['cli-contract', 'workflow-direct', 'workflow-fallback']) {
+    const scenario = accepted.scenarios.find((scenario) => scenario.id === id);
+    const original = manifest.scenarios.find((scenario) => scenario.id === id);
+    const oldResult = id === 'cli-contract'
+      ? observedCliResult({ session: OBSERVED_CLI_SESSION_283.map(decodeObservedSession), hooks: observedHooks(OBSERVED_CLI_HOOKS_283) })
+      : workflowMatrixResult(with283SessionRows(workflowLifecycleFixture({ deliveryMode: id.slice('workflow-'.length), bashPairs: 2, subagentStops: 3 }), { recordAfter: 'skill_listing' }), id.slice('workflow-'.length));
+    const judge = (result, version, useOriginal = false) => evaluateMatrixVersionEvidence({
+      scenario: useOriginal ? original : scenario,
+      versionKey: useOriginal ? 'candidate' : version === '2.1.283' ? 'old' : 'candidate',
+      expectations: useOriginal ? CANDIDATE_EXPECTATIONS : accepted.expectations[version],
+      results: Array.from({ length: scenario.comparison.runsPerVersion || 1 }, () => result),
+    }).pass;
+    assert.equal(judge(oldResult, '2.1.283', true), true, `${id} historical baseline`);
+    assert.equal(judge(oldResult, '2.1.283'), true, `${id} equivalent factored old baseline`);
+    const candidate = withSessionRecords(oldResult, (session) => {
+      session.find((row) => row.type === 'user' && row.originKind === 'channel').hasParent = true;
+    });
+    assert.equal(judge(candidate, '2.1.322'), true, `${id} observed candidate shape`);
+    for (const [name, mutate] of Object.entries({
+      'wrong parent': (session) => { const row = session.find((row) => row.originKind === 'channel'); row.hasParent = !row.hasParent; },
+      'missing first row': (session) => { session.splice(session.findIndex((row) => row.originKind === 'channel'), 1); },
+      'duplicate first row': (session) => { const i = session.findIndex((row) => row.originKind === 'channel'); session.splice(i, 0, structuredClone(session[i])); },
+      'moved first row': (session) => { const i = session.findIndex((row) => row.originKind === 'channel'); const [row] = session.splice(i, 1); session.splice(session.findIndex((row) => row.type === 'system' && row.subtype === 'stop_hook_summary') + 1, 0, row); },
+      'wrong first field': (session) => { session.find((row) => row.originKind === 'channel').promptSource = 'other'; },
+      'later lifecycle drift': (session) => { session.find((row) => row.type === 'system' && row.subtype === 'turn_duration').subtype = 'unknown_duration'; },
+    })) {
+      const oldMutation = withSessionRecords(oldResult, mutate);
+      assert.equal(judge(oldMutation, '2.1.283'), false, `${id} old ${name}`);
+      assert.equal(judge(oldMutation, '2.1.283', true), false, `${id} old equivalent rejection ${name}`);
+      assert.equal(judge(withSessionRecords(candidate, mutate), '2.1.322'), false, `${id} candidate ${name}`);
+    }
+  }
+});
+
+
+test('matched accepted summary validates retained per-cell SDK proofs before cleanup', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matched-accept-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true })); fs.chmodSync(dir, 0o700);
+  const fixture = createAcceptedGateFixture(dir);
+  const source = require.resolve('@shumkov/orchestra/lib/process/sdk-process');
+  const sourceHash = crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex');
+  const identity = { version: '0.3.220', claudeCodeVersion: OLD_VERSION, entrySha256: '1'.repeat(64), packageSha256: '2'.repeat(64) };
+  const runnerDir = path.join(dir, 'matrix-runner-private'); fs.mkdirSync(runnerDir, { mode: 0o700 });
+  for (const run of fixture.runs) {
+    run.sdkRuntime = identity; run.orchestraSdkProcessSha256 = sourceHash;
+    fs.writeFileSync(path.join(runnerDir, `${run.versionKey}-${run.scenarioId}-${run.repeatIndex}-sdk.json`), JSON.stringify({
+      runId: run.env.CLAUDE_GATE_RUN_ID, identity, orchestraSourceSha256: sourceHash, loaded: true,
+    }), { mode: 0o600 });
+    // Fixture runs use one cell shape with distinct run IDs.
+    run.repeatIndex = Number(run.id.split(':').at(-1));
+    fs.renameSync(path.join(runnerDir, `${run.versionKey}-${run.scenarioId}-undefined-sdk.json`), path.join(runnerDir, `${run.versionKey}-${run.scenarioId}-${run.repeatIndex}-sdk.json`));
+  }
+  const summary = { ...acceptedGateSummary(fixture.runs), sdkRuntimes: { old: identity }, orchestraSdkProcessSha256: sourceHash };
+  const { purgeAcceptedGateArtifacts } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  const accept = value => purgeAcceptedGateArtifacts({ artifactBaseDir: dir, runPrefix: 'matrix', summary: value,
+    expectedRuns: fixture.runs, expectedScenarios: fixture.scenarios, expectedManifestSha256: 'a'.repeat(64), claudeProjectsDir: path.join(dir, 'projects') });
+  assert.throws(() => accept({ ...summary, sdkRuntimes: { old: { ...identity, entrySha256: '3'.repeat(64) } } }));
+  const proof = path.join(runnerDir, 'old-sdk-resume-1-sdk.json'); const bytes = fs.readFileSync(proof);
+  fs.unlinkSync(proof); assert.throws(() => accept(summary)); fs.writeFileSync(proof, bytes, { mode: 0o600 });
+  assert.doesNotThrow(() => accept(summary));
+  assert.equal(fs.existsSync(runnerDir), false);
+});
+
+test('candidate background MCP must not require evidence from the explicitly waived old cell', async () => {
+  const { buildClaudeMatrixRuns } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  const matched = JSON.parse(fs.readFileSync(path.join(repoRoot, 'scripts/spikes/claude-2.1.322-matrix.json')));
+  const runs = buildClaudeMatrixRuns({ manifest: matched,
+    binaries: { old: '/private/bin/old', candidate: '/private/bin/new' },
+    artifactBaseDir: '/private/artifacts', runPrefix: 'waived-old-pair' });
+  assert.equal(runs.length, 23);
+  assert.equal(runs.some(run => run.id === 'old:delayed-mcp'), false);
+  assert.equal(runs.find(run => run.id === 'candidate:delayed-mcp').pairComparisonRequired, false);
+  assert.equal(runs.find(run => run.id === 'candidate:delayed-mcp-foreground').pairComparisonRequired, true);
+  assert.equal(runs.find(run => run.id === 'candidate:cli-contract:2').pairComparisonRequired, true);
+});
+
+test('waived-old comparison decision preserves scheduled pairs and cannot trust unrelated waiver claims', async () => {
+  const { matrixCrossVersionComparisonRequired, matrixWaivedCells } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  const matched = JSON.parse(fs.readFileSync(path.join(repoRoot, 'scripts/spikes/claude-2.1.322-matrix.json')));
+  const scenario = matched.scenarios.find(s => s.id === 'delayed-mcp');
+  const waived = matrixWaivedCells(matched);
+  assert.equal(matrixCrossVersionComparisonRequired(scenario, waived), false);
+  assert.equal(matrixCrossVersionComparisonRequired(scenario, []), true, 'missing scheduled old evidence must still block');
+  assert.equal(matrixCrossVersionComparisonRequired(scenario, [{ ...waived[0], id: 'candidate:delayed-mcp' }]), true);
+  assert.equal(matrixCrossVersionComparisonRequired(scenario, [{ ...waived[0], id: 'old:delayed-mcp-foreground' }]), true);
+  const foreground = matched.scenarios.find(s => s.id === 'delayed-mcp-foreground');
+  assert.equal(matrixCrossVersionComparisonRequired(foreground, waived), true);
+  const scheduled = structuredClone(matched);
+  scheduled.expectations[scheduled.versions.old].delayedMcpModes = { autoBackground: 'background', default: 'foreground' };
+  assert.equal(matrixCrossVersionComparisonRequired(scenario, matrixWaivedCells(scheduled)), true,
+    'retained acceptance must derive waivers from checked manifest, not a summary claim');
 });

@@ -9,6 +9,7 @@ import { isDeepStrictEqual } from 'node:util';
 import {
   createDelayedMcpLifecycleProof,
   evaluateDelayedMcpEvidence,
+  matchedDelayedMcpTurnsMatch,
 } from './delayed-mcp-gate.mjs';
 import {
   collectGateLifecycleEvidence,
@@ -30,6 +31,7 @@ import {
 } from './workflow-fixture.mjs';
 
 const require = createRequire(import.meta.url);
+const { assertSdkLoadProof } = require('./gate-sdk-runtime.cjs');
 const { encodeCwd } = require('../../lib/util/claude-session-jsonl');
 
 const RUN_PREFIX_RE = /^[A-Za-z0-9._-]{1,96}$/;
@@ -46,6 +48,10 @@ const CLI_PROCESS_TREE_SCENARIOS = new Set([
 // this host; the sanitized result must then say NOT-APPLICABLE as well.
 export const MATRIX_NOT_APPLICABLE_EXIT_CODE = 3;
 const RUNNER_OWNED_ENV_KEYS = new Set([
+  'CLAUDE_GATE_SDK_ROOT',
+  'CLAUDE_GATE_SDK_EXPECTED',
+  'CLAUDE_GATE_SDK_ATTESTATION_PATH',
+  'CLAUDE_GATE_ORCHESTRA_SOURCE_SHA256',
   'CLAUDE_GATE_BIN',
   'CLAUDE_GATE_EXPECTED_VERSION',
   'CLAUDE_GATE_ARTIFACT_BASE',
@@ -55,6 +61,7 @@ const RUNNER_OWNED_ENV_KEYS = new Set([
   'CLAUDE_GATE_EXPECTED_RESOLVED_MODEL',
   'CLAUDE_GATE_DOCUMENTED_WORKFLOW_SIZE_GUIDELINE',
   'CLAUDE_GATE_MANIFEST_SHA256',
+  'CLAUDE_GATE_MANIFEST_PATH',
 ]);
 const CROSS_VERSION_POLICIES = new Set(['single', 'all-pairs']);
 const VERSION_SPECIFIC_LIFECYCLE_ORACLES = new Map([
@@ -235,14 +242,29 @@ export const MATRIX_MANIFEST_PATH = fileURLToPath(
   new URL('./claude-2.1.283-matrix.json', import.meta.url),
 );
 
+export function assertClaudeMatrixMode(manifest, { onlyVersion, accepting = false } = {}) {
+  const stage = Object.hasOwn(manifest, 'validationStage') ? manifest.validationStage : 'acceptance';
+  if (!['acceptance', 'discovery'].includes(stage)) {
+    throw new TypeError('unknown matrix validationStage');
+  }
+  if (stage === 'discovery' && (accepting || onlyVersion !== 'candidate')) {
+    throw new Error('discovery requires --version candidate and cannot accept artifacts');
+  }
+  return stage;
+}
+
 // Drivers judge their own evidence against the same reviewed manifest the
 // runner schedules from, keyed by the version the executable attested. Under
 // the runner the manifest must still be the exact bytes it scheduled from.
 export function readGateExpectations(
   attestedVersion,
-  { expectedManifestSha256 = process.env.CLAUDE_GATE_MANIFEST_SHA256 } = {},
+  {
+    expectedManifestSha256 = process.env.CLAUDE_GATE_MANIFEST_SHA256,
+    manifestPath = process.env.CLAUDE_GATE_MANIFEST_PATH || MATRIX_MANIFEST_PATH,
+  } = {},
 ) {
-  const manifestText = fs.readFileSync(MATRIX_MANIFEST_PATH, 'utf8');
+  if (!path.isAbsolute(manifestPath)) throw new TypeError('gate manifest path must be absolute');
+  const manifestText = fs.readFileSync(manifestPath, 'utf8');
   if (
     expectedManifestSha256 !== undefined
     && hashSensitiveString(manifestText) !== expectedManifestSha256
@@ -371,7 +393,7 @@ function versionSpecificLifecycleMatches(
         typeof autoBackground === 'boolean'
         && result?.evidence?.expectedMode
           === expectedDelayedMcpMode(expectations, autoBackground)
-        && evaluateDelayedMcpEvidence(result.evidence).pass
+        && evaluateDelayedMcpEvidence(result.evidence, { sdkVersion: result.sdkRuntime?.version, cliVersion: result.attestation?.version }).pass
       );
     }
     if (oracle === 'sdk-subagent-v1') {
@@ -410,6 +432,11 @@ export function matrixWaivedCells(manifest) {
   return waived;
 }
 
+export function matrixCrossVersionComparisonRequired(scenario, waivedCells) {
+  return !scenario.candidateOnly
+    && !waivedCells.some(cell => cell.id === `old:${scenario.id}`);
+}
+
 export function buildClaudeMatrixRuns({
   manifest,
   binaries,
@@ -439,6 +466,7 @@ export function buildClaudeMatrixRuns({
     );
   }
 
+  const waivedCells = matrixWaivedCells(manifest);
   const runs = [];
   for (const versionKey of ['old', 'candidate']) {
     const expectations = expectationsFor(
@@ -515,7 +543,7 @@ export function buildClaudeMatrixRuns({
             repeatIndex === repeatCount
             && (
               (
-                !scenario.candidateOnly
+                matrixCrossVersionComparisonRequired(scenario, waivedCells)
                 && versionKey === 'candidate'
               )
               || scenario.comparison?.lifecycle?.mode
@@ -532,6 +560,7 @@ export function buildClaudeMatrixRuns({
             ? expectations.resolvedOpus
             : manifest.comparator.model,
           expectations: structuredClone(expectations),
+          ...(manifest.sdkRuntimes && { sdkRuntime: structuredClone(manifest.sdkRuntimes[versionKey]), orchestraSdkProcessSha256: manifest.orchestraSdkProcessSha256 }),
           ...(maxBridgeReadyToMcpReadyMs !== undefined && {
             maxBridgeReadyToMcpReadyMs,
           }),
@@ -1297,9 +1326,15 @@ function privateLifecycleSourcesMatch({
       (record) => record?.type === 'result',
     );
     if (
-      terminalResults.length !== 1
-      || terminalResults[0].subtype !== result.resultSubtype
-      || terminalResults[0].subtype !== result?.evidence?.resultSubtype
+      run.sdkRuntime?.version === '0.3.322'
+        ? (!isDeepStrictEqual(result.sdkRuntime, run.sdkRuntime)
+          || !matchedDelayedMcpTurnsMatch(privateSdkRecords, { sdkVersion: run.sdkRuntime.version,
+            cliVersion: run.version, expectedMode: result.evidence.expectedMode, markerHash: result.markerHash }))
+        : (terminalResults.length !== 1
+          || terminalResults[0].subtype !== result.resultSubtype
+          || terminalResults[0].subtype !== result?.evidence?.resultSubtype
+          || !isDeepStrictEqual(result.sdkRuntime, run.sdkRuntime)
+          || (run.sdkRuntime && !matchedDelayedMcpTurnsMatch(privateSdkRecords, { sdkVersion: run.sdkRuntime.version, cliVersion: run.version, expectedMode: result.evidence.expectedMode, markerHash: result.markerHash })))
     ) {
       return false;
     }
@@ -1898,7 +1933,7 @@ export function matrixScenarioOracleMatches(scenarioId, result, expectations) {
     pass = successfulWorkflowOracleMatches(result, true);
   } else if (DELAYED_MCP_SCENARIOS.has(scenarioId)) {
     pass = (
-      evaluateDelayedMcpEvidence(result.evidence).pass
+      evaluateDelayedMcpEvidence(result.evidence, { sdkVersion: result.sdkRuntime?.version, cliVersion: result.attestation?.version }).pass
       && result.markerCount === 1
       && result.resultSubtype === 'success'
       && result.reasonCount === 0
@@ -2731,6 +2766,15 @@ export function purgeAcceptedGateArtifacts({
   const authoritativeRunCount =
     AUTHORITATIVE_RUN_COUNT - waivedCellList.length;
   const expectedRunList = Array.isArray(expectedRuns) ? expectedRuns : [];
+  const matchedRuns = expectedRunList.filter(run => run.sdkRuntime);
+  const expectedSdkRuntimes = Object.fromEntries(matchedRuns.map(run => [run.versionKey, run.sdkRuntime]));
+  if (matchedRuns.length) expectedSummaryKeys.push('sdkRuntimes', 'orchestraSdkProcessSha256');
+  if (matchedRuns.length && (matchedRuns.length !== expectedRunList.length
+    || !isDeepStrictEqual(summary.sdkRuntimes, expectedSdkRuntimes)
+    || !SHA256_RE.test(summary.orchestraSdkProcessSha256 || '')
+    || matchedRuns.some(run => run.orchestraSdkProcessSha256 !== summary.orchestraSdkProcessSha256))) {
+    throw new Error('matched summary identities do not match the checked manifest');
+  }
   const expectedIds = expectedRunList.map((run) => run?.id);
   const expectedRunIds = expectedRunList.map(
     (run) => run?.env?.CLAUDE_GATE_RUN_ID,
@@ -2856,6 +2900,10 @@ export function purgeAcceptedGateArtifacts({
     ? fs.realpathSync(claudeProjectsDir)
     : path.resolve(claudeProjectsDir);
 
+  for (const run of matchedRuns) {
+    assertSdkLoadProof({ proofPath: assertContained(artifactBaseDir, path.join(artifactBaseDir, `${runPrefix}-runner-private`, `${run.versionKey}-${run.scenarioId}-${run.repeatIndex}-sdk.json`)),
+      identity: run.sdkRuntime, runId: run.env.CLAUDE_GATE_RUN_ID, orchestraSourceSha256: run.orchestraSdkProcessSha256 });
+  }
   const cleanupPlans = [];
   const sourceSessionTargets = new Set();
   const sanitizedResults = [];
@@ -2997,7 +3045,7 @@ export function purgeAcceptedGateArtifacts({
     }
     if (
       run.versionKey === 'candidate'
-      && !scenario.candidateOnly
+      && matrixCrossVersionComparisonRequired(scenario, expectedWaivedCells)
       && evidence.candidate.length === run.repeatCount
     ) {
       if (

@@ -16,6 +16,8 @@ const execFileAsync = promisify(execFile);
 const RUN_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const PROTECTED_GATE_ENV_KEYS = new Set([
+  'CLAUDE_GATE_MANIFEST_PATH',
+  'CLAUDE_GATE_MANIFEST_SHA256',
   'CLAUDE_CODE_GATE_ARTIFACT_DIR',
   'CLAUDE_CODE_GATE_RUN_ID',
   'CLAUDE_CODE_PROCESS_WRAPPER',

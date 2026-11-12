@@ -1292,3 +1292,36 @@ test('SDK observer records normalized lifecycle and fails a missing init model',
   assert.equal(mixedModelEvidence.pass, false);
   assert.match(mixedModelEvidence.reasons.join('\n'), /observed models must match/);
 });
+
+
+test('candidate request diagnostics remain private typed evidence without bypassing unknown schemas', async () => {
+  const {
+    collectGateSessionEvidence,
+    normalizedGateLifecycleRecordSchemaMatches,
+  } = await import(moduleUrl);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-gate-diagnostics-'));
+  const types = ['session-owner', 'tools-used', 'api-request-shape', 'api-request-blob', 'api-request'];
+  const rows = types.map((type) => ({
+    type,
+    accountUuid: 'PRIVATE-IDENTITY-CANARY',
+    message: { content: 'PRIVATE-REQUEST-CANARY' },
+    params: { secret: 'PRIVATE-PARAM-CANARY' },
+  }));
+  const source = path.join(dir, 'session.jsonl');
+  fs.writeFileSync(source, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+  try {
+    const evidence = collectGateSessionEvidence(source);
+    assert.deepEqual(evidence.records, types.map((type) => ({ type })));
+    assert.equal(evidence.source.rawRecordCount, rows.length);
+    assert.deepEqual(evidence.proofs, []);
+    assert.ok(!JSON.stringify(evidence).includes('PRIVATE-'));
+    for (const record of evidence.records) {
+      assert.equal(normalizedGateLifecycleRecordSchemaMatches(record), true);
+      assert.equal(normalizedGateLifecycleRecordSchemaMatches({ ...record, payload: 'unsafe' }), false);
+    }
+    assert.equal(normalizedGateLifecycleRecordSchemaMatches({ type: 'api-request-unknown' }), false);
+    assert.equal(fs.readFileSync(source, 'utf8').split('\n').filter(Boolean).length, rows.length);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

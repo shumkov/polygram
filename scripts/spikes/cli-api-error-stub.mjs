@@ -1,6 +1,6 @@
 /**
  * Real-CLI reproduction of a Claude turn that ends in an API error, without any
- * paid or authenticated call.
+ * paid model inference. Optional native auth enables account-backed startup.
  *
  * The pinned claude CLI runs under orchestra's CliProcess exactly as in
  * production (tmux + channels bridge + hook ndjson). A session launcher points
@@ -20,11 +20,14 @@
  * dir (removed at exit) that also holds this run's copy of the pinned claude
  * binary, and the session's ~/.claude/projects entry for that temp cwd
  * (removed at exit). Model traffic goes only to the local stub, so no
- * paid or authenticated inference call is made; the CLI's own startup traffic
+ * paid model inference call is made; the CLI's own startup traffic
  * (feature flags) still runs, because Channels depends on it. The CLI's
  * auto-updater is disabled for the run.
  *
- * Ends with PASS or FAIL (exit 0 / 1) against the mode's expected outcome.
+ * The disposable project's included local settings supply bypass consent.
+ * Channels still needs supported account/feature authorization at startup.
+ * Ends with PASS / FAIL (exit 0 / 1), or BLOCKED (exit 2) on an explicit
+ * Channels prerequisite rejection before sending the test prompt.
  *
  * Usage (from the polygram package root; needs tmux and the pinned claude from
  * the Agent SDK package or ~/.local/share/claude/versions):
@@ -34,6 +37,8 @@
  *   node scripts/spikes/cli-api-error-stub.mjs --mode flaky --fail-count 2
  *   node scripts/spikes/cli-api-error-stub.mjs --mode 401
  * Options:
+ *   --native-auth       preserve native auth inside a marked private HOME (stub only).
+ *   --keep-artifacts    retain private fixture files and a pre-shutdown hook snapshot.
  *   --orchestra <path>   load CliProcess from this orchestra checkout instead of
  *                        node_modules (to run a candidate fix).
  *   --max-retries <n>    CLAUDE_CODE_MAX_RETRIES for the CLI (omit = CLI default,
@@ -65,6 +70,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
+import { localStubAuthLines, rejectUnavailableChannels, writeFixtureConsent } from './cli-fixture-prerequisites.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -76,6 +82,8 @@ function arg(name, fallback = null) {
 }
 
 const MODE = arg('mode', 'fail');
+const NATIVE_AUTH = arg('native-auth', false) === true;
+const KEEP_ARTIFACTS = arg('keep-artifacts', false) === true;
 const FAIL_COUNT = Number(arg('fail-count', 2));
 const MAX_RETRIES = arg('max-retries', null);
 const WAIT_MS = Number(arg('wait-ms', 240_000));
@@ -94,6 +102,11 @@ if (!['fail', 'flaky', '401', 'fold', 'subagent'].includes(MODE)) {
   console.error(`unknown --mode ${MODE}`);
   process.exit(2);
 }
+
+const stubAuthLines = localStubAuthLines({
+  nativeAuth: NATIVE_AUTH, home: os.homedir(),
+  isolatedHome: process.env.CLAUDE_GATE_ISOLATED_HOME, model: 'stub',
+});
 
 const orchestra = require(ORCHESTRA_PATH ? path.resolve(ORCHESTRA_PATH) : '@shumkov/orchestra');
 const { CliProcess, createTmuxRunner, hookSettings } = orchestra;
@@ -256,6 +269,7 @@ const work = fs.mkdtempSync(path.join(os.tmpdir(), 'pgapierr-'));
 fs.chmodSync(work, 0o700);
 if (!VENDOR_DIR_OVERRIDE) process.env.ORCHESTRA_CLAUDE_VENDOR_DIR = path.join(work, 'claude-bin');
 const cwd = fs.realpathSync(fs.mkdtempSync(path.join(work, 'cwd-')));
+writeFixtureConsent({ cwd, fixtureRoot: work });
 if (WITH_AGENT) {
   fs.mkdirSync(path.join(cwd, '.claude', 'agents'), { recursive: true });
   fs.writeFileSync(path.join(cwd, '.claude', 'agents', 'stubagent.md'),
@@ -264,16 +278,11 @@ if (WITH_AGENT) {
 const launcher = path.join(work, 'launcher.sh');
 fs.writeFileSync(launcher, [
   '#!/bin/sh',
-  // Same shape as the VPS proxy launcher: replace competing auth with a
-  // base URL + bearer token. The token is a dummy; inference never leaves the
-  // host. Nonessential traffic stays ON: with it disabled the CLI cannot read
-  // the feature flag that enables Channels, so the bridge would never deliver.
-  // The auto-updater is off so the run cannot move the operator's own
-  // `claude` symlink (the vendored pin is a separate copy either way).
-  'unset CLAUDE_CODE_OAUTH_TOKEN',
-  'export ANTHROPIC_API_KEY=',
+  // Keep model traffic local. Optional native auth retains the account needed
+  // for Channels startup; default mode uses a dummy token. Normal feature
+  // evaluation stays enabled, and the updater cannot move the user's binary.
+  ...stubAuthLines,
   `export ANTHROPIC_BASE_URL=http://127.0.0.1:${stubPort}`,
-  'export ANTHROPIC_AUTH_TOKEN=stub-token-not-a-secret',
   'export DISABLE_AUTOUPDATER=1',
   MAX_RETRIES != null ? `export CLAUDE_CODE_MAX_RETRIES=${Number(MAX_RETRIES)}` : '',
   'exec "$@"',
@@ -288,7 +297,8 @@ const binResult = ensureVendoredClaudeBin(CLAUDE_CLI_PINNED_VERSION, { logger: {
 if (!binResult.ok) {
   log(`pinned claude unavailable: ${binResult.reason}`);
   stub.close();
-  fs.rmSync(work, { recursive: true, force: true });
+  if (!KEEP_ARTIFACTS) fs.rmSync(work, { recursive: true, force: true });
+  else log(`retained fixture: ${work}`);
   process.exit(2);
 }
 log(`claude binary: ${binResult.path}`);
@@ -367,6 +377,7 @@ try {
     existingSessionId: null,
   });
   log(`${ts()} claude started session=${proc.claudeSessionId}`);
+  rejectUnavailableChannels(await proc.runner.captureWide(proc.tmuxSession));
 
   const first = await runTurn('turn-1', 'Reply with the single word PONG.', 1);
   if (INTERRUPT_AFTER_MS != null) {
@@ -506,9 +517,10 @@ try {
     log('\nPASS');
   }
 } catch (err) {
-  exitCode = 1;
-  log(`spike failed: ${err.stack || err.message}`);
-  log('FAIL');
+  const blocked = err.code === 'CHANNELS_FIXTURE_UNAVAILABLE';
+  exitCode = blocked ? 2 : 1;
+  log(`spike ${blocked ? 'blocked' : 'failed'}: ${err.stack || err.message}`);
+  log(blocked ? 'BLOCKED' : 'FAIL');
 } finally {
   // claude writes its session file as it exits, which can be after the tmux
   // session is gone; removing the project entry before then leaves it behind.
@@ -519,6 +531,13 @@ try {
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
     claudePid = Number(out.trim().split('\n')[0]) || null;
   } catch {}
+  if (KEEP_ARTIFACTS) {
+    try {
+      const hookPresent = Boolean(proc._hookNdjsonPath && fs.existsSync(proc._hookNdjsonPath));
+      if (hookPresent) fs.writeFileSync(path.join(work, 'raw-hooks-before-shutdown.ndjson'), fs.readFileSync(proc._hookNdjsonPath), { flag: 'wx', mode: 0o600 });
+      fs.writeFileSync(path.join(work, 'hook-snapshot.json'), JSON.stringify({ capturedAt: new Date().toISOString(), hookPresent }), { flag: 'wx', mode: 0o600 });
+    } catch (error) { exitCode = 1; log(`hook snapshot failed: ${error.message}`); }
+  }
   try { await proc.kill('spike-done'); } catch {}
   const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
   for (const deadline = Date.now() + 15_000; claudePid && alive(claudePid) && Date.now() < deadline;) {
@@ -526,10 +545,13 @@ try {
   }
   if (claudePid && alive(claudePid)) log(`claude (pid ${claudePid}) still running; its project entry may be left behind`);
   stub.close();
-  try {
-    const encoded = cwd.replace(/[^a-zA-Z0-9]/g, '-');
-    fs.rmSync(path.join(os.homedir(), '.claude', 'projects', encoded), { recursive: true, force: true });
-  } catch {}
-  fs.rmSync(work, { recursive: true, force: true });
+  if (KEEP_ARTIFACTS) log(`retained fixture: ${work}; projects: ${path.join(os.homedir(), '.claude', 'projects')}`);
+  else {
+    try {
+      const encoded = cwd.replace(/[^a-zA-Z0-9]/g, '-');
+      fs.rmSync(path.join(os.homedir(), '.claude', 'projects', encoded), { recursive: true, force: true });
+    } catch {}
+    fs.rmSync(work, { recursive: true, force: true });
+  }
 }
 process.exit(exitCode);

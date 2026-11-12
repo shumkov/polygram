@@ -22,11 +22,43 @@ candidate side. A version without an entry blocks the matrix before any
 run starts. Moving the pin means adding the new version's entry and
 dropping the one that is no longer compared.
 
-The Agent SDK is held constant across both sides: every SDK cell runs the
-installed `@anthropic-ai/claude-agent-sdk` (`sdkVersion` in the manifest,
-checked against the installed package by `npm test`) and varies only
-`pathToClaudeCodeExecutable`. The matrix therefore compares CLI versions,
-not SDK versions.
+The legacy/default matrix holds the installed SDK constant (`sdkVersion` in the
+manifest). The separate .322 acceptance manifest instead declares exact
+`sdkRuntimes.old/candidate` identities and requires `--old-sdk-root <absolute SDK
+package directory>` and `--candidate-sdk-root <absolute SDK package directory>`.
+A gate-only Node24 preload resolves both ESM and CJS SDK imports to that side's
+attested package without editing package pins. The same recorded gate source
+runs actual .283/.283 and .322/.322 pairs. Persisted load proofs and source hashes
+are checked after every child and again before accepting retained evidence.
+The b796 crossed old-SDK/new-CLI failure remains FAIL. See the
+[matched-pair spec](../../docs/CLAUDE_MATCHED_SDK_GATE_SPEC.md) for the source-backed
+.322 task lifecycle policy and required distinct-agent attribution witness.
+
+For the pending .283/.322 evaluation, the separate
+`claude-2.1.322-discovery.json` contains provisional candidate expectations.
+Select it with `--manifest /absolute/path/to/claude-2.1.322-discovery.json`
+and `--version candidate`. Discovery rejects unfiltered runs and
+`--accept-run` before creating artifacts or launching a child; its summaries
+are non-authoritative. The selected absolute path and exact content hash
+are runner-owned child inputs. The default accepted manifest is unchanged.
+See [the expectation dossier](../../docs/claude-322-discovery-dossier.md)
+before requesting provider calls. A separate reviewed `claude-2.1.322-matrix.json` now describes acceptance
+expectations after observation. It requires the candidate background MCP cell,
+which failed discovery; the manifest does not claim compatibility or permit a
+pin change. A full unfiltered comparison must run on its recorded signed gate
+commit. Keep the default accepted manifest unchanged.
+
+The local API-error and mailbox stubs put only bypass consent into each
+fresh project's `.claude/settings.local.json`, which is included by
+`--setting-sources project,local`. Explicit Channels-unavailable output
+reports `BLOCKED` (exit 2) before sending a prompt. These fixtures still
+need supported Channels account/feature authorization; a local model stub
+does not enable that prerequisite. Use isolated HOME, Keychain/network
+denial and a private tmux server for credential-free preparation. The two local
+stubs support explicit `--keep-artifacts` to retain only their owned fixture and
+project files, plus hook snapshots through the recorded pre-shutdown cutoff;
+resource shutdown still runs. Existing authenticated local-stub starts remain
+BLOCKED when the CLI rejects Channels for the fixture provider presentation.
 
 Preserve and attest the old executable outside both mutable binary
 trees before running the candidate. Then run:

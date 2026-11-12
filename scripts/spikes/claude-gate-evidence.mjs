@@ -427,6 +427,13 @@ const NORMALIZED_GATE_LIFECYCLE_SCHEMAS = {
   // Written by Claude Code 2.1.283 as a running session cost total; no
   // lifecycle data, and nothing in Polygram or Orchestra reads it.
   'cost-state': (record) => Object.keys(record).length === 1,
+  // Request diagnostics and ownership stay in raw replay; review evidence
+  // carries only their type so identities and request bodies remain private.
+  'session-owner': (record) => Object.keys(record).length === 1,
+  'tools-used': (record) => Object.keys(record).length === 1,
+  'api-request-shape': (record) => Object.keys(record).length === 1,
+  'api-request-blob': (record) => Object.keys(record).length === 1,
+  'api-request': (record) => Object.keys(record).length === 1,
   // SDK heartbeat streamed every 30 s while a long tool (e.g. an Agent) runs.
   tool_progress: (record) => Object.keys(record).length === 1,
 };
@@ -1100,7 +1107,12 @@ export function sanitizedGateResultSchemaMatches(result, matrixScenario) {
   const keys = SANITIZED_RESULT_KEYS.get(scenario);
   if (
     !keys
-    || !hasExactKeys(result, keys)
+    || !hasExactKeys(result, scenario === 'delayed-mcp' && Object.hasOwn(result, 'sdkRuntime') ? [...keys, 'sdkRuntime'] : keys)
+    || (Object.hasOwn(result, 'sdkRuntime') && !(scenario === 'delayed-mcp'
+      && hasExactKeys(result.sdkRuntime, ['version', 'claudeCodeVersion', 'entrySha256', 'packageSha256'])
+      && /^0\.3\.\d+$/.test(result.sdkRuntime.version)
+      && result.sdkRuntime.claudeCodeVersion === result.attestation?.version
+      && [result.sdkRuntime.entrySha256, result.sdkRuntime.packageSha256].every(hash => /^[a-f0-9]{64}$/.test(hash))))
     || result.matrixScenario !== matrixScenario
     || result.evidenceSchemaVersion !== 1
     || !(
