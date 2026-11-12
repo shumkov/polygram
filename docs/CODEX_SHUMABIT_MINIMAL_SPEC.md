@@ -231,9 +231,11 @@ surface. Repository tests do not prove proxy inference or production Telegram us
 
 ### Agreed runtime upgrade sequence
 
-Ivan agreed to the planned upgrades on 2026-11-12. Finish the current shared-skills,
-memory, Astra-selection and proxy integration first; then upgrade Codex as a separate
-change, followed by Claude as a separate change. Earlier registry research found
+Ivan agreed to the planned upgrades on 2026-11-12 and then explicitly requested
+Claude preparation in a separate parallel worker. Finish the current shared-skills,
+memory, Astra-selection and proxy integration before upgrading Codex. Prepare the
+Claude upgrade independently in parallel; keep both upgrades separately reviewable.
+Earlier registry research found
 Codex 0.167.2 and Claude 2.1.322 / Agent SDK 0.3.322 as candidates; recheck official
 releases before choosing the exact pins. This supersedes deferring all runtime
 upgrades, but does not fold a pin bump into the current implementation.
