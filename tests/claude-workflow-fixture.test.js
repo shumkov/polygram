@@ -987,3 +987,37 @@ test('Workflow timing oracle rejects a task notification inside stop grace', asy
     completionAfterTaskNotificationMs: 3_000,
   });
 });
+
+
+test('Workflow receipt snapshots are not duplicate live tool invocations', async (t) => {
+  const { waitForWorkflowCompletionTurnEvidence } = await import(moduleUrl);
+  for (const duplicateType of ['api-request-blob', 'assistant']) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-workflow-snapshot-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const sessionPath = path.join(dir, 'session.jsonl');
+    const toolName = 'mcp__polygram-workflow-gate-bridge__reply';
+    const marker = 'WF-COMPLETE:snapshot-fixture';
+    const use = workflowReplyToolUse({ toolUseId: 'target-snapshot', toolName, marker });
+    const result = workflowReplyToolResult({ toolUseId: 'target-snapshot', payload: { ok: true, message_id: 220 } });
+    writeSessionRows(sessionPath, [
+      use, result,
+      { ...use, type: duplicateType },
+      ...(duplicateType === 'api-request-blob' ? [{ ...result, type: duplicateType }] : []),
+      { type: 'system', subtype: 'stop_hook_summary' },
+      { type: 'system', subtype: 'turn_duration' },
+    ]);
+    const emitter = new EventEmitter();
+    const pending = waitForWorkflowCompletionTurnEvidence({ emitter, sessionPath, completionMarker: marker, replyToolName: toolName,
+      deliveryMode: 'direct', afterTurnDurationCount: 0, eventTimeoutMs: 250, durableTimeoutMs: 250, pollMs: 5 });
+    emitter.emit('tool-use-detail', { name: toolName, input: { text: marker }, toolUseId: 'target-snapshot' });
+    emitter.emit('tool-result', { name: toolName, toolUseId: 'target-snapshot', isError: false });
+    emitter.emit('stop-hook', {});
+    if (duplicateType === 'assistant') await assert.rejects(pending, /identity is ambiguous/);
+    else {
+      const evidence = await pending;
+      assert.equal(evidence.transcriptToolUseCount, 1);
+      assert.equal(evidence.transcriptToolResultCount, 1);
+      assert.equal(evidence.receiptOk, true);
+    }
+  }
+});

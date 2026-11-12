@@ -1,12 +1,54 @@
 # Provisional Claude .283/.322 discovery expectations
 
-This dossier is preparation, not observed compatibility. The separate manifest
-`scripts/spikes/claude-2.1.322-discovery.json` is explicitly `discovery`: only
-candidate-filtered execution is permitted, no acceptance. No provider run has
-been authorized or performed. SDK stays 0.3.283. The default accepted
-.220/.283 manifest remains byte-for-byte unchanged.
+This dossier retains initial discovery hypotheses and current authorized
+observations. Discovery remains candidate-filtered and non-authoritative.
+The separate acceptance contract does not claim a passed matrix. Installed SDK
+stays 0.3.283 and the default accepted .220/.283 manifest remains unchanged.
+Current execution and authorization are governed by
+[the provider execution spec](claude-322-provider-execution-spec.md).
 
-## Sources and unresolved expectations
+## Authorized observations and separate acceptance contract
+
+All thirteen planned candidate invocations have now been exercised across
+retained batches under explicit paid-call authorization. The actual-new-SDK
+supplemental five scenarios also pass. Discovery remains non-authoritative;
+failed prerequisite and comparison attempts are retained without relabeling.
+
+The separate reviewed `scripts/spikes/claude-2.1.322-matrix.json` states an
+acceptance contract, not a passed gate. Candidate instructions count is observed
+zero. The first channel user hasParent is true, linked in raw JSONL to the
+anonymous meta tools-used-before-summary reminder. Existing exact positional
+rows assert the complete first channel record at index2 separately for old
+false and candidate true on new baseline IDs. The old assertion is equivalent;
+existing old values/default accepted matrix stay intact. The four listing
+attachments remain in the common baseline. Offline counterfactual replays of
+CLI repeats, Workflow direct/fallback and nested Opus are supplemental only.
+
+Candidate auto-background delayed MCP definitively fails: markerCount0,
+taskCompleted0, failed notification. Its background expectation remains required,
+with NO candidate waiver. SDK queued-prompt/report attribution fails on both
+old and new actual pairs; .322 additionally emits a zero-turn empty result that
+drains pending user work. Runtime queue semantics are unchanged; correction
+proposal and deterministic RED reproducer are in the Orchestra child. The
+tracking issue is still unpublished, and both 24h soaks remain open.
+
+Both old/new API-error local-stub starts report explicit Channels rejection
+before the turn sender despite genuine native auth, under their third-party
+base URL/dummy-token presentation. The exact rendered rejection branch was not captured before teardown; account
+insufficiency is not inferred. These are BLOCKED, not failures of the API-
+error oracle or successes. Downstream modes/mailbox are not retried against
+that unchanged prerequisite. Their retained fixture trees and pre-shutdown hook
+snapshots support diagnosis; native temporary credential files were removed.
+
+## Historical preparation record
+
+The sections below preserve the pre-authorization preparation state and original
+procedure. Their statements about no authorized calls, no real credential reads,
+separate future approvals and uncommitted-only delivery are historical, not
+current instructions. The authorized observations above and provider execution
+spec supersede those facts; the original hypotheses are retained for audit.
+
+### Original sources and unresolved expectations
 
 The old .283 entry and all scenario/comparator definitions are copied unchanged
 from the reviewed .283 manifest at consumer commit
@@ -34,7 +76,7 @@ Every declared candidate Workflow anchor was found in these exact bytes during
 manifest creation. This is static evidence only. It does not establish account
 authorization, Workflow delivery, or any model behavior.
 
-## Consent and Channels
+### Original consent and Channels preparation
 
 The official [settings reference](https://code.claude.com/docs/en/settings-reference#skipdangerousmodepermissionprompt)
 supports consent in local project settings. Both attested binaries reached
@@ -58,7 +100,7 @@ or changed and no feature cache was forged. Stop retries until an authorized
 account context changes this prerequisite. Mailbox and the remaining local
 error modes were deliberately not retried.
 
-## Discovery and acceptance procedure
+### Original discovery and acceptance procedure
 
 After a separate explicit provider go, invoke the runner with the absolute
 discovery manifest and `--version candidate`. Pure planning yields 13 candidate

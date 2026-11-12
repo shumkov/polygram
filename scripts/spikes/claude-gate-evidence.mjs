@@ -427,6 +427,13 @@ const NORMALIZED_GATE_LIFECYCLE_SCHEMAS = {
   // Written by Claude Code 2.1.283 as a running session cost total; no
   // lifecycle data, and nothing in Polygram or Orchestra reads it.
   'cost-state': (record) => Object.keys(record).length === 1,
+  // Request diagnostics and ownership stay in raw replay; review evidence
+  // carries only their type so identities and request bodies remain private.
+  'session-owner': (record) => Object.keys(record).length === 1,
+  'tools-used': (record) => Object.keys(record).length === 1,
+  'api-request-shape': (record) => Object.keys(record).length === 1,
+  'api-request-blob': (record) => Object.keys(record).length === 1,
+  'api-request': (record) => Object.keys(record).length === 1,
   // SDK heartbeat streamed every 30 s while a long tool (e.g. an Agent) runs.
   tool_progress: (record) => Object.keys(record).length === 1,
 };

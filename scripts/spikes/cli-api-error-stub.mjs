@@ -37,6 +37,7 @@
  *   node scripts/spikes/cli-api-error-stub.mjs --mode flaky --fail-count 2
  *   node scripts/spikes/cli-api-error-stub.mjs --mode 401
  * Options:
+ *   --keep-artifacts    retain private fixture files and a pre-shutdown hook snapshot.
  *   --orchestra <path>   load CliProcess from this orchestra checkout instead of
  *                        node_modules (to run a candidate fix).
  *   --max-retries <n>    CLAUDE_CODE_MAX_RETRIES for the CLI (omit = CLI default,
@@ -80,6 +81,7 @@ function arg(name, fallback = null) {
 }
 
 const MODE = arg('mode', 'fail');
+const KEEP_ARTIFACTS = arg('keep-artifacts', false) === true;
 const FAIL_COUNT = Number(arg('fail-count', 2));
 const MAX_RETRIES = arg('max-retries', null);
 const WAIT_MS = Number(arg('wait-ms', 240_000));
@@ -293,7 +295,8 @@ const binResult = ensureVendoredClaudeBin(CLAUDE_CLI_PINNED_VERSION, { logger: {
 if (!binResult.ok) {
   log(`pinned claude unavailable: ${binResult.reason}`);
   stub.close();
-  fs.rmSync(work, { recursive: true, force: true });
+  if (!KEEP_ARTIFACTS) fs.rmSync(work, { recursive: true, force: true });
+  else log(`retained fixture: ${work}`);
   process.exit(2);
 }
 log(`claude binary: ${binResult.path}`);
@@ -526,6 +529,13 @@ try {
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
     claudePid = Number(out.trim().split('\n')[0]) || null;
   } catch {}
+  if (KEEP_ARTIFACTS) {
+    try {
+      const hookPresent = Boolean(proc._hookNdjsonPath && fs.existsSync(proc._hookNdjsonPath));
+      if (hookPresent) fs.writeFileSync(path.join(work, 'raw-hooks-before-shutdown.ndjson'), fs.readFileSync(proc._hookNdjsonPath), { flag: 'wx', mode: 0o600 });
+      fs.writeFileSync(path.join(work, 'hook-snapshot.json'), JSON.stringify({ capturedAt: new Date().toISOString(), hookPresent }), { flag: 'wx', mode: 0o600 });
+    } catch (error) { exitCode = 1; log(`hook snapshot failed: ${error.message}`); }
+  }
   try { await proc.kill('spike-done'); } catch {}
   const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
   for (const deadline = Date.now() + 15_000; claudePid && alive(claudePid) && Date.now() < deadline;) {
@@ -533,10 +543,13 @@ try {
   }
   if (claudePid && alive(claudePid)) log(`claude (pid ${claudePid}) still running; its project entry may be left behind`);
   stub.close();
-  try {
-    const encoded = cwd.replace(/[^a-zA-Z0-9]/g, '-');
-    fs.rmSync(path.join(os.homedir(), '.claude', 'projects', encoded), { recursive: true, force: true });
-  } catch {}
-  fs.rmSync(work, { recursive: true, force: true });
+  if (KEEP_ARTIFACTS) log(`retained fixture: ${work}; projects: ${path.join(os.homedir(), '.claude', 'projects')}`);
+  else {
+    try {
+      const encoded = cwd.replace(/[^a-zA-Z0-9]/g, '-');
+      fs.rmSync(path.join(os.homedir(), '.claude', 'projects', encoded), { recursive: true, force: true });
+    } catch {}
+    fs.rmSync(work, { recursive: true, force: true });
+  }
 }
 process.exit(exitCode);

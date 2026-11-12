@@ -38,3 +38,12 @@ test('explicit Channels absence is a prerequisite error and silence is not fabri
   }
   assert.equal(rejectUnavailableChannels('unknown startup output'), undefined);
 });
+
+test('every isolated matrix CLI workspace includes consent before registration and first launch', () => {
+  for (const file of ['cli-contract-matrix.mjs', 'workflow-autonomous-completion.mjs', 'system-prompt-snapshot.mjs']) {
+    const source = fs.readFileSync(path.join(__dirname, '../scripts/spikes', file), 'utf8');
+    const call = source.indexOf('writeFixtureConsent({');
+    const registration = source.indexOf('registerGateSessionProject(selection,', call);
+    assert.ok(call >= 0 && registration > call, `${file} must include disposable consent before the project can launch`);
+  }
+});

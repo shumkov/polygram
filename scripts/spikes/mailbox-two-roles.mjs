@@ -51,6 +51,7 @@
  *   node scripts/spikes/mailbox-two-roles.mjs
  *   node scripts/spikes/mailbox-two-roles.mjs --model real
  * Options:
+ *   --keep-artifacts    retain private fixture files and pre-shutdown hook snapshots.
  *   --orchestra <path>  load CliProcess from this orchestra checkout.
  *   --wait-ms <ms>      how long to wait for the scenario to settle
  *                       (default 300000).
@@ -80,6 +81,7 @@ function arg(name, fallback = null) {
 }
 
 const MODEL = arg('model', 'stub');
+const KEEP_ARTIFACTS = arg('keep-artifacts', false) === true;
 const WAIT_MS = Number(arg('wait-ms', 300_000));
 const ORCHESTRA_PATH = arg('orchestra', null);
 if (!['stub', 'real'].includes(MODEL)) {
@@ -288,6 +290,10 @@ let db; let ipc; let jobs; let mailbox; let pump; let exitCode = 0;
 const sessionKeyOf = (role) => getSessionKey(ROLES[role].chatId, null, {});
 
 function cleanupPaths() {
+  if (KEEP_ARTIFACTS) {
+    log(`retained fixture: ${work}; IPC: ${ipcDir}; projects: ${path.join(os.homedir(), '.claude', 'projects')}`);
+    return;
+  }
   for (const cwd of Object.values(cwds)) {
     try { fs.rmSync(path.join(os.homedir(), '.claude', 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-')), { recursive: true, force: true }); } catch {}
   }
@@ -538,6 +544,7 @@ try {
   // claude writes its session file as it exits, which can be after the tmux
   // session is gone; removing the project entry before then leaves it behind.
   const pids = [];
+  let hookIndex = 0;
   for (const proc of procs.values()) {
     try {
       const out = execFileSync('tmux', ['-L', SOCKET, 'list-panes', '-t', proc.tmuxSession, '-F', '#{pane_pid}'],
@@ -545,6 +552,14 @@ try {
       const pid = Number(out.trim().split('\n')[0]);
       if (pid) pids.push(pid);
     } catch {}
+    if (KEEP_ARTIFACTS) {
+      try {
+        const hookPresent = Boolean(proc._hookNdjsonPath && fs.existsSync(proc._hookNdjsonPath));
+        const prefix = `role-${hookIndex++}`;
+        if (hookPresent) fs.writeFileSync(path.join(work, `${prefix}-raw-hooks-before-shutdown.ndjson`), fs.readFileSync(proc._hookNdjsonPath), { flag: 'wx', mode: 0o600 });
+        fs.writeFileSync(path.join(work, `${prefix}-hook-snapshot.json`), JSON.stringify({ capturedAt: new Date().toISOString(), hookPresent }), { flag: 'wx', mode: 0o600 });
+      } catch (error) { exitCode = 1; log(`hook snapshot failed: ${error.message}`); }
+    }
     try { await proc.kill('spike-done'); } catch {}
   }
   const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };

@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { writeFixtureConsent } from './cli-fixture-prerequisites.mjs';
 
 import {
   createClaudeGateSelection,
@@ -139,6 +140,7 @@ const selection = await createClaudeGateSelection();
 const fixtureParent = path.join(selection.artifactDir, 'workflow-workspace');
 fs.mkdirSync(fixtureParent, { mode: 0o700 });
 const fixture = await prepareWorkflowProject({ parentDir: fixtureParent });
+writeFixtureConsent({ cwd: fixture.cwd, fixtureRoot: selection.artifactDir });
 registerGateSessionProject(selection, fixture.cwd);
 const suffix = crypto.randomBytes(4).toString('hex');
 const sentinel = `${selection.version.replace(/\./g, '-')}-${suffix}`;

@@ -30,6 +30,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { writeFixtureConsent } from './cli-fixture-prerequisites.mjs';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -213,6 +214,7 @@ async function stopLeg(proc) {
 async function runLeg(name, { firstLauncher, resumedLauncher }) {
   const cwd = path.join(selection.artifactDir, `${name}-workspace`);
   fs.mkdirSync(cwd, { mode: 0o700 });
+  writeFixtureConsent({ cwd, fixtureRoot: selection.artifactDir });
   workspaces.push(cwd);
   registerGateSessionProject(selection, cwd);
   const markers = {

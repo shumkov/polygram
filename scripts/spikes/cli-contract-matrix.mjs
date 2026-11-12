@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { writeFixtureConsent } from './cli-fixture-prerequisites.mjs';
 
 import {
   createClaudeGateSelection,
@@ -102,6 +103,7 @@ function copyAndNormalizeLifecycle(proc, cwd, selection) {
 const selection = await createClaudeGateSelection();
 const cwd = path.join(selection.artifactDir, 'cli-workspace');
 fs.mkdirSync(cwd, { mode: 0o700 });
+writeFixtureConsent({ cwd, fixtureRoot: selection.artifactDir });
 registerGateSessionProject(selection, cwd);
 const suffix = crypto.randomBytes(4).toString('hex');
 const replies = [];

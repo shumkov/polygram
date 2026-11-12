@@ -36,8 +36,11 @@ and `--version candidate`. Discovery rejects unfiltered runs and
 are non-authoritative. The selected absolute path and exact content hash
 are runner-owned child inputs. The default accepted manifest is unchanged.
 See [the expectation dossier](../../docs/claude-322-discovery-dossier.md)
-before requesting provider calls. A distinct reviewed acceptance manifest
-and recorded gate commit are still required before a pin change.
+before requesting provider calls. A separate reviewed `claude-2.1.322-matrix.json` now describes acceptance
+expectations after observation. It requires the candidate background MCP cell,
+which failed discovery; the manifest does not claim compatibility or permit a
+pin change. A full unfiltered comparison must run on its recorded signed gate
+commit. Keep the default accepted manifest unchanged.
 
 The local API-error and mailbox stubs put only bypass consent into each
 fresh project's `.claude/settings.local.json`, which is included by
@@ -45,7 +48,11 @@ fresh project's `.claude/settings.local.json`, which is included by
 reports `BLOCKED` (exit 2) before sending a prompt. These fixtures still
 need supported Channels account/feature authorization; a local model stub
 does not enable that prerequisite. Use isolated HOME, Keychain/network
-denial and a private tmux server for credential-free preparation.
+denial and a private tmux server for credential-free preparation. The two local
+stubs support explicit `--keep-artifacts` to retain only their owned fixture and
+project files, plus hook snapshots through the recorded pre-shutdown cutoff;
+resource shutdown still runs. Existing authenticated local-stub starts remain
+BLOCKED when the CLI rejects Channels for the fixture provider presentation.
 
 Preserve and attest the old executable outside both mutable binary
 trees before running the candidate. Then run:

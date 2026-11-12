@@ -4424,3 +4424,46 @@ test('accepted matrix cleanup rejects a session project outside its run', async 
 
   assert.equal(fs.existsSync(path.join(runDir, 'run-metadata.json')), true);
 });
+
+
+test('283/322 manifest preserves exact first-channel assertions for both versions', async () => {
+  const { evaluateMatrixVersionEvidence, buildClaudeMatrixRuns } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  const accepted = JSON.parse(fs.readFileSync(path.join(repoRoot, 'scripts/spikes/claude-2.1.322-matrix.json'), 'utf8'));
+  assert.equal(accepted.validationStage, 'acceptance');
+  assert.equal(accepted.expectations['2.1.322'].delayedMcpModes.autoBackground, 'background');
+  assert.equal(Object.hasOwn(accepted.expectations['2.1.322'].delayedMcpModes, 'waiverReason'), false);
+  assert.equal(buildClaudeMatrixRuns({ manifest: accepted, binaries: { old: '/private/old', candidate: '/private/candidate' }, artifactBaseDir: '/private/artifacts', runPrefix: 'exact-parent-contract' }).length, 23);
+  for (const id of ['cli-contract', 'workflow-direct', 'workflow-fallback']) {
+    const scenario = accepted.scenarios.find((scenario) => scenario.id === id);
+    const original = manifest.scenarios.find((scenario) => scenario.id === id);
+    const oldResult = id === 'cli-contract'
+      ? observedCliResult({ session: OBSERVED_CLI_SESSION_283.map(decodeObservedSession), hooks: observedHooks(OBSERVED_CLI_HOOKS_283) })
+      : workflowMatrixResult(with283SessionRows(workflowLifecycleFixture({ deliveryMode: id.slice('workflow-'.length), bashPairs: 2, subagentStops: 3 }), { recordAfter: 'skill_listing' }), id.slice('workflow-'.length));
+    const judge = (result, version, useOriginal = false) => evaluateMatrixVersionEvidence({
+      scenario: useOriginal ? original : scenario,
+      versionKey: useOriginal ? 'candidate' : version === '2.1.283' ? 'old' : 'candidate',
+      expectations: useOriginal ? CANDIDATE_EXPECTATIONS : accepted.expectations[version],
+      results: Array.from({ length: scenario.comparison.runsPerVersion || 1 }, () => result),
+    }).pass;
+    assert.equal(judge(oldResult, '2.1.283', true), true, `${id} historical baseline`);
+    assert.equal(judge(oldResult, '2.1.283'), true, `${id} equivalent factored old baseline`);
+    const candidate = withSessionRecords(oldResult, (session) => {
+      session.find((row) => row.type === 'user' && row.originKind === 'channel').hasParent = true;
+      session.splice(session.findIndex((row) => row.attachmentType === 'instructions'), 1);
+    });
+    assert.equal(judge(candidate, '2.1.322'), true, `${id} observed candidate shape`);
+    for (const [name, mutate] of Object.entries({
+      'wrong parent': (session) => { const row = session.find((row) => row.originKind === 'channel'); row.hasParent = !row.hasParent; },
+      'missing first row': (session) => { session.splice(session.findIndex((row) => row.originKind === 'channel'), 1); },
+      'duplicate first row': (session) => { const i = session.findIndex((row) => row.originKind === 'channel'); session.splice(i, 0, structuredClone(session[i])); },
+      'moved first row': (session) => { const i = session.findIndex((row) => row.originKind === 'channel'); const [row] = session.splice(i, 1); session.splice(session.findIndex((row) => row.type === 'system' && row.subtype === 'stop_hook_summary') + 1, 0, row); },
+      'wrong first field': (session) => { session.find((row) => row.originKind === 'channel').promptSource = 'other'; },
+      'later lifecycle drift': (session) => { session.find((row) => row.type === 'system' && row.subtype === 'turn_duration').subtype = 'unknown_duration'; },
+    })) {
+      const oldMutation = withSessionRecords(oldResult, mutate);
+      assert.equal(judge(oldMutation, '2.1.283'), false, `${id} old ${name}`);
+      assert.equal(judge(oldMutation, '2.1.283', true), false, `${id} old equivalent rejection ${name}`);
+      assert.equal(judge(withSessionRecords(candidate, mutate), '2.1.322'), false, `${id} candidate ${name}`);
+    }
+  }
+});
