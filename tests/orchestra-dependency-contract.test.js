@@ -2,6 +2,9 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { createRequire } = require('node:module');
 
 const packageJson = require('../package.json');
 const lockfile = require('../package-lock.json');
@@ -147,6 +150,21 @@ test('installed Orchestra sends clean replay only to the expected live process',
 // exercises a different SDK than production runs.
 test('Polygram and Orchestra pin the same exact Agent SDK version', () => {
   const sdk = '@anthropic-ai/claude-agent-sdk';
+  const sdkEntry = require.resolve(sdk);
+  const installedSdk = JSON.parse(fs.readFileSync(
+    path.join(path.dirname(sdkEntry), 'package.json'), 'utf8',
+  ));
+  const requireFromOrchestra = createRequire(require.resolve('@shumkov/orchestra'));
+  assert.equal(installedSdk.version, packageJson.dependencies[sdk]);
+  assert.equal(
+    installedSdk.claudeCodeVersion,
+    orchestra.claudeBin.CLAUDE_CLI_PINNED_VERSION,
+  );
+  assert.equal(
+    fs.realpathSync(sdkEntry),
+    fs.realpathSync(requireFromOrchestra.resolve(sdk)),
+    'Polygram and Orchestra load the same physical SDK entry',
+  );
   assert.equal(
     packageJson.dependencies[sdk],
     orchestraPackage.optionalDependencies[sdk],

@@ -1,5 +1,73 @@
 # Matched SDK/CLI acceptance gate amendment
 
+## Orchestra patch release and consumer hold
+
+Coordinator supplied published Orchestra0.12.0 base706dab; owned Claude branch
+integrated it without conflicts and prepares0.12.1 through reviewed PR/CI/OIDC
+release with artifact readback. No Codex source/pin changes were introduced by
+that merge. This consumer child preserves its reviewed generic actual-installed
+SDK metadata/shared-resolution assertions independently, with current3/3PASS and
+no dependency/version change. Exact consumer SDK0.3.322/Orchestra0.12.1 update
+requires the actual published0.12.1 artifact and coordinator-provided released
+Polygram0.46.0 base before consumer merge/version/publication. Do not merge or
+modify the coordinator parent branch; no deploy or new provider loops. Earlier
+Orchestra published-base hold statements below are superseded; accepted gate
+6cceb3b23/23 and strict focused INCONCLUSIVE limits remain unchanged.
+
+
+## Current publication and release ordering
+
+Tracking issue [Polygram #133](https://github.com/shumkov/polygram/issues/133) is
+OPEN and its complete body was authoritatively read back. Publication and planned
+activation are authorized. Bounded runtime correction is signed Orchestra commit
+0664a00dea8b1b4fd1f8c3ff803683171b2c69d8, with the exact accepted runtime source.
+Codex owns Orchestra 0.12.0; Claude release version/tag/main integration waits for
+its published base and no deployment occurs in this worker. The separate aligned
+consumer update must use the actual subsequent Claude Orchestra release plus
+SDK 0.3.322, with artifact-backed lock metadata and independent diff review.
+Current consumer dependencies remain unchanged rather than installing an invalid
+0.11.3/.322 pair. The reviewed pin/consumer design is in the owned Orchestra child,
+docs/CLAUDE_2_1_322_PIN_CONSUMER_SPEC.md. The accepted 23/23 matrix does not need
+repeating for these documentation/pin metadata changes; prior INCONCLUSIVE
+focused traces and failed matrix attempts retain their original verdicts. Both
+24-hour soaks remain. Earlier status statements below are historical.
+
+
+## Coordinator acceptance and retained limits
+
+The coordinator accepts this bounded ownership correction on the completed
+23/23 matched matrix, all three distinct UUID-owned user completions observed on
+both actual SDK/CLI pairs, observed peer/zero events preserving pending owners,
+reviewed retained-shape RED 2 FAIL -> GREEN 2 PASS, the cancellation/drop
+regressions, and independent clean code reviews. The former strict focused
+oracle required unsupported standalone-report/notification-before-zero behavior
+and its overlap holds were denied. Its INCONCLUSIVE verdicts remain unchanged;
+those extra assumptions are not a release gate. No new live scheduling fixture,
+provider query, or instrumentation loop is required or planned for this correction.
+This accepts explicitly limited coverage; downstream delivery and every overlap
+schedule remain unproven. Tracking-issue publication remains the explicit pre-pin
+prerequisite, and pin/consumer reviews, release/activation authority, staging and
+both 24-hour soaks remain. No runtime or package pin changes are made here.
+
+## Final full unit/integration verification
+
+Ran the complete package test command once on the final corrected runtime with
+Node 24.4.0: `node --test --test-force-exit --test-concurrency=1 tests/*.test.js`.
+All 34 test files completed: 1,579 tests, 1,560 PASS, 0 FAIL, 19 existing contract
+capability-N/A skips (17 channels-protocol, 2 Codex-capability), 0 cancelled.
+Duration 103.370 seconds, exit 0. Runtime SHA-256 remains
+`c6f61a85acd139a0c524a7726dc5eead02be34480305bcd3fbdde32005c72184`.
+HOME/CODEX_HOME/TMP/tmux/vendor/versions were private synthetic trees, with an
+allowlisted credential-free environment and disabled installer/updater. The suite
+uses fake processes/bridges and local fixtures; no paid queries were repeated.
+No failures required code changes. This is unit/integration proof, not additional
+provider, downstream delivery, persistence, activation or soak proof. Full log,
+command, times and per-skip receipts:
+`/tmp/orchestra-claude-upgrade-research-3agLJs/compatibility-acceptance-full-suite/`.
+
+
+
+
 Status: coordinator aligned with actual .283/.283 and .322/.322 on one recorded
 source commit; design review required before implementation. b796 crossed-pair
 FAIL and all exact artifacts remain immutable. No pin/publication/production change.
