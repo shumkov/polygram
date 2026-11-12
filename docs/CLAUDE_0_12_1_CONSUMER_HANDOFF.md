@@ -56,3 +56,46 @@ No consumer version/tag/merge/publication or deployment was performed. No new
 provider call. Coordinator owns required24hSDKstaging on shumorobot then coordinated
 VPS rollout/24hCLIsoak, preserving Linux rollback binary before vendor GC and
 watching autosteer-match-miss, autonomous-wakeup-message and tool-only-completion.
+
+## Released 0.46.0 integration amendment
+
+Coordinator now supplies actual published Polygram0.46.0 main/tag base
+f401ba44489925f7861f07b72db51288ebe4968b (PR134, OIDC43219636597), ending the
+consumer source integration/PR/CI/merge hold. Fresh main API and public npm
+package polygram both confirm0.46.0, and0.46.1 is absent; choose patch0.46.1.
+This worker MUST NOT tag, publish or deploy Polygram. The canonical helper owns
+publication and staging; coordinator owns both24hsoaks and active production
+Codex work. No production operations occur here.
+
+Research: released base changes only12files: Codex controller/profile and tests,
+a new Codex spike/spec, dependency contract Codex0.167.2 hashes, package/plugin
+0.46.0 and Orchestra0.12.0 metadata. It does not change Claude gate inputs or
+SDK caller production code. Preserve all released Codex behavior/bytes and its
+new dependency-contract assertions. The current branch is clean, with signed
+consumer contract4c9fcc5/handofff9f1360 and accepted gate6cceb3b history intact.
+
+Merge the exact released base into this related owned child with a signed
+non-rewriting merge; resolve/review only actual conflicts. Then npm-install exact
+Orchestra0.12.1 + SDK0.3.322 with scripts disabled, isolated npm HOME/cache and
+no credentials, without touching parent piddock/dependencies. Preserve the old
+SDK source archive and offline native binaries; old/current failed evidence is
+immutable. Update REQUIRED_ORCHESTRA_VERSION only from0.12.0to0.12.1, retaining
+the released Codex0.167.2/hash/features assertions and our generic actual-installed
+SDK/CLI/physical-resolution checks. Reject unrelated npm lock drift; preserve
+other production dependency pins. Alternative SDK-only bump is an incoherent
+shipped pair; file tarball dependencies/invented integrity are unnecessary now
+that the exact registry0.12.1 artifact is verified.
+
+Record consumer patch0.46.1 consistently in package.json, package-lock root and
+.claude-plugin/plugin.json, preserving other plugin fields; no tag. Run existing
+alignment contract, directly affected SDK tests and the relevant full local unit/
+integration suite once under credential-free synthetic HOME/CODEX_HOME/TMP/tmux/
+vendor/version roots, E2E_REAL_CLAUDE disabled. Inspect real-test guards and boot
+preflight before launch; no provider call, login mutation or production vendor GC.
+Classify/resolve actual local failures only and do not repeat unaffected paid
+matrix inputs; full23/23 and accepted runtime source remain unchanged. Independent
+design review precedes integration; independent final code review checks exact
+Codex/gate input preservation, aligned registry lock/no nested SDK, version/plugin
+coherence and retained coverage. Push feature branch, PR against released main,
+await CI and merge only exact reviewed head; read back authoritative main tuple
+and report it to coordinator for canonical publication. No tag/publish/deploy.
