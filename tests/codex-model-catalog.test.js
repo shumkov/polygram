@@ -59,6 +59,7 @@ function expectedProfile(overrides = {}) {
     model: 'gpt-5.6-sol',
     effort: 'xhigh',
     cwd: '/workspace',
+    expectedConfig: { modelProvider: 'openai' },
     ...overrides,
   });
 }
@@ -96,6 +97,51 @@ function fakeOrchestra(results) {
 }
 
 describe('Codex authenticated model catalog', () => {
+  test('CLIProxy catalog preserves external-provider state without claiming ChatGPT authentication', async () => {
+    const auth = { authenticated: false, accountType: null, requiresOpenaiAuth: false };
+    const catalog = new CodexModelCatalog({ orchestra: fakeOrchestra([result({ auth })]) });
+    const available = await catalog.preflight(expectedProfile({
+      expectedConfig: { modelProvider: 'cliproxyapi' },
+    }), { deploymentIdentity: 'private-proxy-key-deployment' });
+    assert.deepEqual(available.auth, auth);
+    assert.equal(catalog.getCached({
+      deploymentIdentity: 'private-proxy-key-deployment', spawnProfileId: SPAWN_A,
+    }), available);
+    assert.equal(catalog.getCached({ deploymentIdentity: 'native-deployment', spawnProfileId: SPAWN_A }), null);
+  });
+
+  test('provider-specific catalog account mismatches invalidate the cache', async () => {
+    for (const provider of ['openai', 'cliproxyapi']) {
+      const external = provider === 'cliproxyapi';
+      const validAuth = external
+        ? { authenticated: false, accountType: null, requiresOpenaiAuth: false }
+        : { authenticated: true, accountType: 'chatgpt', requiresOpenaiAuth: true };
+      const mismatches = external ? [
+        { authenticated: true, accountType: 'chatgpt', requiresOpenaiAuth: true },
+        { authenticated: true, accountType: 'chatgpt', requiresOpenaiAuth: false },
+        { authenticated: true, accountType: null, requiresOpenaiAuth: false },
+        { authenticated: false, accountType: null, requiresOpenaiAuth: true },
+        { authenticated: false, requiresOpenaiAuth: false },
+      ] : [
+        { authenticated: false, accountType: null, requiresOpenaiAuth: false },
+        { authenticated: true, accountType: 'chatgpt', requiresOpenaiAuth: false },
+        { authenticated: true, accountType: 'apiKey', requiresOpenaiAuth: true },
+        { authenticated: true, accountType: null, requiresOpenaiAuth: true },
+      ];
+      for (const auth of mismatches) {
+        const catalog = new CodexModelCatalog({ orchestra: fakeOrchestra([
+          result({ auth: validAuth }), result({ auth }),
+        ]) });
+        const profile = expectedProfile({ expectedConfig: { modelProvider: provider } });
+        await catalog.preflight(profile, { deploymentIdentity: 'deployment' });
+        await assert.rejects(catalog.preflight(profile, { deploymentIdentity: 'deployment' }), {
+          code: 'CODEX_PREFLIGHT_INVALID',
+        });
+        assert.equal(catalog.getCached({ deploymentIdentity: 'deployment', spawnProfileId: SPAWN_A }), null);
+      }
+    }
+  });
+
   test('exposes only models and efforts returned by branded successful preflight', async () => {
     const orchestra = fakeOrchestra([result({
       models: [

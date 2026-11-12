@@ -94,15 +94,19 @@ is included. This source-only amendment passed independent plan and diff reviews
 
 Reuse the existing Photoroom pattern: a named `cliproxyapi` Responses provider,
 loopback `/v1` endpoint, bearer read from a private key file, and
-`requires_openai_auth = true`. This deliberately retains local ChatGPT auth/catalog
-as the smallest initial implementation; inference uses the proxy pool. Loss of local
-ChatGPT auth may still block startup even when the pool is healthy.
+`requires_openai_auth = false`. CLIProxy owns upstream authentication; the client
+uses only that private bearer and needs no native ChatGPT login or auth transfer.
+Native `openai` mode still requires ChatGPT authentication. External preflight has
+`auth: { authenticated: false, accountType: null, requiresOpenaiAuth: false }`, bound
+to the exact CLIProxy profile and branded receipt. This records provider configuration,
+not authenticated provider entitlement: pinned `model/list` may use bundled metadata.
+Actual provider/tool completion is a separate validation layer.
 
 Orchestra and Polygram must both recognize this explicit provider and include its
 configuration in the existing exact-profile validation. Preserve native behavior
 when absent. Never weaken validation to accept arbitrary config; never fall back to
 native inference after proxy failure. Keep key material out of errors, receipts,
-logs and command arguments. Do not remove existing auth/account checks to make a
+logs and command arguments. Validate the provider-specific account tuple; do not bypass account/config checks to make a
 probe pass. Infra provisions the key and performs the backed-up owned-config
 transition; editing a running config by hand currently causes rejection.
 Orchestra's process factory also pins the provider to `openai`: update its expected
@@ -189,7 +193,8 @@ or changed key/config fails clearly; no automatic migration or native fallback.
   current command policy.
 - Just add a proxy environment variable: the environment is sanitized and both
   validators reject a custom provider.
-- Remove native ChatGPT auth immediately: larger account/catalog contract change.
+- Remove native ChatGPT auth in native mode: only explicit CLIProxy uses its own bearer;
+  the native account requirement remains enforced.
 - Upgrade Codex incidentally: unnecessary until evidence shows the pin blocks Astra.
 
 ## Verification and rollout
