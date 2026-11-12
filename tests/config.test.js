@@ -112,6 +112,20 @@ describe('saveConfig — atomic write + bot-scoped merge', () => {
     assert.equal(after.maxWarmProcesses, 10);
   });
 
+  // config.json holds every bot token. A rewrite (a /config change, a chat
+  // onboarding or a group migration) must not leave it readable by other
+  // users, whatever the process umask is.
+  test('rewritten config is owner-only (0600), even from a 0644 file under umask 022', () => {
+    const p = path.join(tmpDir, 'config.json');
+    fs.writeFileSync(p, JSON.stringify({ bots: {}, chats: {} }), { mode: 0o644 });
+    fs.chmodSync(p, 0o644);
+    const old = process.umask(0o022);
+    try {
+      saveConfig({ configPath: p, botName: 'bot', config: { bots: {}, chats: {} } });
+    } finally { process.umask(old); }
+    assert.equal(fs.statSync(p).mode & 0o777, 0o600);
+  });
+
   test('atomic write — temp file is gone after success', () => {
     const p = path.join(tmpDir, 'config.json');
     fs.writeFileSync(p, JSON.stringify({ bots: {}, chats: {} }));
