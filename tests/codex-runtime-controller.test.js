@@ -3318,3 +3318,158 @@ test('failed durable lease acquisition rolls back generation and prepared attemp
   );
   assert.equal(db.getCodexAttempt('attempt-rollback'), undefined);
 });
+
+
+function trustedConfig(pm = 'codex') {
+  return {
+    codex: { home: '/srv/codex-home', daemonSecretRoots: ['/srv/polygram'],
+      access: { mode: 'trusted', chatIds: ['100'], commandPath: '/usr/local/bin:/usr/bin:/bin' } },
+    defaults: { codexEnabled: true },
+    chats: { '100': { pm, cwd: '/srv/workspace', codexModel: 'gpt-5.6-sol', codexEffort: 'xhigh' } },
+  };
+}
+
+test('candidate preflight rejects trusted access revoked during the asynchronous catalog read', async () => {
+  const config = trustedConfig('sdk');
+  const { controller, receipt } = fixture({ configOverride: config, modelCatalogOverride: {
+    async preflight() {
+      config.codex.access.chatIds = ['200'];
+      return { state: 'available', spawnProfile: receipt, models: [], selected: { model: 'gpt-5.6-sol', effort: 'xhigh' } };
+    },
+  } });
+  await assert.rejects(controller.resolveCandidateRuntimeView({ sessionKey: '100', chatId: '100' }),
+    (error) => ['CODEX_SCOPE_DISABLED', 'CODEX_PREFLIGHT_PROFILE_MISMATCH'].includes(error.code));
+});
+
+test('cached receipt and client reject deployment drift before reuse', async () => {
+  for (const change of [
+    (config) => { delete config.codex.access; },
+    (config) => { config.codex.access.commandPath = '/usr/bin:/bin'; },
+    (config) => { config.codex.access.chatIds = ['200']; },
+  ]) {
+    const config = trustedConfig();
+    const { controller, receipt, clientOptions } = fixture({ configOverride: config });
+    await controller.prepareSession({ sessionKey: '100', chatId: '100' });
+    change(config);
+    assert.throws(() => controller.resolveReceipt('100', { runtime: 'codex', spawnProfileId: receipt.spawnProfileId }));
+    assert.throws(() => controller.clientFactory({ sessionKey: '100', expectedStaticProfile: receipt.expectedStaticProfile }));
+    assert.equal(clientOptions.length, 0);
+  }
+});
+
+test('running trusted generation rejects new follow-ups after access is removed while admitted work can settle', async () => {
+  const config = trustedConfig();
+  const { controller, receipt, calls } = fixture({ configOverride: config });
+  await controller.prepareSession({ sessionKey: '100', chatId: '100' });
+  await registerDurableProcess(controller, receipt);
+  delete config.codex.access;
+  assert.throws(() => controller.claimDispatchReservation({ sessionKey: '100', generationId: 'generation-dispatch',
+    botName: 'bot-a', telegramChatId: '100', telegramMessageId: '99' }), { code: 'CODEX_PREFLIGHT_PROFILE_MISMATCH' });
+  assert.equal(calls.filter((call) => call[0] === 'claim-dispatch').length, 0);
+});
+
+
+test('clean replay queue authorization rejects drift but existing reservation settlement remains possible', async () => {
+  const config = trustedConfig();
+  const { controller, receipt, calls } = fixture({ configOverride: config });
+  await controller.prepareSession({ sessionKey: '100', chatId: '100' });
+  await registerDurableProcess(controller, receipt);
+  const claim = controller.claimDispatchReservation({ sessionKey: '100', generationId: 'generation-dispatch',
+    botName: 'bot-a', telegramChatId: '100', telegramMessageId: '99' });
+  delete config.codex.access;
+  assert.throws(() => controller.markDispatchDisposition({ sessionKey: '100', generationId: 'generation-dispatch',
+    reservationId: claim.reservationId, disposition: 'queue-authorized' }), { code: 'CODEX_PREFLIGHT_PROFILE_MISMATCH' });
+  assert.doesNotThrow(() => controller.finalizeAcceptedSteer({ sessionKey: '100', generationId: 'generation-dispatch',
+    reservationId: claim.reservationId, steerAttemptId: 'steer-1', targetAttemptId: 'target-1' }));
+});
+
+
+test('cached preflight rechecks scope after asynchronous credential attestation', async () => {
+  const config = trustedConfig();
+  let attests = 0;
+  const { controller } = fixture({ configOverride: config, controllerOptions: {
+    attestCodexHome: async () => {
+      if (++attests > 1) config.codex.access.chatIds = ['200'];
+      return { authFingerprint: { ino: 'auth-1' }, configFingerprint: { ino: 'config-1' } };
+    },
+  } });
+  await controller.prepareSession({ sessionKey: '100', chatId: '100' });
+  await assert.rejects(controller.prepareSession({ sessionKey: '100', chatId: '100' }), { code: 'CODEX_SCOPE_DISABLED' });
+});
+
+test('deployment cache binds origin chat and topic instead of treating sessionKey as authorization', async () => {
+  const config = trustedConfig();
+  config.codex.access.chatIds.push('200');
+  config.chats['200'] = { ...config.chats['100'] };
+  const { controller, calls } = fixture({ configOverride: config });
+  await controller.prepareSession({ sessionKey: 'same-key', chatId: '100' });
+  await controller.prepareSession({ sessionKey: 'same-key', chatId: '200', threadId: '7' });
+  assert.equal(calls.filter((call) => call[0] === 'prepare-profile').length, 2);
+  const { receipt } = fixture();
+  await registerDurableProcess(controller, receipt, { sessionKey: 'same-key' });
+  assert.throws(() => controller.claimDispatchReservation({ sessionKey: 'same-key', generationId: 'generation-dispatch',
+    botName: 'bot-a', telegramChatId: '100', telegramMessageId: '1' }), { code: 'CODEX_DISPATCH_BINDING_MISSING' });
+});
+
+test('environment, proxy endpoint, key identity and key content invalidate cached clients', async (t) => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'polygram-proxy-cache-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const keyFile = path.join(root, 'key');
+  const secret = 'test-cache-secret';
+  const processEnv = { HOME: '/home/service', TMPDIR: '/srv/tmp' };
+  for (const change of [
+    () => { processEnv.HOME = '/home/changed'; },
+    (config) => { config.codex.proxy.baseUrl = 'http://127.0.0.1:8319/v1'; },
+    () => { fs.writeFileSync(keyFile, 'changed-key'); },
+    () => { fs.writeFileSync(keyFile, secret + '\n'); },
+    () => { fs.renameSync(keyFile, keyFile + '.old'); fs.writeFileSync(keyFile, secret, { mode: 0o600 }); },
+  ]) {
+    fs.writeFileSync(keyFile, secret, { mode: 0o600 });
+    const config = trustedConfig();
+    config.codex.proxy = { baseUrl: 'http://127.0.0.1:8318/v1', clientKeyFile: keyFile };
+    processEnv.HOME = '/home/service';
+    const { controller, receipt } = fixture({ configOverride: config, controllerOptions: { processEnv } });
+    await controller.prepareSession({ sessionKey: '100', chatId: '100' });
+    change(config);
+    assert.throws(() => controller.clientFactory({ sessionKey: '100', expectedStaticProfile: receipt.expectedStaticProfile }),
+      (error) => { assert.doesNotMatch(String(error), new RegExp(secret)); return error.code === 'CODEX_PREFLIGHT_PROFILE_MISMATCH'; });
+  }
+});
+
+test('trusted-to-beta idle profile change requires process replacement', async () => {
+  const config = trustedConfig();
+  const { controller, receipt } = fixture({ configOverride: config });
+  await controller.prepareSession({ sessionKey: '100', chatId: '100' });
+  const proc = await registerDurableProcess(controller, receipt);
+  delete config.codex.access;
+  await controller.prepareSession({ sessionKey: '100', chatId: '100' });
+  assert.equal(controller.processReplacementReason('100', proc), 'deployment-config-drift');
+});
+
+
+test('malformed trusted deployment fails explicitly on Codex preparation while Claude stays usable', async () => {
+  const config = trustedConfig();
+  config.codex.access.commandPath = 'relative';
+  const { controller } = fixture({ configOverride: config });
+  await assert.rejects(controller.prepareSession({ sessionKey: '100', chatId: '100' }),
+    { code: 'CODEX_DEPLOYMENT_CONFIG_INVALID' });
+  config.chats['100'].pm = 'sdk';
+  assert.equal(await controller.prepareSession({ sessionKey: '100', chatId: '100' }), null);
+});
+
+test('queued turn start cannot enter an old trusted process after deployment drift', async () => {
+  const config = trustedConfig();
+  const { controller, receipt, calls } = fixture({ configOverride: config });
+  await controller.prepareSession({ sessionKey: '100', chatId: '100' });
+  const proc = await registerDurableProcess(controller, receipt);
+  proc.providerSessionId = 'thread-queued-1';
+  bindPreparedTurn(proc, { attemptId: 'queued-1', clientUserMessageId: 'user-queued-1' });
+  delete config.codex.access;
+  await assert.rejects(controller.checkpointSink({ kind: 'request-prepared', method: 'turn/start',
+    generationId: proc.generationId, hostIdentity: 'host:current', bootSessionIdentity: 'boot:current',
+    attemptId: 'queued-1', threadId: 'thread-queued-1', clientUserMessageId: 'user-queued-1' }), { code: 'CODEX_PREFLIGHT_PROFILE_MISMATCH' });
+  assert.equal(calls.filter((call) => call[0] === 'turn-start-prepared').length, 0);
+});

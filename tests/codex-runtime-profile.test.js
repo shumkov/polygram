@@ -1149,3 +1149,152 @@ describe('owned Codex native-beta runtime profile', () => {
     );
   });
 });
+
+
+function trustedProjection(f, { proxyKey = null, overrides = {} } = {}) {
+  const config = ownedConfig(f);
+  config.default_permissions = 'polygram-trusted';
+  config.web_search = 'live';
+  config.memories = { generate_memories: false, use_memories: false };
+  config.shell_environment_policy.set.HOME = f.serviceHome;
+  config.shell_environment_policy.set.PATH = '/usr/local/bin:/usr/bin:/bin';
+  config.permissions = { 'polygram-trusted': { filesystem: { ':root': 'write' }, network: { enabled: true } } };
+  if (proxyKey !== null) {
+    config.model_provider = 'cliproxyapi';
+    config.model_providers = { cliproxyapi: { name: 'CLIProxyAPI', base_url: 'http://127.0.0.1:8318/v1',
+      wire_api: 'responses', requires_openai_auth: true, experimental_bearer_token: proxyKey, supports_websockets: true } };
+  }
+  const filesystem = { glob_scan_max_depth: null, ':root': 'write' };
+  const projection = projectedConfig(f, {
+    modelProvider: config.model_provider,
+    defaultPermissions: 'polygram-trusted', webSearch: 'live',
+    permissionProfiles: [{ id: 'polygram-trusted', extends: null, networkEnabled: true,
+      filesystemSha256: digest(filesystem), filesystem: [{ rootSha256: digest(':root'), access: 'write' }] }],
+    modelProviders: proxyKey === null ? { count: 0, keySha256: [] } : { count: 1, keySha256: [digest('cliproxyapi')] },
+    ...overrides,
+  });
+  const results = projectedResults(f, { config: projection, layers: [{ type: 'user', version: 'user-v1', disabled: false,
+    configSha256: digest(config) }], permissionPages: [{ data: [{ id: 'polygram-trusted', allowed: true,
+    descriptionSha256: null }], nextCursor: null }] });
+  return { config, results };
+}
+
+const trustedAccess = { mode: 'trusted', chatIds: ['68861949'], commandPath: '/usr/local/bin:/usr/bin:/bin' };
+
+test('trusted profile advertises full filesystem, network and web with real HOME and no daemon environment', async (t) => {
+  const f = fixture(t);
+  const { results } = trustedProjection(f);
+  const { builder, clients } = createBuilder(f, results);
+  const profile = await builder.prepare(prepareOptions(f, { access: trustedAccess }));
+  assert.equal(profile.permissionProfileId, 'polygram-trusted');
+  assert.equal(profile.expectedConfig.webSearch, 'live');
+  const raw = readFileSync(path.join(f.codexHome, 'config.toml'), 'utf8');
+  assert.match(raw, /default_permissions = "polygram-trusted"/);
+  assert.match(raw, /":root" = "write"/);
+  assert.doesNotMatch(raw, /"deny"|:minimal|:workspace_roots/);
+  assert.match(raw, new RegExp('HOME = ' + JSON.stringify(f.serviceHome)));
+  assert.match(raw, /PATH = "\/usr\/local\/bin:\/usr\/bin:\/bin"/);
+  assert.match(raw, /generate_memories = false/);
+  assert.match(raw, /use_memories = false/);
+  assert.equal(clients[0].options.env.TELEGRAM_BOT_TOKEN, undefined);
+});
+
+test('trusted proxy renders the explicit Responses provider privately and pins its config layer', async (t) => {
+  const f = fixture(t);
+  const key = 'test-proxy-secret';
+  const keyFile = path.join(f.root, 'proxy.key');
+  writeFileSync(keyFile, key + '\n', { mode: 0o600 });
+  const { results } = trustedProjection(f, { proxyKey: key });
+  const { builder } = createBuilder(f, results);
+  const profile = await builder.prepare(prepareOptions(f, { access: trustedAccess,
+    proxy: { baseUrl: 'http://127.0.0.1:8318/v1', clientKeyFile: keyFile } }));
+  assert.equal(profile.expectedConfig.modelProvider, 'cliproxyapi');
+  assert.doesNotMatch(JSON.stringify(profile), new RegExp(key));
+  const raw = readFileSync(path.join(f.codexHome, 'config.toml'), 'utf8');
+  assert.match(raw, /model_provider = "cliproxyapi"/);
+  assert.match(raw, /wire_api = "responses"/);
+  assert.match(raw, /requires_openai_auth = true/);
+  assert.match(raw, /supports_websockets = true/);
+  assert.match(raw, /experimental_bearer_token = "test-proxy-secret"/);
+  writeFileSync(keyFile, 'changed-secret', { mode: 0o600 });
+  await assert.rejects(builder.prepare(prepareOptions(f, { access: trustedAccess,
+    proxy: { baseUrl: 'http://127.0.0.1:8318/v1', clientKeyFile: keyFile } })),
+    { code: 'CODEX_OWNED_CONFIG_DRIFT' });
+  assert.equal(readFileSync(path.join(f.codexHome, 'config.toml'), 'utf8'), raw);
+});
+
+test('proxy rejects external endpoints and unsafe or missing key files without disclosure', async (t) => {
+  const f = fixture(t);
+  const { builder } = createBuilder(f);
+  const keyFile = path.join(f.root, 'proxy.key');
+  writeFileSync(keyFile, 'must-never-leak', { mode: 0o644 });
+  for (const proxy of [
+    { baseUrl: 'https://example.com/v1', clientKeyFile: keyFile },
+    { baseUrl: 'http://127.0.0.1:8318/v1?secret=must-never-leak', clientKeyFile: keyFile },
+    { baseUrl: 'http://127.0.0.1:8318/v1', clientKeyFile: keyFile },
+    { baseUrl: 'http://127.0.0.1:8318/v1', clientKeyFile: keyFile + '-missing' },
+  ]) {
+    await assert.rejects(builder.prepare(prepareOptions(f, { proxy })), (error) => {
+      assert.equal(error.code, 'CODEX_DEPLOYMENT_CONFIG_INVALID');
+      assert.doesNotMatch(String(error) + JSON.stringify(error), /must-never-leak/);
+      return true;
+    });
+  }
+});
+
+test('trusted projected policy rejects partial network or filesystem relaxations', async (t) => {
+  for (const overrides of [{ webSearch: 'disabled' }, { modelProvider: 'openai-unexpected' },
+    { permissionProfiles: [{ id: 'polygram-trusted', extends: null, networkEnabled: false,
+      filesystemSha256: digest({ glob_scan_max_depth: null, ':root': 'write' }),
+      filesystem: [{ rootSha256: digest(':root'), access: 'write' }] }] }]) {
+    const f = fixture(t);
+    const { results } = trustedProjection(f, { overrides });
+    const { builder } = createBuilder(f, results);
+    await assert.rejects(builder.prepare(prepareOptions(f, { access: trustedAccess })),
+      { code: 'CODEX_RUNTIME_POLICY_DRIFT' });
+  }
+});
+
+
+test('proxy can be selected independently while the beta command policy remains limited', async (t) => {
+  const f = fixture(t);
+  const key = 'beta-proxy-test-key';
+  const keyFile = path.join(f.root, 'proxy.key');
+  writeFileSync(keyFile, key, { mode: 0o600 });
+  const config = ownedConfig(f);
+  config.model_provider = 'cliproxyapi';
+  config.model_providers = { cliproxyapi: { name: 'CLIProxyAPI', base_url: 'http://127.0.0.1:8318/v1',
+    wire_api: 'responses', requires_openai_auth: true, experimental_bearer_token: key, supports_websockets: true } };
+  const results = projectedResults(f, { config: { modelProvider: 'cliproxyapi',
+    modelProviders: { count: 1, keySha256: [digest('cliproxyapi')] } }, layers: [{
+    type: 'user', version: 'user-v1', disabled: false, configSha256: digest(config),
+  }] });
+  const { builder } = createBuilder(f, results);
+  const profile = await builder.prepare(prepareOptions(f, {
+    proxy: { baseUrl: 'http://127.0.0.1:8318/v1', clientKeyFile: keyFile },
+  }));
+  assert.equal(profile.permissionProfileId, CODEX_PERMISSION_PROFILE_ID);
+  assert.equal(profile.expectedConfig.webSearch, 'disabled');
+  assert.equal(profile.expectedConfig.permissionProfiles[0].networkEnabled, false);
+  assert.equal(profile.expectedConfig.modelProvider, 'cliproxyapi');
+  assert.doesNotMatch(JSON.stringify(profile), new RegExp(key));
+});
+
+test('proxy cannot silently use native inference or a mismatched provider configuration', async (t) => {
+  for (const mismatch of ['native', 'registry', 'layer']) {
+    const f = fixture(t);
+    const key = 'private-provider-config-test';
+    const keyFile = path.join(f.root, 'proxy.key');
+    writeFileSync(keyFile, key, { mode: 0o600 });
+    const { results } = trustedProjection(f, { proxyKey: key });
+    if (mismatch === 'native') results['config/read'].config.modelProvider = 'openai';
+    if (mismatch === 'registry') results['config/read'].config.modelProviders = { count: 0, keySha256: [] };
+    if (mismatch === 'layer') results['config/read'].layers[0].configSha256 = digest({ wrong: 'provider' });
+    const { builder } = createBuilder(f, results);
+    await assert.rejects(builder.prepare(prepareOptions(f, { access: trustedAccess,
+      proxy: { baseUrl: 'http://127.0.0.1:8318/v1', clientKeyFile: keyFile } })), (error) => {
+      assert.doesNotMatch(String(error) + JSON.stringify(error), new RegExp(key));
+      return error.code === 'CODEX_RUNTIME_POLICY_DRIFT';
+    });
+  }
+});

@@ -411,7 +411,7 @@ describe('buildPrompt — full integration', () => {
     assert.match(p, /native Codex beta/);
     assert.doesNotMatch(p, /macOS/);
     assert.match(p, /command network and model-native web search are disabled/);
-    assert.match(p, /product MCP tools and interactive approvals are unavailable/);
+    assert.match(p, /product MCP tools and interactive approvals are unavailable/i);
     assert.match(p, /Keep long-running commands in the foreground/);
     assert.match(p, /Do not start detached or background servers/);
     assert.doesNotMatch(p, /mcp__polygram-bridge__reply/);
@@ -611,4 +611,14 @@ describe('buildPrompt — full integration', () => {
     const security = p.split('\n').find((l) => l.startsWith('Security:'));
     assert.match(security, /<voice>/);
   });
+});
+
+
+test('trusted Codex preamble describes the effective filesystem and live network policy', () => {
+  const prompt = buildPrompt({ msg: { message_id: 1, date: 1700000000, chat: { id: 100 }, from: { id: 100, first_name: 'Ivan' }, text: 'hello' }, backend: 'codex',
+    codexAccess: { mode: 'trusted', chatIds: ['100'], commandPath: '/usr/bin:/bin' } });
+  assert.match(prompt, /service user.*filesystem rights/);
+  assert.match(prompt, /command network and model-native web search are enabled/);
+  assert.match(prompt, /product MCP tools and interactive approvals are unavailable/i);
+  assert.doesNotMatch(prompt, /network.*disabled|credential isolation|native Codex beta/);
 });
