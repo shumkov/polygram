@@ -7,6 +7,9 @@ const {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
+  lstatSync,
+  unlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -1152,6 +1155,7 @@ describe('owned Codex native-beta runtime profile', () => {
 
 
 function trustedProjection(f, { proxyKey = null, overrides = {} } = {}) {
+  writeFileSync(path.join(f.workspace, 'AGENTS.md'), 'synthetic trusted root instructions', { mode: 0o600 });
   const config = ownedConfig(f);
   config.default_permissions = 'polygram-trusted';
   config.web_search = 'live';
@@ -1297,4 +1301,70 @@ test('proxy cannot silently use native inference or a mismatched provider config
       return error.code === 'CODEX_RUNTIME_POLICY_DRIFT';
     });
   }
+});
+
+
+test('untrusted project root instructions remain one canonical file in the dedicated home', async (t) => {
+  const f = fixture(t);
+  const rootInstructions = path.join(f.workspace, 'AGENTS.md');
+  writeFileSync(rootInstructions, 'synthetic canonical instructions', { mode: 0o600 });
+  const { builder } = createBuilder(f);
+  const profile = await builder.prepare(prepareOptions(f));
+  assert.equal(lstatSync(path.join(f.codexHome, 'AGENTS.md')).isSymbolicLink(), true);
+  assert.equal(readlinkSync(path.join(f.codexHome, 'AGENTS.md')), rootInstructions);
+  builder.reattest(profile);
+  writeFileSync(rootInstructions, 'ordinary canonical edit');
+  builder.reattest(profile);
+  assert.equal(readFileSync(path.join(f.codexHome, 'AGENTS.md'), 'utf8'), 'ordinary canonical edit');
+});
+
+test('foreign home instructions and overrides cannot replace the admitted canonical root', async (t) => {
+  for (const kind of ['regular', 'foreign', 'dangling', 'override']) {
+    const f = fixture(t);
+    writeFileSync(path.join(f.workspace, 'AGENTS.md'), 'canonical', { mode: 0o600 });
+    mkdirSync(f.codexHome, { mode: 0o700 });
+    const target = path.join(f.codexHome, kind === 'override' ? 'AGENTS.override.md' : 'AGENTS.md');
+    if (kind === 'regular' || kind === 'override') writeFileSync(target, 'must survive', { mode: 0o600 });
+    else symlinkSync(path.join(f.root, kind === 'foreign' ? 'foreign.md' : 'missing.md'), target);
+    if (kind === 'foreign') writeFileSync(path.join(f.root, 'foreign.md'), 'foreign', { mode: 0o600 });
+    const { builder } = createBuilder(f);
+    await assert.rejects(builder.prepare(prepareOptions(f)), { code: 'CODEX_INSTRUCTION_BINDING_DRIFT' });
+    if (kind === 'regular' || kind === 'override') assert.equal(readFileSync(target, 'utf8'), 'must survive');
+  }
+});
+
+test('a dedicated home cannot serve another workspace or admit retargeted instructions', async (t) => {
+  const f = fixture(t);
+  writeFileSync(path.join(f.workspace, 'AGENTS.md'), 'canonical', { mode: 0o600 });
+  const { builder } = createBuilder(f);
+  const profile = await builder.prepare(prepareOptions(f));
+  const otherWorkspace = path.join(f.root, 'other-workspace');
+  mkdirSync(otherWorkspace, { mode: 0o700 });
+  const otherInstructions = path.join(otherWorkspace, 'AGENTS.md');
+  writeFileSync(otherInstructions, 'foreign', { mode: 0o600 });
+  await assert.rejects(builder.prepare(prepareOptions(f, { workspace: otherWorkspace })), { code: 'CODEX_OWNED_CONFIG_DRIFT' });
+  unlinkSync(path.join(f.codexHome, 'AGENTS.md'));
+  symlinkSync(otherInstructions, path.join(f.codexHome, 'AGENTS.md'));
+  assert.throws(() => builder.reattest(profile), { code: 'CODEX_INSTRUCTION_BINDING_DRIFT' });
+});
+
+test('introducing root instructions or a home override invalidates a prepared profile', async (t) => {
+  for (const kind of ['root', 'override']) {
+    const f = fixture(t);
+    const { builder } = createBuilder(f);
+    const profile = await builder.prepare(prepareOptions(f));
+    const target = kind === 'root' ? path.join(f.workspace, 'AGENTS.md') : path.join(f.codexHome, 'AGENTS.override.md');
+    writeFileSync(target, 'new authority', { mode: 0o600 });
+    assert.throws(() => builder.reattest(profile), { code: 'CODEX_INSTRUCTION_BINDING_DRIFT' });
+  }
+});
+
+
+test('global service Codex home is rejected before any provisioning write', async (t) => {
+  const f = fixture(t);
+  const { builder } = createBuilder(f);
+  const codexHome = path.join(f.serviceHome, '.codex');
+  await assert.rejects(builder.prepare(prepareOptions(f, { codexHome })), { code: 'CODEX_INSTRUCTION_BINDING_DRIFT' });
+  assert.equal(require('node:fs').existsSync(codexHome), false);
+  assert.equal(require('node:fs').existsSync(path.join(f.workspace, '.codex-command-home')), false);
 });

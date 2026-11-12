@@ -650,6 +650,27 @@ async function registerDurableProcess(controller, receipt, {
   return proc;
 }
 
+test('instruction ownership survives receipt normalization and fences registered dispatch on drift', async () => {
+  let rebuilt;
+  let drift = false;
+  const owned = Object.freeze({ codexHome: '/srv/codex-home', cwd: '/srv/workspace' });
+  const runtimeProfileBuilder = {
+    async prepare() { return owned; },
+    reattest(profile) {
+      assert.equal(profile, owned, 'reattest the original builder-owned profile');
+      if (drift) throw Object.assign(new Error('instruction drift'), { code: 'CODEX_INSTRUCTION_BINDING_DRIFT' });
+    },
+  };
+  rebuilt = fixture({ controllerOptions: { runtimeProfileBuilder } });
+  await rebuilt.controller.prepareSession({ sessionKey: '100', chatId: '100' });
+  await registerDurableProcess(rebuilt.controller, rebuilt.receipt);
+  drift = true;
+  assert.throws(() => rebuilt.controller.claimDispatchReservation({
+    sessionKey: '100', generationId: 'generation-dispatch', botName: 'bot-a',
+    telegramChatId: '100', telegramMessageId: '42',
+  }), { code: 'CODEX_INSTRUCTION_BINDING_DRIFT' });
+});
+
 test('durable dispatch wrappers bind reservation mutations to the current generation owner', async () => {
   const { calls, controller, receipt } = fixture();
   await controller.prepareSession({
@@ -2050,7 +2071,8 @@ test('hook-enabled clients are reattested and receive only the prepared manifest
   });
 
   assert.deepEqual(preparedInput.hooks, hookOptions);
-  assert.equal(reattested.length, 2);
+  assert(reattested.length >= 4);
+  assert(reattested.every((profile) => profile === rebuilt.receipt.expectedStaticProfile));
   assert.equal(reattested[0], rebuilt.receipt.expectedStaticProfile);
   assert.equal(
     rebuilt.clientOptions[0].hookManifest,

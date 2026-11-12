@@ -52,15 +52,15 @@ describe('pinned Codex binary resolution', () => {
   test('production pins are the reviewed Orchestra target receipts', () => {
     assert.deepEqual(DARWIN_PIN, {
       target: 'aarch64-apple-darwin',
-      cliVersion: 'codex-cli 0.145.0',
+      cliVersion: 'codex-cli 0.167.2',
       binarySha256:
-        '1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590',
+        '97bc82fd46f117cf10efb95e6ff0c81dc4784f5797bcdc2cb75093ba09e4def0',
     });
     assert.deepEqual(LINUX_PIN, {
       target: 'x86_64-unknown-linux-musl',
-      cliVersion: 'codex-cli 0.145.0',
+      cliVersion: 'codex-cli 0.167.2',
       binarySha256:
-        'a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14',
+        'a9672d0fa0dd8fcf8cad136fa0d056b914bc046f5ac3d78f4a5cf390655af56b',
     });
   });
 
@@ -114,12 +114,12 @@ describe('pinned Codex binary resolution', () => {
 
     await assert.rejects(
       resolve({
-        binaryPath: '/definitely/missing/polygram/codex-0.145.0',
+        binaryPath: '/definitely/missing/polygram/codex-0.167.2',
       }),
       (error) => (
         error instanceof CodexBinaryError
         && error.code === 'CODEX_BINARY_MISSING'
-        && /0\.145\.0/.test(error.action)
+        && /0\.167\.2/.test(error.action)
       ),
     );
   });
