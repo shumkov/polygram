@@ -28,6 +28,25 @@ checked against the installed package by `npm test`) and varies only
 `pathToClaudeCodeExecutable`. The matrix therefore compares CLI versions,
 not SDK versions.
 
+For the pending .283/.322 evaluation, the separate
+`claude-2.1.322-discovery.json` contains provisional candidate expectations.
+Select it with `--manifest /absolute/path/to/claude-2.1.322-discovery.json`
+and `--version candidate`. Discovery rejects unfiltered runs and
+`--accept-run` before creating artifacts or launching a child; its summaries
+are non-authoritative. The selected absolute path and exact content hash
+are runner-owned child inputs. The default accepted manifest is unchanged.
+See [the expectation dossier](../../docs/claude-322-discovery-dossier.md)
+before requesting provider calls. A distinct reviewed acceptance manifest
+and recorded gate commit are still required before a pin change.
+
+The local API-error and mailbox stubs put only bypass consent into each
+fresh project's `.claude/settings.local.json`, which is included by
+`--setting-sources project,local`. Explicit Channels-unavailable output
+reports `BLOCKED` (exit 2) before sending a prompt. These fixtures still
+need supported Channels account/feature authorization; a local model stub
+does not enable that prerequisite. Use isolated HOME, Keychain/network
+denial and a private tmux server for credential-free preparation.
+
 Preserve and attest the old executable outside both mutable binary
 trees before running the candidate. Then run:
 

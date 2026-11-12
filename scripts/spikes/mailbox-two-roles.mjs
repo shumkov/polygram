@@ -33,6 +33,8 @@
  *
  * Output is content-free: PASS/FAIL per check, ids, counts and timings. Exit
  * 0 when every check passes, 1 on any failure, 2 when the run could not start.
+ * Disposable local settings supply bypass consent. An explicit Channels
+ * prerequisite rejection reports BLOCKED before either role receives a prompt.
  *
  * Side-effects: a dedicated tmux server (`tmux -L pgmbx`), a mode-0700 temp
  * dir (removed at exit) that holds this run's copy of the pinned claude
@@ -66,6 +68,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
+import { rejectUnavailableChannels, writeFixtureConsent } from './cli-fixture-prerequisites.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -263,6 +266,7 @@ if (!VENDOR_DIR_OVERRIDE) process.env.ORCHESTRA_CLAUDE_VENDOR_DIR = path.join(wo
 const ipcDir = fs.mkdtempSync(path.join(os.homedir(), '.pgmbx-ipc-'));
 fs.chmodSync(ipcDir, 0o700);
 const cwds = Object.fromEntries(Object.keys(ROLES).map((role) => [role, fs.realpathSync(fs.mkdtempSync(path.join(work, `${role}-`)))]));
+for (const cwd of Object.values(cwds)) writeFixtureConsent({ cwd, fixtureRoot: work });
 const launcher = path.join(work, 'launcher.sh');
 fs.writeFileSync(launcher, [
   '#!/bin/sh',
@@ -412,6 +416,9 @@ try {
     throw err;
   }
   log(`${ts()} both role sessions started`);
+  for (const proc of procs.values()) {
+    rejectUnavailableChannels(await proc.runner.captureWide(proc.tmuxSession));
+  }
   jobs.start(); mailbox.start();
   // The production timer runs every 60 s; a faster pump keeps a deferred job
   // from stretching the run.
@@ -520,9 +527,10 @@ try {
   log(`\n${exitCode === 0 ? 'PASS' : 'FAIL'} (${checks.filter((c) => c.ok).length}/${checks.length} checks)`);
 } catch (err) {
   if (err !== null) {
-    exitCode = 1;
-    log(`spike failed: ${err?.stack || err?.message || err}`);
-    log('FAIL');
+    const blocked = err?.code === 'CHANNELS_FIXTURE_UNAVAILABLE';
+    exitCode = blocked ? 2 : 1;
+    log(`spike ${blocked ? 'blocked' : 'failed'}: ${err?.stack || err?.message || err}`);
+    log(blocked ? 'BLOCKED' : 'FAIL');
   }
 } finally {
   clearInterval(pump);

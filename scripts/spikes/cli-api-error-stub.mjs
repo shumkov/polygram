@@ -24,7 +24,10 @@
  * (feature flags) still runs, because Channels depends on it. The CLI's
  * auto-updater is disabled for the run.
  *
- * Ends with PASS or FAIL (exit 0 / 1) against the mode's expected outcome.
+ * The disposable project's included local settings supply bypass consent.
+ * Channels still needs supported account/feature authorization at startup.
+ * Ends with PASS / FAIL (exit 0 / 1), or BLOCKED (exit 2) on an explicit
+ * Channels prerequisite rejection before sending the test prompt.
  *
  * Usage (from the polygram package root; needs tmux and the pinned claude from
  * the Agent SDK package or ~/.local/share/claude/versions):
@@ -65,6 +68,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
+import { rejectUnavailableChannels, writeFixtureConsent } from './cli-fixture-prerequisites.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -256,6 +260,7 @@ const work = fs.mkdtempSync(path.join(os.tmpdir(), 'pgapierr-'));
 fs.chmodSync(work, 0o700);
 if (!VENDOR_DIR_OVERRIDE) process.env.ORCHESTRA_CLAUDE_VENDOR_DIR = path.join(work, 'claude-bin');
 const cwd = fs.realpathSync(fs.mkdtempSync(path.join(work, 'cwd-')));
+writeFixtureConsent({ cwd, fixtureRoot: work });
 if (WITH_AGENT) {
   fs.mkdirSync(path.join(cwd, '.claude', 'agents'), { recursive: true });
   fs.writeFileSync(path.join(cwd, '.claude', 'agents', 'stubagent.md'),
@@ -367,6 +372,7 @@ try {
     existingSessionId: null,
   });
   log(`${ts()} claude started session=${proc.claudeSessionId}`);
+  rejectUnavailableChannels(await proc.runner.captureWide(proc.tmuxSession));
 
   const first = await runTurn('turn-1', 'Reply with the single word PONG.', 1);
   if (INTERRUPT_AFTER_MS != null) {
@@ -506,9 +512,10 @@ try {
     log('\nPASS');
   }
 } catch (err) {
-  exitCode = 1;
-  log(`spike failed: ${err.stack || err.message}`);
-  log('FAIL');
+  const blocked = err.code === 'CHANNELS_FIXTURE_UNAVAILABLE';
+  exitCode = blocked ? 2 : 1;
+  log(`spike ${blocked ? 'blocked' : 'failed'}: ${err.stack || err.message}`);
+  log(blocked ? 'BLOCKED' : 'FAIL');
 } finally {
   // claude writes its session file as it exits, which can be after the tmux
   // session is gone; removing the project entry before then leaves it behind.

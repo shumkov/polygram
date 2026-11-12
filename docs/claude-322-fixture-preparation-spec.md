@@ -1,0 +1,41 @@
+# Claude .283/.322 fixture and discovery preparation
+
+Scope: local gate preparation only, based on `960b0be3b191f5a336bab8d5d6577d411c548a3a`. Keep SDK/Orchestra/CLI pins unchanged, the parent piddock checkout read-only, and all source/docs uncommitted. This Orca child belongs to Orchestra's `claude-runtime-upgrade` worktree. Provider approval remains unanswered.
+
+## Research and decision
+
+Both local CLI drivers force `--setting-sources project,local`; synthetic consent in user settings is excluded. The official [settings reference](https://code.claude.com/docs/en/settings-reference#skipdangerousmodepermissionprompt) permits `skipDangerousModePermissionPrompt: true` in a local file or `--settings` file; background sessions are more restrictive. Native .283/.322 bytes both consult local/flag settings for interactive startup consent. Use a single fresh `.claude/settings.local.json` under each disposable driver cwd, preserving included setting sources and normal Orchestra launch behavior. No user settings or real login are needed to establish that narrow prerequisite.
+
+The official [Channels docs](https://code.claude.com/docs/en/channels) require Anthropic authentication and feature availability, with organization enablement where applicable. The [development flag](https://code.claude.com/docs/en/channels-reference#test-during-the-research-preview) permits a custom server; it does not substitute for feature/account authorization. Attested .283 bytes test the remote `tengu_harbor` feature; .322 additionally consults the `allow_channels` authorization verdict. No documented credential-free force-enable was found. Do not set synthetic feature flags, forge account cache entries, or weaken external-network/Keychain denial. Consent success followed by an explicit unavailable banner is a concrete supported-prerequisite blocker, not a compatibility failure or success.
+
+Alternatives rejected: import real HOME/caches (isolation violation); re-enable user settings (changes the gate's input surface); automatically click consent on every startup (less deterministic and hides source-selection behavior); change Orchestra's production hook settings (unnecessary behavior change); change the default accepted .220/.283 manifest in place (risks treating hypotheses as accepted behavior).
+
+## Minimal implementation
+
+1. Add a small shared fixture helper called only with a fresh driver cwd and its fresh temp root. Verify canonical strict containment, create `.claude/settings.local.json` with only the consent key, mode 0600 and exclusive creation. Refuse overwrite or symlink escape. Both checked local drivers call it before spawning the CLI.
+2. The helper also recognizes only explicit Channels-unavailable/policy/provider messages. After readiness and before sending a test prompt, local drivers capture the pane once and throw a dedicated precondition error if that negative evidence is present. Report BLOCKED with exit 2 in their existing catch/finally paths. Absence of a known banner does not prove enrollment; all existing delivery/error assertions still run. No new waiver or synthetic success.
+3. Add optional `--manifest <absolute-path>` selection to the checked matrix runner. Pass its absolute path to every child using runner-owned `CLAUDE_GATE_MANIFEST_PATH`; `readGateExpectations()` uses that path and the existing exact-content hash. Keep the current checked manifest and installed SDK .283 unchanged. Protect the new environment key from scenario/driver override alongside existing selection keys.
+4. Add `validationStage: discovery` to a separate .283/.322 manifest. Missing stage means legacy acceptance; only explicit `acceptance` or `discovery` are valid. Discovery requires `--version candidate`, cannot run acceptance or an unfiltered matrix, and always produces a non-authoritative summary. Reject violations before artifacts, executable attestation, or child spawn. Accepted-stage manifests retain all current proof/oracle/summary checks.
+5. The .322 discovery entry is explicitly provisional. Retain .283 expectations intact, remove .220 from the separate manifest, hypothesize .322 behavior from the prior comparator only where no observation exists, bind Workflow anchors to candidate bytes, and do not inherit the .283 delayed-MCP opt-in waiver. Record provenance and unknowns in a companion dossier. Promote only after real observations and independent review, on a distinct recorded gate commit; no accepted .322 entry is created here.
+
+## Verification and failure cases
+
+Test supported consent file content/mode, exclusive creation, root escape and symlink rejection; explicit negative Channels classification and no positive claim from silence. Run the same fixture against old/new attested binaries in synthetic HOME/CODEX_HOME, private short TMUX_TMPDIR, dummy loopback auth, external-network denial and Keychain denial. One attempt per version after the changed prerequisite; if both show missing Channels, stop all downstream modes rather than repeat the same absent prerequisite.
+
+Regression first: write tests for external manifest propagation/hash mismatch and for discovery acceptance/unfiltered rejection before implementing the mechanism, and observe them fail against unchanged code. Cover legacy accepted behavior, unknown stage rejection, runner-owned env override rejection, and refusal before any artifact creation/child execution. Then pass the focused matrix/executable tests and fixture helper tests. Do not run broad live matrix commands.
+
+No repository-mandated monetary ceiling was found in AGENTS.md or the checked matrix drivers. Retain actual runner limits (15 minutes per child) and any per-driver maxTurns/deadlines. The request will state up to 13 candidate discovery invocations (195 minutes of child deadlines), then separately one expected 23-cell authoritative matrix (345 minutes), each stopping on the first failure and without automatic paid retries. These are invocation/time scope, not a promised API-request, token, cost or cleanup bound. No new spending-cap or metering project is required. Tracking issue, accepted matrix on one gate commit, aligned reviewed pins, separately reviewed consumer update and both 24h soaks remain mandatory.
+
+Independent spec and final code review receipts, actual local outcomes and exact remaining account prerequisites will be recorded after execution.
+
+## Review and verification receipts
+
+Three independent built-in reviewers examined the spec before implementation: `/root/spec_compatibility`, `/root/spec_isolation`, and `/root/spec_scope`, all CLEAN after their lenses were addressed. They performed read-only one-shot reviews; no long-running helper worker was launched.
+
+The same three independently reviewed the actual final child diff. Compatibility and scope returned CLEAN. Isolation found a malformed `--accept-run` edge case: a trailing flag could become candidate discovery rather than rejected cleanup. A fake-binary subprocess regression failed before the correction and passed afterward; the runner now detects flag presence and rejects absent/option-like prefixes before effects. Isolation re-reviewed and returned CLEAN. No outstanding must-fixes.
+
+Final focused verification: 72 tests passed, 0 failed, 0 skipped, using:
+`node --test tests/claude-fixture-prerequisites.test.js tests/claude-discovery-manifest.test.js tests/claude-gate-matrix.test.js tests/claude-executable-spike.test.js`.
+Initial seven new tests were observed failing before implementation (agent observation, not a retained raw log). The later malformed-accept red/green raw logs are retained. Syntax checks for both changed local drivers and the runner, plus `git diff --check`, passed.
+
+Native included-consent attempts ran exactly once per attested binary under the previously verified OS sandbox and scrubbed synthetic environment. Both reached readiness and exited 2 on explicit Channels absence before the turn sender. Candidate was 2.966s, old 3.466s. No downstream retry, mailbox execution, broad matrix, provider call, account mutation or pin change followed. Evidence root: `/tmp/orchestra-claude-upgrade-research-3agLJs`; followup report: `/tmp/orchestra-claude-upgrade-followup-report.md`.

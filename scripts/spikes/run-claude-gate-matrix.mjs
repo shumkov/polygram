@@ -11,6 +11,7 @@ import {
 } from './claude-executable.mjs';
 import {
   assertSafeRunPrefix,
+  assertClaudeMatrixMode,
   buildClaudeMatrixChildEnv,
   buildClaudeMatrixRuns,
   evaluateMatrixCrossVersionEvidence,
@@ -36,8 +37,11 @@ const oldBin = argument('--old-bin');
 const candidateBin = argument('--candidate-bin');
 const artifactBaseDir = argument('--artifact-base');
 const acceptedRunPrefix = argument('--accept-run');
+const accepting = process.argv.includes('--accept-run');
 const onlyScenario = argument('--scenario');
 const onlyVersion = argument('--version');
+const manifestPath = argument('--manifest') || MATRIX_MANIFEST_PATH;
+if (!path.isAbsolute(manifestPath)) throw new TypeError('--manifest must be an absolute path');
 const runPrefix = argument('--run-prefix') || (
   new Date().toISOString().replace(/[:.]/g, '-')
 );
@@ -45,14 +49,18 @@ if (!artifactBaseDir || !oldBin || !candidateBin) {
   console.error(
     'usage: run-claude-gate-matrix.mjs --old-bin <abs> '
       + '--candidate-bin <abs> --artifact-base <abs> '
-      + '[--run-prefix <id>] [--version old|candidate] [--scenario <id>]\n'
+      + '[--manifest <abs>] [--run-prefix <id>] [--version old|candidate] [--scenario <id>]\n'
       + '   or: run-claude-gate-matrix.mjs --artifact-base <abs> '
       + '--old-bin <abs> --candidate-bin <abs> --accept-run <run-prefix>',
   );
   process.exit(64);
 }
-const manifestText = fs.readFileSync(MATRIX_MANIFEST_PATH, 'utf8');
+const manifestText = fs.readFileSync(manifestPath, 'utf8');
 const manifest = JSON.parse(manifestText);
+assertClaudeMatrixMode(manifest, { onlyVersion, accepting });
+if (accepting && (!acceptedRunPrefix || acceptedRunPrefix.startsWith('--'))) {
+  throw new TypeError('--accept-run requires a run prefix');
+}
 const manifestSha256 = hashSensitiveString(manifestText);
 if (acceptedRunPrefix) {
   assertSafeRunPrefix(acceptedRunPrefix);
@@ -134,6 +142,7 @@ for (const [index, run] of runs.entries()) {
       env: buildClaudeMatrixChildEnv(process.env, {
         ...run.env,
         CLAUDE_GATE_MANIFEST_SHA256: manifestSha256,
+        CLAUDE_GATE_MANIFEST_PATH: manifestPath,
       }),
       encoding: 'utf8',
       timeout: 15 * 60_000,

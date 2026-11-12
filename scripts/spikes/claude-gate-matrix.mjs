@@ -55,6 +55,7 @@ const RUNNER_OWNED_ENV_KEYS = new Set([
   'CLAUDE_GATE_EXPECTED_RESOLVED_MODEL',
   'CLAUDE_GATE_DOCUMENTED_WORKFLOW_SIZE_GUIDELINE',
   'CLAUDE_GATE_MANIFEST_SHA256',
+  'CLAUDE_GATE_MANIFEST_PATH',
 ]);
 const CROSS_VERSION_POLICIES = new Set(['single', 'all-pairs']);
 const VERSION_SPECIFIC_LIFECYCLE_ORACLES = new Map([
@@ -235,14 +236,29 @@ export const MATRIX_MANIFEST_PATH = fileURLToPath(
   new URL('./claude-2.1.283-matrix.json', import.meta.url),
 );
 
+export function assertClaudeMatrixMode(manifest, { onlyVersion, accepting = false } = {}) {
+  const stage = Object.hasOwn(manifest, 'validationStage') ? manifest.validationStage : 'acceptance';
+  if (!['acceptance', 'discovery'].includes(stage)) {
+    throw new TypeError('unknown matrix validationStage');
+  }
+  if (stage === 'discovery' && (accepting || onlyVersion !== 'candidate')) {
+    throw new Error('discovery requires --version candidate and cannot accept artifacts');
+  }
+  return stage;
+}
+
 // Drivers judge their own evidence against the same reviewed manifest the
 // runner schedules from, keyed by the version the executable attested. Under
 // the runner the manifest must still be the exact bytes it scheduled from.
 export function readGateExpectations(
   attestedVersion,
-  { expectedManifestSha256 = process.env.CLAUDE_GATE_MANIFEST_SHA256 } = {},
+  {
+    expectedManifestSha256 = process.env.CLAUDE_GATE_MANIFEST_SHA256,
+    manifestPath = process.env.CLAUDE_GATE_MANIFEST_PATH || MATRIX_MANIFEST_PATH,
+  } = {},
 ) {
-  const manifestText = fs.readFileSync(MATRIX_MANIFEST_PATH, 'utf8');
+  if (!path.isAbsolute(manifestPath)) throw new TypeError('gate manifest path must be absolute');
+  const manifestText = fs.readFileSync(manifestPath, 'utf8');
   if (
     expectedManifestSha256 !== undefined
     && hashSensitiveString(manifestText) !== expectedManifestSha256
