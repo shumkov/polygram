@@ -492,9 +492,10 @@ describe('createFormatConfigInfoText', () => {
     // The runtime view still decides Codex-vs-Claude: the beta warning and the
     // authenticated model catalog are Codex-only, and the Claude help must not
     // leak into a Codex card.
-    assert.match(out, /_Codex beta:/);
+    assert.match(out, /_Codex uses CLIProxy/);
     assert.doesNotMatch(out, /macOS/);
-    assert.match(out, /no command network, web search, product MCP tools/);
+    assert.match(out, /service-user filesystem access, command network and web search/);
+    assert.match(out, /No product MCP tools or interactive approvals/);
     assert.match(out, /or interactive approvals\./);
     assert.match(
       out,
@@ -530,7 +531,7 @@ describe('createFormatConfigInfoText', () => {
         }),
       });
       assert.match(out, /^⚙️ Settings/);
-      assert.match(out, /_Codex beta:/);
+      assert.match(out, /_Codex uses CLIProxy/);
       assert.doesNotMatch(out, /containment/, 'the unavailable reason was card copy');
       assert.doesNotMatch(out, /not loaded; its next message may be busy/);
       assert.doesNotMatch(out, /Saved selection awaiting live reconciliation/);

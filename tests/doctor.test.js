@@ -1,11 +1,15 @@
 'use strict';
 
+const deployment = require('./helpers/codex-deployment');
+
 const assert = require('node:assert/strict');
 const {
   chmodSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
+  unlinkSync,
+  symlinkSync,
   rmSync,
   writeFileSync,
 } = require('node:fs');
@@ -40,25 +44,20 @@ function createDeployment(t, lease = null) {
     chmodSync(directory, 0o700);
   }
   writeFileSync(binary, '#!/bin/sh\n', { mode: 0o700 });
-  writeFileSync(
-    path.join(codexHome, 'config.toml'),
-    [
-      'default_permissions = "polygram-session"',
-      'approval_policy = "never"',
-      'web_search = "disabled"',
-      '',
-      '[features]',
-      'goals = false',
-      '',
-      '[permissions."polygram-session".filesystem]',
-      `${JSON.stringify(codexTmp)} = "deny"`,
-      '',
-      '[permissions."polygram-session".network]',
-      'enabled = false',
-      '',
-    ].join('\n'),
-    { mode: 0o600 },
-  );
+  writeFileSync(path.join(workspace, 'AGENTS.md'), 'Synthetic root instructions', { mode: 0o600 });
+  symlinkSync(path.join(workspace, 'AGENTS.md'), path.join(codexHome, 'AGENTS.md'));
+  writeFileSync(path.join(codexHome, 'config.toml'), [
+    'default_permissions = "polygram-trusted"',
+    'model_provider = "cliproxyapi"',
+    'approval_policy = "never"',
+    'web_search = "live"',
+    '[features]', 'goals = false',
+    '[permissions."polygram-trusted".filesystem]', '":root" = "write"',
+    '[permissions."polygram-trusted".network]', 'enabled = true',
+    '[memories]', 'generate_memories = false', 'use_memories = false',
+    '[model_providers.cliproxyapi]',
+    ...Object.entries(deployment.provider).map(([key, value]) => `${key} = ${JSON.stringify(value)}`), '',
+  ].join('\n'), { mode: 0o600 });
   writeFileSync(
     path.join(codexHome, 'auth.json'),
     '{"credential":"must-never-appear"}\n',
@@ -72,7 +71,8 @@ function createDeployment(t, lease = null) {
     },
   };
   const config = {
-    codex: { home: codexHome, binary },
+    codex: { access: deployment.access, proxy: deployment.proxy, home: codexHome, binary },
+    defaults: { codexEnabled: true },
     chats: {
       100: {
         bot: 'test-bot',
@@ -172,6 +172,35 @@ test('offline Codex doctor verifies the local pin, home, profile, identity, and 
   );
 });
 
+test('CLIProxy trusted doctor accepts a home without native authentication or command denies', async (t) => {
+  const deployment = createDeployment(t);
+  const keyFile = path.join(deployment.codexHome, 'proxy.key');
+  writeFileSync(keyFile, 'synthetic-doctor-key', { mode: 0o600 });
+  deployment.config.codex.access = { mode: 'trusted', commandPath: '/usr/bin:/bin' };
+  deployment.config.codex.proxy = { baseUrl: 'http://127.0.0.1:8318/v1', clientKeyFile: keyFile };
+  unlinkSync(path.join(deployment.codexHome, 'auth.json'));
+  writeFileSync(path.join(deployment.codexHome, 'config.toml'), [
+    'default_permissions = "polygram-trusted"',
+    'model_provider = "cliproxyapi"',
+    'approval_policy = "never"',
+    'web_search = "live"',
+    '[features]', 'goals = false',
+    '[permissions."polygram-trusted".filesystem]', '":root" = "write"',
+    '[permissions."polygram-trusted".network]', 'enabled = true',
+    '[memories]', 'generate_memories = false', 'use_memories = false',
+    '[model_providers.cliproxyapi]',
+    'name = "CLIProxyAPI"', 'base_url = "http://127.0.0.1:8318/v1"',
+    'wire_api = "responses"', 'requires_openai_auth = false',
+    'experimental_bearer_token = "synthetic-doctor-key"', 'supports_websockets = true', '',
+  ].join('\n'), { mode: 0o600 });
+  const checks = await collectCodexDoctorChecks({ config: deployment.config, db: deployment.db,
+    dependencies: deployment.dependencies, processEnv: deployment.processEnv });
+  for (const name of ['codex-home', 'codex-profile', 'codex-tmpdir']) {
+    assert.equal(checks.find((check) => check.name === name).status, 'ok', name);
+  }
+  assert.doesNotMatch(JSON.stringify(checks), /synthetic-doctor-key|protected from commands/);
+});
+
 test('doctor rejects an opposite-target binary receipt', async (t) => {
   const deployment = createDeployment(t);
   deployment.dependencies.resolveBinary = async () => ({
@@ -263,7 +292,7 @@ test('unsafe Codex temp roots fail closed without exposing their path', async (t
   );
 });
 
-test('Codex temp is not reported protected when its profile deny is missing', async (t) => {
+test('doctor does not confuse private temp metadata with command sandbox isolation', async (t) => {
   const deployment = createDeployment(t);
   writeFileSync(
     path.join(deployment.codexHome, 'config.toml'),
@@ -287,8 +316,10 @@ test('Codex temp is not reported protected when its profile deny is missing', as
   });
   const temp = checks.find(({ name }) => name === 'codex-tmpdir');
 
-  assert.equal(temp.status, 'fail');
-  assert.equal(temp.extra.protected, false);
+  assert.equal(temp.status, 'ok');
+  assert.equal(temp.extra.ownerOnly, true);
+  assert.equal(checks.find(({ name }) => name === 'codex-profile').status, 'fail');
+  assert.doesNotMatch(temp.detail, /protected|isolation/);
 });
 
 test('Codex temp overlap is found through bot selection and default cwd inheritance', async (t) => {
@@ -311,7 +342,7 @@ test('Codex temp overlap is found through bot selection and default cwd inherita
   const temp = checks.find(({ name }) => name === 'codex-tmpdir');
 
   assert.equal(temp.status, 'fail');
-  assert.equal(temp.extra.protected, false);
+  assert.equal(temp.extra.ownerOnly, false);
 });
 
 test('Codex temp overlap is found in a topic-specific cwd', async (t) => {
@@ -332,10 +363,10 @@ test('Codex temp overlap is found in a topic-specific cwd', async (t) => {
   const temp = checks.find(({ name }) => name === 'codex-tmpdir');
 
   assert.equal(temp.status, 'fail');
-  assert.equal(temp.extra.protected, false);
+  assert.equal(temp.extra.ownerOnly, false);
 });
 
-test('Codex temp accepts an owned-profile parent deny that covers it', async (t) => {
+test('Codex temp accepts an owner-only child directory without a command deny', async (t) => {
   const deployment = createDeployment(t);
   const childTmp = path.join(deployment.codexTmp, 'app-server');
   mkdirSync(childTmp, { mode: 0o700 });
@@ -351,31 +382,15 @@ test('Codex temp accepts an owned-profile parent deny that covers it', async (t)
   const temp = checks.find(({ name }) => name === 'codex-tmpdir');
 
   assert.equal(temp.status, 'ok');
-  assert.equal(temp.extra.protected, true);
+  assert.equal(temp.extra.ownerOnly, true);
 });
 
 test('Codex temp inspection honors the configured permission profile', async (t) => {
   const deployment = createDeployment(t);
   deployment.dependencies.profileId = 'custom-session';
-  writeFileSync(
-    path.join(deployment.codexHome, 'config.toml'),
-    [
-      'default_permissions = "custom-session"',
-      'approval_policy = "never"',
-      'web_search = "disabled"',
-      '',
-      '[features]',
-      'goals = false',
-      '',
-      '[permissions."custom-session".filesystem]',
-      `${JSON.stringify(deployment.codexTmp)} = "deny"`,
-      '',
-      '[permissions."custom-session".network]',
-      'enabled = false',
-      '',
-    ].join('\n'),
-    { mode: 0o600 },
-  );
+  const configPath = path.join(deployment.codexHome, 'config.toml');
+  const raw = require('node:fs').readFileSync(configPath, 'utf8');
+  writeFileSync(configPath, raw.replaceAll('polygram-trusted', 'custom-session'), { mode: 0o600 });
 
   const checks = await collectCodexDoctorChecks({
     config: deployment.config,
@@ -394,7 +409,7 @@ test('Codex temp inspection honors the configured permission profile', async (t)
   );
 });
 
-test('Codex temp rejects a deny forged under an indented unrelated TOML table', async (t) => {
+test('doctor rejects a restricted profile even when an unrelated table has a temp deny', async (t) => {
   const deployment = createDeployment(t);
   writeFileSync(
     path.join(deployment.codexHome, 'config.toml'),
@@ -422,8 +437,9 @@ test('Codex temp rejects a deny forged under an indented unrelated TOML table', 
   });
   const temp = checks.find(({ name }) => name === 'codex-tmpdir');
 
-  assert.equal(temp.status, 'fail');
-  assert.equal(temp.extra.protected, false);
+  assert.equal(temp.status, 'ok');
+  assert.equal(checks.find(({ name }) => name === 'codex-profile').status, 'fail');
+  assert.equal(temp.extra.ownerOnly, true);
 });
 
 test('unsafe IPC runtime roots fail without exposing paths or raw errors', async (t) => {
@@ -540,4 +556,51 @@ test('an unconfigured Codex runtime produces one quiet disabled check', async ()
     detail: 'not configured',
     extra: { runtime: 'codex', configured: false },
   }]);
+});
+
+test('doctor refuses derived foreign instructions and overrides instead of reporting profile ready', async (t) => {
+  for (const kind of ['foreign', 'override', 'home-alias']) {
+    const f = createDeployment(t);
+    const other = path.join(path.dirname(f.workspace), 'other-workspace');
+    mkdirSync(other, { mode: 0o700 });
+    writeFileSync(path.join(other, 'AGENTS.md'), 'Other canonical root', { mode: 0o600 });
+    const { selectCodexWorkspaceHome } = require('../lib/codex/runtime-profile');
+    const selected = selectCodexWorkspaceHome({ codexHome: f.codexHome, workspace: other }, { create: true }).codexHome;
+    mkdirSync(selected, { mode: 0o700 });
+    const raw = require('node:fs').readFileSync(path.join(f.codexHome, 'config.toml'), 'utf8');
+    writeFileSync(path.join(selected, 'config.toml'), raw, { mode: 0o600 });
+    if (kind === 'foreign') symlinkSync(path.join(f.workspace, 'AGENTS.md'), path.join(selected, 'AGENTS.md'));
+    if (kind === 'override') writeFileSync(path.join(selected, 'AGENTS.override.md'), 'Unexpected authority', { mode: 0o600 });
+    if (kind === 'home-alias') {
+      rmSync(selected, { recursive: true });
+      symlinkSync(f.codexHome, selected);
+    }
+    f.config.chats[100].cwd = other;
+    const checks = await collectCodexDoctorChecks({ config: f.config, db: f.db,
+      dependencies: f.dependencies, processEnv: f.processEnv });
+    assert.equal(checks.find(({ name }) => name === 'codex-home').status, 'fail', kind);
+    assert.equal(checks.find(({ name }) => name === 'codex-profile').status, 'fail', kind);
+  }
+});
+
+test('doctor uses environment anchor and rejects temp inside an actual selected workspace home', async (t) => {
+  const f = createDeployment(t);
+  f.processEnv.POLYGRAM_CODEX_HOME = f.config.codex.home;
+  delete f.config.codex.home;
+  let checks = await collectCodexDoctorChecks({ config: f.config, db: f.db,
+    dependencies: f.dependencies, processEnv: f.processEnv });
+  assert.equal(checks.find(({ name }) => name === 'codex-tmpdir').status, 'ok');
+  const other = path.join(path.dirname(f.workspace), 'other-workspace');
+  mkdirSync(other, { mode: 0o700 });
+  writeFileSync(path.join(other, 'AGENTS.md'), 'Other canonical root', { mode: 0o600 });
+  const selected = require('../lib/codex/runtime-profile').selectCodexWorkspaceHome({
+    codexHome: f.codexHome, workspace: other }, { create: true }).codexHome;
+  mkdirSync(selected, { mode: 0o700 });
+  const tmp = path.join(selected, 'child-tmp');
+  mkdirSync(tmp, { mode: 0o700 });
+  f.config.chats[100].cwd = other;
+  f.processEnv.POLYGRAM_CODEX_TMPDIR = tmp;
+  checks = await collectCodexDoctorChecks({ config: f.config, db: f.db,
+    dependencies: f.dependencies, processEnv: f.processEnv });
+  assert.equal(checks.find(({ name }) => name === 'codex-tmpdir').status, 'fail');
 });
