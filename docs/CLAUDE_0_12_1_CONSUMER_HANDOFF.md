@@ -1,5 +1,20 @@
 # Claude consumer update after Polygram 0.46.0 publication
 
+## Current consumer source checkpoint
+
+Released Polygram0.46.0 basef401ba44489925f7861f07b72db51288ebe4968b is now
+integrated without conflicts by signed2dcdebe. Consumer0.46.1 preparation aligns
+exact registry Orchestra0.12.1 and SDK0.3.322; source/PR/CI/merge is authorized.
+No Polygram tag, npm publication, canonical helper or deployment is run by this
+worker. Released Codex features/pins and accepted provider gate inputs remain
+unchanged. Actual old SDK source was archived before replacing this child's
+installed SDK; original matrix receipts retain their point-in-time identities.
+The initial failed local full run remains FAIL, with47runner-environment failures
+resolved and the sole historical-SDK unit corrected through reviewed RED/GREEN.
+Final exact-head full CI remains required before merge. Earlier consumer-hold
+statements below are historical; both24hsoaks remain coordinator-owned.
+
+
 Orchestra0.12.1 is published through PR71, merged main/tag source
 8457bd601269396e167cafa12747e255e51814eb. Signed annotated tagv0.12.1 points to
 that commit; release workflow43220554574 succeeded through npmOIDC and GitHub
@@ -99,3 +114,51 @@ Codex/gate input preservation, aligned registry lock/no nested SDK, version/plug
 coherence and retained coverage. Push feature branch, PR against released main,
 await CI and merge only exact reviewed head; read back authoritative main tuple
 and report it to coordinator for canonical publication. No tag/publish/deploy.
+
+## Actual local verification findings
+
+The first full consumer run retained4843tests/4779PASS/48FAIL/16SKIP. Forty-seven
+failures are fixture environment candidates: the runner's umask0077 invalidated
+explicit permissive-mode negative cases and hook fixtures, HOME under .local was
+too long for the boot IPC socket and .local0700 prevented synthetic alternate-
+UID hook traversal. Correct the runner only: short new owner-only HOME beneath
+/Users/ivanshumkov, separate public0755synthetic hook test parent beneath the
+already traversable home, umask0022 for fixture creation; keep logs/privateHOME/
+tmp/vendor protected and E2Edisabled. Never chmod the user's .local or existing
+settings. Re-run failed files to classify these precisely, without production edits.
+
+One deterministic stale UNIT assertion ties historical .220/.283 matrix's
+constant SDK.283 to the now-installed SDK.322. Preserve the legacy manifest and
+all50accepted spike sources unchanged. Amend only that unit test to retain the
+legacy constant-SDK check against the reviewed matched manifest's OLD SDK/CLI,
+and require the installed SDK/version/claudeCodeVersion plus entry/package SHA to
+match the reviewed matched manifest's CANDIDATE identity. This preserves the
+original purpose that an SDK bump needs a reviewed manifest, and distinguishes
+historical SDK.283 from actual shipped.322 rather than weakening provider task,
+ownership, result or old lifecycle assertions. The actual RED .283!=.322 failure
+is retained; focused GREEN must follow, with independent amendment/code review.
+No production code, gate manifest/oracle/driver, paid result or public contract
+is changed by this correction. No paid matrix rerun is justified by a unit-test
+metadata expectation update; mandatory provider evidence stays23/23beforepins.
+
+## Completed local correction and final consumer state
+
+The0.46.0base merged without conflict as signed2dcdebe. Package/lock/plugin are
+consistently0.46.1, exact SDK0.3.322 and registry Orchestra0.12.1 installed; every
+one of57installed Orchestra files matches verified registry artifact and accepted
+SDK entry/package/runtime hashes match. Released Codex.167.2/hashes/features and
+all50existing gate source files remain unchanged. No nested Orchestra SDK.
+
+Corrected runner reran ONLY seven failed files:194tests/193PASS/1FAIL/0SKIP; all47
+environment failures resolved without production/source changes. The sole stale
+unit then received the independently reviewed manifest-identity correction:
+focused54PASS/0FAIL/0SKIP, retaining the deterministicRED receipt. No full local
+suite PASS is claimed for the initially failed run. Unaffected local tests were
+not repeated; final full CI must pass on the exact reviewed head before merge.
+Three initial design/code reviewers and three targeted amendment/code reviewers
+returned CLEAN. No failed provider trace or unit run is relabelled.
+
+The earlier consumer hold has ended for source PR/CI/merge only. Current work
+must be merged through reviewed PR and CI, then the exact main/release tuple
+handed to coordinator. This worker does not create Polygram tag, publish npm,
+run canonical release/deploy helper, or activate production. Both24hsoaks remain.

@@ -11,7 +11,7 @@ const lockfile = require('../package-lock.json');
 const orchestra = require('@shumkov/orchestra');
 const orchestraPackage = require('@shumkov/orchestra/package.json');
 
-const REQUIRED_ORCHESTRA_VERSION = '0.12.0';
+const REQUIRED_ORCHESTRA_VERSION = '0.12.1';
 
 test('installed Orchestra exactly matches the reviewed Codex contract', () => {
   assert.equal(

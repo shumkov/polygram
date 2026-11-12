@@ -553,9 +553,9 @@ test('Claude 2.1.283 matrix declares every mandatory old/new gate', () => {
   assert.equal(manifest.comparator.effort, 'medium');
 });
 
-test('matrix holds the Agent SDK constant at the installed exact version', () => {
-  // Both sides drive the same SDK and vary only pathToClaudeCodeExecutable,
-  // so an SDK bump must be reviewed together with the manifest.
+test('legacy and matched matrices retain their reviewed SDK identities', () => {
+  // The legacy comparison retains its historical SDK while the installed
+  // consumer must match the separately reviewed candidate, including source.
   const sdkEntry = require.resolve('@anthropic-ai/claude-agent-sdk');
   let sdkDir = path.dirname(sdkEntry);
   while (!fs.existsSync(path.join(sdkDir, 'package.json'))) {
@@ -565,7 +565,22 @@ test('matrix holds the Agent SDK constant at the installed exact version', () =>
     fs.readFileSync(path.join(sdkDir, 'package.json'), 'utf8'),
   );
   assert.equal(sdkPackage.name, '@anthropic-ai/claude-agent-sdk');
-  assert.equal(manifest.sdkVersion, sdkPackage.version);
+  const matched = JSON.parse(fs.readFileSync(
+    path.join(repoRoot, 'scripts/spikes/claude-2.1.322-matrix.json'), 'utf8',
+  ));
+  assert.equal(manifest.sdkVersion, matched.sdkRuntimes.old.version);
+  assert.equal(manifest.versions.candidate, matched.sdkRuntimes.old.claudeCodeVersion);
+  assert.equal(sdkPackage.version, matched.sdkRuntimes.candidate.version);
+  assert.equal(sdkPackage.claudeCodeVersion, matched.sdkRuntimes.candidate.claudeCodeVersion);
+  assert.equal(sdkPackage.claudeCodeVersion, matched.versions.candidate);
+  assert.equal(
+    crypto.createHash('sha256').update(fs.readFileSync(sdkEntry)).digest('hex'),
+    matched.sdkRuntimes.candidate.entrySha256,
+  );
+  assert.equal(
+    crypto.createHash('sha256').update(fs.readFileSync(path.join(sdkDir, 'package.json'))).digest('hex'),
+    matched.sdkRuntimes.candidate.packageSha256,
+  );
 });
 
 test('every compared CLI version has reviewed per-version expectations', async () => {

@@ -1,5 +1,20 @@
 # Matched SDK/CLI acceptance gate amendment
 
+## Current consumer source checkpoint
+
+Released Polygram0.46.0 basef401ba44489925f7861f07b72db51288ebe4968b is now
+integrated without conflicts by signed2dcdebe. Consumer0.46.1 preparation aligns
+exact registry Orchestra0.12.1 and SDK0.3.322; source/PR/CI/merge is authorized.
+No Polygram tag, npm publication, canonical helper or deployment is run by this
+worker. Released Codex features/pins and accepted provider gate inputs remain
+unchanged. Actual old SDK source was archived before replacing this child's
+installed SDK; original matrix receipts retain their point-in-time identities.
+The initial failed local full run remains FAIL, with47runner-environment failures
+resolved and the sole historical-SDK unit corrected through reviewed RED/GREEN.
+Final exact-head full CI remains required before merge. Earlier consumer-hold
+statements below are historical; both24hsoaks remain coordinator-owned.
+
+
 ## Orchestra patch release and consumer hold
 
 Coordinator supplied published Orchestra0.12.0 base706dab; owned Claude branch
