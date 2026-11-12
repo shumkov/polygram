@@ -144,7 +144,7 @@ ask's delivery turn ends with no reply ──► one notice job into A
   - boot fails if two roles share a session.
 - **`allow`:** who may start an `ask` or `tell` to whom (`"*"` = every role).
   A `reply` is never checked against it. No role may message itself.
-- **`mirror`:** posts each message to the target role's topic.
+- **`mirror`:** `true`/`"target"` posts each message to the target role's topic; `"both"` also posts a sender line to the sending role's topic; `false` posts nothing.
 - **Disabled by default.** With no `mailbox` key, nothing changes.
 - **Deployment note:** roles need isolated topics. Shumabit's existing groups
   run with `isolateTopics: false`, so the organization gets a new forum group.
@@ -320,6 +320,10 @@ into the target role's topic:
 - The target's final text already lands in the same topic through the job
   report.
 - A mirror failure is logged and never blocks delivery.
+- With `"mirror": "both"`, a sender line (`📤`, same header, the first 300
+  characters of the redacted body) is also posted into the sending role's
+  topic. System senders have no topic and get none. `true` keeps meaning
+  `"target"`.
 
 ### Rules the daemon enforces
 

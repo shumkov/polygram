@@ -35,8 +35,11 @@ test('a valid configuration resolves every role to its frozen session', () => {
   assert.equal(cfg.roleForSession('-1001:11'), 'orchestrator');
   assert.equal(cfg.roleForSession('-1001:99'), null);
   assert.deepEqual(cfg.limits, { maxDepth: 2, perPairPerHour: 10, maxBodyBytes: 3500, systemPerHour: 60 });
-  assert.equal(cfg.mirror, true, 'every message is visible in Telegram unless explicitly turned off');
+  assert.equal(cfg.mirror, 'target', 'every message is visible in Telegram unless explicitly turned off');
   assert.equal(read({ ...base(), mirror: false }).mirror, false);
+  assert.equal(read({ ...base(), mirror: true }).mirror, 'target', 'true keeps its original meaning: the target topic only');
+  assert.equal(read({ ...base(), mirror: 'target' }).mirror, 'target');
+  assert.equal(read({ ...base(), mirror: 'both' }).mirror, 'both');
 });
 
 test('limits default to the documented values', () => {
@@ -102,7 +105,9 @@ test('limits must be positive integers and about text bounded', () => {
   assert.equal(read({ ...base(), limits: { maxBodyBytes: 3500, maxDepth: 1 } }).limits.maxBodyBytes, 3500, 'a mirrored body at the ceiling still fits one Telegram message');
   const long = base(); long.roles.ops.about = 'x'.repeat(301);
   assert.throws(() => read(long), /about/i);
-  assert.throws(() => read({ ...base(), mirror: 'yes' }), /mirror/i);
+  for (const mirror of ['yes', 'sender', 'Both', 1, {}]) {
+    assert.throws(() => read({ ...base(), mirror }), /mirror/i, JSON.stringify(mirror));
+  }
 });
 
 test('starting a message checks kind, target, self and the allowlist', () => {

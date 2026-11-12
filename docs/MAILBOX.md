@@ -47,7 +47,7 @@ rules.
 | `enabled` | Must be `true`. Without a `mailbox` key nothing changes. |
 | `roles.<name>` | Role name = route id, `^[a-z][a-z0-9_-]*$`. `about` (≤ 300 characters) is shown to the roles allowed to message it. |
 | `allow.<name>` | Roles this role may start an `ask` or `tell` to; `"*"` means every role. A role without an entry can only reply. Replies are never checked against it. |
-| `mirror` | Post each message into the target role's topic. Default `true`. |
+| `mirror` | Where each message is posted as plain text: `"target"` (or `true`) posts it into the target role's topic; `"both"` also posts a sender line into the sending role's topic; `false` posts nothing. Default `true`. See [Telegram mirror](#telegram-mirror). |
 | `systemSenders` | Names of processes outside any session that may send through `mailbox_submit` as `system:<name>` (see [System senders](#system-senders)). Distinct names, `^[a-z][a-z0-9_-]*$`; `polygram` is reserved. Default none. |
 | `limits.maxDepth` | Longest chain. A human message starts at depth 0, a system tell is depth 1, and each new message is one deeper. Default 2. |
 | `limits.perPairPerHour` | Asks and tells per (from, to) pair in the last hour. Default 10. |
@@ -101,6 +101,29 @@ text lands in its own topic through the normal job report.
   it is a deliberate re-ask and creates a new message.
 - Bodies are redacted before they are stored, hashed or mirrored.
 
+## Telegram mirror
+
+Each message is posted once, right after it commits, never from the
+dispatch path. The target role's topic gets the whole redacted body:
+
+```
+📨 role:orchestrator → role:marketing (ask m_…)
+<body>
+```
+
+With `"mirror": "both"`, the sending role's topic also gets a sender line,
+so a role's chat shows what it sent. It carries the first 300 characters of
+the redacted body, with `…` when the body is longer:
+
+```
+📤 role:orchestrator → role:marketing (ask m_…)
+<first 300 characters of the body>
+```
+
+Only a `role:` sender has a topic, so a system sender's message gets the
+target line only. A failed post is logged and never blocks delivery or the
+other post. Duplicates and refused messages are not posted.
+
 ## System senders
 
 A process outside every session, such as the agent-org task runner, can
@@ -123,7 +146,8 @@ to the IPC socket with the bot's secret, like any other IPC client.
 - `limits.systemPerHour` applies per sender, counted only after the key
   lookup, so a retry of an accepted message is never rate limited. System
   sends don't use up a role pair's budget.
-- The size cap, redaction and mirror apply as for agent messages.
+- The size cap, redaction and target mirror apply as for agent messages.
+  A system sender has no topic, so it never gets a sender line.
 - `ref` (optional, 1 to 512 bytes) is an opaque reference such as a task id
   or URL. It is redacted, stored, and shown to the receiver only inside the
   untrusted payload, never in the trusted header.
