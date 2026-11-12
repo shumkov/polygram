@@ -122,3 +122,34 @@ consumer package copies used in tests are own disposable/child trees and hashed.
 Tracking issue remains draft, pins stay old until repository gates actually pass,
 and 24h staging/CLI soaks, separately reviewed consumer update and publication/
 activation remain unproven and unauthorized.
+
+## Existing waived-old cell comparison correction
+
+The complete e1870e2 run remains FAIL (14PASS/1BLOCKED/8not-run,15/23 completed).
+Its candidate matched background MCP task, exact marker, raw two-turn lifecycle,
+imported SDK and actual Orchestra source all PASS. The runner then blocks on
+missing old same-scenario evidence even though its existing manifest explicitly
+waives that old opt-in regression. This is a runner planning/acceptance mismatch,
+not a failed candidate task or a new waiver. Preserve this exact summary and
+artifacts; no retroactive acceptance.
+
+Use one small shared decision for cross-version comparison, derived solely from
+manifest-generated waivedCells: comparison is required for non-candidate-only
+scenarios except when that exact old cell is explicitly listed as waived. Use
+it in run construction's pairComparisonRequired, runner comparison scheduling,
+and retained acceptance replay. If an old cell is scheduled but missing/failed,
+keep BLOCKED; unrelated old waivers and candidate waivers cannot excuse it.
+Per-run raw/schema/identity/native version-specific oracle validation remains
+mandatory; repetitions and absolute/same-version checks remain. Do not compare a
+candidate background task to old production foreground as though the modes were
+equivalent, fabricate old results, or require execution of the known waived task.
+
+Alternative rejected: candidateOnly for the scenario (would bypass lifecycle
+policy intent) or unconditionally skip all version-specific comparisons (weakens
+unaffected cells). Add focused RED tests for the exact current manifest's
+candidate delayed run requiring a nonexistent old pair; negative tests preserve
+scheduled-old/unrelated-waiver and repeat/absolute comparison requirements.
+Implement only the shared comparison decision and its three existing callers;
+review code and test retained acceptance behavior. Record a new signed gate
+commit and run one new full unfiltered23-cell matrix. The e187 failed run and
+b796 failed crossed-pair run stay immutable and cannot be combined into PASS.

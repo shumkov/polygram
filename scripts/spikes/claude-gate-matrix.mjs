@@ -432,6 +432,11 @@ export function matrixWaivedCells(manifest) {
   return waived;
 }
 
+export function matrixCrossVersionComparisonRequired(scenario, waivedCells) {
+  return !scenario.candidateOnly
+    && !waivedCells.some(cell => cell.id === `old:${scenario.id}`);
+}
+
 export function buildClaudeMatrixRuns({
   manifest,
   binaries,
@@ -461,6 +466,7 @@ export function buildClaudeMatrixRuns({
     );
   }
 
+  const waivedCells = matrixWaivedCells(manifest);
   const runs = [];
   for (const versionKey of ['old', 'candidate']) {
     const expectations = expectationsFor(
@@ -537,7 +543,7 @@ export function buildClaudeMatrixRuns({
             repeatIndex === repeatCount
             && (
               (
-                !scenario.candidateOnly
+                matrixCrossVersionComparisonRequired(scenario, waivedCells)
                 && versionKey === 'candidate'
               )
               || scenario.comparison?.lifecycle?.mode
@@ -3039,7 +3045,7 @@ export function purgeAcceptedGateArtifacts({
     }
     if (
       run.versionKey === 'candidate'
-      && !scenario.candidateOnly
+      && matrixCrossVersionComparisonRequired(scenario, expectedWaivedCells)
       && evidence.candidate.length === run.repeatCount
     ) {
       if (

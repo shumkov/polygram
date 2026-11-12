@@ -4495,3 +4495,33 @@ test('matched accepted summary validates retained per-cell SDK proofs before cle
   assert.doesNotThrow(() => accept(summary));
   assert.equal(fs.existsSync(runnerDir), false);
 });
+
+test('candidate background MCP must not require evidence from the explicitly waived old cell', async () => {
+  const { buildClaudeMatrixRuns } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  const matched = JSON.parse(fs.readFileSync(path.join(repoRoot, 'scripts/spikes/claude-2.1.322-matrix.json')));
+  const runs = buildClaudeMatrixRuns({ manifest: matched,
+    binaries: { old: '/private/bin/old', candidate: '/private/bin/new' },
+    artifactBaseDir: '/private/artifacts', runPrefix: 'waived-old-pair' });
+  assert.equal(runs.length, 23);
+  assert.equal(runs.some(run => run.id === 'old:delayed-mcp'), false);
+  assert.equal(runs.find(run => run.id === 'candidate:delayed-mcp').pairComparisonRequired, false);
+  assert.equal(runs.find(run => run.id === 'candidate:delayed-mcp-foreground').pairComparisonRequired, true);
+  assert.equal(runs.find(run => run.id === 'candidate:cli-contract:2').pairComparisonRequired, true);
+});
+
+test('waived-old comparison decision preserves scheduled pairs and cannot trust unrelated waiver claims', async () => {
+  const { matrixCrossVersionComparisonRequired, matrixWaivedCells } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  const matched = JSON.parse(fs.readFileSync(path.join(repoRoot, 'scripts/spikes/claude-2.1.322-matrix.json')));
+  const scenario = matched.scenarios.find(s => s.id === 'delayed-mcp');
+  const waived = matrixWaivedCells(matched);
+  assert.equal(matrixCrossVersionComparisonRequired(scenario, waived), false);
+  assert.equal(matrixCrossVersionComparisonRequired(scenario, []), true, 'missing scheduled old evidence must still block');
+  assert.equal(matrixCrossVersionComparisonRequired(scenario, [{ ...waived[0], id: 'candidate:delayed-mcp' }]), true);
+  assert.equal(matrixCrossVersionComparisonRequired(scenario, [{ ...waived[0], id: 'old:delayed-mcp-foreground' }]), true);
+  const foreground = matched.scenarios.find(s => s.id === 'delayed-mcp-foreground');
+  assert.equal(matrixCrossVersionComparisonRequired(foreground, waived), true);
+  const scheduled = structuredClone(matched);
+  scheduled.expectations[scheduled.versions.old].delayedMcpModes = { autoBackground: 'background', default: 'foreground' };
+  assert.equal(matrixCrossVersionComparisonRequired(scenario, matrixWaivedCells(scheduled)), true,
+    'retained acceptance must derive waivers from checked manifest, not a summary claim');
+});

@@ -20,6 +20,7 @@ import {
   evaluateMatrixVersionEvidence,
   MATRIX_MANIFEST_PATH,
   matrixWaivedCells,
+  matrixCrossVersionComparisonRequired,
   MATRIX_NOT_APPLICABLE_EXIT_CODE,
   purgeAcceptedGateArtifacts,
 } from './claude-gate-matrix.mjs';
@@ -280,7 +281,7 @@ for (const [index, run] of runs.entries()) {
   if (
     status === 'PASS'
     && run.versionKey === 'candidate'
-    && !scenario.candidateOnly
+    && matrixCrossVersionComparisonRequired(scenario, summary.waivedCells)
     && !onlyVersion
     && evidence.candidate.length === run.repeatCount
   ) {
