@@ -229,6 +229,37 @@ surface. Repository tests do not prove proxy inference or production Telegram us
 
 ## Implementation checkpoint
 
+### Release readiness after the Codex upgrade
+
+The integrated Codex 0.167.2 source is signed at Orchestra `c651ac7` and Polygram
+`3d16b80`. Final integrated Polygram tests: 4791 passed, zero failures, 16 existing
+opt-in Claude skips. Native Astra and CLIProxy each completed two real turns,
+proving canonical instructions, discovered skill-body consumption, unprompted
+synthetic file-memory recall, shell tools, fresh resume, steer and durable events.
+Two earlier aborted native attempts remain recorded separately; total provider
+logical turns are six attempted/four completed, with transport attempts unknown.
+
+The isolated native Linux x64 gate on umi-vps subsequently passed exact binary,
+companion and schema checks, limited filesystem/network enforcement, trusted
+helper execution, persistence/resume/steer, normal stop and the accepted hard-loss
+quarantine contract. Initial fixture path/observer failures are retained; no
+product policy was weakened. All thirteen test scopes and both private trees
+were proved absent, source auth unchanged and daemon identities invariant.
+No external inference was performed by that Linux fixture. Receipt:
+`/tmp/codex-native-linux-gate-c651ac7-0ada7b1a84fb/NATIVE_LINUX_RESULT.md`;
+continuation evidence archive SHA-256:
+`49478a31599c80f1708d349a4e92acc186325e6d367f5cfac53417d4de820066`.
+
+No new native/runtime blocker remains. Publication and production installation,
+rollback preservation, configuration transition and private-chat activation are
+pending Ivan's go. The release must install the exact CLI and code-mode helper
+as immutable siblings; a limited-mode runtime path must be visible under its
+existing readable roots. Release the new Orchestra package before pinning that
+published version in Polygram; the private same-version test tarball is not a
+registry release. Claude's separate upgrade is not a dependency. Live Telegram
+acceptance follows activation; successful WebSocket selection remains unproven
+and is not inferred from the completed Responses provider turns.
+
 ### Agreed runtime upgrade sequence
 
 Ivan agreed to the planned upgrades on 2026-11-12 and then explicitly requested

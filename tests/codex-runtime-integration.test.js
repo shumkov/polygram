@@ -450,6 +450,7 @@ function makeFixture(t, scenario = {}) {
     '{"auth_mode":"chatgpt-test"}\n',
     { mode: 0o600 },
   );
+  writeFileSync(path.join(fixture.workspace, 'AGENTS.md'), 'Synthetic integration workspace.\n', { mode: 0o600 });
   writeScenario(fixture, scenario);
   return fixture;
 }
