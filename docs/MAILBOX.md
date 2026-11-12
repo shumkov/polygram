@@ -188,7 +188,8 @@ agent-org runner relaying a person's Notion comment, adds an `origin`:
 ```
 
 - `origin` must be exactly `{"kind":"human","name":"…"}`, with a name of 1 to
-  64 characters (not only whitespace) and no other keys. Anything else is
+  64 characters (not only whitespace, no control characters such as a
+  newline) and no other keys. Anything else is
   refused with `MAILBOX_INVALID_ORIGIN` and nothing is stored. Only a sender
   listed in `systemSenders` can submit at all, so only one can claim an
   origin.
@@ -224,7 +225,7 @@ contract and do not change:
 | `MAILBOX_TOO_LARGE` | The body is over `maxBodyBytes`, before or after redaction. | No. |
 | `MAILBOX_RATE_LIMITED` | `systemPerHour`, or the per-pair limit for agent sends. | Yes, later. |
 | `MAILBOX_KEY_CONFLICT` | The key was used for a different target, body or origin. | No. |
-| `MAILBOX_INVALID_ORIGIN` | `origin` is not exactly `{kind:"human", name}` with a name of 1 to 64 characters. | No. |
+| `MAILBOX_INVALID_ORIGIN` | `origin` is not exactly `{kind:"human", name}` with a name of 1 to 64 characters and no control characters. | No. |
 
 A refusal from the external-jobs queue keeps its own code, for example
 `EXTERNAL_JOB_QUEUE_FULL` (retry later) or `EXTERNAL_JOB_ROUTE_UNAVAILABLE`.
