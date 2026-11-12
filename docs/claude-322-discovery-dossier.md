@@ -1,13 +1,55 @@
 # Provisional Claude .283/.322 discovery expectations
 
-This dossier retains initial discovery hypotheses and current authorized
-observations. Discovery remains candidate-filtered and non-authoritative.
+This dossier retains current verification, prior authorized observations and
+initial discovery hypotheses. Discovery remains candidate-filtered and non-authoritative.
 The separate acceptance contract does not claim a passed matrix. Installed SDK
 stays 0.3.283 and the default accepted .220/.283 manifest remains unchanged.
 Current execution and authorization are governed by
 [the provider execution spec](claude-322-provider-execution-spec.md).
 
-## Authorized observations and separate acceptance contract
+## Current verification after the recorded gate attempt
+
+The acceptance manifest at signed gate commit
+`b796ec57a010edc092a9e03a287a00870dbb891d` requires exactly one instructions
+attachment on both versions. Neutral owned CLAUDE.md input restores that assertion;
+all old/new CLI repeats pass. Instructions count zero below was an earlier
+clean-profile observation, superseded as a fixture hypothesis rather than accepted
+version drift. The historical source of the old instruction input is unproven.
+
+The unfiltered full gate FAILS: 14 PASS, one candidate background MCP failure,
+eight not run after stopping. All eight later PASS in separate filtered runs on
+that same gate commit, after short invocation IDs fix two definite nested project
+path lookups. They cannot be assembled into full acceptance. With actual new SDK,
+background MCP completes its task and marker but notification precedes membership
+clear and two terminal results violate the strict checked contract. The original focused normal-send/report attribution fails on both actual pairs.
+The separate bounded Orchestra correction now passes focused regression/contract
+tests and has independent clean code reviews; its first candidate provider run
+completed all three user sources correctly but is INCONCLUSIVE because copied
+fixture source ended before the distinct-agent batching witness. The checked
+probe is repaired to hold synthetic sleeps in the foreground and await direct
+agent/report provenance. No provider acceptance, candidate waiver, pin move or
+issue publication is claimed; both 24h soaks remain.
+
+The new [matched SDK gate amendment](CLAUDE_MATCHED_SDK_GATE_SPEC.md) preserves
+b796 FAIL and uses exact SDK/CLI pairs with immutable per-side SDK source hashes.
+SDK .292 documents the changed clear-after-notification ordering, while .319 adds
+SDK MCP-task support. The amended .322 proof keeps exact result text, distinct
+turn origins, task/run/session correlation, statuses and all timing/delivery checks.
+A new complete run on one recorded commit remains required.
+
+The native/eager local fixture results supersede earlier BLOCKED/untested claims
+below: HTTP 500/401, flaky recovery, injections/followup, subagent, interrupt and
+fold cases PASS both binaries; mailbox PASS7/7 each. Native auth is guarded inside
+owned private HOME with no refresh material. ENABLE_TOOL_SEARCH=false applies
+only to deterministic local stubs; default candidate flaky/mailbox failures are
+retained, and the real-provider matrix/runtime defaults are unchanged. No feature
+cache/enrollment was forged. All temporary native credentials were removed.
+
+This current documentation correction remains uncommitted after the recorded
+source commit, preserving immutable gate history. Detailed receipts are in
+`/tmp/orchestra-claude-upgrade-provider-report.md`.
+
+## Prior authorized observations (superseded where noted)
 
 All thirteen planned candidate invocations have now been exercised across
 retained batches under explicit paid-call authorization. The actual-new-SDK
@@ -45,7 +87,7 @@ snapshots support diagnosis; native temporary credential files were removed.
 The sections below preserve the pre-authorization preparation state and original
 procedure. Their statements about no authorized calls, no real credential reads,
 separate future approvals and uncommitted-only delivery are historical, not
-current instructions. The authorized observations above and provider execution
+current instructions. Current verification above and the provider execution
 spec supersede those facts; the original hypotheses are retained for audit.
 
 ### Original sources and unresolved expectations

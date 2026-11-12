@@ -1107,7 +1107,12 @@ export function sanitizedGateResultSchemaMatches(result, matrixScenario) {
   const keys = SANITIZED_RESULT_KEYS.get(scenario);
   if (
     !keys
-    || !hasExactKeys(result, keys)
+    || !hasExactKeys(result, scenario === 'delayed-mcp' && Object.hasOwn(result, 'sdkRuntime') ? [...keys, 'sdkRuntime'] : keys)
+    || (Object.hasOwn(result, 'sdkRuntime') && !(scenario === 'delayed-mcp'
+      && hasExactKeys(result.sdkRuntime, ['version', 'claudeCodeVersion', 'entrySha256', 'packageSha256'])
+      && /^0\.3\.\d+$/.test(result.sdkRuntime.version)
+      && result.sdkRuntime.claudeCodeVersion === result.attestation?.version
+      && [result.sdkRuntime.entrySha256, result.sdkRuntime.packageSha256].every(hash => /^[a-f0-9]{64}$/.test(hash))))
     || result.matrixScenario !== matrixScenario
     || result.evidenceSchemaVersion !== 1
     || !(

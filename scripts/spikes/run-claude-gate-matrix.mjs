@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import sdkRuntimeTools from './gate-sdk-runtime.cjs';
 
 import {
   ensurePrivateArtifactBase,
@@ -57,6 +58,13 @@ if (!artifactBaseDir || !oldBin || !candidateBin) {
 }
 const manifestText = fs.readFileSync(manifestPath, 'utf8');
 const manifest = JSON.parse(manifestText);
+const sdkRoots = { old: argument('--old-sdk-root'), candidate: argument('--candidate-sdk-root') };
+if (manifest.sdkRuntimes) {
+  if (Object.keys(manifest.sdkRuntimes).sort().join(',') !== 'candidate,old') throw new Error('both SDK runtime identities required');
+  if (!/^[a-f0-9]{64}$/.test(manifest.orchestraSdkProcessSha256 || '')) throw new Error('fixed Orchestra SDK process hash required');
+  for (const side of ['old', 'candidate']) sdkRuntimeTools.assertSdkRuntime(sdkRoots[side], manifest.sdkRuntimes[side], manifest.versions[side]);
+} else if (sdkRoots.old || sdkRoots.candidate) throw new Error('SDK roots require a checked matched-pair manifest');
+
 assertClaudeMatrixMode(manifest, { onlyVersion, accepting });
 if (accepting && (!acceptedRunPrefix || acceptedRunPrefix.startsWith('--'))) {
   throw new TypeError('--accept-run requires a run prefix');
@@ -123,6 +131,7 @@ const summary = {
   selectedRunCount: runs.length,
   expectedAuthoritativeRunCount,
   manifestSha256,
+  ...(manifest.sdkRuntimes && { sdkRuntimes: manifest.sdkRuntimes, orchestraSdkProcessSha256: manifest.orchestraSdkProcessSha256 }),
   waivedCells: matrixWaivedCells(manifest),
   results: [],
 };
@@ -134,13 +143,21 @@ const evidenceByScenario = new Map();
 for (const [index, run] of runs.entries()) {
   console.log(`[${index + 1}/${runs.length}] ${run.id} START`);
   const startedAt = Date.now();
+  const sdkAttestationPath = path.join(runnerPrivateDir, `${run.versionKey}-${run.scenarioId}-${run.repeatIndex}-sdk.json`);
+  const sdkEnv = manifest.sdkRuntimes ? {
+    CLAUDE_GATE_SDK_ROOT: sdkRoots[run.versionKey],
+    CLAUDE_GATE_SDK_EXPECTED: JSON.stringify(run.sdkRuntime),
+    CLAUDE_GATE_SDK_ATTESTATION_PATH: sdkAttestationPath,
+    CLAUDE_GATE_ORCHESTRA_SOURCE_SHA256: manifest.orchestraSdkProcessSha256,
+  } : {};
   const child = spawnSync(
     process.execPath,
-    [path.join(repoRoot, run.driver), ...run.args],
+    [...(manifest.sdkRuntimes ? ['--require', path.join(scriptDir, 'gate-sdk-runtime.cjs')] : []), path.join(repoRoot, run.driver), ...run.args],
     {
       cwd: repoRoot,
       env: buildClaudeMatrixChildEnv(process.env, {
         ...run.env,
+        ...sdkEnv,
         CLAUDE_GATE_MANIFEST_SHA256: manifestSha256,
         CLAUDE_GATE_MANIFEST_PATH: manifestPath,
       }),
@@ -208,6 +225,17 @@ for (const [index, run] of runs.entries()) {
     && (!artifactValidation.pass || sanitizedResult?.status !== status)
   ) {
     status = 'BLOCKED';
+  }
+
+  if (manifest.sdkRuntimes) {
+    try {
+      sdkRuntimeTools.assertSdkRuntime(sdkRoots[run.versionKey], run.sdkRuntime, run.version);
+      sdkRuntimeTools.assertSdkLoadProof({ proofPath: sdkAttestationPath, identity: run.sdkRuntime,
+        runId: run.env.CLAUDE_GATE_RUN_ID, orchestraSourceSha256: manifest.orchestraSdkProcessSha256 });
+    } catch {
+      status = 'BLOCKED';
+      artifactValidation = { pass: false, reasons: [...artifactValidation.reasons, 'matched SDK load evidence missing or changed'] };
+    }
   }
 
   let pairComparison = null;

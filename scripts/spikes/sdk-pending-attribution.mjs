@@ -4,12 +4,12 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { buildClaudeGateSdkOptions, createClaudeGateSelection } from './claude-executable.mjs';
-import { evaluatePendingAttribution } from './sdk-pending-attribution-oracle.mjs';
+import { evaluatePendingAttribution, foregroundFixtureSleep, pendingAttributionFollowupReady } from './sdk-pending-attribution-oracle.mjs';
 import { writeFixtureConsent } from './cli-fixture-prerequisites.mjs';
 
 const require = createRequire(import.meta.url);
 const { SdkProcess, makeInputController } = require('@shumkov/orchestra/lib/process/sdk-process');
-const sdkVersion = JSON.parse(fs.readFileSync(path.join(path.dirname(require.resolve('@anthropic-ai/claude-agent-sdk')), 'package.json'), 'utf8')).version;
+const sdkVersion = globalThis[Symbol.for('polygram.gate.sdk')]?.version || JSON.parse(fs.readFileSync(path.join(path.dirname(require.resolve('@anthropic-ai/claude-agent-sdk')), 'package.json'), 'utf8')).version;
 const gate = await createClaudeGateSelection();
 writeFixtureConsent({ cwd: gate.sdkCwd, fixtureRoot: gate.artifactDir });
 const privateDir = path.join(gate.artifactDir, 'raw-private');
@@ -21,6 +21,7 @@ const q = query({
   prompt: inputController.iter,
   options: buildClaudeGateSdkOptions(gate, {
     permissionMode: 'auto', maxTurns: 12,
+    hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [async input => foregroundFixtureSleep(input)] }] },
     systemPrompt: 'This is a synthetic SDK compatibility fixture. Follow the requested bounded tasks exactly. Do not read credentials or access the network.',
   }),
 });
@@ -32,6 +33,7 @@ const proc = new SdkProcess({
 const rawResults = [];
 const resultErrors = new Map();
 const taskIds = new Set();
+const taskRuns = new Map();
 const notifiedIds = new Set();
 const completions = [];
 let actualPermissionMode = null;
@@ -58,20 +60,24 @@ proc._handleEvent = async function (message) {
   if (message.type === 'system' && message.subtype === 'init') actualPermissionMode = message.permissionMode;
   if (message.type === 'system' && message.subtype === 'task_started'
     && message.task_type === 'local_agent' && message.is_backgrounded === true
-    && message.spawn_depth === 1) taskIds.add(message.task_id);
-  if (message.type === 'system' && message.subtype === 'task_notification') notifiedIds.add(message.task_id);
+    && message.spawn_depth === 1) { taskIds.add(message.task_id); taskRuns.set(message.task_id, message.run_id || null); }
+  if (message.type === 'system' && message.subtype === 'task_notification' && message.status === 'completed') notifiedIds.add(message.task_id);
   const before = this.pendingQueue.map((pending) => pending.context?.sourceMsgId);
   if (message.type === 'result') resultErrors.set(before[0], message.is_error === true);
   await originalHandleEvent.call(this, message);
   if (message.type === 'result') rawResults.push({
+    originKind: message.origin?.kind || null, senderTaskId: message.origin?.senderTaskId || null, originRunId: message.origin?.runId || null,
+    notificationTaskIds: [...notifiedIds].filter(id => taskIds.has(id)),
     subtype: message.subtype, isError: message.is_error === true, numTurns: message.num_turns,
     notificationCount: [...notifiedIds].filter((id) => taskIds.has(id)).length,
     textPresent: typeof message.result === 'string' && message.result.length > 0,
     before, after: this.pendingQueue.map((pending) => pending.context?.sourceMsgId),
   });
-  if (!followupsQueued && taskIds.size >= 2 && actualPermissionMode === 'auto') {
+  if (!followupsQueued && pendingAttributionFollowupReady({ message, actualPermissionMode,
+    firstUserCompleted: completions.some(c => c.sourceMsgId === 1 && !c.error && !c.rejected),
+    pendingCount: this.pendingQueue.length, taskCount: taskIds.size, notificationCount: [...notifiedIds].filter(id => taskIds.has(id)).length })) {
     followupsQueued = true;
-    send(`Reply with exactly ${markers[1]}.`, 2);
+    send(`First run Bash sleep 30 in the foreground, then reply with exactly ${markers[1]}.`, 2);
     send(`Reply with exactly ${markers[2]}.`, 3);
   }
 };
@@ -81,7 +87,7 @@ try {
   await proc.start(context(1));
   send(`Launch exactly two BACKGROUND subagents using the Task or Agent tool. Each must do only one Bash command: the first runs sleep 20 and the second sleep 22, then each reports its distinct name. After starting both, run one parent Bash sleep 30 so their reports can queue. Finally reply with exactly ${markers[0]}. Do not launch any other tasks.`, 1);
   const deadline = Date.now() + 180000;
-  while (Date.now() < deadline && (!followupsQueued || completions.length < 3 || notifiedIds.size < 2)) {
+  while (Date.now() < deadline && evaluatePendingAttribution({ actualPermissionMode, failure, taskCount: taskIds.size, notificationCount: [...notifiedIds].filter(id => taskIds.has(id)).length, followupsQueued, rawResults, completions, tasks: [...taskRuns].map(([taskId, runId]) => ({ taskId, runId, notified: notifiedIds.has(taskId) })), requireEmptyWitness: sdkVersion === '0.3.322' }).status !== 'PASS') {
     if (proc.closed || (actualPermissionMode && actualPermissionMode !== 'auto')) break;
     await sleep(100);
   }
@@ -95,7 +101,7 @@ try {
   gate.stopSdkProcessSampling();
   fs.closeSync(fd);
 }
-const evaluation = evaluatePendingAttribution({ actualPermissionMode, failure, taskCount: taskIds.size, notificationCount: [...notifiedIds].filter((id) => taskIds.has(id)).length, followupsQueued, rawResults, completions });
+const evaluation = evaluatePendingAttribution({ actualPermissionMode, failure, taskCount: taskIds.size, notificationCount: [...notifiedIds].filter((id) => taskIds.has(id)).length, followupsQueued, rawResults, completions, tasks: [...taskRuns].map(([taskId, runId]) => ({ taskId, runId, notified: notifiedIds.has(taskId) })), requireEmptyWitness: sdkVersion === '0.3.322' });
 const { status } = evaluation;
 fs.writeFileSync(path.join(gate.artifactDir, 'focused-result.json'), `${JSON.stringify({
   status, attestation: gate.sanitizedAttestation, sdkVersion,

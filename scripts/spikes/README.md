@@ -22,11 +22,17 @@ candidate side. A version without an entry blocks the matrix before any
 run starts. Moving the pin means adding the new version's entry and
 dropping the one that is no longer compared.
 
-The Agent SDK is held constant across both sides: every SDK cell runs the
-installed `@anthropic-ai/claude-agent-sdk` (`sdkVersion` in the manifest,
-checked against the installed package by `npm test`) and varies only
-`pathToClaudeCodeExecutable`. The matrix therefore compares CLI versions,
-not SDK versions.
+The legacy/default matrix holds the installed SDK constant (`sdkVersion` in the
+manifest). The separate .322 acceptance manifest instead declares exact
+`sdkRuntimes.old/candidate` identities and requires `--old-sdk-root <absolute SDK
+package directory>` and `--candidate-sdk-root <absolute SDK package directory>`.
+A gate-only Node24 preload resolves both ESM and CJS SDK imports to that side's
+attested package without editing package pins. The same recorded gate source
+runs actual .283/.283 and .322/.322 pairs. Persisted load proofs and source hashes
+are checked after every child and again before accepting retained evidence.
+The b796 crossed old-SDK/new-CLI failure remains FAIL. See the
+[matched-pair spec](../../docs/CLAUDE_MATCHED_SDK_GATE_SPEC.md) for the source-backed
+.322 task lifecycle policy and required distinct-agent attribution witness.
 
 For the pending .283/.322 evaluation, the separate
 `claude-2.1.322-discovery.json` contains provisional candidate expectations.

@@ -24,6 +24,7 @@ import {
 import {
   buildDelayedMcpGatePrompt,
   evaluateDelayedMcpEvidence,
+  matchedDelayedMcpTurnsMatch,
   isTargetDelayedMcpToolResult,
 } from './delayed-mcp-gate.mjs';
 
@@ -293,10 +294,16 @@ if (asyncResultAt !== null) {
   proof.timing.asyncResultLeadMs = handlerCompletedAt - asyncResultAt;
 }
 
-const evaluation = evaluateDelayedMcpEvidence(evidence);
+const sdkRuntime = globalThis[Symbol.for('polygram.gate.sdk')];
+const runtime = { sdkVersion: sdkRuntime?.version, cliVersion: selection.version };
+const evaluation = evaluateDelayedMcpEvidence(evidence, runtime);
+if (sdkRuntime?.version === '0.3.322' && !matchedDelayedMcpTurnsMatch(fs.readFileSync(streamPath, 'utf8').trim().split('\n').map(JSON.parse),
+  { ...runtime, markerHash: hashSensitiveString(marker), expectedMode })) evaluation.reasons.push('matched SDK task turn correlation failed');
+evaluation.pass = evaluation.reasons.length === 0;
 const sdkEvidence = observer.finish();
 const pass = evaluation.pass && sdkEvidence.pass;
 const result = {
+  ...(sdkRuntime && { sdkRuntime }),
   evidenceSchemaVersion: 1,
   matrixScenario: process.env.CLAUDE_GATE_SCENARIO_ID || 'delayed-mcp',
   scenario: 'delayed-mcp',

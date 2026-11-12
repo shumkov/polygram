@@ -352,7 +352,7 @@ function foregroundProofMatches(proof) {
   );
 }
 
-function backgroundProofMatches(proof, evidence) {
+function backgroundProofMatches(proof, evidence, matchedPair) {
   const { counts, ordinals, membership, correlations, statuses, timing } = proof;
   const nativeOrdinals = [
     ordinals.membershipListed,
@@ -386,7 +386,9 @@ function backgroundProofMatches(proof, evidence) {
     && ordinals.taskStarted < ordinals.toolResult
     && ordinals.toolResult < ordinals.membershipCleared
     && ordinals.toolResult < ordinals.taskCompleted
-    && ordinals.membershipCleared < ordinals.taskNotification
+    && (matchedPair
+      ? ordinals.taskNotification < ordinals.membershipCleared && ordinals.membershipCleared < ordinals.marker
+      : ordinals.membershipCleared < ordinals.taskNotification)
     && ordinals.taskCompleted < ordinals.taskNotification
     && ordinals.taskNotification < ordinals.marker
     && membership.listedTaskCount === 1
@@ -397,7 +399,7 @@ function backgroundProofMatches(proof, evidence) {
   );
 }
 
-function nativeLifecycleProofMatches(evidence) {
+function nativeLifecycleProofMatches(evidence, matchedPair) {
   const proof = evidence.nativeLifecycleProof;
   if (
     !proofHasExactSchema(proof)
@@ -408,7 +410,7 @@ function nativeLifecycleProofMatches(evidence) {
   }
   return evidence.expectedMode === 'foreground'
     ? foregroundProofMatches(proof)
-    : backgroundProofMatches(proof, evidence);
+    : backgroundProofMatches(proof, evidence, matchedPair);
 }
 
 export function isTargetDelayedMcpToolResult(block, targetToolUseId) {
@@ -420,7 +422,7 @@ export function isTargetDelayedMcpToolResult(block, targetToolUseId) {
   );
 }
 
-export function evaluateDelayedMcpEvidence(evidence) {
+export function evaluateDelayedMcpEvidence(evidence, runtime = {}) {
   if (!delayedMcpEvidenceSchemaMatches(evidence)) {
     return {
       pass: false,
@@ -450,7 +452,7 @@ export function evaluateDelayedMcpEvidence(evidence) {
     reasons.push('background tool result did not arrive before the handler completed');
   }
 
-  if (!nativeLifecycleProofMatches(evidence)) {
+  if (!nativeLifecycleProofMatches(evidence, runtime.sdkVersion === '0.3.322' && runtime.cliVersion === '2.1.322')) {
     reasons.push(`native lifecycle proof does not match the ${evidence.expectedMode} contract`);
   }
 
@@ -458,4 +460,39 @@ export function evaluateDelayedMcpEvidence(evidence) {
     pass: reasons.length === 0,
     reasons,
   };
+}
+
+
+export function matchedDelayedMcpTurnsMatch(messages, { markerHash, sdkVersion, cliVersion, expectedMode }) {
+  const records = Array.isArray(messages) ? messages : [];
+  const results = records.map((message, i) => ({ message, ordinal: i + 1 })).filter(({ message }) => message.type === 'result');
+  const candidate = sdkVersion === '0.3.322' && cliVersion === '2.1.322';
+  const old = sdkVersion === '0.3.283' && cliVersion === '2.1.283';
+  if (!candidate && !old) return false;
+  if (results.some(({ message }) => message.subtype !== 'success' || message.is_error !== false)) return false;
+  if (expectedMode === 'foreground') return results.length === 1;
+  if (!candidate || expectedMode !== 'background' || results.length !== 2) return false;
+  const listed = records.filter(m => m.type === 'system' && m.subtype === 'background_tasks_changed' && m.tasks?.length);
+  const started = records.filter(m => m.type === 'system' && m.subtype === 'task_started');
+  const updates = records.filter(m => m.type === 'system' && m.subtype === 'task_updated');
+  const notified = records.filter(m => m.type === 'system' && m.subtype === 'task_notification');
+  if ([listed, started, updates, notified].some(events => events.length !== 1) || listed[0].tasks.length !== 1) return false;
+  const task = listed[0].tasks[0], start = started[0], update = updates[0], notification = notified[0];
+  const { task_id: taskId, run_id: runId } = start;
+  const sessionId = start.session_id;
+  if (![taskId, runId, sessionId, start.tool_use_id].every(value => typeof value === 'string' && value.length > 0)) return false;
+  if (![task, update, notification].every(m => m.task_id === taskId && m.run_id === runId)) return false;
+  if (records.some(m => ['assistant', 'user', 'result'].includes(m.type) || (m.type === 'system' && ['background_tasks_changed', 'task_started', 'task_updated', 'task_notification'].includes(m.subtype)) ? m.session_id !== sessionId : false)) return false;
+  if ([task, update, notification].some(m => m.tool_use_id != null && m.tool_use_id !== start.tool_use_id)) return false;
+  const [initial, final] = results;
+  const proof = createDelayedMcpLifecycleProof(records, { expectedMode, markerHash, asyncPlaceholder: true,
+    timing: { asyncResultDelayMs: null, asyncResultLeadMs: null } });
+  const origin = final.message.origin;
+  return initial.message.origin == null
+    && proof.statuses.taskCompleted && proof.statuses.notificationCompleted
+    && proof.ordinals.toolResult < initial.ordinal && initial.ordinal < proof.ordinals.taskCompleted
+    && proof.ordinals.marker < final.ordinal
+    && origin?.kind === 'task-notification' && origin.producer === 'session-task' && origin.runId === runId
+    && typeof final.message.result === 'string'
+    && crypto.createHash('sha256').update(final.message.result).digest('hex') === markerHash;
 }

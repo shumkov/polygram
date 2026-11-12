@@ -9,6 +9,7 @@ import { isDeepStrictEqual } from 'node:util';
 import {
   createDelayedMcpLifecycleProof,
   evaluateDelayedMcpEvidence,
+  matchedDelayedMcpTurnsMatch,
 } from './delayed-mcp-gate.mjs';
 import {
   collectGateLifecycleEvidence,
@@ -30,6 +31,7 @@ import {
 } from './workflow-fixture.mjs';
 
 const require = createRequire(import.meta.url);
+const { assertSdkLoadProof } = require('./gate-sdk-runtime.cjs');
 const { encodeCwd } = require('../../lib/util/claude-session-jsonl');
 
 const RUN_PREFIX_RE = /^[A-Za-z0-9._-]{1,96}$/;
@@ -46,6 +48,10 @@ const CLI_PROCESS_TREE_SCENARIOS = new Set([
 // this host; the sanitized result must then say NOT-APPLICABLE as well.
 export const MATRIX_NOT_APPLICABLE_EXIT_CODE = 3;
 const RUNNER_OWNED_ENV_KEYS = new Set([
+  'CLAUDE_GATE_SDK_ROOT',
+  'CLAUDE_GATE_SDK_EXPECTED',
+  'CLAUDE_GATE_SDK_ATTESTATION_PATH',
+  'CLAUDE_GATE_ORCHESTRA_SOURCE_SHA256',
   'CLAUDE_GATE_BIN',
   'CLAUDE_GATE_EXPECTED_VERSION',
   'CLAUDE_GATE_ARTIFACT_BASE',
@@ -387,7 +393,7 @@ function versionSpecificLifecycleMatches(
         typeof autoBackground === 'boolean'
         && result?.evidence?.expectedMode
           === expectedDelayedMcpMode(expectations, autoBackground)
-        && evaluateDelayedMcpEvidence(result.evidence).pass
+        && evaluateDelayedMcpEvidence(result.evidence, { sdkVersion: result.sdkRuntime?.version, cliVersion: result.attestation?.version }).pass
       );
     }
     if (oracle === 'sdk-subagent-v1') {
@@ -548,6 +554,7 @@ export function buildClaudeMatrixRuns({
             ? expectations.resolvedOpus
             : manifest.comparator.model,
           expectations: structuredClone(expectations),
+          ...(manifest.sdkRuntimes && { sdkRuntime: structuredClone(manifest.sdkRuntimes[versionKey]), orchestraSdkProcessSha256: manifest.orchestraSdkProcessSha256 }),
           ...(maxBridgeReadyToMcpReadyMs !== undefined && {
             maxBridgeReadyToMcpReadyMs,
           }),
@@ -1313,9 +1320,15 @@ function privateLifecycleSourcesMatch({
       (record) => record?.type === 'result',
     );
     if (
-      terminalResults.length !== 1
-      || terminalResults[0].subtype !== result.resultSubtype
-      || terminalResults[0].subtype !== result?.evidence?.resultSubtype
+      run.sdkRuntime?.version === '0.3.322'
+        ? (!isDeepStrictEqual(result.sdkRuntime, run.sdkRuntime)
+          || !matchedDelayedMcpTurnsMatch(privateSdkRecords, { sdkVersion: run.sdkRuntime.version,
+            cliVersion: run.version, expectedMode: result.evidence.expectedMode, markerHash: result.markerHash }))
+        : (terminalResults.length !== 1
+          || terminalResults[0].subtype !== result.resultSubtype
+          || terminalResults[0].subtype !== result?.evidence?.resultSubtype
+          || !isDeepStrictEqual(result.sdkRuntime, run.sdkRuntime)
+          || (run.sdkRuntime && !matchedDelayedMcpTurnsMatch(privateSdkRecords, { sdkVersion: run.sdkRuntime.version, cliVersion: run.version, expectedMode: result.evidence.expectedMode, markerHash: result.markerHash })))
     ) {
       return false;
     }
@@ -1914,7 +1927,7 @@ export function matrixScenarioOracleMatches(scenarioId, result, expectations) {
     pass = successfulWorkflowOracleMatches(result, true);
   } else if (DELAYED_MCP_SCENARIOS.has(scenarioId)) {
     pass = (
-      evaluateDelayedMcpEvidence(result.evidence).pass
+      evaluateDelayedMcpEvidence(result.evidence, { sdkVersion: result.sdkRuntime?.version, cliVersion: result.attestation?.version }).pass
       && result.markerCount === 1
       && result.resultSubtype === 'success'
       && result.reasonCount === 0
@@ -2747,6 +2760,15 @@ export function purgeAcceptedGateArtifacts({
   const authoritativeRunCount =
     AUTHORITATIVE_RUN_COUNT - waivedCellList.length;
   const expectedRunList = Array.isArray(expectedRuns) ? expectedRuns : [];
+  const matchedRuns = expectedRunList.filter(run => run.sdkRuntime);
+  const expectedSdkRuntimes = Object.fromEntries(matchedRuns.map(run => [run.versionKey, run.sdkRuntime]));
+  if (matchedRuns.length) expectedSummaryKeys.push('sdkRuntimes', 'orchestraSdkProcessSha256');
+  if (matchedRuns.length && (matchedRuns.length !== expectedRunList.length
+    || !isDeepStrictEqual(summary.sdkRuntimes, expectedSdkRuntimes)
+    || !SHA256_RE.test(summary.orchestraSdkProcessSha256 || '')
+    || matchedRuns.some(run => run.orchestraSdkProcessSha256 !== summary.orchestraSdkProcessSha256))) {
+    throw new Error('matched summary identities do not match the checked manifest');
+  }
   const expectedIds = expectedRunList.map((run) => run?.id);
   const expectedRunIds = expectedRunList.map(
     (run) => run?.env?.CLAUDE_GATE_RUN_ID,
@@ -2872,6 +2894,10 @@ export function purgeAcceptedGateArtifacts({
     ? fs.realpathSync(claudeProjectsDir)
     : path.resolve(claudeProjectsDir);
 
+  for (const run of matchedRuns) {
+    assertSdkLoadProof({ proofPath: assertContained(artifactBaseDir, path.join(artifactBaseDir, `${runPrefix}-runner-private`, `${run.versionKey}-${run.scenarioId}-${run.repeatIndex}-sdk.json`)),
+      identity: run.sdkRuntime, runId: run.env.CLAUDE_GATE_RUN_ID, orchestraSourceSha256: run.orchestraSdkProcessSha256 });
+  }
   const cleanupPlans = [];
   const sourceSessionTargets = new Set();
   const sanitizedResults = [];

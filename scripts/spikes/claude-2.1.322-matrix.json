@@ -4,7 +4,6 @@
     "old": "2.1.283",
     "candidate": "2.1.322"
   },
-  "sdkVersion": "0.3.283",
   "expectations": {
     "2.1.283": {
       "wrapperRequired": true,
@@ -1211,5 +1210,20 @@
       "artifactCollector": "private control and test sessions, leg markers, snapshot-on launcher records, per-spawn CLI process trees, wrapper records, and sanitized-result.json"
     }
   ],
-  "validationStage": "acceptance"
+  "validationStage": "acceptance",
+  "sdkRuntimes": {
+    "old": {
+      "version": "0.3.283",
+      "claudeCodeVersion": "2.1.283",
+      "entrySha256": "d88abad1360f675dda417c9a6ce7395447d0892b77735529083d10ea4fbdd242",
+      "packageSha256": "35b69121e47f66bc1fbc41804523c38b542c012719c4f2a99eeee5723511e77d"
+    },
+    "candidate": {
+      "version": "0.3.322",
+      "claudeCodeVersion": "2.1.322",
+      "entrySha256": "1c70356fe073f6c5423fb7138e2f2f6580a790eb055ad247e5d7927f57b53e8b",
+      "packageSha256": "d915ef8b7cbe591ef61b10b6c2182ea907e43c416783f01ec9ac45cc947e05ea"
+    }
+  },
+  "orchestraSdkProcessSha256": "c6f61a85acd139a0c524a7726dc5eead02be34480305bcd3fbdde32005c72184"
 }

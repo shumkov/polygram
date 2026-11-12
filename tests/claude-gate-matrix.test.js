@@ -4466,3 +4466,32 @@ test('283/322 manifest preserves exact first-channel assertions for both version
     }
   }
 });
+
+
+test('matched accepted summary validates retained per-cell SDK proofs before cleanup', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matched-accept-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true })); fs.chmodSync(dir, 0o700);
+  const fixture = createAcceptedGateFixture(dir);
+  const source = require.resolve('@shumkov/orchestra/lib/process/sdk-process');
+  const sourceHash = crypto.createHash('sha256').update(fs.readFileSync(source)).digest('hex');
+  const identity = { version: '0.3.220', claudeCodeVersion: OLD_VERSION, entrySha256: '1'.repeat(64), packageSha256: '2'.repeat(64) };
+  const runnerDir = path.join(dir, 'matrix-runner-private'); fs.mkdirSync(runnerDir, { mode: 0o700 });
+  for (const run of fixture.runs) {
+    run.sdkRuntime = identity; run.orchestraSdkProcessSha256 = sourceHash;
+    fs.writeFileSync(path.join(runnerDir, `${run.versionKey}-${run.scenarioId}-${run.repeatIndex}-sdk.json`), JSON.stringify({
+      runId: run.env.CLAUDE_GATE_RUN_ID, identity, orchestraSourceSha256: sourceHash, loaded: true,
+    }), { mode: 0o600 });
+    // Fixture runs use one cell shape with distinct run IDs.
+    run.repeatIndex = Number(run.id.split(':').at(-1));
+    fs.renameSync(path.join(runnerDir, `${run.versionKey}-${run.scenarioId}-undefined-sdk.json`), path.join(runnerDir, `${run.versionKey}-${run.scenarioId}-${run.repeatIndex}-sdk.json`));
+  }
+  const summary = { ...acceptedGateSummary(fixture.runs), sdkRuntimes: { old: identity }, orchestraSdkProcessSha256: sourceHash };
+  const { purgeAcceptedGateArtifacts } = await import('../scripts/spikes/claude-gate-matrix.mjs');
+  const accept = value => purgeAcceptedGateArtifacts({ artifactBaseDir: dir, runPrefix: 'matrix', summary: value,
+    expectedRuns: fixture.runs, expectedScenarios: fixture.scenarios, expectedManifestSha256: 'a'.repeat(64), claudeProjectsDir: path.join(dir, 'projects') });
+  assert.throws(() => accept({ ...summary, sdkRuntimes: { old: { ...identity, entrySha256: '3'.repeat(64) } } }));
+  const proof = path.join(runnerDir, 'old-sdk-resume-1-sdk.json'); const bytes = fs.readFileSync(proof);
+  fs.unlinkSync(proof); assert.throws(() => accept(summary)); fs.writeFileSync(proof, bytes, { mode: 0o600 });
+  assert.doesNotThrow(() => accept(summary));
+  assert.equal(fs.existsSync(runnerDir), false);
+});
