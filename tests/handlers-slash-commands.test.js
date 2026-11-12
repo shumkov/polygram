@@ -347,6 +347,35 @@ describe('slash-commands — Codex model and effort', () => {
     efforts: ['medium', 'high', 'xhigh'],
   };
 
+  test('/model accepts advertised Astra and preserves supported effort', async () => {
+    const fx = fixture({
+      resolveRuntimeView: async () => ({
+        ...codexView,
+        models: [...codexView.models, {
+          model: 'gpt-6-astra',
+          displayName: 'GPT-6 Astra',
+          defaultReasoningEffort: 'high',
+          supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+        }],
+      }),
+    });
+    const ctx = fx.makeCtx({ text: '/model gpt-6-astra' });
+    ctx.chatConfig.codexModel = 'gpt-5.6-sol';
+    ctx.chatConfig.codexEffort = 'xhigh';
+    await fx.dispatch(ctx);
+    assert.equal(ctx.chatConfig.codexModel, 'gpt-6-astra');
+    assert.equal(ctx.chatConfig.codexEffort, 'xhigh');
+    assert.equal(ctx.chatConfig.model, 'sonnet');
+    assert.deepEqual(
+      fx.calls.pmCalls.filter((call) => call.kind === 'selectModelSettings'),
+      [{
+        kind: 'selectModelSettings',
+        sk: 'sk:999',
+        settings: { model: 'gpt-6-astra', effort: 'xhigh' },
+      }],
+    );
+  });
+
   test('/model validates the catalog, writes codexModel only, and reports the next-session timing', async () => {
     const runtimeCalls = [];
     const fx = fixture({

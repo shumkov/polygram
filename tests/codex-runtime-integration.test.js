@@ -450,6 +450,7 @@ function makeFixture(t, scenario = {}) {
     '{"auth_mode":"chatgpt-test"}\n',
     { mode: 0o600 },
   );
+  writeFileSync(path.join(fixture.workspace, 'AGENTS.md'), 'Synthetic integration workspace.\n', { mode: 0o600 });
   writeScenario(fixture, scenario);
   return fixture;
 }
@@ -2502,3 +2503,90 @@ test('fake app-server serializes two rapid steers in Telegram order', {
   assert.equal(await runtime.manager.interrupt('1'), true);
   assert.equal((await primary).error, 'interrupted');
 });
+
+for (const { trusted, proxy } of [
+  { trusted: true, proxy: false },
+  { trusted: true, proxy: true },
+  { trusted: false, proxy: true },
+]) {
+  test(`combined owned profile, preflight and process start/resume: trusted=${trusted}, proxy=${proxy}`, {
+    timeout: 30_000,
+  }, async (t) => {
+    const fixture = makeFixture(t);
+    const config = integrationConfig(fixture);
+    const securityConfig = ownedConfig(fixture);
+    const profileId = trusted ? 'polygram-trusted' : 'polygram-session';
+    const modelProvider = proxy ? 'cliproxyapi' : 'openai';
+    const fakeKey = 'combined-test-proxy-key';
+    if (trusted) {
+      config.codex.access = {
+        mode: 'trusted', chatIds: ['1'], commandPath: '/usr/local/bin:/usr/bin:/bin',
+      };
+      securityConfig.default_permissions = profileId;
+      securityConfig.web_search = 'live';
+      securityConfig.memories = { generate_memories: false, use_memories: false };
+      securityConfig.shell_environment_policy.set.HOME = fixture.serviceHome;
+      securityConfig.shell_environment_policy.set.PATH = config.codex.access.commandPath;
+      securityConfig.permissions = {
+        [profileId]: { filesystem: { ':root': 'write' }, network: { enabled: true } },
+      };
+    }
+    if (proxy) {
+      const keyFile = path.join(fixture.root, 'proxy.key');
+      writeFileSync(keyFile, fakeKey, { mode: 0o600 });
+      config.codex.proxy = { baseUrl: 'http://127.0.0.1:8318/v1', clientKeyFile: keyFile };
+      securityConfig.model_provider = modelProvider;
+      securityConfig.model_providers = { cliproxyapi: {
+        name: 'CLIProxyAPI', base_url: config.codex.proxy.baseUrl, wire_api: 'responses',
+        requires_openai_auth: true, experimental_bearer_token: fakeKey, supports_websockets: true,
+      } };
+    }
+    const effectiveConfig = {
+      ...securityConfig,
+      permissions: { [profileId]: {
+        ...securityConfig.permissions[profileId],
+        filesystem: { glob_scan_max_depth: null, ...securityConfig.permissions[profileId].filesystem },
+      } },
+      model_providers: securityConfig.model_providers ?? {},
+    };
+    const thread = threadResult(fixture.workspace);
+    thread.modelProvider = modelProvider;
+    thread.thread.modelProvider = modelProvider;
+    thread.activePermissionProfile.id = profileId;
+    if (trusted) thread.sandbox = { type: 'dangerFullAccess' };
+    writeScenario(fixture, { methods: {
+      'config/read': { result: { config: effectiveConfig, layers: [{
+        name: 'user', version: 'user-v1', config: securityConfig,
+      }], origins: {} } },
+      'permissionProfile/list': { result: { data: [{
+        id: profileId, allowed: true, description: null,
+      }], nextCursor: null } },
+      'thread/start': { result: thread },
+      'thread/resume': { result: thread },
+    } });
+    const db = dbClient.open(fixture.dbPath);
+    const runtime = createRuntime({ db, config, fixture, integrationOrchestra: createIntegrationOrchestra() });
+    t.after(async () => {
+      try { await runtime.manager.kill('1', 'test-cleanup'); } catch {}
+      try { db.raw.close(); } catch {}
+    });
+    const { proc } = await spawnCodex(runtime, db, config);
+    const result = await runtime.manager.send('1', 'Simulated integration turn');
+    await runtime.controller.settleTelegramDelivery('1', result);
+    const stored = db.getProviderSession('1', 'codex:app-server');
+    assert.equal(stored.provider_session_id, 'codex-thread-1');
+    assert.equal(stored.spawn_profile_id, proc.spawnProfileId);
+    const receipt = runtime.controller.resolveReceipt('1', { runtime: 'codex', spawnProfileId: proc.spawnProfileId });
+    assert.equal(receipt.expectedStaticProfile.expectedConfig.modelProvider, modelProvider);
+    assert.doesNotMatch(JSON.stringify(receipt), new RegExp(fakeKey));
+    assert.equal(await runtime.manager.kill('1', 'integration-resume'), true);
+    const resumed = await spawnCodex(runtime, db, config);
+    assert.equal(resumed.resumed, stored.provider_session_id);
+    assert.equal(resumed.proc.providerSessionId, stored.provider_session_id);
+    const requests = readFileSync(path.join(fixture.workspace, 'fake-codex-requests.jsonl'), 'utf8')
+      .trim().split('\n').map((line) => JSON.parse(line));
+    assert.equal(requests.filter((entry) => entry.method === 'thread/start').length, 1);
+    assert.equal(requests.filter((entry) => entry.method === 'thread/resume').length, 1);
+    assert.equal(await runtime.manager.kill('1', 'integration-complete'), true);
+  });
+}
