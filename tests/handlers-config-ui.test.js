@@ -287,6 +287,27 @@ describe('buildConfigKeyboard', () => {
     assert.match(kb.inline_keyboard[2][1].text, /^✓ xhigh$/);
   });
 
+  test('Astra is selectable only when the authenticated Codex catalog advertises it', () => {
+    const astra = {
+      model: 'gpt-6-astra',
+      displayName: 'GPT-6 Astra',
+      defaultReasoningEffort: 'high',
+      supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+    };
+    const buttons = (view) => buildConfigKeyboard(
+      {}, 'model', null, false, view,
+    ).inline_keyboard.flat();
+    assert.deepEqual(
+      buttons({ ...CODEX_VIEW, models: [...CODEX_VIEW.models, astra] })
+        .find((button) => button.callback_data === 'cfg:model:gpt-6-astra'),
+      { text: 'Astra', callback_data: 'cfg:model:gpt-6-astra' },
+    );
+    assert.equal(
+      buttons(CODEX_VIEW).some((button) => button.callback_data === 'cfg:model:gpt-6-astra'),
+      false,
+    );
+  });
+
   test('/model and /effort remain provider-relative when Codex is disabled', () => {
     const disabledCodex = { ...CODEX_VIEW, codexEnabled: false };
     const model = buildConfigKeyboard(
