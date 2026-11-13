@@ -27,33 +27,54 @@ test('migration 024 creates the mailbox table', (t) => {
     VALUES ('m_x','test','forward','role:a','role:b','b','x',1,'h',1)`).run(), /CHECK/);
 });
 
-test('migration 025 adds the idempotency key and ref columns and bumps the schema version', (t) => {
+test('migrations 025 and 026 add the idempotency key, ref and origin name columns and bump the schema version', (t) => {
   const { db } = fixture(t);
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 25);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 26);
   const columns = db.raw.prepare('PRAGMA table_info(mailbox_messages)').all().map((c) => c.name);
-  assert.deepEqual(columns.slice(12), ['idem_key', 'ref']);
+  assert.deepEqual(columns.slice(12), ['idem_key', 'ref', 'origin_name']);
 });
 
-test('a database at version 24 upgrades to 25 and keeps its messages, with no key or ref', (t) => {
-  const dbPath = path.join(os.tmpdir(), `mailbox-v24-${process.pid}-${Date.now()}.db`);
+// A database built by applying the migrations up to `version` by hand.
+function legacyDb(version) {
+  const dbPath = path.join(os.tmpdir(), `mailbox-v${version}-${process.pid}-${Date.now()}.db`);
   const legacy = new Database(dbPath);
   const migrations = path.join(__dirname, '..', 'migrations');
   for (const file of fs.readdirSync(migrations).filter((name) => name.endsWith('.sql')).sort()) {
-    const version = Number.parseInt(file.slice(0, 3), 10);
-    if (version > 24) continue;
+    const fileVersion = Number.parseInt(file.slice(0, 3), 10);
+    if (fileVersion > version) continue;
     legacy.exec(fs.readFileSync(path.join(migrations, file), 'utf8'));
-    legacy.pragma(`user_version = ${version}`);
+    legacy.pragma(`user_version = ${fileVersion}`);
   }
+  return { dbPath, legacy };
+}
+
+test('a database at version 24 upgrades to the current schema and keeps its messages, with no key, ref or origin', (t) => {
+  const { dbPath, legacy } = legacyDb(24);
   legacy.prepare(`INSERT INTO mailbox_messages(id,bot_name,kind,from_addr,to_addr,route_id,body,depth,body_hash,created_at)
     VALUES ('m_old','test','ask','role:a','role:b','b','x',1,'h',1)`).run();
   legacy.close();
   const db = open(dbPath);
   t.after(() => cleanupDb(dbPath, db));
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 25);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 26);
   const row = createMailboxStore(db.raw, { botName: 'test' }).get('m_old');
   assert.equal(row.body, 'x');
   assert.equal(row.idem_key, null);
   assert.equal(row.ref, null);
+  assert.equal(row.origin_name, null);
+});
+
+// System messages stored before origins existed must keep depth 1 and match
+// their retries, so the upgrade leaves them without an origin.
+test('a database at version 25 upgrades to 26 and keeps its system messages, with no origin', (t) => {
+  const { dbPath, legacy } = legacyDb(25);
+  legacy.prepare(`INSERT INTO mailbox_messages(id,bot_name,kind,from_addr,to_addr,route_id,body,depth,body_hash,created_at,idem_key,ref)
+    VALUES ('m_sys','test','tell','system:agent-org','role:b','b','x',1,'h',1,'task:1','notion:1')`).run();
+  legacy.close();
+  const db = open(dbPath);
+  t.after(() => cleanupDb(dbPath, db));
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 26);
+  const row = createMailboxStore(db.raw, { botName: 'test' }).findByKey('system:agent-org', 'task:1');
+  assert.deepEqual({ id: row.id, depth: row.depth, idem_key: row.idem_key, origin_name: row.origin_name }, { id: 'm_sys', depth: 1, idem_key: 'task:1', origin_name: null });
 });
 
 test('an idempotency key is unique per sender within a bot; messages without a key are unconstrained', (t) => {
@@ -86,7 +107,7 @@ test('a stored message reads back with every field', (t) => {
   assert.deepEqual(store.get('m_0000000000000001'), {
     id: 'm_0000000000000001', bot_name: 'test', kind: 'ask', from_addr: 'role:orchestrator', to_addr: 'role:marketing',
     route_id: 'marketing', body: 'What is the campaign budget?', in_reply_to: null, depth: 1, body_hash: 'h1', notice_sent: 0, created_at: now(),
-    idem_key: null, ref: null,
+    idem_key: null, ref: null, origin_name: null,
   });
   assert.equal(store.get('m_missing'), null);
 });

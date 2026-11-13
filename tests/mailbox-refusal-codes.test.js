@@ -36,7 +36,8 @@ const coded = (code) => (error) => { assert.equal(error.code, code, error.messag
 
 test('the refusal codes are exactly the contracted strings', () => {
   assert.deepEqual(Object.values(rules.REFUSAL).sort(), [
-    'MAILBOX_DISABLED', 'MAILBOX_KEY_CONFLICT', 'MAILBOX_NOT_SYSTEM_SENDER', 'MAILBOX_RATE_LIMITED', 'MAILBOX_TOO_LARGE', 'MAILBOX_UNKNOWN_ROLE',
+    'MAILBOX_DISABLED', 'MAILBOX_INVALID_ORIGIN', 'MAILBOX_KEY_CONFLICT', 'MAILBOX_NOT_SYSTEM_SENDER', 'MAILBOX_RATE_LIMITED', 'MAILBOX_TOO_LARGE',
+    'MAILBOX_UNKNOWN_ROLE',
   ]);
 });
 
@@ -56,6 +57,11 @@ test('the system hourly budget is MAILBOX_RATE_LIMITED, like the per-pair limit'
   const f = fixture(t, { limits: { systemPerHour: 1 } });
   f.service.submit({ sender: 'agent-org', to: 'marketing', body: 'B', key: 'k1' });
   assert.throws(() => f.service.submit({ sender: 'agent-org', to: 'marketing', body: 'B', key: 'k2' }), coded('MAILBOX_RATE_LIMITED'));
+});
+
+test('an origin other than {kind:"human", name} is MAILBOX_INVALID_ORIGIN', (t) => {
+  const f = fixture(t);
+  assert.throws(() => f.service.submit({ sender: 'agent-org', to: 'marketing', body: 'B', key: 'k', origin: { kind: 'agent', name: 'x' } }), coded('MAILBOX_INVALID_ORIGIN'));
 });
 
 test('an unknown target role is MAILBOX_UNKNOWN_ROLE', (t) => {
@@ -101,4 +107,6 @@ test('a refusal code reaches an IPC client unchanged', async (t) => {
   assert.deepEqual({ ok: accepted.ok, state: accepted.state }, { ok: true, state: 'queued' });
   const conflict = await client.call({ path: socket, op: 'mailbox_submit', payload: { sender: 'agent-org', to: 'marketing', body: 'other', key: 'k' } });
   assert.deepEqual({ ok: conflict.ok, code: conflict.code }, { ok: false, code: 'MAILBOX_KEY_CONFLICT' });
+  const origin = await client.call({ path: socket, op: 'mailbox_submit', payload: { sender: 'agent-org', to: 'marketing', body: 'B', key: 'k2', origin: { kind: 'human', name: '' } } });
+  assert.deepEqual({ ok: origin.ok, code: origin.code }, { ok: false, code: 'MAILBOX_INVALID_ORIGIN' });
 });
