@@ -58,3 +58,15 @@ test('rich reply traversal tolerates malformed and excessively nested nodes', ()
   assert.ok(!body.includes('too-deep'));
   assert.ok(body.includes('Still visible'));
 });
+
+test('a URL nested inside closed details survives truncation of the card body', () => {
+  const replied = card('https://notion.so/task', 'x'.repeat(600), 'y'.repeat(600));
+  replied.rich_message.blocks[0].blocks[2].blocks.push({ type: 'paragraph', text: [
+    { type: 'italic', text: { type: 'url', text: 'Related task', url: 'https://notion.so/related' } },
+  ] });
+  normalizeRichInbound({ text: 'Follow up', reply_to_message: replied });
+  const body = bodyOf(buildReplyToBlock({ telegram: replied }));
+  assert.ok(body.includes('Related task <https://notion.so/related>'));
+  assert.ok(body.includes('<https://notion.so/task>'));
+  assert.ok(body.length <= 500);
+});
