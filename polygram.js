@@ -4534,7 +4534,7 @@ async function main() {
     db, dbWrite, config, botName: BOT_NAME, extractAttachments,
   });
   handleSendOverIpc = createHandleSendOverIpc({
-    config, bot, tg, botName: BOT_NAME,
+    config, bot, tg, botName: BOT_NAME, sendRich: (args) => richSendMessage(args),
   });
   ({
     dispatchHandleMessage,
