@@ -41,7 +41,7 @@ the controller's existing exact-owner check. Today cleanup emits null and the
 controller rejects it. Correct the payload rather than weakening the verifier;
 normal transport closure and durable cleanup still must succeed. Containment
 entered while attaching and before a provider thread is accepted uses the same
-attachment-failure category, including direct transport/notification faults;
+attachment-failure category, including direct transport faults;
 accepted-thread and active-turn fault categories remain unchanged.
 Failed-generation settlement must also preserve a provider pointer belonging to
 a prior generation: failed attachment never admitted a turn that superseded it.
