@@ -1,5 +1,7 @@
 'use strict';
 
+const deployment = require('./helpers/codex-deployment');
+
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { mkdtempSync, rmSync } = require('node:fs');
@@ -201,7 +203,7 @@ function fixture({
   }
   const controller = createCodexRuntimeController({
     config: configOverride ?? {
-      codex: {
+      codex: { ...deployment.policy,
         home: '/srv/codex-home',
         daemonSecretRoots: ['/srv/polygram'],
       },
@@ -402,7 +404,7 @@ test('different chats serialize native preflight admission daemon-wide', async (
   };
   const { controller } = fixture({
     configOverride: {
-      codex: {
+      codex: { ...deployment.policy,
         home: '/srv/codex-home',
         daemonSecretRoots: ['/srv/polygram'],
       },
@@ -476,7 +478,7 @@ test('preflight admission wait is bounded without starting a competing app-serve
   };
   const { controller } = fixture({
     configOverride: {
-      codex: {
+      codex: { ...deployment.policy,
         home: '/srv/codex-home',
         daemonSecretRoots: ['/srv/polygram'],
       },
@@ -939,7 +941,7 @@ test('a transient credential-home read error keeps the valid prepared receipt', 
 
 test('model changes reuse the authenticated static receipt and preflight', async () => {
   const config = {
-    codex: {
+    codex: { ...deployment.policy,
       home: '/srv/codex-home',
       daemonSecretRoots: ['/srv/polygram'],
     },
@@ -1023,7 +1025,7 @@ test('expired catalogs block a turn when the durable model disappeared', async (
     { code: 'CODEX_MODEL_UNAVAILABLE' },
   );
   const config = {
-    codex: {
+    codex: { ...deployment.policy,
       home: '/srv/codex-home',
       daemonSecretRoots: ['/srv/polygram'],
     },
@@ -1771,7 +1773,7 @@ test('restores durable ownership before preparing an exact Codex session', async
 
 test('prospective Codex preflight is cached without changing the configured Claude runtime', async () => {
   const config = {
-    codex: {
+    codex: { ...deployment.policy,
       home: '/srv/codex-home',
       daemonSecretRoots: ['/srv/polygram'],
     },
@@ -1832,7 +1834,7 @@ test('prospective Codex preflight is cached without changing the configured Clau
 
 test('unused prospective Codex preflight can be discarded without touching config', async () => {
   const config = {
-    codex: {
+    codex: { ...deployment.policy,
       home: '/srv/codex-home',
       daemonSecretRoots: ['/srv/polygram'],
     },
@@ -1896,7 +1898,7 @@ test('candidate discard refuses a receipt bound to a registered Codex process', 
 
 test('normal prepare revalidates configured Codex selection after candidate preflight', async () => {
   const config = {
-    codex: {
+    codex: { ...deployment.policy,
       home: '/srv/codex-home',
       daemonSecretRoots: ['/srv/polygram'],
     },
@@ -2025,7 +2027,7 @@ test('hook-enabled clients are reattested and receive only the prepared manifest
   const reattested = [];
   let preparedInput;
   const config = {
-    codex: {
+    codex: { ...deployment.policy,
       home: '/srv/codex-home',
       daemonSecretRoots: ['/srv/polygram'],
       hooks: hookOptions,
@@ -2096,7 +2098,7 @@ test('hook configuration changes during preflight invalidate the prepared profil
     version: '0.38.6',
   };
   const config = {
-    codex: {
+    codex: { ...deployment.policy,
       home: '/srv/codex-home',
       daemonSecretRoots: ['/srv/polygram'],
       hooks: hookOptions,
@@ -3344,8 +3346,8 @@ test('failed durable lease acquisition rolls back generation and prepared attemp
 
 function trustedConfig(pm = 'codex') {
   return {
-    codex: { home: '/srv/codex-home', daemonSecretRoots: ['/srv/polygram'],
-      access: { mode: 'trusted', chatIds: ['100'], commandPath: '/usr/local/bin:/usr/bin:/bin' } },
+    codex: { ...deployment.policy, home: '/srv/codex-home', daemonSecretRoots: ['/srv/polygram'],
+      access: { mode: 'trusted', commandPath: '/usr/local/bin:/usr/bin:/bin' } },
     defaults: { codexEnabled: true },
     chats: { '100': { pm, cwd: '/srv/workspace', codexModel: 'gpt-5.6-sol', codexEffort: 'xhigh' } },
   };
@@ -3355,7 +3357,7 @@ test('candidate preflight rejects trusted access revoked during the asynchronous
   const config = trustedConfig('sdk');
   const { controller, receipt } = fixture({ configOverride: config, modelCatalogOverride: {
     async preflight() {
-      config.codex.access.chatIds = ['200'];
+      config.chats['100'].codexEnabled = false;
       return { state: 'available', spawnProfile: receipt, models: [], selected: { model: 'gpt-5.6-sol', effort: 'xhigh' } };
     },
   } });
@@ -3367,7 +3369,7 @@ test('cached receipt and client reject deployment drift before reuse', async () 
   for (const change of [
     (config) => { delete config.codex.access; },
     (config) => { config.codex.access.commandPath = '/usr/bin:/bin'; },
-    (config) => { config.codex.access.chatIds = ['200']; },
+    (config) => { delete config.codex.proxy; },
   ]) {
     const config = trustedConfig();
     const { controller, receipt, clientOptions } = fixture({ configOverride: config });
@@ -3386,7 +3388,7 @@ test('running trusted generation rejects new follow-ups after access is removed 
   await registerDurableProcess(controller, receipt);
   delete config.codex.access;
   assert.throws(() => controller.claimDispatchReservation({ sessionKey: '100', generationId: 'generation-dispatch',
-    botName: 'bot-a', telegramChatId: '100', telegramMessageId: '99' }), { code: 'CODEX_PREFLIGHT_PROFILE_MISMATCH' });
+    botName: 'bot-a', telegramChatId: '100', telegramMessageId: '99' }), { code: 'CODEX_DEPLOYMENT_CONFIG_INVALID' });
   assert.equal(calls.filter((call) => call[0] === 'claim-dispatch').length, 0);
 });
 
@@ -3400,7 +3402,7 @@ test('clean replay queue authorization rejects drift but existing reservation se
     botName: 'bot-a', telegramChatId: '100', telegramMessageId: '99' });
   delete config.codex.access;
   assert.throws(() => controller.markDispatchDisposition({ sessionKey: '100', generationId: 'generation-dispatch',
-    reservationId: claim.reservationId, disposition: 'queue-authorized' }), { code: 'CODEX_PREFLIGHT_PROFILE_MISMATCH' });
+    reservationId: claim.reservationId, disposition: 'queue-authorized' }), { code: 'CODEX_DEPLOYMENT_CONFIG_INVALID' });
   assert.doesNotThrow(() => controller.finalizeAcceptedSteer({ sessionKey: '100', generationId: 'generation-dispatch',
     reservationId: claim.reservationId, steerAttemptId: 'steer-1', targetAttemptId: 'target-1' }));
 });
@@ -3411,7 +3413,7 @@ test('cached preflight rechecks scope after asynchronous credential attestation'
   let attests = 0;
   const { controller } = fixture({ configOverride: config, controllerOptions: {
     attestCodexHome: async () => {
-      if (++attests > 1) config.codex.access.chatIds = ['200'];
+      if (++attests > 1) config.chats['100'].codexEnabled = false;
       return { authFingerprint: { ino: 'auth-1' }, configFingerprint: { ino: 'config-1' } };
     },
   } });
@@ -3421,7 +3423,6 @@ test('cached preflight rechecks scope after asynchronous credential attestation'
 
 test('deployment cache binds origin chat and topic instead of treating sessionKey as authorization', async () => {
   const config = trustedConfig();
-  config.codex.access.chatIds.push('200');
   config.chats['200'] = { ...config.chats['100'] };
   const { controller, calls } = fixture({ configOverride: config });
   await controller.prepareSession({ sessionKey: 'same-key', chatId: '100' });
@@ -3461,12 +3462,12 @@ test('environment, proxy endpoint, key identity and key content invalidate cache
   }
 });
 
-test('trusted-to-beta idle profile change requires process replacement', async () => {
+test('trusted command PATH change requires process replacement', async () => {
   const config = trustedConfig();
   const { controller, receipt } = fixture({ configOverride: config });
   await controller.prepareSession({ sessionKey: '100', chatId: '100' });
   const proc = await registerDurableProcess(controller, receipt);
-  delete config.codex.access;
+  config.codex.access.commandPath = '/usr/bin:/bin';
   await controller.prepareSession({ sessionKey: '100', chatId: '100' });
   assert.equal(controller.processReplacementReason('100', proc), 'deployment-config-drift');
 });
@@ -3492,6 +3493,6 @@ test('queued turn start cannot enter an old trusted process after deployment dri
   delete config.codex.access;
   await assert.rejects(controller.checkpointSink({ kind: 'request-prepared', method: 'turn/start',
     generationId: proc.generationId, hostIdentity: 'host:current', bootSessionIdentity: 'boot:current',
-    attemptId: 'queued-1', threadId: 'thread-queued-1', clientUserMessageId: 'user-queued-1' }), { code: 'CODEX_PREFLIGHT_PROFILE_MISMATCH' });
+    attemptId: 'queued-1', threadId: 'thread-queued-1', clientUserMessageId: 'user-queued-1' }), { code: 'CODEX_DEPLOYMENT_CONFIG_INVALID' });
   assert.equal(calls.filter((call) => call[0] === 'turn-start-prepared').length, 0);
 });

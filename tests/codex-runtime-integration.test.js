@@ -1,5 +1,7 @@
 'use strict';
 
+const deployment = require('./helpers/codex-deployment');
+
 const assert = require('node:assert/strict');
 const {
   chmodSync,
@@ -91,14 +93,17 @@ function ownedConfig({
   codexTmp,
   daemonSecretRoot,
   workspace,
+  serviceHome,
 }) {
   return {
     cli_auth_credentials_store: 'file',
-    model_provider: 'openai',
-    default_permissions: 'polygram-session',
+    model_provider: 'cliproxyapi',
+    model_providers: { cliproxyapi: deployment.provider },
+    default_permissions: 'polygram-trusted',
     approval_policy: 'never',
     approvals_reviewer: 'user',
-    web_search: 'disabled',
+    web_search: 'live',
+    memories: { generate_memories: false, use_memories: false },
     allow_login_shell: false,
     features: {
       goals: false,
@@ -107,21 +112,15 @@ function ownedConfig({
       inherit: 'none',
       ignore_default_excludes: false,
       set: {
-        HOME: path.join(workspace, '.codex-command-home'),
+        HOME: serviceHome,
         TMPDIR: path.join(workspace, '.codex-command-tmp'),
         PATH: '/usr/bin:/bin',
       },
     },
     permissions: {
-      'polygram-session': {
-        filesystem: {
-          ':minimal': 'read',
-          [codexHome]: 'deny',
-          [codexTmp]: 'deny',
-          [daemonSecretRoot]: 'deny',
-          ':workspace_roots': { '.': 'write' },
-        },
-        network: { enabled: false },
+      'polygram-trusted': {
+        filesystem: { ':root': 'write' },
+        network: { enabled: true },
       },
     },
     projects: {
@@ -138,7 +137,7 @@ function threadResult(workspace, threadId = 'codex-thread-1') {
       cwd: workspace,
       ephemeral: false,
       id: threadId,
-      modelProvider: 'openai',
+      modelProvider: 'cliproxyapi',
       preview: '',
       sessionId: threadId,
       source: 'appServer',
@@ -150,18 +149,12 @@ function threadResult(workspace, threadId = 'codex-thread-1') {
     approvalsReviewer: 'user',
     cwd: workspace,
     model: 'gpt-5.6-sol',
-    modelProvider: 'openai',
+    modelProvider: 'cliproxyapi',
     reasoningEffort: 'medium',
     runtimeWorkspaceRoots: [workspace],
-    sandbox: {
-      type: 'workspaceWrite',
-      writableRoots: [],
-      networkAccess: false,
-      excludeSlashTmp: true,
-      excludeTmpdirEnvVar: true,
-    },
+    sandbox: { type: 'dangerFullAccess' },
     activePermissionProfile: {
-      id: 'polygram-session',
+      id: 'polygram-trusted',
       extends: null,
     },
   };
@@ -253,16 +246,16 @@ function writeScenario(fixture, overrides = {}) {
   const effectiveConfig = {
     ...securityConfig,
     permissions: {
-      'polygram-session': {
-        ...securityConfig.permissions['polygram-session'],
+      'polygram-trusted': {
+        ...securityConfig.permissions['polygram-trusted'],
         filesystem: {
           glob_scan_max_depth: null,
-          ...securityConfig.permissions['polygram-session'].filesystem,
+          ...securityConfig.permissions['polygram-trusted'].filesystem,
         },
       },
     },
-    model_provider: 'openai',
-    model_providers: {},
+    model_provider: 'cliproxyapi',
+    model_providers: { cliproxyapi: deployment.provider },
   };
   const turnId = 'turn-text-1';
   writeFileSync(
@@ -288,7 +281,7 @@ function writeScenario(fixture, overrides = {}) {
         'permissionProfile/list': {
           result: {
             data: [{
-              id: 'polygram-session',
+              id: 'polygram-trusted',
               allowed: true,
               description: 'Polygram native beta profile',
             }],
@@ -297,12 +290,8 @@ function writeScenario(fixture, overrides = {}) {
         },
         'account/read': {
           result: {
-            account: {
-              type: 'chatgpt',
-              email: null,
-              planType: 'pro',
-            },
-            requiresOpenaiAuth: true,
+            account: null,
+            requiresOpenaiAuth: false,
           },
         },
         'model/list': {
@@ -451,6 +440,7 @@ function makeFixture(t, scenario = {}) {
     { mode: 0o600 },
   );
   writeFileSync(path.join(fixture.workspace, 'AGENTS.md'), 'Synthetic integration workspace.\n', { mode: 0o600 });
+  require('node:fs').symlinkSync(path.join(fixture.workspace, 'AGENTS.md'), path.join(fixture.codexHome, 'AGENTS.md'));
   writeScenario(fixture, scenario);
   return fixture;
 }
@@ -1069,7 +1059,7 @@ function integrationConfig(fixture) {
   return {
     bot: { pm: 'sdk' },
     defaults: { pm: 'sdk' },
-    codex: {
+    codex: { ...deployment.policy,
       home: fixture.codexHome,
       binary: fixture.binary,
       daemonSecretRoots: [],
@@ -1441,7 +1431,7 @@ test('fake app-server runs Polygram text start, stream, final, persistence, and 
   const config = {
     bot: { pm: 'sdk' },
     defaults: { pm: 'sdk' },
-    codex: {
+    codex: { ...deployment.policy,
       home: fixture.codexHome,
       binary: fixture.binary,
       daemonSecretRoots: [],
@@ -2504,23 +2494,22 @@ test('fake app-server serializes two rapid steers in Telegram order', {
   assert.equal((await primary).error, 'interrupted');
 });
 
-for (const { trusted, proxy } of [
-  { trusted: true, proxy: false },
-  { trusted: true, proxy: true },
-  { trusted: false, proxy: true },
-]) {
-  test(`combined owned profile, preflight and process start/resume: trusted=${trusted}, proxy=${proxy}`, {
+for (const preserveNativeAuth of [false, true]) {
+  const trusted = true;
+  const proxy = true;
+  test(`combined owned profile, preflight and process start/resume: nativeAuthPreserved=${preserveNativeAuth}`, {
     timeout: 30_000,
   }, async (t) => {
     const fixture = makeFixture(t);
+    if (!preserveNativeAuth) require('node:fs').unlinkSync(path.join(fixture.codexHome, 'auth.json'));
     const config = integrationConfig(fixture);
     const securityConfig = ownedConfig(fixture);
-    const profileId = trusted ? 'polygram-trusted' : 'polygram-session';
+    const profileId = trusted ? 'polygram-trusted' : 'polygram-trusted';
     const modelProvider = proxy ? 'cliproxyapi' : 'openai';
     const fakeKey = 'combined-test-proxy-key';
     if (trusted) {
       config.codex.access = {
-        mode: 'trusted', chatIds: ['1'], commandPath: '/usr/local/bin:/usr/bin:/bin',
+        mode: 'trusted', commandPath: '/usr/local/bin:/usr/bin:/bin',
       };
       securityConfig.default_permissions = profileId;
       securityConfig.web_search = 'live';
@@ -2594,3 +2583,74 @@ for (const { trusted, proxy } of [
     assert.equal(await runtime.manager.kill('1', 'integration-complete'), true);
   });
 }
+
+
+test('derived workspace home survives cache reuse and fresh-process resume without adopting legacy native auth', { timeout: 30_000 }, async (t) => {
+  const legacy = makeFixture(t);
+  const other = makeFixture(t);
+  const fixture = { ...legacy, workspace: other.workspace };
+  writeScenario(fixture);
+  const config = integrationConfig(fixture);
+  const db = dbClient.open(legacy.dbPath);
+  const integrationOrchestra = createIntegrationOrchestra();
+  const attestedHomes = [];
+  const attester = async (...args) => {
+    attestedHomes.push(args[0]);
+    return integrationOrchestra._attestCodexHome(...args);
+  };
+  const runtime = createRuntime({ db, config, fixture, integrationOrchestra,
+    controllerOptions: { attestCodexHome: attester } });
+  let replacement;
+  t.after(async () => {
+    try { await runtime.manager.kill('1', 'test-cleanup'); } catch {}
+    try { await replacement?.manager.kill('1', 'test-cleanup'); } catch {}
+    try { db.raw.close(); } catch {}
+  });
+  const { proc } = await spawnCodex(runtime, db, config);
+  const selectedHome = runtime.controller.resolveReceipt('1', {
+    runtime: 'codex', spawnProfileId: proc.spawnProfileId,
+  }).expectedStaticProfile.codexHome;
+  assert.notEqual(selectedHome, legacy.codexHome);
+  assert.equal(JSON.parse(readFileSync(path.join(fixture.workspace, 'fake-codex-spawn.json'), 'utf8')).env.CODEX_HOME, selectedHome);
+  await runtime.controller.prepareSession({ sessionKey: '1', chatId: '1' });
+  assert.ok(attestedHomes.length >= 2);
+  assert.ok(attestedHomes.every((home) => home === selectedHome));
+  const result = await runtime.manager.send('1', 'Synthetic derived-home turn');
+  await runtime.controller.settleTelegramDelivery('1', result);
+  assert.equal(await runtime.manager.kill('1', 'fresh-runtime-resume'), true);
+  replacement = createRuntime({ db, config, fixture, integrationOrchestra: createIntegrationOrchestra() });
+  const resumed = await spawnCodex(replacement, db, config);
+  assert.equal(resumed.resumed, 'codex-thread-1');
+  assert.equal(JSON.parse(readFileSync(path.join(fixture.workspace, 'fake-codex-spawn.json'), 'utf8')).env.CODEX_HOME, selectedHome);
+  assert.equal(require('node:fs').existsSync(path.join(selectedHome, 'auth.json')), false);
+  assert.equal(readFileSync(path.join(legacy.codexHome, 'auth.json'), 'utf8'), '{"auth_mode":"chatgpt-test"}\n');
+  assert.equal(require('node:fs').readlinkSync(path.join(legacy.codexHome, 'AGENTS.md')), path.join(legacy.workspace, 'AGENTS.md'));
+  assert.equal(await replacement.manager.kill('1', 'integration-complete'), true);
+});
+
+test('fresh receipt is refused when anchor binding changes during asynchronous provider preflight', { timeout: 30_000 }, async (t) => {
+  const legacy = makeFixture(t);
+  const other = makeFixture(t);
+  const fixture = { ...legacy, workspace: other.workspace };
+  writeScenario(fixture);
+  const config = integrationConfig(fixture);
+  const db = dbClient.open(legacy.dbPath);
+  t.after(() => { try { db.raw.close(); } catch {} });
+  const integrationOrchestra = createIntegrationOrchestra();
+  const catalog = new CodexModelCatalog({ orchestra: integrationOrchestra });
+  const replacementWorkspace = path.join(legacy.root, 'replacement-binding');
+  mkdirSync(replacementWorkspace, { mode: 0o700 });
+  writeFileSync(path.join(replacementWorkspace, 'AGENTS.md'), 'Other canonical instructions', { mode: 0o600 });
+  const runtime = createRuntime({ db, config, fixture, integrationOrchestra,
+    controllerOptions: { modelCatalog: { async preflight(...args) {
+      const result = await catalog.preflight(...args);
+      require('node:fs').unlinkSync(path.join(legacy.codexHome, 'AGENTS.md'));
+      require('node:fs').symlinkSync(path.join(replacementWorkspace, 'AGENTS.md'), path.join(legacy.codexHome, 'AGENTS.md'));
+      return result;
+    } } } });
+  await assert.rejects(runtime.controller.prepareSession({ sessionKey: '1', chatId: '1' }),
+    { code: 'CODEX_INSTRUCTION_BINDING_DRIFT' });
+  assert.throws(() => runtime.controller.resolveReceipt('1', { runtime: 'codex', spawnProfileId: 'a'.repeat(64) }));
+  const requests = readFileSync(path.join(fixture.workspace, 'fake-codex-requests.jsonl'), 'utf8');
+  assert.doesNotMatch(requests, /"method":"(?:thread\/start|turn\/start)"/);
+});

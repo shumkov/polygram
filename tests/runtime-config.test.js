@@ -1085,29 +1085,6 @@ describe('resolveRuntimeConfig — fail-closed explicit Codex selection', () => 
 });
 
 
-test('trusted deployment admission intersects scoped flags with exact private chat IDs', () => {
-  const access = { mode: 'trusted', chatIds: ['100'], commandPath: '/usr/local/bin:/usr/bin:/bin' };
-  const config = { codex: { access }, defaults: { codexEnabled: true }, chats: {
-    '-100': { topics: { '7': { codexEnabled: true } } },
-    '100': { topics: { '7': { codexEnabled: false } } },
-  } };
-  assert.equal(resolveCodexEnabled(config, '100'), true);
-  assert.equal(resolveCodexEnabled(config, '100', '7'), false);
-  assert.equal(resolveCodexEnabled(config, '200'), false);
-  assert.equal(resolveCodexEnabled(config, '-100', '7'), false);
-  assert.equal(resolveCodexEnabled(config, '0100'), false);
-  for (const invalid of [null, {}, { ...access, chatIds: [] }, { ...access, chatIds: [100] },
-    { ...access, chatIds: ['-100'] }, { ...access, chatIds: ['*'] }, { ...access, chatIds: ['0100'] },
-    { ...access, mode: 'other' }, { ...access, commandPath: '/bin:relative' },
-    { ...access, commandPath: '/bin:' }]) {
-    config.codex.access = invalid;
-    assert.equal(resolveCodexEnabled(config, '100'), false);
-  }
-  delete config.codex.access;
-  assert.equal(resolveCodexEnabled(config, '200'), true);
-});
-
-
 test('Codex enablement remains false when configuration is absent', () => {
   assert.equal(resolveCodexEnabled(undefined, '100'), false);
   assert.equal(resolveCodexEnabled(null, '100'), false);

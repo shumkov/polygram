@@ -623,7 +623,6 @@ function formatPrompt(msg, sessionCtx, attachments = [], { sessionKey = null } =
     replyTo: resolveReplyTo(msg),
     polygramHistory: polygramHistory + (notificationService?.context(sessionKey, msg.reply_to_message?.message_id) || '') + (notificationService?.instructions(sessionKey) || '') + (mailboxService?.instructions(sessionKey) || ''),
     backend: resolvePromptBackend({ config, chatId, threadId }),
-    codexAccess: config.codex?.access,
     // Only advertise stickers this bot actually has — empty for a bot with no
     // sticker set, so its prompt never mentions stickers.
     stickerEmojis: Object.keys(emojiToSticker),

@@ -1,5 +1,7 @@
 'use strict';
 
+const deployment = require('./helpers/codex-deployment');
+
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const {
@@ -86,6 +88,9 @@ function fixture(t) {
     mkdirSync(directory, { mode: 0o700 });
     chmodSync(directory, 0o700);
   }
+  writeFileSync(path.join(workspace, 'AGENTS.md'), 'Synthetic canonical instructions', { mode: 0o600 });
+  mkdirSync(codexHome, { mode: 0o700 });
+  symlinkSync(path.join(workspace, 'AGENTS.md'), path.join(codexHome, 'AGENTS.md'));
   return {
     root,
     workspace,
@@ -106,25 +111,15 @@ function fixture(t) {
 }
 
 function ownedConfig(f) {
-  const appServerTmp = realpathSync(
-    f.processEnv.POLYGRAM_CODEX_TMPDIR ?? f.processEnv.TMPDIR,
-  );
-  const deniedRoots = normalizeDeniedRoots([
-    f.codexHome,
-    f.daemonSecretRoot,
-    f.ipcRuntimeRoot,
-    appServerTmp,
-  ]);
-  const filesystem = { ':minimal': 'read' };
-  for (const root of deniedRoots.sort()) filesystem[root] = 'deny';
-  filesystem[':workspace_roots'] = { '.': 'write' };
   return {
     cli_auth_credentials_store: 'file',
-    model_provider: 'openai',
+    model_provider: 'cliproxyapi',
+    model_providers: { cliproxyapi: deployment.provider },
     default_permissions: CODEX_PERMISSION_PROFILE_ID,
     approval_policy: 'never',
     approvals_reviewer: 'user',
-    web_search: 'disabled',
+    web_search: 'live',
+    memories: { generate_memories: false, use_memories: false },
     allow_login_shell: false,
     features: {
       goals: false,
@@ -133,15 +128,15 @@ function ownedConfig(f) {
       inherit: 'none',
       ignore_default_excludes: false,
       set: {
-        HOME: path.join(f.workspace, '.codex-command-home'),
+        HOME: f.serviceHome,
         TMPDIR: path.join(f.workspace, '.codex-command-tmp'),
         PATH: '/usr/bin:/bin',
       },
     },
     permissions: {
       [CODEX_PERMISSION_PROFILE_ID]: {
-        filesystem,
-        network: { enabled: false },
+        filesystem: { ':root': 'write' },
+        network: { enabled: true },
       },
     },
     projects: {
@@ -163,23 +158,23 @@ function projectedConfig(f, overrides = {}) {
   return {
     sha256: 'e'.repeat(64),
     model: null,
-    modelProvider: 'openai',
+    modelProvider: 'cliproxyapi',
     defaultPermissions: CODEX_PERMISSION_PROFILE_ID,
     approvalPolicy: 'never',
     approvalsReviewer: 'user',
-    webSearch: 'disabled',
+    webSearch: 'live',
     allowLoginShell: false,
     shellEnvironmentInherit: 'none',
     permissionProfiles: [{
       id: CODEX_PERMISSION_PROFILE_ID,
       extends: null,
-      networkEnabled: false,
+      networkEnabled: true,
       filesystemSha256: digest(filesystem),
       filesystem: stringRules,
     }],
     mcpServers: { count: 0, keySha256: [] },
     plugins: { count: 0, keySha256: [] },
-    modelProviders: { count: 0, keySha256: [] },
+    modelProviders: { count: 1, keySha256: [digest('cliproxyapi')] },
     ...overrides,
   };
 }
@@ -303,6 +298,7 @@ function createBuilder(f, results = projectedResults(f), clientOptions = {}) {
 
 function prepareOptions(f, overrides = {}) {
   return {
+    ...deployment.policy,
     binaryReceipt: binaryReceipt(),
     codexHome: f.codexHome,
     workspace: f.workspace,
@@ -454,8 +450,8 @@ describe('owned Codex native-beta runtime profile', () => {
       0o600,
     );
     assert.equal(
-      statSync(path.join(f.workspace, '.codex-command-home')).mode & 0o777,
-      0o700,
+      profile.env.HOME,
+      f.serviceHome,
     );
     assert.equal(
       statSync(path.join(f.workspace, '.codex-command-tmp')).mode & 0o777,
@@ -463,18 +459,14 @@ describe('owned Codex native-beta runtime profile', () => {
     );
 
     const raw = readFileSync(path.join(f.codexHome, 'config.toml'), 'utf8');
-    assert.match(raw, /model_provider = "openai"/);
-    assert.match(raw, /default_permissions = "polygram-session"/);
+    assert.match(raw, /model_provider = "cliproxyapi"/);
+    assert.match(raw, /default_permissions = "polygram-trusted"/);
     assert.match(raw, /approval_policy = "never"/);
     assert.match(raw, /allow_login_shell = false/);
     assert.match(raw, /^\[features\]\ngoals = false$/m);
-    assert.match(raw, /network = \\{ enabled = false \\}|enabled = false/);
-    assert.match(raw, new RegExp(
-      `${f.ipcRuntimeRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*deny`,
-    ));
-    assert.match(raw, new RegExp(
-      `${f.serviceTmp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*deny`,
-    ));
+    assert.match(raw, /enabled = true/);
+    assert.doesNotMatch(raw, /"deny"/);
+    assert.doesNotMatch(raw, /"deny"/);
     assert.doesNotMatch(raw, /sandbox|mcp|plugin|TELEGRAM_BOT_TOKEN/);
 
     assert.equal(profile.runtime, 'codex');
@@ -490,10 +482,10 @@ describe('owned Codex native-beta runtime profile', () => {
     assert.equal(profile.cwd, f.workspace);
     assert.equal(profile.model, 'gpt-5.6-sol');
     assert.equal(profile.effort, 'xhigh');
-    assert.equal(profile.expectedConfig.modelProvider, 'openai');
+    assert.equal(profile.expectedConfig.modelProvider, 'cliproxyapi');
     assert.deepEqual(profile.expectedConfig.modelProviders, {
-      count: 0,
-      keySha256: [],
+      count: 1,
+      keySha256: [digest('cliproxyapi')],
     });
     assert.equal(profile.expectedConfig.mcpServers.count, 0);
     assert.equal(profile.expectedRequirements, null);
@@ -633,9 +625,7 @@ describe('owned Codex native-beta runtime profile', () => {
 
     assert.equal(profile.env.TMPDIR, f.codexTmp);
     assert.equal(clients[0].options.env.TMPDIR, f.codexTmp);
-    assert.match(raw, new RegExp(
-      `${f.codexTmp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*deny`,
-    ));
+    assert.doesNotMatch(raw, /"deny"/);
     assert.deepEqual(f.processEnv, inherited);
     assert.equal(profile.env.POLYGRAM_CODEX_TMPDIR, undefined);
   });
@@ -651,7 +641,7 @@ describe('owned Codex native-beta runtime profile', () => {
     assert.equal(f.processEnv.TMPDIR, `${f.serviceTmp}${path.sep}`);
   });
 
-  test('materializes one parent deny when the IPC root is already covered', async (t) => {
+  test('full filesystem access remains root-only when daemon roots overlap', async (t) => {
     const f = fixture(t);
     f.ipcRuntimeRoot = path.join(f.daemonSecretRoot, '.ipc');
     mkdirSync(f.ipcRuntimeRoot, { mode: 0o700 });
@@ -661,9 +651,7 @@ describe('owned Codex native-beta runtime profile', () => {
     await builder.prepare(prepareOptions(f));
     const raw = readFileSync(path.join(f.codexHome, 'config.toml'), 'utf8');
 
-    assert.match(raw, new RegExp(
-      `${f.daemonSecretRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*deny`,
-    ));
+    assert.doesNotMatch(raw, /"deny"/);
     assert.doesNotMatch(raw, new RegExp(
       `${f.ipcRuntimeRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*deny`,
     ));
@@ -671,7 +659,7 @@ describe('owned Codex native-beta runtime profile', () => {
 
   test('does not read, copy, rewrite, or expose credential contents', async (t) => {
     const f = fixture(t);
-    mkdirSync(f.codexHome, { mode: 0o700 });
+    mkdirSync(f.codexHome, { mode: 0o700, recursive: true });
     chmodSync(f.codexHome, 0o700);
     const authPath = path.join(f.codexHome, 'auth.json');
     const secret = 'CHATGPT-REFRESH-SECRET';
@@ -696,8 +684,8 @@ describe('owned Codex native-beta runtime profile', () => {
     }, {
       ...results,
       'account/read': {
-        account: { type: 'chatgpt' },
-        requiresOpenaiAuth: true,
+        account: null,
+        requiresOpenaiAuth: false,
       },
       'model/list': {
         data: [{
@@ -751,12 +739,12 @@ describe('owned Codex native-beta runtime profile', () => {
     assert.equal(second.clients.length, 0);
   });
 
-  test('prior owned config requires an explicit backup before TMPDIR deny reprovision', async (t) => {
+  test('prior limited policy requires explicit backup before full policy reprovision', async (t) => {
     const f = fixture(t);
     f.processEnv.POLYGRAM_CODEX_TMPDIR = f.codexTmp;
     await createBuilder(f).builder.prepare(prepareOptions(f));
     const configPath = path.join(f.codexHome, 'config.toml');
-    const tmpDeny = `${JSON.stringify(f.codexTmp)} = "deny"\n`;
+    const tmpDeny = `":root" = "write"\n`;
     const priorConfig = readFileSync(configPath, 'utf8').replace(tmpDeny, '');
     assert.notEqual(priorConfig, readFileSync(configPath, 'utf8'));
     writeFileSync(configPath, priorConfig, { mode: 0o600 });
@@ -777,7 +765,7 @@ describe('owned Codex native-beta runtime profile', () => {
 
     const backupPath = path.join(
       f.daemonSecretRoot,
-      'config.toml.before-tmpdir-deny',
+      'config.toml.before-full-policy',
     );
     const backupFromSecretRoot = path.relative(
       f.daemonSecretRoot,
@@ -816,17 +804,17 @@ describe('owned Codex native-beta runtime profile', () => {
     }, {
       name: 'unsafe home mode',
       setup: (f) => {
-        mkdirSync(f.codexHome, { mode: 0o700 });
+        mkdirSync(f.codexHome, { mode: 0o700, recursive: true });
         chmodSync(f.codexHome, 0o770);
         return { prepare: {} };
       },
       code: 'CODEX_HOME_UNSAFE',
     }, {
-      name: 'symlinked command home',
+      name: 'symlinked command temp',
       setup: (f) => {
         const target = path.join(f.workspace, 'command-home-target');
         mkdirSync(target, { mode: 0o700 });
-        symlinkSync(target, path.join(f.workspace, '.codex-command-home'));
+        symlinkSync(target, path.join(f.workspace, '.codex-command-tmp'));
         return { prepare: {} };
       },
       code: 'CODEX_COMMAND_DIR_UNSAFE',
@@ -974,10 +962,10 @@ describe('owned Codex native-beta runtime profile', () => {
         config: { approvalPolicy: 'on-request' },
       }),
     }, {
-      name: 'network enabled',
+      name: 'network disabled',
       mutate: (f) => {
         const config = projectedConfig(f);
-        config.permissionProfiles[0].networkEnabled = true;
+        config.permissionProfiles[0].networkEnabled = false;
         return projectedResults(f, { config });
       },
     }, {
@@ -1154,7 +1142,7 @@ describe('owned Codex native-beta runtime profile', () => {
 });
 
 
-function trustedProjection(f, { proxyKey = null, overrides = {} } = {}) {
+function trustedProjection(f, { proxyKey = deployment.provider.experimental_bearer_token, overrides = {} } = {}) {
   writeFileSync(path.join(f.workspace, 'AGENTS.md'), 'synthetic trusted root instructions', { mode: 0o600 });
   const config = ownedConfig(f);
   config.default_permissions = 'polygram-trusted';
@@ -1174,7 +1162,7 @@ function trustedProjection(f, { proxyKey = null, overrides = {} } = {}) {
     defaultPermissions: 'polygram-trusted', webSearch: 'live',
     permissionProfiles: [{ id: 'polygram-trusted', extends: null, networkEnabled: true,
       filesystemSha256: digest(filesystem), filesystem: [{ rootSha256: digest(':root'), access: 'write' }] }],
-    modelProviders: proxyKey === null ? { count: 0, keySha256: [] } : { count: 1, keySha256: [digest('cliproxyapi')] },
+    modelProviders: { count: 1, keySha256: [digest('cliproxyapi')] },
     ...overrides,
   });
   const results = projectedResults(f, { config: projection, layers: [{ type: 'user', version: 'user-v1', disabled: false,
@@ -1183,7 +1171,7 @@ function trustedProjection(f, { proxyKey = null, overrides = {} } = {}) {
   return { config, results };
 }
 
-const trustedAccess = { mode: 'trusted', chatIds: ['68861949'], commandPath: '/usr/local/bin:/usr/bin:/bin' };
+const trustedAccess = { mode: 'trusted', commandPath: '/usr/local/bin:/usr/bin:/bin' };
 
 test('trusted profile advertises full filesystem, network and web with real HOME and no daemon environment', async (t) => {
   const f = fixture(t);
@@ -1261,7 +1249,7 @@ test('trusted projected policy rejects partial network or filesystem relaxations
 });
 
 
-test('proxy can be selected independently while the beta command policy remains limited', async (t) => {
+test('CLIProxy always uses full access without a limited policy fallback', async (t) => {
   const f = fixture(t);
   const key = 'beta-proxy-test-key';
   const keyFile = path.join(f.root, 'proxy.key');
@@ -1279,8 +1267,8 @@ test('proxy can be selected independently while the beta command policy remains 
     proxy: { baseUrl: 'http://127.0.0.1:8318/v1', clientKeyFile: keyFile },
   }));
   assert.equal(profile.permissionProfileId, CODEX_PERMISSION_PROFILE_ID);
-  assert.equal(profile.expectedConfig.webSearch, 'disabled');
-  assert.equal(profile.expectedConfig.permissionProfiles[0].networkEnabled, false);
+  assert.equal(profile.expectedConfig.webSearch, 'live');
+  assert.equal(profile.expectedConfig.permissionProfiles[0].networkEnabled, true);
   assert.equal(profile.expectedConfig.modelProvider, 'cliproxyapi');
   assert.doesNotMatch(JSON.stringify(profile), new RegExp(key));
 });
@@ -1323,7 +1311,8 @@ test('foreign home instructions and overrides cannot replace the admitted canoni
   for (const kind of ['regular', 'foreign', 'dangling', 'override']) {
     const f = fixture(t);
     writeFileSync(path.join(f.workspace, 'AGENTS.md'), 'canonical', { mode: 0o600 });
-    mkdirSync(f.codexHome, { mode: 0o700 });
+    mkdirSync(f.codexHome, { mode: 0o700, recursive: true });
+    unlinkSync(path.join(f.codexHome, 'AGENTS.md'));
     const target = path.join(f.codexHome, kind === 'override' ? 'AGENTS.override.md' : 'AGENTS.md');
     if (kind === 'regular' || kind === 'override') writeFileSync(target, 'must survive', { mode: 0o600 });
     else symlinkSync(path.join(f.root, kind === 'foreign' ? 'foreign.md' : 'missing.md'), target);
@@ -1334,7 +1323,7 @@ test('foreign home instructions and overrides cannot replace the admitted canoni
   }
 });
 
-test('a dedicated home cannot serve another workspace or admit retargeted instructions', async (t) => {
+test('distinct workspaces receive separate profiles while legacy retargeting invalidates its receipt', async (t) => {
   const f = fixture(t);
   writeFileSync(path.join(f.workspace, 'AGENTS.md'), 'canonical', { mode: 0o600 });
   const { builder } = createBuilder(f);
@@ -1343,19 +1332,25 @@ test('a dedicated home cannot serve another workspace or admit retargeted instru
   mkdirSync(otherWorkspace, { mode: 0o700 });
   const otherInstructions = path.join(otherWorkspace, 'AGENTS.md');
   writeFileSync(otherInstructions, 'foreign', { mode: 0o600 });
-  await assert.rejects(builder.prepare(prepareOptions(f, { workspace: otherWorkspace })), { code: 'CODEX_OWNED_CONFIG_DRIFT' });
+  const other = createBuilder({ ...f, workspace: otherWorkspace });
+  const otherProfile = await other.builder.prepare(prepareOptions(f, { workspace: otherWorkspace }));
+  assert.notEqual(otherProfile.codexHome, profile.codexHome);
+  assert.equal(readlinkSync(path.join(otherProfile.codexHome, 'AGENTS.md')), otherInstructions);
+  other.builder.reattest(otherProfile);
+  builder.reattest(profile);
   unlinkSync(path.join(f.codexHome, 'AGENTS.md'));
   symlinkSync(otherInstructions, path.join(f.codexHome, 'AGENTS.md'));
   assert.throws(() => builder.reattest(profile), { code: 'CODEX_INSTRUCTION_BINDING_DRIFT' });
 });
 
-test('introducing root instructions or a home override invalidates a prepared profile', async (t) => {
+test('removing root instructions or adding a home override invalidates a prepared profile', async (t) => {
   for (const kind of ['root', 'override']) {
     const f = fixture(t);
     const { builder } = createBuilder(f);
     const profile = await builder.prepare(prepareOptions(f));
     const target = kind === 'root' ? path.join(f.workspace, 'AGENTS.md') : path.join(f.codexHome, 'AGENTS.override.md');
-    writeFileSync(target, 'new authority', { mode: 0o600 });
+    if (kind === 'root') unlinkSync(target);
+    else writeFileSync(target, 'new authority', { mode: 0o600 });
     assert.throws(() => builder.reattest(profile), { code: 'CODEX_INSTRUCTION_BINDING_DRIFT' });
   }
 });
@@ -1368,4 +1363,34 @@ test('global service Codex home is rejected before any provisioning write', asyn
   await assert.rejects(builder.prepare(prepareOptions(f, { codexHome })), { code: 'CODEX_INSTRUCTION_BINDING_DRIFT' });
   assert.equal(require('node:fs').existsSync(codexHome), false);
   assert.equal(require('node:fs').existsSync(path.join(f.workspace, '.codex-command-home')), false);
+});
+
+
+test('one builder prepares distinct workspace profiles concurrently and reuses each exact owned home', async (t) => {
+  const f = fixture(t);
+  unlinkSync(path.join(f.codexHome, 'AGENTS.md'));
+  const second = path.join(f.root, 'second-workspace');
+  mkdirSync(second, { mode: 0o700 });
+  writeFileSync(path.join(second, 'AGENTS.md'), 'Other canonical root', { mode: 0o600 });
+  const builder = createCodexRuntimeProfileBuilder({ temporaryRoots: [], resolveTargetPin: () => TARGET_PIN,
+    clientFactory: (options) => new FakeClient(options, projectedResults({ ...f, workspace: options.cwd })) });
+  const profiles = await Promise.all([f.workspace, second].map((workspace) => builder.prepare(prepareOptions(f, { workspace }))));
+  assert.notEqual(profiles[0].codexHome, profiles[1].codexHome);
+  for (const profile of profiles) {
+    builder.reattest(profile);
+    assert.equal(profile.env.CODEX_HOME, profile.codexHome);
+    assert.equal(readlinkSync(path.join(profile.codexHome, 'AGENTS.md')), path.join(profile.cwd, 'AGENTS.md'));
+    const again = await builder.prepare(prepareOptions(f, { workspace: profile.cwd }));
+    assert.equal(again.codexHome, profile.codexHome);
+  }
+  assert.equal(require('node:fs').existsSync(path.join(f.codexHome, 'config.toml')), false);
+});
+
+test('legacy binding changed during asynchronous profile characterization is rejected', async (t) => {
+  const f = fixture(t);
+  unlinkSync(path.join(f.codexHome, 'AGENTS.md'));
+  const { builder } = createBuilder(f, projectedResults(f), { start: async () => {
+    symlinkSync(path.join(f.workspace, 'AGENTS.md'), path.join(f.codexHome, 'AGENTS.md'));
+  } });
+  await assert.rejects(builder.prepare(prepareOptions(f)), { code: 'CODEX_INSTRUCTION_BINDING_DRIFT' });
 });
