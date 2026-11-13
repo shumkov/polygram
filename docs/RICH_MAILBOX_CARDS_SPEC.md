@@ -27,6 +27,15 @@ inline-address checks before either send; require chat_id for the rich method.
 Validate a nonempty blocks array and a supplied fallback before sending. A
 fallback cannot override the destination or carry extra send parameters.
 
+```json
+{"op":"send","method":"sendRichMessage","params":{"chat_id":"-1001","message_thread_id":142,"rich_message":{"blocks":[{"type":"blockquote","blocks":[{"type":"paragraph","text":["📌 ",{"type":"bold","text":"New task"}," · prices"]}]}]}},"fallback":{"text":"<blockquote><b>New task</b> · prices</blockquote>","parse_mode":"HTML"}}
+```
+
+The successful authenticated IPC response is
+`{ok:true, result: Message, rich:true|false}`. Use the low-level IPC `call`
+for this complete envelope; the existing `tell` convenience function still
+returns only the Message and does not forward a fallback option.
+
 A small shared adapter takes the existing rich sender, tg, destination, blocks
 and optional HTML fallback. It makes one rich attempt and, on `wentRich:false`,
 one HTML send. Both use `strictDestination:true`, preserving chat and topic;

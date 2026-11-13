@@ -9,10 +9,13 @@ identity in the body. Tokens expire when the daemon restarts, so always use the
 current turn's command.
 
 `send` takes one JSON object: `{"to":"<role>","kind":"ask"|"tell","body":"..."}`.
-An `ask` expects exactly one reply; a `tell` expects none. `reply` takes
+`send` also accepts optional `summary`: a short, nonblank one-line heading (up to
+120 characters, no controls) for the collapsed mirror card. It is not sent to
+the receiving role. An `ask` expects exactly one reply; a `tell` expects none.
+`reply` takes
 `{"id":"<message id of the ask>","body":"..."}`. Both return `{"id","state"}`
 right away; `state` is `queued`, or `paused` while the target role is paused.
-A repeated identical send (same target, kind and body) within ten minutes
+A repeated identical send (same target, kind, body and summary) within ten minutes
 returns the existing message with `duplicate: true` and its current delivery
 state, which may already be `running`, `succeeded`, `failed`, `interrupted` or
 `unknown`. After you get a notice about an ask, sending the same ask again
