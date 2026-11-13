@@ -24,9 +24,9 @@ test('mailbox ops pass the token separately and strip transport metadata', async
 test('mailbox_submit passes the sender fields and strips transport metadata', async () => {
   const seen = [];
   const handlers = createIpcHandlers({ mailbox: { submit: (input) => { seen.push(input); return { id: 'm_1', state: 'queued' }; } } });
-  assert.deepEqual(await handlers.mailbox_submit({ op: 'mailbox_submit', id: 'req-1', secret: 's', sender: 'agent-org', to: 'ops', body: 'B', key: 'k', ref: 'r' }),
-    { id: 'm_1', state: 'queued' });
-  assert.deepEqual(seen, [{ sender: 'agent-org', to: 'ops', body: 'B', key: 'k', ref: 'r' }]);
+  assert.deepEqual(await handlers.mailbox_submit({ op: 'mailbox_submit', id: 'req-1', secret: 's', sender: 'agent-org', to: 'ops', body: 'B', key: 'k', ref: 'r',
+    origin: { kind: 'human', name: 'Ivan' } }), { id: 'm_1', state: 'queued' });
+  assert.deepEqual(seen, [{ sender: 'agent-org', to: 'ops', body: 'B', key: 'k', ref: 'r', origin: { kind: 'human', name: 'Ivan' } }]);
 });
 
 test('mailbox_identify passes only the token and strips transport metadata', async () => {
