@@ -52,6 +52,7 @@ const {
   classifyCodexRecoveryEvidence,
 } = require('../lib/handlers/replay-disposition');
 const { createSdkCallbacks } = require('../lib/sdk/callbacks');
+const { createSlashCommands } = require('../lib/handlers/slash-commands');
 const {
   insertInbound,
 } = require('./helpers/db-fixture');
@@ -317,6 +318,9 @@ function writeScenario(fixture, overrides = {}) {
         },
         'thread/start': {
           result: threadResult(fixture.workspace),
+        },
+        'thread/read': {
+          result: { thread: threadResult(fixture.workspace).thread, readState: null },
         },
         'thread/resume': {
           result: threadResult(fixture.workspace),
@@ -2654,3 +2658,90 @@ test('fresh receipt is refused when anchor binding changes during asynchronous p
   const requests = readFileSync(path.join(fixture.workspace, 'fake-codex-requests.jsonl'), 'utf8');
   assert.doesNotMatch(requests, /"method":"(?:thread\/start|turn\/start)"/);
 });
+
+for (const cleanupFails of [false, true]) {
+test(`stale Codex resume and explicit new ${cleanupFails ? 'retain ownership on cleanup failure' : 'preserve incident evidence'}`, {
+  timeout: 30_000,
+}, async (t) => {
+  const fixture = makeFixture(t, { methods: {
+    'thread/resume': { error: { code: -32600, message: 'synthetic attachment refusal' } },
+  } });
+  const db = dbClient.open(fixture.dbPath);
+  const config = integrationConfig(fixture);
+  let releaseCleanup;
+  let cleanupWaiting = false;
+  const cleanupBarrier = new Promise((resolve) => { releaseCleanup = resolve; });
+  const runtime = createRuntime({ db, config, fixture,
+    integrationOrchestra: createIntegrationOrchestra(),
+    checkpointSinkDecorator: (sink) => async (checkpoint) => {
+      if (checkpoint.kind === 'containment-cleanup-completed') {
+        cleanupWaiting = true;
+        await cleanupBarrier;
+        if (cleanupFails) throw new Error('synthetic cleanup persistence failure');
+      }
+      return sink(checkpoint);
+    },
+  });
+  t.after(async () => {
+    releaseCleanup();
+    try { await runtime.manager.get('1')?.containmentClosePromise; } catch {}
+    try { await runtime.manager.kill('1', 'test-cleanup'); } catch {}
+    db.raw.close();
+  });
+  db.upsertProviderSession({ session_key: '1', namespace: 'codex:app-server',
+    provider: 'codex', provider_session_id: 'codex-thread-1', cwd: fixture.workspace,
+    model: 'old-model', effort: 'high', pm_backend: 'codex', spawn_profile_id: 'old-profile' });
+  db.upsertProviderSession({ session_key: '1', namespace: 'claude:channels',
+    provider: 'claude', provider_session_id: 'unrelated-claude-history' });
+  const unrelated = db.getProviderSession('1', 'claude:channels');
+  await assert.rejects(spawnCodex(runtime, db, config), { code: 'CODEX_RPC_ERROR' });
+  const failed = runtime.manager.get('1');
+  await waitFor(() => cleanupWaiting, 'bounded containment checkpoint');
+  await assert.rejects(spawnCodex(runtime, db, config), { code: 'CODEX_CONTAINMENT_FAILED' });
+  assert.equal(readRequests(fixture).some(({ method }) => method === 'turn/start' || method === 'turn/steer'), false);
+  const attemptsBefore = db.raw.prepare('SELECT attempt_id FROM codex_turn_attempts ORDER BY attempt_id').all();
+  assert.equal(db.getCodexLease().status, 'quarantined');
+  const replies = [];
+  const clearProviderSession = db.clearProviderSession.bind(db);
+  db.clearProviderSession = (sessionKey, namespace) => {
+    assert.equal(db.getProviderSession(sessionKey, namespace)?.provider_session_id, 'codex-thread-1',
+      'failed attachment cleanup must preserve the prior conversation until explicit /new');
+    return clearProviderSession(sessionKey, namespace);
+  };
+  const dispatch = createSlashCommands({ config: { bot: { allowConfigCommands: true } },
+    intentLock: require('@shumkov/orchestra').createAsyncLock(),
+    db, pm: runtime.manager, contextHintShown: new Set(), logEvent() {}, logger: QUIET,
+    resolveRuntimeView: async () => ({ runtime: 'codex' }),
+  });
+  const resetting = dispatch({ text: '/new', sessionKey: '1', chatId: '1',
+    threadIdStr: null, chatConfig: config.chats['1'], label: 'synthetic',
+    sendReply: async (reply) => replies.push(reply) });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(replies.length, 0);
+  assert.equal(db.getProviderSession('1', 'codex:app-server').provider_session_id, 'codex-thread-1');
+  releaseCleanup();
+  await resetting;
+  if (cleanupFails) {
+    await assert.rejects(failed.containmentClosePromise);
+    assert.match(replies[0], /cleanup was not proven/);
+    assert.equal(db.getCodexLease().status, 'quarantined');
+    assert.equal(runtime.manager.get('1'), failed);
+    assert.equal(db.getProviderSession('1', 'codex:app-server').provider_session_id, 'codex-thread-1');
+    assert.deepEqual(db.getProviderSession('1', 'claude:channels'), unrelated);
+    assert.deepEqual(db.raw.prepare('SELECT attempt_id FROM codex_turn_attempts ORDER BY attempt_id').all(), attemptsBefore);
+    return;
+  }
+  await assert.doesNotReject(failed.containmentClosePromise);
+  assert.ok(failed.containmentCleanupCommitted);
+  assert.match(replies[0], /Started a fresh Codex thread/);
+  assert.equal(db.getCodexLease().status, 'clear');
+  assert.equal(db.getProviderSession('1', 'codex:app-server'), undefined);
+  assert.deepEqual(db.getProviderSession('1', 'claude:channels'), unrelated);
+  assert.deepEqual(db.raw.prepare('SELECT attempt_id FROM codex_turn_attempts ORDER BY attempt_id').all(), attemptsBefore);
+  const fresh = await spawnCodex(runtime, db, config);
+  assert.equal(fresh.resumed, null);
+  assert.notEqual(fresh.proc.generationId, failed.generationId);
+  assert.equal(readRequests(fixture).filter(({ method }) => method === 'thread/resume').length, 1);
+});
+
+}

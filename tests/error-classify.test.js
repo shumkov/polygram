@@ -163,6 +163,7 @@ describe('classify — Codex typed errors stay provider-specific and retry-safe'
   });
 
   const cases = [
+    ['CODEX_THREAD_UNAVAILABLE', 'codexThreadUnavailable'],
     ['CODEX_AUTH_UNAVAILABLE', 'codexAuthUnavailable'],
     ['CODEX_MODEL_UNAVAILABLE', 'codexModelUnavailable'],
     ['CODEX_RATE_LIMITED', 'codexRateLimited'],

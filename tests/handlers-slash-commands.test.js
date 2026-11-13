@@ -39,6 +39,7 @@ function fixture(overrides = {}) {
       calls.pmCalls.push({ kind: 'reset', sk, opts });
       return { drainedPendings: 0 };
     },
+    getModelSettingsStatus: async () => overrides.modelStatus ?? { outcome: 'not-loaded' },
     setModel: async (sk, m) => { calls.pmCalls.push({ kind: 'setModel', m }); return overrides.applyApplied !== false; },
     applyFlagSettings: async (sk, s) => { calls.pmCalls.push({ kind: 'applyFlag', s }); return overrides.applyApplied !== false; },
     selectModelSettings: async (sk, settings) => {
@@ -71,6 +72,9 @@ function fixture(overrides = {}) {
       },
     },
     db: {
+      getCodexLease: () => overrides.codexLease ?? { status: 'clear' },
+      getProviderSession: () => undefined,
+      clearProviderSession: (sk, namespace) => { calls.db.cleared = { sk, namespace }; },
       logConfigChange: (row) => calls.db.configChanges.push(row),
       logConfigChanges: (rows) => {
         if (overrides.auditError) throw overrides.auditError;
@@ -231,6 +235,47 @@ describe('slash-commands — /reload', () => {
 });
 
 describe('slash-commands — /new + /reset', () => {
+  test('Codex /new excludes concurrent input until its pointer is cleared', async () => {
+    const intentLock = createAsyncLock();
+    const releaseInput = await intentLock.acquire('sk:999');
+    const fx = fixture({ intentLock, resolveRuntimeView: async () => ({ runtime: 'codex' }) });
+    const resetting = fx.dispatch(fx.makeCtx({ text: '/new' }));
+    await new Promise((resolve) => setImmediate(resolve));
+    const raced = fx.calls.db.cleared;
+    releaseInput();
+    await resetting;
+    assert.equal(raced, undefined, 'reset must wait for the existing input intent');
+    assert.deepEqual(fx.calls.db.cleared, { sk: 'sk:999', namespace: 'codex:app-server' });
+  });
+
+  test('explicit Codex /new clears only its saved provider pointer after verified cleanup', async () => {
+    const fx = fixture({ resolveRuntimeView: async () => ({ runtime: 'codex' }) });
+    await fx.dispatch(fx.makeCtx({ text: '/new' }));
+    assert.deepEqual(fx.calls.db.cleared, { sk: 'sk:999', namespace: 'codex:app-server' });
+  });
+
+  test('Codex /new cannot clear a pointer or advertise success while persisted quarantine remains', async () => {
+    const fx = fixture({ resolveRuntimeView: async () => ({ runtime: 'codex' }),
+      codexLease: { status: 'quarantined' } });
+    await fx.dispatch(fx.makeCtx({ text: '/new' }));
+    assert.equal(fx.calls.db.cleared, undefined);
+    assert.match(fx.calls.sendReply[0], /cleanup was not proven/);
+  });
+
+  test('Codex /new waits outside manager reset for containment and does not clear on cleanup failure', async () => {
+    let release;
+    const cleanup = new Promise((_, reject) => { release = reject; });
+    const fx = fixture({ resolveRuntimeView: async () => ({ runtime: 'codex' }),
+      pmEntry: { state: 'ContainmentFailed', containmentClosePromise: cleanup } });
+    const resetting = fx.dispatch(fx.makeCtx({ text: '/new' }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(fx.calls.pmCalls.some(({ kind }) => kind === 'reset'), false);
+    release(new Error('owned cleanup unverified'));
+    await resetting;
+    assert.equal(fx.calls.db.cleared, undefined);
+    assert.match(fx.calls.sendReply[0], /cleanup was not proven/);
+  });
+
   test('Codex reset names the provider only after strict reset succeeds', async () => {
     const fx = fixture({
       resolveRuntimeView: async () => ({ runtime: 'codex' }),
