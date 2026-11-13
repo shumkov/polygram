@@ -37,15 +37,15 @@ function fixture(t, { mirror, send, turn, jobs: jobSettings = {}, systemSenders 
   return f;
 }
 
-test('each message is mirrored once, as plain text, into the target topic after it commits', async (t) => {
+test('each message is mirrored once, as an HTML card, into the target topic after it commits', async (t) => {
   const f = fixture(t);
   const sent = f.mailbox.send(f.token('orchestrator'), { to: 'marketing', kind: 'ask', body: 'What is the Q3 budget?' });
   await settle();
   assert.equal(f.posts.length, 1);
   const [post] = f.posts;
   assert.equal(post.method, 'sendMessage');
-  assert.deepEqual(post.params, { chat_id: '-1001', message_thread_id: '12', text: `📨 role:orchestrator → role:marketing (ask ${sent.id})\nWhat is the Q3 budget?` });
-  assert.equal(post.meta.plainText, true); assert.equal(post.meta.strictDestination, true);
+  assert.deepEqual(post.params, { chat_id: '-1001', message_thread_id: '12', parse_mode: 'HTML', text: '❓ <b>orchestrator asks marketing</b>\n<blockquote expandable>What is the Q3 budget?</blockquote>' });
+  assert.notEqual(post.meta.plainText, true); assert.equal(post.meta.strictDestination, true);
   assert.equal(post.meta.source, 'mailbox-mirror'); assert.equal(post.meta.sessionKey, session('marketing'));
   assert.equal(post.committed, 1, 'the post happens only after the row and its job are committed');
 });
@@ -59,8 +59,8 @@ test('a reply is mirrored into the asker topic; duplicates and refusals are not 
   const answer = f.mailbox.reply(f.mailbox.scope(session('marketing')), { inReplyTo: question.id, body: 'A' });
   await settle();
   assert.deepEqual(f.posts.map((post) => [post.params.message_thread_id, post.params.text]), [
-    ['12', `📨 role:orchestrator → role:marketing (ask ${question.id})\nQ`],
-    ['11', `📨 role:marketing → role:orchestrator (reply ${answer.id})\nA`],
+    ['12', '❓ <b>orchestrator asks marketing</b>\n<blockquote expandable>Q</blockquote>'],
+    ['11', '↩️ <b>marketing answered orchestrator</b>\n<blockquote expandable>A</blockquote>'],
   ]);
 });
 
@@ -105,7 +105,7 @@ test('mirror: false posts nothing', async (t) => {
 });
 
 test('the mirror line is rendered from the stored row', () => {
-  assert.equal(envelope.renderMirror({ id: 'm_1', kind: 'tell', from_addr: 'role:a', to_addr: 'role:b', body: 'hi' }), '📨 role:a → role:b (tell m_1)\nhi');
+  assert.equal(envelope.renderMirror({ id: 'm_1', kind: 'tell', from_addr: 'role:a', to_addr: 'role:b', body: 'hi' }), '📨 <b>a → b</b>\n<blockquote expandable>hi</blockquote>');
 });
 
 test('a send refused by its job submit posts no mirror', async (t) => {
@@ -114,7 +114,7 @@ test('a send refused by its job submit posts no mirror', async (t) => {
   f.mailbox.send(token, { to: 'marketing', kind: 'ask', body: 'first' });
   assert.throws(() => f.mailbox.send(token, { to: 'marketing', kind: 'tell', body: 'second' }), /queue full/);
   await settle();
-  assert.deepEqual(f.posts.map((post) => post.params.text.split('\n')[1]), ['first'], 'only a committed message is mirrored');
+  assert.deepEqual(f.posts.map((post) => post.params.text.split('\n')[1]), ['<blockquote expandable>first</blockquote>'], 'only a committed message is mirrored');
 });
 
 // The sender-side line: a role's own topic shows what that role sent.
@@ -124,7 +124,7 @@ test('mirror "both" also posts a sender line into the sender topic, after the ta
   const sent = f.mailbox.send(f.token('orchestrator'), { to: 'marketing', kind: 'ask', body: 'What is the Q3 budget?' });
   await settle();
   assert.deepEqual(f.posts.map((post) => post.params), [
-    { chat_id: '-1001', message_thread_id: '12', text: `📨 role:orchestrator → role:marketing (ask ${sent.id})\nWhat is the Q3 budget?` },
+    { chat_id: '-1001', message_thread_id: '12', parse_mode: 'HTML', text: '❓ <b>orchestrator asks marketing</b>\n<blockquote expandable>What is the Q3 budget?</blockquote>' },
     { chat_id: '-1001', message_thread_id: '11', text: `📤 role:orchestrator → role:marketing (ask ${sent.id})\nWhat is the Q3 budget?` },
   ]);
   const sender = f.posts[1];
@@ -143,11 +143,11 @@ test('mirror "both" mirrors a reply into both topics; duplicates are not mirrore
   const answer = f.mailbox.reply(f.mailbox.scope(session('marketing')), { inReplyTo: ask.id, body: 'A' });
   await settle();
   assert.deepEqual(f.posts.map((post) => [post.params.message_thread_id, post.params.text]), [
-    ['12', `📨 role:orchestrator → role:marketing (tell ${question.id})\nQ`],
+    ['12', '📨 <b>orchestrator → marketing</b>\n<blockquote expandable>Q</blockquote>'],
     ['11', `📤 role:orchestrator → role:marketing (tell ${question.id})\nQ`],
-    ['12', `📨 role:orchestrator → role:marketing (ask ${ask.id})\nBudget?`],
+    ['12', '❓ <b>orchestrator asks marketing</b>\n<blockquote expandable>Budget?</blockquote>'],
     ['11', `📤 role:orchestrator → role:marketing (ask ${ask.id})\nBudget?`],
-    ['11', `📨 role:marketing → role:orchestrator (reply ${answer.id})\nA`],
+    ['11', '↩️ <b>marketing answered orchestrator</b>\n<blockquote expandable>A</blockquote>'],
     ['12', `📤 role:marketing → role:orchestrator (reply ${answer.id})\nA`],
   ]);
 });
@@ -166,7 +166,7 @@ test('a system sender has no topic, so "both" posts only the target mirror', asy
   const sent = f.mailbox.submit({ sender: 'agent-org', to: 'marketing', body: 'Task 42 is yours', key: 'k1' });
   await settle();
   assert.deepEqual(f.posts.map((post) => [post.params.message_thread_id, post.params.text]), [
-    ['12', `📨 system:agent-org → role:marketing (tell ${sent.id})\nTask 42 is yours`],
+    ['12', '📨 <b>agent-org → marketing</b>\n<blockquote expandable>Task 42 is yours</blockquote>'],
   ]);
 });
 
@@ -176,11 +176,55 @@ test('the sender line carries the first 300 characters of the redacted body', as
   const body = `AKIAABCDEFGHIJKLMNOP ${'🙂'.repeat(400)}`;
   f.mailbox.send(f.token('orchestrator'), { to: 'marketing', kind: 'tell', body });
   await settle();
-  const target = f.posts[0].params.text.split('\n').slice(1).join('\n');
+  const target = f.db.raw.prepare('SELECT body FROM mailbox_messages').get().body;
   const sender = f.posts[1].params.text.split('\n').slice(1).join('\n');
   assert.doesNotMatch(sender, /AKIAABCDEFGHIJKLMNOP/, 'the sender line is cut from the redacted text');
   assert.equal(sender, `${Array.from(target).slice(0, 300).join('')}…`, 'a cut body is marked as cut');
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(sender), 'no emoji is split in half');
+});
+
+test('target cards escape the stored body and human origin without interpreting HTML or Markdown', () => {
+  const text = envelope.renderMirror({ kind: 'tell', from_addr: 'system:agent-org', to_addr: 'role:prices', origin_name: 'Ivan <&>',
+    body: 'Task <b>title</b> & **raw**\nRun `tasks umi show id`.' });
+  assert.equal(text, '📨 <b>agent-org → prices · from Ivan &lt;&amp;&gt;</b>\n<blockquote expandable>Task &lt;b&gt;title&lt;/b&gt; &amp; **raw**\nRun `tasks umi show id`.</blockquote>');
+});
+
+const mirrorText = (html) => html.replace(/<\/?(?:b|blockquote)(?: expandable)?>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+test('HTML entity expansion does not truncate a valid 3500-byte mirror body', () => {
+  const body = '&<>'.repeat(1166) + '&&';
+  const html = envelope.renderMirror({ kind: 'tell', from_addr: 'role:a', to_addr: 'role:b', body });
+  assert.equal(mirrorText(html), `📨 a → b\n${body}`);
+  assert.ok(html.length > 4096, 'Telegram limits parsed text, not serialized HTML');
+});
+
+test('long target cards bound parsed text without cutting an entity or surrogate pair', () => {
+  for (const body of ['&'.repeat(8000), '🙂'.repeat(4000), '<&🙂>'.repeat(1500)]) {
+    const html = envelope.renderMirror({ kind: 'tell', from_addr: 'role:a', to_addr: 'role:b', body });
+    const text = mirrorText(html);
+    assert.ok(text.length <= 4096);
+    assert.ok(text.endsWith('…'));
+    assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(text));
+    assert.match(html, /<blockquote expandable>.*<\/blockquote>$/s);
+    assert.doesNotMatch(html, /&(?!amp;|lt;|gt;)/);
+  }
+});
+
+test('unbounded role names cannot overflow the header or consume the whole body budget', () => {
+  const html = envelope.renderMirror({ kind: 'ask', from_addr: `role:${'<&🙂>'.repeat(2000)}`, to_addr: 'role:b', body: 'Task' });
+  const text = mirrorText(html);
+  assert.ok(text.length <= 4096);
+  assert.ok(text.endsWith('\nTask'));
+  assert.ok(text.split('\n')[0].length <= 512);
+});
+
+test('a relayed human origin appears on the system tell card and its body remains redacted', async (t) => {
+  const f = fixture(t, { mirror: 'both', systemSenders: ['agent-org'] });
+  f.mailbox.submit({ sender: 'agent-org', to: 'marketing', body: 'Use AKIAABCDEFGHIJKLMNOP', key: 'human', origin: { kind: 'human', name: 'Ivan' } });
+  await settle();
+  assert.equal(f.posts.length, 1);
+  assert.match(f.posts[0].params.text, /^📨 <b>agent-org → marketing · from Ivan<\/b>/);
+  assert.doesNotMatch(f.posts[0].params.text, /AKIAABCDEFGHIJKLMNOP/);
 });
 
 test('the sender line is rendered from the stored row; a short body is not marked as cut', () => {

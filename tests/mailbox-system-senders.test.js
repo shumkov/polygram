@@ -281,7 +281,7 @@ test('a system message is mirrored into the target topic once', async (t) => {
   f.mailbox.submit(submit());
   await settle();
   assert.deepEqual(f.posts.map((post) => post.params), [{ chat_id: '-1001', message_thread_id: '12',
-    text: `📨 system:agent-org → role:marketing (tell ${sent.id})\nTask 42 is yours: draft the launch post` }]);
+    parse_mode: 'HTML', text: '📨 <b>agent-org → marketing</b>\n<blockquote expandable>Task 42 is yours: draft the launch post</blockquote>' }]);
 });
 
 test('a disabled mailbox refuses submits', (t) => {
