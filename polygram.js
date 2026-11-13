@@ -4534,7 +4534,7 @@ async function main() {
     db, dbWrite, config, botName: BOT_NAME, extractAttachments,
   });
   handleSendOverIpc = createHandleSendOverIpc({
-    config, bot, tg, botName: BOT_NAME,
+    config, bot, tg, botName: BOT_NAME, sendRich: (args) => richSendMessage(args),
   });
   ({
     dispatchHandleMessage,
@@ -4603,7 +4603,7 @@ async function main() {
   });
   mailboxService = createMailboxService({
     config, db, botName: BOT_NAME, jobs: externalJobService, resolveTarget: resolveExternalTarget, bot, tg,
-    ipcDir: ipcRuntimeDir,
+    ipcDir: ipcRuntimeDir, sendRich: (args) => richSendMessage(args),
   });
   // 0.12.0 post-turn edit re-delivery: constructed AFTER dispatchHandleMessage is assigned (above).
   // Claude keeps its same-message fold behavior. Codex defers edits to the

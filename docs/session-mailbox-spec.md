@@ -144,7 +144,7 @@ ask's delivery turn ends with no reply ──► one notice job into A
   - boot fails if two roles share a session.
 - **`allow`:** who may start an `ask` or `tell` to whom (`"*"` = every role).
   A `reply` is never checked against it. No role may message itself.
-- **`mirror`:** `true`/`"target"` posts each message to the target role's topic; `"both"` also posts a sender line to the sending role's topic; `false` posts nothing.
+- **`mirror`:** `true`/`"target"` posts each message to the target role's topic; `"both"` also posts the same card to the sending role's topic; `false` posts nothing.
 - **Disabled by default.** With no `mailbox` key, nothing changes.
 - **Deployment note:** roles need isolated topics. Shumabit's existing groups
   run with `isolateTopics: false`, so the organization gets a new forum group.
@@ -308,31 +308,36 @@ How notices are produced:
 
 ### Telegram mirror
 
-Once, right after the send transaction commits (never from the dispatch path,
-which retries on deferral), the mailbox posts the redacted body as an HTML card
-into the target role's topic:
+Once after the send transaction commits (never from dispatch), the mailbox
+posts one rich blockquote containing a header and a closed `details` block:
 
-```html
-❓ <b>orchestrator asks marketing</b>
-<blockquote expandable>What is the Q3 budget?</blockquote>
+```
+❓ Question · orchestrator → marketing
+▸ What is the Q3 budget?
 ```
 
-- Tells use `📨 <b>agent-org → prices</b>`, asks `❓ <b>cmo asks direct</b>`,
-  and replies `↩️ <b>direct answered cmo</b>`. The stored `origin_name`, when
-  present, adds `· from Ivan` inside the bold header. Addresses have no
-  `role:`/`system:` prefix, kind code or message id.
-- All dynamic text is escaped; the quotation contains the stored redacted
-  body literally. The decoded header, newline and body fit 4096 UTF-16 units,
-  with whole-code-point truncation marked `…`; entity expansion costs no
-  parsed-text budget. The header is capped at 512 units. Link previews are off.
-  Expandable blockquotes require Bot API 7.3+; VPS apiRoot uses Bot API 10.2.
-- The target's final text already lands in the same topic through the job
-  report.
-- A mirror failure is logged and never blocks delivery.
-- With `"mirror": "both"`, a sender line (`📤`, transport header, the first 300
-  characters of the redacted body) is also posted into the sending role's
-  topic as plain text. System senders have no topic and get none. `true` keeps meaning
-  `"target"`.
+The event is bold (`Message`, `Question`, `Answer`); the context uses plain role
+names and optional `· from <origin_name>`. Details contains the complete stored
+redacted body literally. Both destination topics use this uniform card when
+mirror is `"both"`; system senders have no topic of their own. Default `true`
+continues to mean target only. Duplicate/refused sends never post again.
+
+The optional `summary` on send/submit is persisted as nullable display metadata,
+redacted and validated as a nonblank single line of up to 120 code points,
+without controls or Unicode line separators. It never enters the delivery
+payload. Without one, details uses the first nonempty body line, shortened to
+80 code points. Replies use that default. Provided summaries participate in
+idempotency; absent summaries preserve legacy hashes.
+
+The existing rich sender supplies transcript recording and the shared capability
+latch. Rich failure makes one HTML send using the previous target card for
+both topics: bold `from asks to` / `from → to` / `from answered to`, then an
+expandable body quotation. All HTML text is escaped and the parsed text fits
+4096 UTF-16 units without splitting code points. Both sends preserve the exact
+destination, disable link previews, and remain best effort. A failed post is
+logged without blocking delivery or the other mirror. See
+[RICH_MAILBOX_CARDS_SPEC.md](RICH_MAILBOX_CARDS_SPEC.md) for the reviewed data flow,
+IPC rich-send interface and whole-URL reply-context budget.
 
 ### Rules the daemon enforces
 
@@ -345,7 +350,7 @@ into the target role's topic:
    (default 2). A reply carries its ask's depth.
 4. **Rate:** at most `perPairPerHour` (default 10) asks and tells per (from,
    to) pair.
-5. **Duplicates:** the same (from, to, kind, body hash) within 10 minutes returns
+5. **Duplicates:** the same (from, to, kind, body/summary hash) within 10 minutes returns
    the existing message with `duplicate: true`, unless the sender has already
    had a notice about that message; then the send is a deliberate re-ask and
    creates a new message.

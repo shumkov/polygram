@@ -47,7 +47,7 @@ rules.
 | `enabled` | Must be `true`. Without a `mailbox` key nothing changes. |
 | `roles.<name>` | Role name = route id, `^[a-z][a-z0-9_-]*$`. `about` (≤ 300 characters) is shown to the roles allowed to message it. |
 | `allow.<name>` | Roles this role may start an `ask` or `tell` to; `"*"` means every role. A role without an entry can only reply. Replies are never checked against it. |
-| `mirror` | Where each message is posted: `"target"` (or `true`) posts an HTML card into the target role's topic; `"both"` also posts a plain sender line into the sending role's topic; `false` posts nothing. Default `true`. See [Telegram mirror](#telegram-mirror). |
+| `mirror` | Where each message is posted: `"target"` (or `true`) posts a collapsed rich card into the target role's topic; `"both"` also posts the same card into the sending role's topic; `false` posts nothing. Default `true`. See [Telegram mirror](#telegram-mirror). |
 | `systemSenders` | Names of processes outside any session that may send through `mailbox_submit` as `system:<name>` (see [System senders](#system-senders)). Distinct names, `^[a-z][a-z0-9_-]*$`; `polygram` is reserved. Default none. |
 | `limits.maxDepth` | Longest chain. A human message starts at depth 0, as does a system tell that relays a human's words (see [Relayed human messages](#relayed-human-messages)); any other system tell is depth 1, and each new message is one deeper. Default 2. |
 | `limits.perPairPerHour` | Asks and tells per (from, to) pair in the last hour. Default 10. |
@@ -103,35 +103,44 @@ text lands in its own topic through the normal job report.
 
 ## Telegram mirror
 
-Each message is posted once, right after it commits, never from the
-dispatch path. The target role's topic gets the whole redacted body:
+Each message is posted once, right after it commits, never from the dispatch
+path. The target role's topic gets one rich blockquote with a header and a closed
+`details` block:
+
+```
+❓ Question · orchestrator → marketing
+▸ What is the Q3 budget?
+```
+
+The event word is bold: `📨 Message`, `❓ Question`, or `↩️ Answer`. Addresses
+have no `role:`/`system:` prefixes or transport ids. A relayed human's stored name
+adds `· from Ivan`. Expanding details reveals the complete stored, redacted body
+literally, including any technical instructions. With `"mirror": "both"`, the
+sender topic gets the same card; a system sender has no sender topic.
+
+`mailbox_send` and `mailbox_submit` accept optional `summary`: one nonblank line
+of at most 120 Unicode code points, without controls or line separators. It is
+redacted, stored in `mailbox_messages.summary`, and used only for the collapsed
+line, never the receiving role's prompt. Without it, the first nonempty body
+line is shortened to 80 code points. Replies derive their summary from the body.
+A role send's duplicate identity includes its supplied summary; a system retry
+with a different summary under the same key conflicts. Absent summaries retain
+legacy hashes. Identical retries return the original receipt without posting.
+
+Rich sends use the shared capability latch. Unsupported or rejected rich cards
+fall back once to the previous HTML target card, in the exact same topic:
 
 ```html
 ❓ <b>orchestrator asks marketing</b>
 <blockquote expandable>What is the Q3 budget?</blockquote>
 ```
 
-Tells use `📨 agent-org → prices`, asks `❓ cmo asks direct`, and replies
-`↩️ direct answered cmo`, with the words in bold and no transport ids. A
-relayed human's stored name adds `· from Ivan` to the header. The expandable
-quotation contains the stored body literally, with HTML escaped; technical
-instructions remain available when expanded. Link previews are disabled.
-Parsed header and body fit 4096 UTF-16 units; longer content is cut by whole
-code points and marked `…`. Supported servers require Bot API 7.3 or newer
-for expandable quotations; the VPS bots use Bot API 10.2.
-
-With `"mirror": "both"`, the sending role's topic also gets a sender line,
-so a role's chat shows what it sent. It carries the first 300 characters of
-the redacted body, with `…` when the body is longer:
-
-```
-📤 role:orchestrator → role:marketing (ask m_…)
-<first 300 characters of the body>
-```
-
-Only a `role:` sender has a topic, so a system sender's message gets the
-target line only. A failed post is logged and never blocks delivery or the
-other post. Duplicates and refused messages are not posted.
+The HTML fallback escapes all text, disables link previews, and fits 4096 parsed
+UTF-16 units, cutting whole code points with `…` when necessary. It is also the
+sender topic's fallback. Rich details were verified on the VPS Bot API 10.2;
+HTML expandable blockquotes require Bot API 7.3+. A failed post is logged and
+never blocks delivery or the other post. Duplicates and refusals are not posted.
+Agent-org tells remain mirrored when mirroring is enabled.
 
 ## System senders
 
@@ -149,14 +158,14 @@ to the IPC socket with the bot's secret, like any other IPC client.
 - `key` (1 to 256 bytes) is the caller's idempotency key. It is looked up
   first, per sender. A hit returns the stored message's receipt with its real
   delivery state and `duplicate: true`. A hit whose `to`, redacted body or
-  `origin` differs is refused with `MAILBOX_KEY_CONFLICT`; a different `ref`
+  `origin` or `summary` differs is refused with `MAILBOX_KEY_CONFLICT`; a different `ref`
   does not conflict.
 - There is no ten-minute duplicate window; the key replaces it.
 - `limits.systemPerHour` applies per sender, counted only after the key
   lookup, so a retry of an accepted message is never rate limited. System
   sends don't use up a role pair's budget.
 - The size cap, redaction and target mirror apply as for agent messages.
-  A system sender has no topic, so it never gets a sender line.
+  A system sender has no topic, so it never gets a sender card.
 - `ref` (optional, 1 to 512 bytes) is an opaque reference such as a task id
   or URL. It is redacted, stored, and shown to the receiver only inside the
   untrusted payload, never in the trusted header.
@@ -233,7 +242,7 @@ contract and do not change:
 | `MAILBOX_UNKNOWN_ROLE` | `to` is not a configured role. | No. |
 | `MAILBOX_TOO_LARGE` | The body is over `maxBodyBytes`, before or after redaction. | No. |
 | `MAILBOX_RATE_LIMITED` | `systemPerHour`, or the per-pair limit for agent sends. | Yes, later. |
-| `MAILBOX_KEY_CONFLICT` | The key was used for a different target, body or origin. | No. |
+| `MAILBOX_KEY_CONFLICT` | The key was used for a different target, body, origin or summary. | No. |
 | `MAILBOX_INVALID_ORIGIN` | `origin` is not exactly `{kind:"human", name}` with a name of 1 to 64 characters and no control characters. | No. |
 
 A refusal from the external-jobs queue keeps its own code, for example
@@ -285,7 +294,7 @@ Messages live in `mailbox_messages`; delivery state lives in `external_jobs`
 under `request_id = 'mailbox:' || id` (notices: `'mailbox-notice:' || askId`,
 or `|| replyId` for a reply that was not delivered). System messages also
 store their `idem_key` and `ref`, and a relayed human message its
-`origin_name`.
+`origin_name`; optional collapsed headings live in `summary`.
 
 ```sql
 SELECT m.id, m.kind, m.from_addr, m.to_addr, m.depth, m.notice_sent, j.state, j.report_state, j.error

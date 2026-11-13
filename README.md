@@ -326,10 +326,16 @@ await tell('admin-bot', 'sendMessage', {
 }, { source: 'cron:inventory-report' });
 ```
 
-Allowed methods: `sendMessage`, `sendPhoto`, `sendDocument`, `sendSticker`,
+Allowed methods: `sendMessage`, `sendRichMessage`, `sendPhoto`, `sendDocument`, `sendSticker`,
 `sendChatAction`, `editMessageText`, `setMessageReaction`. The socket
 server rejects others. Cross-bot sends are rejected (chat must belong
 to the bot on the other end of the socket).
+
+Rich cards use the authenticated `send` request with typed `rich_message.blocks`
+and optional top-level `fallback: {text, parse_mode: "HTML"}`. The response is
+`{ok: true, result: Message, rich: true|false}`; rich failure without a fallback
+is an error. Both transports keep the same chat/topic. See the
+[rich cards interface and examples](docs/RICH_MAILBOX_CARDS_SPEC.md).
 
 If the bot process is down, the call throws. This is intentional — cron
 failures should surface.
