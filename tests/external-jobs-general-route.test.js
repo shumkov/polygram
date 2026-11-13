@@ -179,7 +179,7 @@ test('a mailbox role whose route is General sends, receives, is mirrored and rep
   f.mailbox.noteHumanPrompt(topicSession);
   const question = f.mailbox.send(f.mailbox.scope(topicSession), { to: 'lead', kind: 'ask', body: 'Which campaign first?' });
   await settle();
-  assert.deepEqual(f.posts[0].params, { chat_id: CHAT, text: `📨 role:marketing → role:lead (ask ${question.id})\nWhich campaign first?` },
+  assert.deepEqual(f.posts[0].params, { chat_id: CHAT, parse_mode: 'HTML', text: '❓ <b>marketing asks lead</b>\n<blockquote expandable>Which campaign first?</blockquote>' },
     'the mirror lands in General: no message_thread_id key');
   assert.equal(f.posts[0].meta.sessionKey, CHAT);
 
@@ -191,6 +191,6 @@ test('a mailbox role whose route is General sends, receives, is mirrored and rep
 
   const answer = f.mailbox.reply(leadToken, { inReplyTo: question.id, body: 'Spring sale.' });
   await settle(); await f.jobs.tick();
-  assert.deepEqual(f.posts[1].params, { chat_id: CHAT, message_thread_id: '12', text: `📨 role:lead → role:marketing (reply ${answer.id})\nSpring sale.` });
+  assert.deepEqual(f.posts[1].params, { chat_id: CHAT, message_thread_id: '12', parse_mode: 'HTML', text: '↩️ <b>lead answered marketing</b>\n<blockquote expandable>Spring sale.</blockquote>' });
   assert.deepEqual({ ...f.sent[1].target }, { chatId: CHAT, threadId: '12', sessionKey: topicSession }, 'the reply goes back to the topic');
 });

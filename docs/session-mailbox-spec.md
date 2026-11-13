@@ -309,20 +309,29 @@ How notices are produced:
 ### Telegram mirror
 
 Once, right after the send transaction commits (never from the dispatch path,
-which retries on deferral), the mailbox posts the redacted body as plain text
+which retries on deferral), the mailbox posts the redacted body as an HTML card
 into the target role's topic:
 
-```
-📨 role:orchestrator → role:marketing (ask m_…)
-<body>
+```html
+❓ <b>orchestrator asks marketing</b>
+<blockquote expandable>What is the Q3 budget?</blockquote>
 ```
 
+- Tells use `📨 <b>agent-org → prices</b>`, asks `❓ <b>cmo asks direct</b>`,
+  and replies `↩️ <b>direct answered cmo</b>`. The stored `origin_name`, when
+  present, adds `· from Ivan` inside the bold header. Addresses have no
+  `role:`/`system:` prefix, kind code or message id.
+- All dynamic text is escaped; the quotation contains the stored redacted
+  body literally. The decoded header, newline and body fit 4096 UTF-16 units,
+  with whole-code-point truncation marked `…`; entity expansion costs no
+  parsed-text budget. The header is capped at 512 units. Link previews are off.
+  Expandable blockquotes require Bot API 7.3+; VPS apiRoot uses Bot API 10.2.
 - The target's final text already lands in the same topic through the job
   report.
 - A mirror failure is logged and never blocks delivery.
-- With `"mirror": "both"`, a sender line (`📤`, same header, the first 300
+- With `"mirror": "both"`, a sender line (`📤`, transport header, the first 300
   characters of the redacted body) is also posted into the sending role's
-  topic. System senders have no topic and get none. `true` keeps meaning
+  topic as plain text. System senders have no topic and get none. `true` keeps meaning
   `"target"`.
 
 ### Rules the daemon enforces
@@ -353,8 +362,21 @@ into the target role's topic:
 
 - **`/automation pause|resume`** in a role's topic pauses or resumes delivery
   into that role.
-  - Only the configured operator's `/stop` also pauses.
+  - Stop phrases and `/stop` only interrupt the current turn. They neither
+    create nor clear a pause. Role identity comes from the resolved session;
+    all alias routes to that session share this policy, including General.
+    Disabled/absent mailbox and separate infrastructure or notification
+    destinations retain durable pause-on-stop.
   - A pause also holds that topic's job reports.
+  - The stop holds admission until interruption and cleanup finish, preventing
+    a queued job from starting during the stop probes. The interrupted job is
+    not retried; the next job becomes eligible after settlement and positive
+    idle proof. If the process was destroyed without that proof, work stays
+    held; existing mailbox recovery only respawns `unknown` jobs.
+  - Active stops keep the existing 👍 reaction, idle stops stay silent, and
+    normal next-job activity may follow immediately. No pause notice is added.
+    `/automation status` still reports actual pause and job counts; `enabled`
+    describes the pause flag, not proof of inactivity.
 - **`mailbox.enabled: false`** stops all delivery.
 - **Renaming or moving a role** requires an empty queue first.
 
@@ -430,7 +452,7 @@ None of these change the tables or interfaces above:
 | The target never replies | One notice when its delivery turn ends. The ask stays open, and a late reply is accepted. |
 | A long turn in another role | No effect: dispatch runs per session. |
 | A restart mid-delivery | The job goes `unknown`. A recovery probe runs, the asker gets a notice, and nothing is replayed. |
-| A human `/stop` during a mailbox turn | The job is `interrupted`, and the asker gets a notice. |
+| A human `/stop` during a mailbox turn | The job is `interrupted`, the asker gets a notice, and delivery remains unpaused; the next job waits for stop cleanup and positive idle proof. |
 | Loops and chatter | One reply per ask, no forwarding, depth, per-pair rate, duplicate window. Turns started by other jobs can only reply. |
 | Prompt injection in a body | The body is an untrusted payload, and the envelope disclaims authority. Stage 2 hardens this further. |
 | A route changes or is removed | Sends are refused, and queued jobs are held by the existing route check. |

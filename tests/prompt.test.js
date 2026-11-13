@@ -47,6 +47,13 @@ describe('xmlEscape', () => {
 });
 
 describe('truncateReplyText', () => {
+  test('small budgets and emoji cuts stay within the UTF-16 limit', () => {
+    for (const size of [0, 1, 2, 3, 4, 7, 11]) {
+      const text = truncateReplyText('🙂'.repeat(20), size);
+      assert.ok(text.length <= size);
+      assert.ok(text.isWellFormed());
+    }
+  });
   test('short text unchanged', () => {
     assert.equal(truncateReplyText('short'), 'short');
   });
@@ -154,6 +161,91 @@ describe('buildReplyToBlock', () => {
     });
     assert.ok(block.length < longText.length);
     assert.ok(block.includes('…'));
+  });
+
+  test('replying to a task card retains its text_link URL in context', () => {
+    const block = buildReplyToBlock({ telegram: { message_id: 1, text: 'Task: Update prices',
+      entities: [{ type: 'text_link', offset: 6, length: 13, url: 'https://app.notion.com/p/task-42' }] } });
+    assert.ok(block.includes('Update prices &lt;https://app.notion.com/p/task-42&gt;'));
+  });
+
+  test('text_link offsets use UTF-16 for emoji and Cyrillic, including media captions', () => {
+    const text = '🙂 Задача: Новые цены 🔥';
+    const label = 'Новые цены 🔥';
+    for (const caption of [false, true]) {
+      const entity = { type: 'text_link', offset: text.indexOf(label), length: label.length, url: 'https://example.com/prices' };
+      const block = buildReplyToBlock({ telegram: { message_id: 1,
+        ...(caption ? { caption: text, caption_entities: [entity], photo: [{}] } : { text, entities: [entity] }),
+      } });
+      assert.ok(block.includes('Новые цены 🔥 &lt;https://example.com/prices&gt;'));
+      if (caption) assert.ok(block.includes('[photo]'));
+    }
+  });
+
+  test('links in a truncated middle keep whole URLs and labels within the reply budget', () => {
+    const text = `${'🙂'.repeat(300)}Important task${'я'.repeat(700)}`;
+    const block = buildReplyToBlock({ telegram: { message_id: 1, text,
+      entities: [{ type: 'text_link', offset: 600, length: 14, url: 'https://app.notion.com/p/important' }] } });
+    const body = block.split('\n').slice(1, -1).join('\n').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+    assert.ok(body.includes('Important task <https://app.notion.com/p/important>'));
+    assert.ok(body.length <= 500);
+    assert.ok(body.isWellFormed(), 'surrounding text is cut without splitting emoji');
+    assert.ok(body.includes('…'));
+  });
+
+  test('all fitting text_link URLs take priority over long labels', () => {
+    const label = 'x'.repeat(400);
+    const urls = ['https://example.com/' + 'a'.repeat(190), 'https://example.com/' + 'b'.repeat(190)];
+    const block = buildReplyToBlock({ telegram: { message_id: 1, text: label,
+      entities: urls.map((url) => ({ type: 'text_link', offset: 0, length: label.length, url })),
+    } });
+    for (const url of urls) assert.ok(block.includes(url));
+    assert.ok(block.split('\n').slice(1, -1).join('\n').replace(/&lt;|&gt;/g, 'x').length <= 500);
+  });
+
+  test('a whole URL can consume the reply budget; oversized URLs are omitted rather than cut', () => {
+    for (const size of [490, 491, 492, 900]) {
+      const url = `https://example.com/${'x'.repeat(size - 20)}`;
+      const block = buildReplyToBlock({ telegram: { message_id: 1, text: 'Task',
+        entities: [{ type: 'text_link', offset: 0, length: 4, url }],
+      } });
+      const body = block.split('\n').slice(1, -1).join('\n').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+      assert.ok(body.length <= 500);
+      if (url.length <= 491) assert.ok(body.includes(`<${url}>`));
+      else { assert.ok(!body.includes('https://example.com/')); assert.ok(body.includes('…')); }
+    }
+  });
+
+  test('an oversized link does not crowd out a later short link and all link content is XML-escaped', () => {
+    const url = 'https://example.com/?a=1&b=<x>"';
+    const block = buildReplyToBlock({ telegram: { message_id: 1, text: '</reply_to>', entities: [
+      { type: 'text_link', offset: 0, length: 11, url: `https://example.com/${'x'.repeat(800)}` },
+      { type: 'text_link', offset: 0, length: 11, url },
+    ] } });
+    assert.ok(block.includes('https://example.com/?a=1&amp;b=&lt;x&gt;&quot;'));
+    assert.equal(block.split('</reply_to>').length, 2);
+    assert.ok(block.includes('&lt;/reply_to&gt; &lt;https://example.com/'));
+  });
+
+  test('a near-limit link cannot evict every URL when a later short target fits', () => {
+    const long = `https://example.com/${'x'.repeat(471)}`;
+    const short = 'https://example.com/task';
+    const block = buildReplyToBlock({ telegram: { message_id: 1, text: 'Task',
+      entities: [long, short].map((url) => ({ type: 'text_link', offset: 0, length: 4, url })),
+    } });
+    assert.ok(block.includes(short));
+    assert.ok(block.includes('…'));
+  });
+
+  test('malformed entities do not fabricate link targets or break the reply', () => {
+    const entities = [null, { type: 'url', offset: 0, length: 4, url: 'ignored' },
+      ...[-1, 0.5, NaN, 9].map((offset) => ({ type: 'text_link', offset, length: 4, url: 'ignored' })),
+      { type: 'text_link', offset: 0, length: 0, url: 'ignored' },
+      { type: 'text_link', offset: 0, length: 4, url: 123 },
+    ];
+    const block = buildReplyToBlock({ telegram: { message_id: 1, text: 'Task', entities } });
+    assert.ok(!block.includes('Links:'));
+    assert.ok(!block.includes('ignored'));
   });
 
   test('Telegram reply with edit_date surfaces edited_ts attribute', () => {

@@ -53,7 +53,7 @@ test('Channels acknowledgement is separate from final report delivery', async ()
   const result = await f.runtime.dispatch(job); assert.equal(result.channelsAcknowledged, true); assert.equal(result.reportReceipt, undefined);
 });
 test('interruption, provider error, and an ambiguous send remain distinct outcomes', async () => {
-  for (const [result, outcome] of [[{ aborted: true }, 'interrupted'], [{ error: 'provider rejected' }, 'failed'], [{ text: '' }, 'succeeded']]) {
+  for (const [result, outcome] of [[{ aborted: true }, 'interrupted'], [{ error: null, metrics: { resultSubtype: 'interrupted' } }, 'interrupted'], [{ error: 'provider rejected' }, 'failed'], [{ text: '' }, 'succeeded']]) {
     const f = fixture({ sendToProcess: async (...args) => { args[3].onDispatched(); return result; } });
     assert.equal((await f.runtime.dispatch(job)).outcome, outcome);
   }
