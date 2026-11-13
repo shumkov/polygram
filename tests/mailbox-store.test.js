@@ -89,6 +89,20 @@ test('an idempotency key is unique per sender within a bot; messages without a k
   assert.equal(store.get('m_5').idem_key, null, 'role messages carry no key');
 });
 
+test('a version 26 database keeps its origin and legacy hash with a NULL summary after upgrade', (t) => {
+  const { dbPath, legacy } = legacyDb(26);
+  legacy.prepare(`INSERT INTO mailbox_messages(id,bot_name,kind,from_addr,to_addr,route_id,body,depth,body_hash,created_at,idem_key,origin_name)
+    VALUES ('m_sys','test','tell','system:agent-org','role:b','b','x',0,'legacy-hash',1,'task:1','Ivan')`).run();
+  legacy.close();
+  const db = open(dbPath);
+  t.after(() => cleanupDb(dbPath, db));
+  const row = createMailboxStore(db.raw, { botName: 'test' }).findByKey('system:agent-org', 'task:1');
+  assert.equal(row.origin_name, 'Ivan');
+  assert.equal(row.body_hash, 'legacy-hash');
+  assert.equal(row.summary, null);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 27);
+});
+
 test('a message is found by its sender and key, scoped to the bot', (t) => {
   const { db, store } = fixture(t);
   store.insert(message({ id: 'm_1', kind: 'tell', from: 'system:agent-org', depth: 0, idemKey: 'k1', ref: 'notion:abc' }));
