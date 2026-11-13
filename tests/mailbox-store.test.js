@@ -27,11 +27,11 @@ test('migration 024 creates the mailbox table', (t) => {
     VALUES ('m_x','test','forward','role:a','role:b','b','x',1,'h',1)`).run(), /CHECK/);
 });
 
-test('migrations 025 and 026 add the idempotency key, ref and origin name columns and bump the schema version', (t) => {
+test('migrations 025 through 027 add idempotency, origin and summary columns and bump the schema version', (t) => {
   const { db } = fixture(t);
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 26);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 27);
   const columns = db.raw.prepare('PRAGMA table_info(mailbox_messages)').all().map((c) => c.name);
-  assert.deepEqual(columns.slice(12), ['idem_key', 'ref', 'origin_name']);
+  assert.deepEqual(columns.slice(12), ['idem_key', 'ref', 'origin_name', 'summary']);
 });
 
 // A database built by applying the migrations up to `version` by hand.
@@ -55,7 +55,7 @@ test('a database at version 24 upgrades to the current schema and keeps its mess
   legacy.close();
   const db = open(dbPath);
   t.after(() => cleanupDb(dbPath, db));
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 26);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 27);
   const row = createMailboxStore(db.raw, { botName: 'test' }).get('m_old');
   assert.equal(row.body, 'x');
   assert.equal(row.idem_key, null);
@@ -65,14 +65,14 @@ test('a database at version 24 upgrades to the current schema and keeps its mess
 
 // System messages stored before origins existed must keep depth 1 and match
 // their retries, so the upgrade leaves them without an origin.
-test('a database at version 25 upgrades to 26 and keeps its system messages, with no origin', (t) => {
+test('a database at version 25 upgrades to the current schema and keeps its system messages, with no origin', (t) => {
   const { dbPath, legacy } = legacyDb(25);
   legacy.prepare(`INSERT INTO mailbox_messages(id,bot_name,kind,from_addr,to_addr,route_id,body,depth,body_hash,created_at,idem_key,ref)
     VALUES ('m_sys','test','tell','system:agent-org','role:b','b','x',1,'h',1,'task:1','notion:1')`).run();
   legacy.close();
   const db = open(dbPath);
   t.after(() => cleanupDb(dbPath, db));
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 26);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 27);
   const row = createMailboxStore(db.raw, { botName: 'test' }).findByKey('system:agent-org', 'task:1');
   assert.deepEqual({ id: row.id, depth: row.depth, idem_key: row.idem_key, origin_name: row.origin_name }, { id: 'm_sys', depth: 1, idem_key: 'task:1', origin_name: null });
 });
@@ -107,7 +107,7 @@ test('a stored message reads back with every field', (t) => {
   assert.deepEqual(store.get('m_0000000000000001'), {
     id: 'm_0000000000000001', bot_name: 'test', kind: 'ask', from_addr: 'role:orchestrator', to_addr: 'role:marketing',
     route_id: 'marketing', body: 'What is the campaign budget?', in_reply_to: null, depth: 1, body_hash: 'h1', notice_sent: 0, created_at: now(),
-    idem_key: null, ref: null, origin_name: null,
+    idem_key: null, ref: null, origin_name: null, summary: null,
   });
   assert.equal(store.get('m_missing'), null);
 });
