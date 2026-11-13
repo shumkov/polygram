@@ -47,7 +47,7 @@ rules.
 | `enabled` | Must be `true`. Without a `mailbox` key nothing changes. |
 | `roles.<name>` | Role name = route id, `^[a-z][a-z0-9_-]*$`. `about` (≤ 300 characters) is shown to the roles allowed to message it. |
 | `allow.<name>` | Roles this role may start an `ask` or `tell` to; `"*"` means every role. A role without an entry can only reply. Replies are never checked against it. |
-| `mirror` | Where each message is posted as plain text: `"target"` (or `true`) posts it into the target role's topic; `"both"` also posts a sender line into the sending role's topic; `false` posts nothing. Default `true`. See [Telegram mirror](#telegram-mirror). |
+| `mirror` | Where each message is posted: `"target"` (or `true`) posts an HTML card into the target role's topic; `"both"` also posts a plain sender line into the sending role's topic; `false` posts nothing. Default `true`. See [Telegram mirror](#telegram-mirror). |
 | `systemSenders` | Names of processes outside any session that may send through `mailbox_submit` as `system:<name>` (see [System senders](#system-senders)). Distinct names, `^[a-z][a-z0-9_-]*$`; `polygram` is reserved. Default none. |
 | `limits.maxDepth` | Longest chain. A human message starts at depth 0, as does a system tell that relays a human's words (see [Relayed human messages](#relayed-human-messages)); any other system tell is depth 1, and each new message is one deeper. Default 2. |
 | `limits.perPairPerHour` | Asks and tells per (from, to) pair in the last hour. Default 10. |
@@ -106,10 +106,19 @@ text lands in its own topic through the normal job report.
 Each message is posted once, right after it commits, never from the
 dispatch path. The target role's topic gets the whole redacted body:
 
+```html
+❓ <b>orchestrator asks marketing</b>
+<blockquote expandable>What is the Q3 budget?</blockquote>
 ```
-📨 role:orchestrator → role:marketing (ask m_…)
-<body>
-```
+
+Tells use `📨 agent-org → prices`, asks `❓ cmo asks direct`, and replies
+`↩️ direct answered cmo`, with the words in bold and no transport ids. A
+relayed human's stored name adds `· from Ivan` to the header. The expandable
+quotation contains the stored body literally, with HTML escaped; technical
+instructions remain available when expanded. Link previews are disabled.
+Parsed header and body fit 4096 UTF-16 units; longer content is cut by whole
+code points and marked `…`. Supported servers require Bot API 7.3 or newer
+for expandable quotations; the VPS bots use Bot API 10.2.
 
 With `"mirror": "both"`, the sending role's topic also gets a sender line,
 so a role's chat shows what it sent. It carries the first 300 characters of
@@ -209,7 +218,7 @@ agent-org runner relaying a person's Notion comment, adds an `origin`:
   with the same key and a different name, or with the origin added or
   dropped, is `MAILBOX_KEY_CONFLICT`, so a message accepted at depth 1 can't
   be upgraded to depth 0 by a retry.
-- The mirror line is the same as for any system message.
+- The target mirror header includes `· from <name>`, using the stored redacted name.
 
 ## Error codes
 
@@ -250,8 +259,20 @@ with backoff from 1 to 30 minutes while the session is paused or busy.
 ## Human control
 
 - `/automation pause|resume` from the operator in a role's topic pauses or
-  resumes delivery into that role. The operator's `/stop` also pauses. A pause
+  resumes delivery into that role. A stop phrase or `/stop` only interrupts
+  the current turn; it never creates or clears a pause. A pause
   holds that topic's job reports too.
+- After a stop, the interrupted job is not retried. Once stopping finishes
+  and the session is proven idle, the next queued job may start immediately.
+  Active stops keep the 👍 reaction; idle stops stay silent. No pause notice
+  is posted. `/automation status` reports the actual pause and job counts;
+  `enabled` does not guarantee that inactivity has been proven. If a stopped
+  process was destroyed, queued work waits for a recovered process's idle
+  proof; the unknown-job recovery poller does not recover `interrupted` jobs.
+- Mailbox roles are identified by their resolved session, including General.
+  A non-mailbox route sharing a role session follows the same interrupt-only
+  stop policy. Dedicated infrastructure and recorded-notification destinations
+  retain durable pause-on-stop. A disabled mailbox retains that default too.
 - `mailbox.enabled: false` (then restart) stops all delivery. Queued mailbox
   jobs are withdrawn unsent as `failed` with error `withdrawn`, and the role's
   other jobs keep flowing.

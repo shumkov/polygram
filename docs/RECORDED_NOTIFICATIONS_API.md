@@ -71,7 +71,9 @@ admission deferrals (busy session, recovery, authentication or spawn) retain the
 same queued identity and use the existing 60-second polling without another LLM
 execution. This change adds no exhaustion policy to that existing queue. Existing
 recovery, pause and definitely-unsent report retry rules remain authoritative. `/automation status` includes unread, active processing,
-last execution/report and due-check counts. Human stop durably pauses automation.
+last execution/report and due-check counts. Human stop durably pauses automation
+in non-mailbox destinations. If a consumer aliases an enabled mailbox role
+session, that session's stop only interrupts; use `/automation pause` to pause it.
 
 Every human turn, including a resumed or paused session, receives bounded unread
 source context. A reply to a processed notification also receives that exact

@@ -50,7 +50,7 @@ The original delivery gap remains: direct Telegram notifications do not enter an
 
 - R4. Repeated submission with the same identity and content returns the existing job; conflicting content is rejected.
 - R5. Acceptance, execution and reporting are distinguishable; uncertain execution never triggers automatic generic replay.
-- R6. An authorized human stop persistently pauses external turns for that destination; only an authorized human resume removes the pause.
+- R6. An authorized human stop persistently pauses external turns for non-mailbox destinations; only an authorized human resume removes the pause. In enabled mailbox role sessions, stop only interrupts; explicit `/automation pause` controls the shared destination pause.
 - R7. Infrastructure intake continues while execution is unavailable or paused, retaining evidence and surfacing coverage failures through its notification-only fallback.
 
 #### Preserved behavior
@@ -121,7 +121,7 @@ Exactly-once LLM side effects and Telegram delivery are not promised.
 Replace `/infra` with generic `/automation status`, `/automation pause`, `/automation resume` in configured destinations.
 Pause blocks external turns while human conversation continues.
 Key pause and admission by the actual effective session destination, not the route label: alias routes to the same conversation share one pause. Validate configured chat/topic destinations, requiring topic isolation for forum routes so external work cannot escape into another conversation.
-The abort hook persists pause before interruption, including idle stop.
+For non-mailbox destinations the abort hook persists pause before interruption, including idle stop. Enabled mailbox role sessions instead hold admission through stop cleanup without creating a durable pause; alias routes share the role session's interrupt-only policy.
 Use the shared admission lock and a final pause check to prevent queued wakeups racing stop.
 IPC can inspect pause but cannot resume it.
 The infra CLI displays transport pause alongside incident status.
