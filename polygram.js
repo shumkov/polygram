@@ -4516,8 +4516,9 @@ async function main() {
     pm, bot, tg, logEvent, isAbortRequest,
     markSessionAborted, clearAutosteeredReactions, getSessionKey,
     retireQuestionSession: (sessionKey) => questionHandlers?.retireSession(sessionKey),
+    holdAutomationAdmission: (sessionKey) => mailboxService?.roleForSession(sessionKey) ? intentLock.acquire(sessionKey) : null,
     pauseAutomation: ({ msg, chatId, threadId, sessionKey }) => {
-      if (externalJobService && isAutomationDestination({ config, getSessionKey }, chatId, threadId) && isAutomationOperator(config, msg)) {
+      if (!mailboxService?.roleForSession(sessionKey) && externalJobService && isAutomationDestination({ config, getSessionKey }, chatId, threadId) && isAutomationOperator(config, msg)) {
         return pauseAutomationSession({ service: externalJobService, intentLock, sessionKey, paused: true });
       }
     },
