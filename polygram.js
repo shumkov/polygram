@@ -33,7 +33,7 @@ const { countInFlight } = require('./lib/queue-utils');
 const { createIpcHandlers } = require('./lib/ipc/handlers');
 const { createExternalJobService } = require('./lib/external-jobs/service');
 const { prepareReport, createReportDelivery } = require('./lib/external-jobs/delivery');
-const { createExternalJobRuntime, createExternalJobTargetResolver, createAutomationCommandHandler, isAutomationOperator, isAutomationDestination, pauseAutomationSession } = require('./lib/external-jobs/runtime');
+const { createExternalJobRuntime, createExternalJobTargetResolver, createAutomationCommandHandler, isAutomationOperator, isAutomationDestination, pauseAutomationSession, stopPausesAutomation } = require('./lib/external-jobs/runtime');
 const {
   buildQualificationEvent,
 } = require('./lib/ops/clean-restart-qualification');
@@ -4516,9 +4516,15 @@ async function main() {
     pm, bot, tg, logEvent, isAbortRequest,
     markSessionAborted, clearAutosteeredReactions, getSessionKey,
     retireQuestionSession: (sessionKey) => questionHandlers?.retireSession(sessionKey),
-    holdAutomationAdmission: (sessionKey) => mailboxService?.roleForSession(sessionKey) ? intentLock.acquire(sessionKey) : null,
+    // A stop in a session the mailbox delivers to holds admission until the
+    // stop finishes, so the next queued message cannot start mid-stop. The
+    // operator's stop in a configured destination that is not a role pauses
+    // it durably instead; the pause takes the same lock, so it never also holds.
+    holdAutomationAdmission: (sessionKey, { msg, chatId, threadId } = {}) => (mailboxService?.receivesMail(sessionKey)
+      && !(externalJobService && stopPausesAutomation({ config, getSessionKey, isRole: !!mailboxService.roleForSession(sessionKey), msg, chatId, threadId }))
+      ? intentLock.acquire(sessionKey) : null),
     pauseAutomation: ({ msg, chatId, threadId, sessionKey }) => {
-      if (!mailboxService?.roleForSession(sessionKey) && externalJobService && isAutomationDestination({ config, getSessionKey }, chatId, threadId) && isAutomationOperator(config, msg)) {
+      if (externalJobService && stopPausesAutomation({ config, getSessionKey, isRole: !!mailboxService?.roleForSession(sessionKey), msg, chatId, threadId })) {
         return pauseAutomationSession({ service: externalJobService, intentLock, sessionKey, paused: true });
       }
     },

@@ -22,14 +22,16 @@ const wiring = source.slice(start, parseExpressionAt(source, start, { ecmaVersio
 const settle = async () => { for (let n = 0; n < 20; n++) await new Promise(setImmediate); };
 const CHAT = '-1004292131077';
 
-function fixture(t, { enabled = true, general = false } = {}) {
+function fixture(t, { enabled = true, general = false, open = false } = {}) {
   const { db, dbPath } = freshDb('mailbox-stop');
   const roleRoute = general ? { chatId: CHAT, general: true } : { chatId: CHAT, threadId: '142' };
   const sessionKey = general ? CHAT : `${CHAT}:142`;
   const config = { bot: { operatorUserId: 7,
     externalJobs: { enabled: true, routes: { infra: { chatId: CHAT, threadId: '2995' }, alias: roleRoute, prices: roleRoute } },
-    mailbox: { enabled, roles: { prices: {} }, systemSenders: ['agent-org'], mirror: false },
-  }, chats: { [CHAT]: { isolateTopics: true, topics: { '142': 'Prices', '2995': 'Admin' } } } };
+    mailbox: open ? { enabled, mirror: false } : { enabled, roles: { prices: {} }, systemSenders: ['agent-org'], mirror: false },
+  }, chats: { [CHAT]: { isolateTopics: true, topics: { '142': 'Prices', '2995': 'Admin', '300': 'Notes' } } } };
+  // An open bot reaches the Prices topic by its implicit session route, with no role or configured route.
+  if (open) { delete config.bot.externalJobs.routes.alias; delete config.bot.externalJobs.routes.prices; }
   const intentLock = createAsyncLock();
   const calls = []; const reactions = []; const replies = [];
   const entry = { backend: 'cli', inFlight: false, closed: false, probeBusyState: async () => ({ busy: entry.inFlight, backgroundShell: false }) };
@@ -71,8 +73,11 @@ function fixture(t, { enabled = true, general = false } = {}) {
   f.command = (cleanText) => runtime.createAutomationCommandHandler({ config, getSessionKey, intentLock,
     getService: () => f.jobs, reply: async (msg, chatId, text) => replies.push(text),
   })({ msg: { from: { id: 7 }, ...(general ? {} : { message_thread_id: '142' }) }, chatId: CHAT, cleanText });
-  f.submit = (key) => f.mailbox.submit({ sender: 'agent-org', to: 'prices', body: `Task ${key}`, key });
-  f.job = (receipt) => f.jobs.get({ routeId: 'prices', requestId: `mailbox:${receipt.id}` }).job;
+  f.submit = open
+    ? (key) => { f.mailbox.noteHumanPrompt(`${CHAT}:300`); return f.mailbox.send(f.mailbox.scope(`${CHAT}:300`), { to: 'prices', kind: 'tell', body: `Task ${key}` }); }
+    : (key) => f.mailbox.submit({ sender: 'agent-org', to: 'prices', body: `Task ${key}`, key });
+  f.routeId = open ? `session:${CHAT}:142` : 'prices';
+  f.job = (receipt) => f.jobs.get({ routeId: f.routeId, requestId: `mailbox:${receipt.id}` }).job;
   t.after(async () => { f.finish({ aborted: true }); f.jobs.stop(); f.mailbox.stop(); await settle(); cleanupDb(dbPath, db); });
   return f;
 }
@@ -132,6 +137,29 @@ test('a turn ending during stop probes cannot admit the next job until stop fini
   await f.abort(); await settle();
   assert.equal(f.interruptedRequest, `mailbox:${first.id}`, 'stop must not hit the newly queued turn');
   assert.equal(f.job(next).state, 'running');
+});
+
+test('open bot: a session reached by its implicit route also holds admission while stop probes run', async (t) => {
+  const f = fixture(t, { open: true });
+  assert.equal(f.mailbox.roleForSession(f.sessionKey), null, 'Prices is not a role here');
+  const first = f.submit('first'); const next = f.submit('next');
+  f.jobs.start(); await settle();
+  assert.equal(f.job(first).state, 'running');
+  let probes = 0;
+  f.entry.probeBusyState = async () => {
+    if (++probes === 1) { f.finish({ text: '' }); await settle(); }
+    return { busy: false, backgroundShell: false };
+  };
+  await f.abort(); await settle();
+  assert.equal(f.interruptedRequest, `mailbox:${first.id}`, 'stop must not hit the newly queued turn');
+  assert.equal(f.job(next).state, 'running');
+  assert.equal(f.db.raw.prepare('SELECT count(*) n FROM external_job_controls WHERE paused=1').get().n, 0, 'and nothing is paused');
+});
+
+test('open bot: the operator\'s stop in a configured destination still pauses it instead of holding', async (t) => {
+  const f = fixture(t, { open: true });
+  await f.abort('/stop', '2995');
+  assert.equal(f.jobs.status('infra').paused, true);
 });
 
 test('uncertain inactivity holds the next job without setting an automation pause', async (t) => {
