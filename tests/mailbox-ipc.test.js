@@ -125,3 +125,26 @@ test('the injected command reaches the daemon from a session whose environment l
   assert.equal(receipt.ok, true);
   assert.equal(db.raw.prepare('SELECT from_addr FROM mailbox_messages WHERE id=?').get(receipt.id).from_addr, 'role:orchestrator');
 });
+
+test('directory and open pass the token separately and need no JSON argument', async (t) => {
+  const dir = fs.mkdtempSync(path.join(process.cwd(), '.mbx-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = { ...process.env, POLYGRAM_IPC_DIR: dir, POLYGRAM_IPC_SECRET: 'synthetic-secret' };
+  const seen = [];
+  const ipc = await server.start({
+    path: server.socketPathFor('testbot', { env }), secret: 'synthetic-secret', logger: { error() {}, log() {} },
+    handlers: createIpcHandlers({ mailbox: {
+      directory: (token, input) => { seen.push(['directory', token, input]); return { you: 'music', targets: [] }; },
+      open: (token, input) => { seen.push(['open', token, input]); return { asks: [] }; },
+    } }),
+  });
+  t.after(() => ipc.close());
+  const run = (...args) => promisify(execFile)(process.execPath, [SCRIPT, ...args], { env });
+  const result = async (...args) => { const { id, ...rest } = JSON.parse((await run(...args)).stdout); return rest; };
+  assert.deepEqual(await result('testbot', 'tok', 'directory'), { ok: true, you: 'music', targets: [] });
+  assert.deepEqual(await result('testbot', 'tok', 'open', '{"token":"forged","op":"mailbox_send"}'), { ok: true, asks: [] });
+  assert.deepEqual(seen, [['directory', 'tok', {}], ['open', 'tok', {}]], 'the command-line token wins and transport keys are dropped');
+  const handlers = createIpcHandlers();
+  await assert.rejects(async () => handlers.mailbox_directory({ token: 't' }), /mailbox is disabled/i);
+  await assert.rejects(async () => handlers.mailbox_open({ token: 't' }), /mailbox is disabled/i);
+});

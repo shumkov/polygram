@@ -340,7 +340,8 @@ test('after a notice about an ask, the same ask sent again is a new message, not
   await f.jobs.tick(); await f.jobs.tick(); await f.mailbox.tick();
   assert.equal(f.notices().length, 1, 'the asker was told the reply did not arrive');
   f.advance(3 * 60000);
-  const again = f.mailbox.send(token, ask('marketing'));
+  // The notice turn replaced the asker's grant; a re-ask comes from a later prompt with its own command.
+  const again = f.mailbox.send(f.human('orchestrator'), ask('marketing'));
   assert.notEqual(again.id, first.id, 'a deliberate re-ask must not collapse into the answered ask');
   assert.equal(again.duplicate, undefined);
   assert.equal(f.job('marketing', `mailbox:${again.id}`).state, 'queued');

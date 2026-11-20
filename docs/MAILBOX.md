@@ -1,17 +1,29 @@
 # Session mailbox
 
-The mailbox lets one role session ask or tell another role session of the same
+The mailbox lets one session of a bot ask or tell another session of the same
 bot, and reply to asks it receives. Polygram is only the transport: it stamps
 the sender, stores every message, delivers it as a new turn when the target is
 idle, enforces limits, and mirrors each message into Telegram. Design:
-[`session-mailbox-spec.md`](./session-mailbox-spec.md).
+[`session-mailbox-spec.md`](./session-mailbox-spec.md) and
+[`UNIVERSAL_MAILBOX_SPEC.md`](./UNIVERSAL_MAILBOX_SPEC.md).
 
-Phase 1 delivers only to Claude CLI sessions of one bot on one host.
+A bot runs in one of two modes (`intra`):
+
+- **`roles`** (today's organization): only configured role sessions take part,
+  and each starts messages only to the roles on its allowlist.
+- **`open`**: every Claude CLI session of the bot has an address and may ask
+  or tell any other, with no role or route to configure.
+
+Messages stay inside one bot on one host, and only Claude CLI sessions can
+receive them.
 
 ## Requirements
 
 - [External jobs](./EXTERNAL_JOBS_API.md) are enabled. Messages travel as
   external jobs, so pause, idle-only admission and job reports apply.
+
+In a `roles` bot, also:
+
 - Each role is an existing session on the CLI backend: a non-forum chat, an
   isolated topic (`isolateTopics: true`), or a forum's General topic. Topics
   in groups that run with `isolateTopics: false` don't qualify; give the
@@ -45,6 +57,7 @@ rules.
 | Key | Meaning |
 |---|---|
 | `enabled` | Must be `true`. Without a `mailbox` key nothing changes. |
+| `intra` | `"roles"` or `"open"` (see above). Default: `"roles"` when `roles` is non-empty, else `"open"`. `allow` is only valid with `"roles"`. |
 | `roles.<name>` | Role name = route id, `^[a-z][a-z0-9_-]*$`. `about` (≤ 300 characters) is shown to the roles allowed to message it. |
 | `allow.<name>` | Roles this role may start an `ask` or `tell` to; `"*"` means every role. A role without an entry can only reply. Replies are never checked against it. |
 | `mirror` | Where each message is posted: `"target"` (or `true`) posts a collapsed rich card into the target role's topic; `"both"` also posts the same card into the sending role's topic; `false` posts nothing. Default `true`. See [Telegram mirror](#telegram-mirror). |
@@ -58,21 +71,82 @@ External jobs now run different conversations concurrently, up to
 `externalJobs.maxConcurrent` (default 4). Each conversation still runs one job
 at a time.
 
+An open bot needs nothing else:
+
+```json
+"externalJobs": { "enabled": true, "routes": { … } },
+"mailbox": { "enabled": true, "mirror": "target" }
+```
+
+## Addresses
+
+Every session the chat config defines has an address. A configured role keeps
+`role:<name>`. Every other session is `session:<sessionKey>`, where the key is
+polygram's own: the chat id for a plain chat, a forum's General, or a forum
+that does not isolate topics; `<chatId>:<threadId>` for an isolated topic.
+Mirrors and job reports for a bare chat key in a forum go to General.
+
+Agents use readable names:
+
+| Name | Means |
+|---|---|
+| `<role>` | a configured role; a role name wins over any other name |
+| `<topic>` | a topic's `name`, lowercased with dashes (`Music` → `music`) |
+| `t<threadId>` | any isolated topic, named or not |
+| `general` | the forum's General, when the bot has exactly one forum |
+| `<chat>` | a chat's bare session, by its `name` |
+| `role:<name>`, `session:<key>` | the canonical address, always accepted |
+
+A name that matches several sessions is refused with
+`MAILBOX_UNKNOWN_ADDRESS` and the candidates. The canonical address is stored,
+so renaming a topic never redirects a message already sent. Trusted headers
+and mirror cards show the name the session had when the message was sent
+(`from_label`, `to_label`), never the raw session key.
+
+A session that can only receive later (Codex, SDK) has an address, gets no
+command, and a send to it is refused with `MAILBOX_BACKEND_UNSUPPORTED`.
+
+A delivery to a session that is not a role travels on an implicit external-job
+route whose id is its address, `session:<sessionKey>`. Configured route ids may
+not start with `session:`, `peer:` or `orca:`, and the IPC ops
+`external_job_submit` and `external_jobs_status` refuse those ids, so outside
+clients cannot use them. `/automation` and the stop-to-pause rule still apply
+only to configured routes.
+
 ## What agents do
 
-Role sessions get instructions in every prompt: their role, the roles they may
-message, and two commands from the `mailbox` skill:
+Sessions that may start messages get instructions in every prompt, with the
+`mailbox` skill's commands:
 
 ```
 POLYGRAM_IPC_DIR="…" node …/skills/mailbox/scripts/msg.js <bot> <token> send  '{"to":"marketing","kind":"ask","body":"…"}'
 POLYGRAM_IPC_DIR="…" node …/skills/mailbox/scripts/msg.js <bot> <token> reply '{"id":"m_…","body":"…"}'
+POLYGRAM_IPC_DIR="…" node …/skills/mailbox/scripts/msg.js <bot> <token> directory
+POLYGRAM_IPC_DIR="…" node …/skills/mailbox/scripts/msg.js <bot> <token> open
 ```
+
+A roles bot's instructions list the roles the session may message, as before.
+An open bot's instructions name the session and point to `directory`, so a
+long list never goes into every prompt. `directory` returns the sessions the
+caller may message, each with the name to use and whether it can receive;
+`open` returns the caller's asks still waiting for a reply, with their
+delivery state.
 
 The command names the daemon's IPC directory itself, because a CLI session
 inherits its environment from whoever started the tmux server, which is often
 not the daemon; `msg.js` reads the socket and the 0600 secret file there, so the
-sessions must run as the daemon's user. The token identifies the session. It lives in memory, so a restart issues new
-ones. Both commands return `{id, state}` right away, where `state` is the
+sessions must run as the daemon's user.
+
+The token is a **grant**:
+
+- **Per prompt.** Every prompt polygram sends the session mints a new one,
+  recording that prompt's depth. A mailbox or other job's grant takes effect
+  only when its prompt is actually sent, so a deferred job never activates one.
+- **A new prompt demotes the previous grant to reply-only.** It can still
+  answer an ask, so a turn overtaken by a queued message can still reply, but
+  it can no longer start a message, and `mailbox_identify` reports `maxDepth`
+  for it. Only the newest few demoted grants are kept.
+- **In memory.** Grants live in memory, so a restart issues new ones. Both commands return `{id, state}` right away, where `state` is the
 message's delivery state: `queued` or `paused` for a new message; a duplicate
 reports where its original delivery stands (`running`, `succeeded`, `failed`,
 `interrupted` or `unknown`).
@@ -86,8 +160,15 @@ text lands in its own topic through the normal job report.
 
 ## Rules
 
-- `ask` and `tell` need the target on the sender's allowlist. No role may
-  message itself.
+- In a roles bot, `ask` and `tell` need the target on the sender's allowlist,
+  and `"*"` means every role, never a session that is not a role. In an open
+  bot any session may start a message to any other. No session may message
+  itself.
+- Only the command from the session's current prompt can start a message; an
+  older one can only reply.
+- A grant marked as having seen foreign content can never start an ask or tell,
+  whatever its depth, until the operator's own next message. Nothing in one bot
+  sets that mark yet; it exists for messages between bots.
 - Exactly one reply per ask, only from the role it was addressed to. An
   identical retried reply returns the stored one. Nothing is forwarded
   automatically.
@@ -244,6 +325,9 @@ contract and do not change:
 | `MAILBOX_RATE_LIMITED` | `systemPerHour`, or the per-pair limit for agent sends. | Yes, later. |
 | `MAILBOX_KEY_CONFLICT` | The key was used for a different target, body, origin or summary. | No. |
 | `MAILBOX_INVALID_ORIGIN` | `origin` is not exactly `{kind:"human", name}` with a name of 1 to 64 characters and no control characters. | No. |
+| `MAILBOX_UNKNOWN_ADDRESS` | In an open bot, `to` names no session; in any bot, a name that matches several sessions (the candidates are listed). A roles bot keeps `MAILBOX_UNKNOWN_ROLE` for a name that matches nothing. | No. |
+| `MAILBOX_NOT_ALLOWED` | The allowlist or the bot's mode refuses this start, the command was replaced by a newer prompt, or the grant has seen foreign content. | No; use the current turn's command. |
+| `MAILBOX_BACKEND_UNSUPPORTED` | The target cannot receive yet (Codex, SDK). | No. |
 
 A refusal from the external-jobs queue keeps its own code, for example
 `EXTERNAL_JOB_QUEUE_FULL` (retry later) or `EXTERNAL_JOB_ROUTE_UNAVAILABLE`.
@@ -294,7 +378,8 @@ Messages live in `mailbox_messages`; delivery state lives in `external_jobs`
 under `request_id = 'mailbox:' || id` (notices: `'mailbox-notice:' || askId`,
 or `|| replyId` for a reply that was not delivered). System messages also
 store their `idem_key` and `ref`, and a relayed human message its
-`origin_name`; optional collapsed headings live in `summary`.
+`origin_name`; optional collapsed headings live in `summary`, and display
+names for `session:` addresses in `from_label` and `to_label`.
 
 ```sql
 SELECT m.id, m.kind, m.from_addr, m.to_addr, m.depth, m.notice_sent, j.state, j.report_state, j.error
@@ -305,11 +390,11 @@ ORDER BY m.created_at DESC LIMIT 20;
 
 ## Not yet hardened
 
-Tokens last until restart, and agents can read the bot's IPC secret, so a
-determined agent could submit an external job directly, or call
+Demoted grants can still reply until restart, and agents can read the bot's
+IPC secret, so a determined agent could submit an external job directly, or call
 `mailbox_submit` as a listed system sender. That includes forging an
 `origin`, which gives its message depth 0, so the receiving role would treat
 it as a human asking. Mirror rows also enter topic history without an
 untrusted tag. These and the wider volume caps are
-listed under "Stage 2" in the spec. Run the mailbox only among roles you
+listed under "Stage 2" in the spec. Run the mailbox only among sessions you
 already trust with each other's topics.

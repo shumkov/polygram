@@ -187,9 +187,10 @@ test('a mailbox role whose route is General sends, receives, is mirrored and rep
   assert.equal(f.sent.length, 1);
   assert.deepEqual({ ...f.sent[0].target }, GENERAL_TARGET, 'the ask is delivered into the General session');
   assert.match(f.sent[0].task, /you are role:lead/, 'General gets the role instructions like any role session');
-  assert.deepEqual(f.mailbox.identify({ token: leadToken }), { role: 'lead', depth: 1 }, 'the delivered ask set the General session depth');
+  const leadTurn = f.mailbox.scope(CHAT);
+  assert.deepEqual(f.mailbox.identify({ token: leadTurn }), { role: 'lead', depth: 1 }, 'the delivered ask set the General session depth');
 
-  const answer = f.mailbox.reply(leadToken, { inReplyTo: question.id, body: 'Spring sale.' });
+  const answer = f.mailbox.reply(leadTurn, { inReplyTo: question.id, body: 'Spring sale.' });
   await settle(); await f.jobs.tick();
   assert.deepEqual(f.posts[1].params, { chat_id: CHAT, message_thread_id: '12', parse_mode: 'HTML', text: '↩️ <b>lead answered marketing</b>\n<blockquote expandable>Spring sale.</blockquote>' });
   assert.deepEqual({ ...f.sent[1].target }, { chatId: CHAT, threadId: '12', sessionKey: topicSession }, 'the reply goes back to the topic');

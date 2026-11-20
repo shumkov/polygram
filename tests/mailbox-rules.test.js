@@ -110,14 +110,32 @@ test('limits must be positive integers and about text bounded', () => {
   }
 });
 
-test('starting a message checks kind, target, self and the allowlist', () => {
+// Targets are resolved before this check (see mailbox-universal), so it sees
+// session records: the role a session holds, if any, and whether it can
+// receive.
+const sessionOf = (role, over = {}) => ({ sessionKey: `${routes[role].chatId}:${routes[role].threadId}`, role, address: `role:${role}`, label: role, receivable: true, ...over });
+const plainSession = (over = {}) => ({ sessionKey: '-1001:20', role: null, address: 'session:-1001:20', label: 'notes', receivable: true, ...over });
+
+test('starting a message checks kind, self, the allowlist and whether the target can receive', () => {
   const cfg = read(base());
-  assert.doesNotThrow(() => rules.checkStart(cfg, { from: 'orchestrator', to: 'marketing', kind: 'ask' }));
-  assert.doesNotThrow(() => rules.checkStart(cfg, { from: 'marketing', to: 'orchestrator', kind: 'tell' }));
-  assert.throws(() => rules.checkStart(cfg, { from: 'orchestrator', to: 'marketing', kind: 'reply' }), /kind/i);
-  assert.throws(() => rules.checkStart(cfg, { from: 'orchestrator', to: 'sales', kind: 'ask' }), /unknown role/i);
-  assert.throws(() => rules.checkStart(cfg, { from: 'orchestrator', to: 'orchestrator', kind: 'ask' }), /itself/i);
-  assert.throws(() => rules.checkStart(cfg, { from: 'marketing', to: 'ops', kind: 'ask' }), /not allowed/i);
+  const coded = (code) => (error) => error?.code === code;
+  assert.doesNotThrow(() => rules.checkStart(cfg, { from: sessionOf('orchestrator'), to: sessionOf('marketing'), kind: 'ask' }));
+  assert.doesNotThrow(() => rules.checkStart(cfg, { from: sessionOf('marketing'), to: sessionOf('orchestrator'), kind: 'tell' }));
+  assert.throws(() => rules.checkStart(cfg, { from: sessionOf('orchestrator'), to: sessionOf('marketing'), kind: 'reply' }), /kind/i);
+  assert.throws(() => rules.checkStart(cfg, { from: sessionOf('orchestrator'), to: sessionOf('orchestrator'), kind: 'ask' }), /itself/i);
+  assert.throws(() => rules.checkStart(cfg, { from: sessionOf('marketing'), to: sessionOf('ops'), kind: 'ask' }),
+    (error) => error.code === 'MAILBOX_NOT_ALLOWED' && /role:marketing is not allowed to message role:ops/.test(error.message));
+  assert.throws(() => rules.checkStart(cfg, { from: sessionOf('orchestrator'), to: plainSession(), kind: 'ask' }), coded('MAILBOX_NOT_ALLOWED'),
+    'a roles bot reaches only roles, even under "*"');
+  assert.throws(() => rules.checkStart(cfg, { from: sessionOf('orchestrator'), to: sessionOf('marketing', { receivable: false }), kind: 'ask' }),
+    coded('MAILBOX_BACKEND_UNSUPPORTED'));
+});
+
+test('an open bot lets any session start a message to any other session', () => {
+  const cfg = read({ enabled: true });
+  assert.equal(cfg.intra, 'open');
+  assert.doesNotThrow(() => rules.checkStart(cfg, { from: plainSession(), to: sessionOf('ops', { role: null, address: 'session:-1001:13' }), kind: 'ask' }));
+  assert.throws(() => rules.checkStart(cfg, { from: plainSession(), to: plainSession(), kind: 'ask' }), /itself/i);
 });
 
 test('depth: a new message is one deeper than its turn and capped at maxDepth', () => {
@@ -154,12 +172,14 @@ test('body: bounded, non-empty, redacted before it is hashed', () => {
 
 test('a reply must answer an open ask addressed to the caller', () => {
   const ask = { id: 'm_1', kind: 'ask', to_addr: 'role:marketing', from_addr: 'role:orchestrator' };
-  assert.doesNotThrow(() => rules.checkReply({ ask, caller: 'marketing', replied: false }));
-  assert.throws(() => rules.checkReply({ ask: null, caller: 'marketing', replied: false }), /no such ask/i);
-  assert.throws(() => rules.checkReply({ ask: { ...ask, kind: 'tell' }, caller: 'marketing', replied: false }), /not an ask/i);
-  assert.throws(() => rules.checkReply({ ask: { ...ask, kind: 'reply' }, caller: 'marketing', replied: false }), /not an ask/i);
-  assert.throws(() => rules.checkReply({ ask, caller: 'ops', replied: false }), /not addressed/i);
-  assert.throws(() => rules.checkReply({ ask, caller: 'marketing', replied: true }), /already/i);
+  assert.doesNotThrow(() => rules.checkReply({ ask, caller: 'role:marketing', replied: false }));
+  assert.throws(() => rules.checkReply({ ask: null, caller: 'role:marketing', replied: false }), /no such ask/i);
+  assert.throws(() => rules.checkReply({ ask: { ...ask, kind: 'tell' }, caller: 'role:marketing', replied: false }), /not an ask/i);
+  assert.throws(() => rules.checkReply({ ask: { ...ask, kind: 'reply' }, caller: 'role:marketing', replied: false }), /not an ask/i);
+  assert.throws(() => rules.checkReply({ ask, caller: 'role:ops', replied: false }), /not addressed/i);
+  assert.throws(() => rules.checkReply({ ask, caller: 'session:-1001:12', replied: false }), /not addressed/i,
+    'a session address never answers an ask addressed to a role');
+  assert.throws(() => rules.checkReply({ ask, caller: 'role:marketing', replied: true }), /already/i);
 });
 
 test('addresses carry their prefix', () => {

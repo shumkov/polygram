@@ -222,3 +222,9 @@ settled, tracked-terminal cleanup was accepted, and a fresh registry page was
 empty; it does not prove arbitrary descendants died. After transport or
 app-server hard loss, such a process may survive until the required host
 reboot.
+
+## Agents
+
+`agents/assistant.md` is the personal assistant for a forum's General topic
+(see `docs/UNIVERSAL_MAILBOX_SPEC.md`, section 8). Copy it to
+`~/.claude/agents/assistant.md` and set the chat's `agent` to `assistant`.
