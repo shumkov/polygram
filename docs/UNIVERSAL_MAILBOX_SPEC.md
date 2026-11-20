@@ -164,9 +164,10 @@ What agents type and humans see:
 | Alias | Resolves to |
 |---|---|
 | `<role>` | a configured role; a role name wins over any other alias |
-| `<topic>` | the slug of a topic's `name`, or `t<threadId>` when unnamed |
+| `<topic>` | the slug of a topic's `name` |
+| `t<threadId>` | any isolated topic, named or not |
 | `general` | the forum's General, when this bot has exactly one forum |
-| `<chat>` | the slug of a non-forum chat's `name` |
+| `<chat>` | the slug of a chat's `name`: its bare session (a plain chat, or a forum's General) |
 | `umi:<alias>` | the same forms on the peer named `umi` |
 | `orca:<worktree>` | the one live agent session in that Orca worktree |
 
@@ -1040,7 +1041,12 @@ Built by whichever of phases 2 and 3 ships first:
 - one Orchestra release carrying both the per-session PreToolUse gate entry
   and the `SendMessage`/`ListAgents` deny for bot sessions;
 - the decision-2 dependency tests, which must pass before `origin` is enabled
-  on the VPS.
+  on the VPS;
+- moving the taint clear out of `formatPrompt`: phase 1 clears it in
+  `noteHumanPrompt` for any operator message, which is harmless while nothing
+  sets taint. Once taint is wired, an operator message folded into a running
+  tainted turn must not clear it, so the clear moves to the point where a new
+  turn is dispatched.
 
 ### Phase 2: federation, personal → UMI
 
