@@ -110,7 +110,9 @@ Layer A cannot stop that. Ivan chose **option C** (section 8): the assistant,
 the only session that receives foreign replies, keeps its full tools in turns
 Ivan starts, and in a tainted turn every tool outside a short read-only list
 needs Ivan's approval in Telegram first. That closes the shell route for the
-tainted turns, which are the only turns foreign text can steer.
+tainted turns, the turns that foreign text starts or joins. It does not cover
+foreign text that stays in the session's context into a later turn Ivan starts
+(see rule 5 and the residual risks in section 7).
 
 **Gaps that exist today, accepted by Ivan, and kept until Stage 2:**
 
@@ -311,31 +313,52 @@ switch. Added:
    - a Telegram message from anyone other than the bot's operator
      (`isAutomationOperator`).
 
-   Starting a tainted turn sets the session's flag. A `read` (peer history)
-   sets the flag and taints the grant it used from that moment. Taint can be
-   raised during a turn, never lowered.
+   Any tainting input sets the session's flag **before** its content is
+   delivered: a tainted turn start, a tainting message folded into a running
+   turn, and a `read` (peer history), which also taints the grant it used.
+   Taint can be raised during a turn, never lowered.
 
    **What clears it:** only an operator message that starts a new turn after the
-   tainted turn has settled. An operator message folded into a running tainted
-   turn does not clear it. So a clean ask from Music cannot launder General:
-   General's turn inherits General's own flag.
+   tainted turn has settled, where settled also means no background task or
+   subagent the tainted turn started is still running. An operator message
+   folded into a running tainted turn does not clear it. So a clean ask from
+   Music cannot launder General: General's turn inherits General's own flag.
 
    **Where it applies:** bots without `senders` (UMI) do not enforce taint. They
    cannot start anything cross-zone, and a personal ask must still be able to
    consult other UMI roles.
-5. **Depth across bots.** A foreign ask accepted into UMI is stored at depth 0
-   with the peer's configured `origin` (`"Ivan"`), so UMI treats it as Ivan
-   asking: tools that require a human at depth 0 (agent-org's process save)
-   accept it, and the role can start a chain under UMI's rules. Without
-   `origin` it is stored at depth 1, like a system tell. Each bot keeps its own
-   depth budget.
+5. **Depth across bots.** A foreign ask accepted into UMI counts as Ivan only
+   when Ivan's own message started the asking turn.
+   - **The grant records it.** Each grant records whether an operator
+     Telegram message started its turn (`byOperator`), and `peer_submit`
+     carries that bit.
+   - **When it is set,** the VPS stores the ask at depth 0 with the peer's
+     configured `origin` (`"Ivan"`). UMI treats it as Ivan asking: tools that
+     require a human at depth 0 (agent-org's process save) accept it, and the
+     role can start a chain under UMI's rules.
+   - **Otherwise** it is stored at depth 1 with no origin, like a system tell.
+     That covers an ask General sends in a turn that Music's ask started, from
+     a wakeup, or after a fold.
+   - **Each bot keeps its own depth budget.**
 
-   **This is safe only because of rule 1's taint check.** A personal grant
-   that has seen foreign content can never start an ask or tell, so UMI or
-   Orca text can never come back into UMI wearing Ivan's name. The dependency
-   is tested (Verification plan, "decision 2 dependency"), and `origin` must
-   not be enabled on the VPS until those tests pass in the shared cross-zone
-   layer.
+   **This depends on rule 1's taint check.** A personal grant that has seen
+   foreign content in its own turn can never start an ask or tell, so UMI or
+   Orca text cannot ride straight back into UMI under Ivan's name. The
+   dependency is tested (Verification plan, "decision 2 dependency"), and
+   `origin` must not be enabled on the VPS until those tests pass in the shared
+   cross-zone layer.
+
+   **What it does not stop:** foreign text that stays in General's context. If
+   Ivan answers a summary with "ok", the new turn is untainted and the
+   assistant may then ask UMI as Ivan, steered partly by that earlier text. Two
+   measures keep this visible rather than silent:
+   - every cross-zone ask is mirrored with its full text into the sender's
+     topic, whatever the `mirror` mode, so Ivan sees what goes out under his
+     name;
+   - the residual risk is listed in section 7.
+
+   A stronger rule (withhold `origin` while foreign text is in context, until
+   `/new`) is in Stage 2.
 6. **Rate.** `perPeerPerHour` (default 30) counts asks and tells this bot sends
    to one peer, or to Orca, at the sender.
 7. **Expiry.** `askTtlHours` (default 24) for peers and `orcaAskTtlHours`
@@ -772,7 +795,9 @@ Residual risks, outside Layer A:
   guarantee](#what-the-policy-can-and-cannot-guarantee));
 - reads polygram does not mediate (section 5);
 - foreign text that stays in a session's context or history-preload into later
-  operator turns.
+  operator turns, including an ask sent to UMI as Ivan after Ivan answers a
+  summary. Every cross-zone ask is mirrored in full into the sender's topic so
+  he sees it (rule 5).
 
 At that point the human is in the loop, and the mirror cards show the traffic.
 
@@ -837,11 +862,18 @@ against the vendored binary and the matching Agent SDK types):
   (`HookPermissionDecision` in the SDK types for 2.1.322).
 - `defer` is print-mode only ("returned permissionDecision=defer in interactive
   mode; ignoring"), so it is unusable for tmux sessions.
-- **`ask` is not used.** Under `bypassPermissions` it would raise the CLI's own
-  TUI prompt, which polygram answers only through the tmux send-keys path that
-  is switched off under bypass (Orchestra `cli-process.js:991`). In `default`
-  mode that path hung the Music topic for 39 minutes in May 2026. So the hook
-  makes the decision itself and returns only `deny` or nothing.
+- **`ask` is not used.** Under `bypassPermissions` it may raise the CLI's own
+  TUI prompt, or may be turned into an allow: the binary has a branch for
+  that (`permission_bypass_removal_prompt_waived`). If it prompts, polygram
+  can answer only through the tmux send-keys path, which is switched off under
+  bypass (Orchestra `cli-process.js:991`). In `default` mode that path hung the
+  Music topic for 39 minutes in May 2026. So the hook makes the decision itself
+  and returns only `deny` or nothing.
+- **A failing hook lets the call through by default.** Command hooks take
+  `onFailure`, whose default is `"continue"`. If the hook cannot start, times
+  out, exits with a code other than 0 or 2, or prints malformed JSON, the tool
+  runs. A deploy that replaces the script under a running session is enough.
+  The gate entry therefore sets `onFailure: "block"`.
 
 **Carrier.** Orchestra writes one more `PreToolUse` entry into the per-session
 `--settings` file it already generates (the flag-settings tier that carries the
@@ -858,32 +890,58 @@ polygram names. That needs an Orchestra release, bundled with the
 **Flow.**
 
 1. The hook command is `node <polygram>/bin/polygram-tool-gate.js` with
-   `POLYGRAM_IPC_DIR` set, as `msg.js` is. It reads the hook input on stdin
+   `POLYGRAM_IPC_DIR` set, as `msg.js` is, and the entry has
+   `onFailure: "block"`. It reads the hook input on stdin
    (`session_id`, `tool_name`, `tool_input`, `tool_use_id`).
 2. It calls the IPC op `mailbox_tool_gate`. The daemon maps the Claude session
    id to one of its own live sessions.
 3. **Untainted session:** the answer is immediate, and the hook prints nothing,
    so the call proceeds as today. That is the cost of a normal turn: one local
    IPC round trip per tool call.
-4. **Tainted session, read-only tool:** `Read`, `Glob`, `Grep`, `TodoWrite`
-   and the `mcp__polygram-bridge__*` tools (replying to Ivan) proceed. Reading
-   alone cannot act: acting needs a tool that is gated.
+4. **Tainted session, read-only tool:** `Read`, `Glob`, `Grep` and
+   `TodoWrite` proceed, as does the bridge `reply` tool with text only.
+   Reading alone cannot act: acting needs a tool that is gated.
+   - The bridge reply tool's chat is fixed to the session's own chat, but its
+     `files` field, and image syntax in its text, can upload any regular file
+     under the session's cwd, which is `~`.
+   - In a tainted turn, a reply that names a file or a local image path
+     therefore goes through the approval in step 5, except for files in the
+     session's own attachment staging folder.
 5. **Tainted session, any other tool** (`Bash`, `Write`, `Edit`,
    `NotebookEdit`, `WebFetch`, `WebSearch`, `Task`/`Agent`, `SendMessage`, any
    other MCP tool): the daemon issues a pending approval through the existing
    approvals store (`pending_approvals`) and posts the card to the admin chat,
-   with **Approve / Deny only**. There are no "always" buttons, and
-   `chat_tool_decisions` is neither read nor written, so one click never
-   becomes a standing allow. It waits up to `limits.taintApprovalSeconds`
-   (default 600).
+   with **Approve / Deny / Deny rest of turn**.
+   - **No standing allow.** There are no "always" buttons, and
+     `chat_tool_decisions` is neither read nor written, so one click never
+     becomes a standing allow.
+   - **Full input, never clipped.** Unlike today's cards
+     (`lib/approvals/ui.js:65` keeps only the first 900 and the last 200
+     characters), a taint card shows the whole tool input, so nothing can hide
+     in the middle.
+   - **Refused outright:** input too long for one message, or input containing
+     control or bidirectional-override characters, is denied without a card.
+   - **What else the card shows:** the tool, the session, and what tainted the
+     turn.
+   - **Who can approve.** The approval chat must be Ivan's DM (68861949), and
+     callbacks are accepted only from it. If no approval chat is configured,
+     the gate denies: today's flow allows every tool when
+     `approvals.adminChatId` is unset (`lib/handlers/approvals.js:85`), and the
+     gate must not inherit that.
+   - **Timeout:** it waits up to `limits.taintApprovalSeconds` (default 600).
 6. **Approve:** the hook prints nothing and the call runs. **Deny, timeout or
    any error:** the hook prints `permissionDecision: "deny"` with the reason
    "Ivan has not approved this tool in a turn that carries foreign content".
    The hook's `timeout` is the approval timeout plus 30 s.
-7. **Fails closed.** An unknown session id, an unreachable daemon or a
-   malformed answer all deny. The hook exists only in settings files that
-   polygram generated, so an unknown id means a mapping fault, not a foreign
-   session.
+7. **Fails closed.**
+   - An unknown session id, an unreachable daemon or a malformed answer all
+     deny. The hook exists only in settings files that polygram generated, so
+     an unknown id means a mapping fault, not a foreign session.
+   - A hook that crashes or times out is blocked by `onFailure: "block"`.
+8. **Subagents.** Hooks fire inside subagents, with `agent_id` present only
+   there (`sdk.d.ts:185`). The gate judges a subagent's call by the taint of
+   the turn that started that subagent. So a `Task` approved in a tainted turn
+   stays gated after Ivan's next message.
 
 **Scope.**
 
@@ -892,9 +950,10 @@ polygram names. That needs an Orchestra release, bundled with the
   following calls at once.
 - **Not covered:**
   - background processes the assistant started in an earlier, untainted turn;
-  - the same-UID gaps (Stage 2);
-  - subagent tool calls, unless the spike shows they pass through the session's
-    PreToolUse hooks.
+  - foreign text left in the session's context, once Ivan starts a new turn
+    (rule 5);
+  - the same-UID gaps, including the fact that the generated settings file is
+    writable by the same user (Stage 2).
 
 **Spike before enabling.** A real-claude script in `scripts/spikes/` on the
 pinned binary, under `--dangerously-skip-permissions`, checks:
@@ -903,12 +962,21 @@ pinned binary, under `--dangerously-skip-permissions`, checks:
    `SendMessage`;
 2. a hook that blocks for minutes is waited for, not killed early;
 3. tool calls inside a `Task` subagent reach the same hook with the parent's
-   `session_id`;
-4. the observation hook and the gate coexist, with deny winning.
+   `session_id` and an `agent_id`;
+4. the observation hook, the gate and the user-level hooks General also loads
+   (`~/.claude/settings.json`, including Orca's PreToolUse hook) coexist, with
+   deny winning;
+5. another hook returning `updatedInput` cannot change the input after the gate
+   approved it;
+6. with `onFailure: "block"`, these all block the call: a gate that exits 1, is
+   killed, times out, or whose script is missing.
 
-If check 1 or 2 fails, the closest equivalent is option A for the assistant
-(`default` mode with approvals on every turn); if only check 3 fails, the gate
-also denies `Task`/`Agent` in tainted turns without asking.
+- If check 1, 2 or 6 fails, the closest equivalent is option A for the
+  assistant: `default` mode with approvals on every turn.
+- If only check 3 fails, the gate also denies `Task`/`Agent` in tainted turns
+  without asking.
+- If check 5 fails, the gate is listed last and other `updatedInput` hooks are
+  removed from General's settings.
 
 **Other settings.**
 
@@ -1047,6 +1115,12 @@ CREATE INDEX mailbox_open_remote ON mailbox_messages(bot_name, route_id, remote_
   takes identity from the serving side, so it does not change. Together they
   close the same-UID gap and the Orca → VPS shell.
 - **A persistent SSH stream** with server push, if a 30 s poll is too slow.
+- **A context flag for decision 2:** mark a session once foreign text is in its
+  context (taint, or a known unmediated read the gate sees: the notion-umi,
+  orca-cli or history skills, Notion MCP tools, `orca terminal read`), and
+  withhold `origin` or keep the gate armed until `/new`.
+- **Tamper evidence for the gate:** compare tool calls in a tainted session's
+  transcript with the gate's own record.
 - **History-preload tagging.** Tag foreign mirror cards in history-preload by
   source, so they are no longer rendered as the bot's own speech.
 - **Limits on the receiving side:** an inbound rate per peer, and a cap on open
@@ -1087,10 +1161,17 @@ CREATE INDEX mailbox_open_remote ON mailbox_messages(bot_name, route_id, remote_
   - General runs `read`, then asks `umi:*` with the same grant;
   - a background command reuses the grant of a tainted turn after Ivan's next
     message;
+  - an ask from a turn that Music's ask started, from a wakeup, or after a fold
+    carries `byOperator: false` and arrives at depth 1 with no origin;
   - the positive control: Ivan's new turn clears the flag, and the ask goes out
-    with `origin` applied on the receiving side.
+    with `byOperator: true` and `origin` applied on the receiving side.
 - **Option C gate:**
   - an untainted session gets an immediate pass;
+  - a tainted bridge reply with `files` or a local image path needs approval;
+  - an over-long input, or one with control or bidi characters, is denied with
+    no card;
+  - with no approval chat configured, everything gated is denied;
+  - a subagent started in a tainted turn stays gated after Ivan's next message;
   - in a tainted session, a read-only tool passes and every other tool waits
     for the approval;
   - Approve lets the call run; Deny, timeout, an unknown session, the daemon
@@ -1161,6 +1242,27 @@ transport operations.
     without Orchestra);
   - `MAILBOX_KEYS`;
   - pins for Admin and topic 5 before changing the model.
+- **Security re-review of v3** (option C and decision 2):
+  - the gate sets `onFailure: "block"`, because a failing hook continues by
+    default;
+  - with no approval chat the gate denies;
+  - taint cards show the full input, never clipped, and refuse control and
+    bidi characters;
+  - bridge-reply uploads from a tainted turn need approval;
+  - a `byOperator` bit makes only Ivan-started turns arrive in UMI as Ivan;
+  - the claims about context carry-over are corrected, with full-text mirrors
+    of cross-zone asks;
+  - the `ask` rationale is corrected (bypass may silently allow it);
+  - folds set the session flag, and "settled" waits for background tasks and
+    subagents;
+  - subagent calls are judged by the taint of the turn that started them;
+  - more spike checks: user-level hooks, `updatedInput`, failure modes;
+  - a "Deny rest of turn" button.
+
+  Deferred to Stage 2:
+  - the context-flag rule (withhold `origin` until `/new`), because it would
+    disable decision 2 for an assistant whose context naturally holds replies;
+  - transcript-based tamper evidence.
 - **Consistency check of v2** (a fifth, final pass): a per-session taint flag
   so a clean ask cannot launder a tainted session; reply-only grants for
   deliveries into sessions that cannot start; Layer A worded as "through
