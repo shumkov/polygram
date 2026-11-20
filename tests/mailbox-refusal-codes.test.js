@@ -36,8 +36,8 @@ const coded = (code) => (error) => { assert.equal(error.code, code, error.messag
 
 test('the refusal codes are exactly the contracted strings', () => {
   assert.deepEqual(Object.values(rules.REFUSAL).sort(), [
-    'MAILBOX_DISABLED', 'MAILBOX_INVALID_ORIGIN', 'MAILBOX_KEY_CONFLICT', 'MAILBOX_NOT_SYSTEM_SENDER', 'MAILBOX_RATE_LIMITED', 'MAILBOX_TOO_LARGE',
-    'MAILBOX_UNKNOWN_ROLE',
+    'MAILBOX_BACKEND_UNSUPPORTED', 'MAILBOX_DISABLED', 'MAILBOX_INVALID_ORIGIN', 'MAILBOX_KEY_CONFLICT', 'MAILBOX_NOT_ALLOWED',
+    'MAILBOX_NOT_SYSTEM_SENDER', 'MAILBOX_RATE_LIMITED', 'MAILBOX_TOO_LARGE', 'MAILBOX_UNKNOWN_ADDRESS', 'MAILBOX_UNKNOWN_ROLE',
   ]);
 });
 

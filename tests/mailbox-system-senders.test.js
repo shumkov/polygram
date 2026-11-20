@@ -18,6 +18,16 @@ const routes = {
   ops: { chatId: '-1001', threadId: '13' },
 };
 const session = (role) => `${routes[role].chatId}:${routes[role].threadId}`;
+
+const TOKEN = /"([0-9a-f-]{36})"/;
+// The command a job's turn actually receives: minted with the job's
+// instructions and live once its prompt is sent, as the dispatch wrapper does.
+function turnToken(service, sessionKey, routeId, requestId) {
+  const job = { routeId, requestId, target: { sessionKey } };
+  const token = TOKEN.exec(service.instructions(sessionKey, job))[1];
+  service.noteJobSend(job);
+  return token;
+}
 const resolveTarget = (route) => ({ chatId: route.chatId, threadId: route.threadId, sessionKey: `${route.chatId}:${route.threadId}` });
 const HOUR = 3600000;
 const MINUTE = 60000;
@@ -236,29 +246,28 @@ test('a system tell delivers at depth 1, so its turn never reads as "a human ask
   const sent = f.mailbox.submit(submit({ to: 'orchestrator' }));
   const token = f.mailbox.scope(session('orchestrator'));
   assert.throws(() => f.mailbox.send(token, { to: 'ops', kind: 'ask', body: 'Q' }), /depth/i, 'a session never prompted is at maxDepth');
-  f.mailbox.noteJobSend({ routeId: 'orchestrator', requestId: `mailbox:${sent.id}`, target: { sessionKey: session('orchestrator') } });
-  assert.deepEqual(f.mailbox.identify({ token }), { role: 'orchestrator', depth: 1 }, 'the task turn is one below a human message');
+  const task = turnToken(f.mailbox, session('orchestrator'), 'orchestrator', `mailbox:${sent.id}`);
+  assert.deepEqual(f.mailbox.identify({ token: task }), { role: 'orchestrator', depth: 1 }, 'the task turn is one below a human message');
 
-  const asked = f.mailbox.send(token, { to: 'marketing', kind: 'ask', body: 'Q' });
+  const asked = f.mailbox.send(task, { to: 'marketing', kind: 'ask', body: 'Q' });
   assert.equal(f.row(asked.id).depth, 2, 'the role may still ask, at maxDepth');
-  const told = f.mailbox.send(token, { to: 'ops', kind: 'tell', body: 'FYI' });
+  const told = f.mailbox.send(task, { to: 'ops', kind: 'tell', body: 'FYI' });
   assert.equal(f.row(told.id).depth, 2, 'or tell');
 
-  const marketing = f.mailbox.scope(session('marketing'));
-  f.mailbox.noteJobSend({ routeId: 'marketing', requestId: `mailbox:${asked.id}`, target: { sessionKey: session('marketing') } });
+  const marketing = turnToken(f.mailbox, session('marketing'), 'marketing', `mailbox:${asked.id}`);
   assert.throws(() => f.mailbox.send(marketing, { to: 'ops', kind: 'ask', body: 'Q2' }), /depth/i, 'the role it asked, at depth 2, cannot pass it on');
   const replied = f.mailbox.reply(marketing, { inReplyTo: asked.id, body: 'A' });
   assert.equal(f.row(replied.id).depth, 2, 'a reply keeps its ask\'s depth');
 
   f.mailbox.noteHumanPrompt(session('orchestrator'));
-  assert.deepEqual(f.mailbox.identify({ token }), { role: 'orchestrator', depth: 0 }, 'only a human message brings the session to depth 0');
+  assert.deepEqual(f.mailbox.identify({ token: f.mailbox.scope(session('orchestrator')) }), { role: 'orchestrator', depth: 0 }, 'only a human message brings the session to depth 0');
+  assert.deepEqual(f.mailbox.identify({ token: task }), { role: 'orchestrator', depth: 2 }, 'the task turn\'s own command is now reply-only');
 });
 
 test('with maxDepth 1, a role that receives a system tell can only reply', (t) => {
   const f = fixture(t, { mailbox: { limits: { maxDepth: 1 } } });
   const sent = f.mailbox.submit(submit({ to: 'orchestrator' }));
-  const token = f.mailbox.scope(session('orchestrator'));
-  f.mailbox.noteJobSend({ routeId: 'orchestrator', requestId: `mailbox:${sent.id}`, target: { sessionKey: session('orchestrator') } });
+  const token = turnToken(f.mailbox, session('orchestrator'), 'orchestrator', `mailbox:${sent.id}`);
   assert.equal(f.mailbox.identify({ token }).depth, 1);
   assert.throws(() => f.mailbox.send(token, { to: 'ops', kind: 'ask', body: 'Q' }), /depth/i);
 });

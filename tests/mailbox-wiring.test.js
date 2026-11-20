@@ -15,7 +15,7 @@ const body = (name) => {
 
 test('every human prompt resets the session depth and carries the mailbox instructions', () => {
   const format = body('formatPrompt');
-  const reset = format.indexOf('mailboxService?.noteHumanPrompt(sessionKey)');
+  const reset = format.indexOf('mailboxService?.noteHumanPrompt(sessionKey, { operator: isAutomationOperator(config, msg), newTurn: !pm?.get(sessionKey)?.inFlight })');
   const instructions = format.indexOf('mailboxService?.instructions(sessionKey)');
   assert.ok(reset >= 0 && instructions > reset, 'depth is reset before the instructions are rendered');
 });
@@ -47,6 +47,6 @@ test('the depth reset runs for every human prompt, not only when a fresh session
     else if (format[i] === '}' && --depth === 0) { blockEnd = i; break; }
   }
   assert.ok(blockEnd > blockStart, 'the block closes');
-  const reset = format.indexOf('mailboxService?.noteHumanPrompt(sessionKey)');
+  const reset = format.indexOf('mailboxService?.noteHumanPrompt(sessionKey, { operator: isAutomationOperator(config, msg), newTurn: !pm?.get(sessionKey)?.inFlight })');
   assert.ok(reset > blockEnd, 'noteHumanPrompt must sit after the fresh-session block, where every prompt passes');
 });

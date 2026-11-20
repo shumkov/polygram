@@ -59,8 +59,8 @@ test('a relayed human message is stored and delivered at depth 0, so identify re
   assert.equal(row.origin_name, 'Ivan');
   assert.equal(f.job('marketing', `mailbox:${sent.id}`).state, 'queued');
 
-  const token = f.service.scope(session('marketing'));
   f.deliver('marketing', sent.id);
+  const token = f.service.scope(session('marketing'));
   assert.deepEqual(f.service.identify({ token }), { role: 'marketing', depth: 0 }, 'the turn reads as "a human asked"');
   const asked = f.service.send(token, { to: 'ops', kind: 'ask', body: 'Can you check the budget?' });
   assert.equal(f.row(asked.id).depth, 1, 'the role starts a chain one hop below the human, as after a Telegram message');
@@ -72,9 +72,8 @@ test('without an origin a system tell keeps depth 1', (t) => {
   const sent = f.service.submit(input);
   assert.equal(f.row(sent.id).depth, 1);
   assert.equal(f.row(sent.id).origin_name, null);
-  const token = f.service.scope(session('marketing'));
   f.deliver('marketing', sent.id);
-  assert.equal(f.service.identify({ token }).depth, 1);
+  assert.equal(f.service.identify({ token: f.service.scope(session('marketing')) }).depth, 1);
 });
 
 // Checked on the queued external job, which is what the role session

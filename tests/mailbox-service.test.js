@@ -12,6 +12,16 @@ const routes = {
   reports: { chatId: '-1001', threadId: '14' },
 };
 const session = (role) => `${routes[role].chatId}:${routes[role].threadId}`;
+
+const TOKEN = /"([0-9a-f-]{36})"/;
+// The command a job's turn actually receives: minted with the job's
+// instructions and live once its prompt is sent, as the dispatch wrapper does.
+function turnToken(service, sessionKey, routeId, requestId) {
+  const job = { routeId, requestId, target: { sessionKey } };
+  const token = TOKEN.exec(service.instructions(sessionKey, job))[1];
+  service.noteJobSend(job);
+  return token;
+}
 const resolveTarget = (route) => ({ chatId: route.chatId, threadId: route.threadId, sessionKey: `${route.chatId}:${route.threadId}` });
 const HOUR = 3600000;
 const MINUTE = 60000;
@@ -84,23 +94,23 @@ test('depth: a human prompt is 0, a mailbox delivery is the message depth, any o
   const first = f.service.send(f.human('orchestrator'), ask('marketing'));
   assert.equal(f.row(first.id).depth, 1, 'a human-started message is depth 1');
 
-  const marketing = f.service.scope(session('marketing'));
-  f.service.noteJobSend({ routeId: 'marketing', requestId: `mailbox:${first.id}`, target: { sessionKey: session('marketing') } });
+  // Each prompt carries a new grant; the turn uses the command from its own prompt.
+  const marketing = turnToken(f.service, session('marketing'), 'marketing', `mailbox:${first.id}`);
   const second = f.service.send(marketing, ask('orchestrator', 'Need the brief first'));
   assert.equal(f.row(second.id).depth, 2, 'a message started from a delivery turn is one deeper');
 
-  const orchestrator = f.service.scope(session('orchestrator'));
-  f.service.noteJobSend({ routeId: 'orchestrator', requestId: `mailbox:${second.id}`, target: { sessionKey: session('orchestrator') } });
+  let orchestrator = turnToken(f.service, session('orchestrator'), 'orchestrator', `mailbox:${second.id}`);
   assert.throws(() => f.service.send(orchestrator, ask('ops')), /depth/i, 'depth 3 exceeds maxDepth 2');
   const replied = f.service.reply(orchestrator, { inReplyTo: second.id, body: 'Brief attached at /tmp/brief.md' });
   assert.equal(f.row(replied.id).depth, 2, 'a reply carries its ask depth and is never refused for depth');
 
-  f.service.noteJobSend({ routeId: 'orchestrator', requestId: 'notifications:abc', target: { sessionKey: session('orchestrator') } });
+  orchestrator = turnToken(f.service, session('orchestrator'), 'orchestrator', 'notifications:abc');
   assert.throws(() => f.service.send(orchestrator, ask('ops')), /depth/i, 'a non-mailbox job turn can only reply');
-  f.service.noteJobSend({ routeId: 'orchestrator', requestId: `mailbox-notice:${first.id}`, target: { sessionKey: session('orchestrator') } });
+  orchestrator = turnToken(f.service, session('orchestrator'), 'orchestrator', `mailbox-notice:${first.id}`);
   assert.throws(() => f.service.send(orchestrator, ask('ops')), /depth/i, 'notice turns carry maxDepth');
 
   f.service.noteHumanPrompt(session('orchestrator'));
+  orchestrator = f.service.scope(session('orchestrator'));
   assert.equal(f.row(f.service.send(orchestrator, ask('ops')).id).depth, 1, 'a human prompt resets depth to 0');
 });
 

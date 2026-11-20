@@ -614,7 +614,7 @@ function formatPrompt(msg, sessionCtx, attachments = [], { sessionKey = null } =
     }
   }
 
-  mailboxService?.noteHumanPrompt(sessionKey);
+  mailboxService?.noteHumanPrompt(sessionKey, { operator: isAutomationOperator(config, msg), newTurn: !pm?.get(sessionKey)?.inFlight });
   return buildPrompt({
     msg,
     topicName,
@@ -4604,6 +4604,7 @@ async function main() {
   mailboxService = createMailboxService({
     config, db, botName: BOT_NAME, jobs: externalJobService, resolveTarget: resolveExternalTarget, bot, tg,
     ipcDir: ipcRuntimeDir, sendRich: (args) => richSendMessage(args),
+    resolveBackend: ({ chatId, threadId }) => resolvePromptBackend({ config, chatId, threadId }), getSessionKey,
   });
   // 0.12.0 post-turn edit re-delivery: constructed AFTER dispatchHandleMessage is assigned (above).
   // Claude keeps its same-message fold behavior. Codex defers edits to the

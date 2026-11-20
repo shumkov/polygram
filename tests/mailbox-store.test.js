@@ -27,11 +27,33 @@ test('migration 024 creates the mailbox table', (t) => {
     VALUES ('m_x','test','forward','role:a','role:b','b','x',1,'h',1)`).run(), /CHECK/);
 });
 
-test('migrations 025 through 027 add idempotency, origin and summary columns and bump the schema version', (t) => {
+test('migrations 025 through 027 add idempotency, origin and summary columns', (t) => {
   const { db } = fixture(t);
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 27);
   const columns = db.raw.prepare('PRAGMA table_info(mailbox_messages)').all().map((c) => c.name);
-  assert.deepEqual(columns.slice(12), ['idem_key', 'ref', 'origin_name', 'summary']);
+  assert.deepEqual(columns.slice(12, 16), ['idem_key', 'ref', 'origin_name', 'summary']);
+});
+
+test('migration 028 adds display labels for session addresses and bumps the schema version', (t) => {
+  const { db, store } = fixture(t);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 28);
+  const columns = db.raw.prepare('PRAGMA table_info(mailbox_messages)').all().map((c) => c.name);
+  assert.deepEqual(columns.slice(16), ['from_label', 'to_label']);
+  store.insert(message({ id: 'm_s', from: 'session:-1:3', to: 'session:-1', routeId: 'session:-1', fromLabel: 'music', toLabel: 'general' }));
+  assert.deepEqual([store.get('m_s').from_label, store.get('m_s').to_label], ['music', 'general']);
+  store.insert(message({ id: 'm_r' }));
+  assert.deepEqual([store.get('m_r').from_label, store.get('m_r').to_label], [null, null], 'a row without labels renders as before');
+});
+
+test('a version 27 database upgrades with its messages intact and no labels', (t) => {
+  const { dbPath, legacy } = legacyDb(27);
+  legacy.prepare(`INSERT INTO mailbox_messages(id,bot_name,kind,from_addr,to_addr,route_id,body,depth,body_hash,created_at,summary)
+    VALUES ('m_27','test','ask','role:a','role:b','b','x',1,'h',1,'Sum')`).run();
+  legacy.close();
+  const db = open(dbPath);
+  t.after(() => cleanupDb(dbPath, db));
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 28);
+  const row = createMailboxStore(db.raw, { botName: 'test' }).get('m_27');
+  assert.deepEqual([row.summary, row.from_label, row.to_label], ['Sum', null, null]);
 });
 
 // A database built by applying the migrations up to `version` by hand.
@@ -55,7 +77,7 @@ test('a database at version 24 upgrades to the current schema and keeps its mess
   legacy.close();
   const db = open(dbPath);
   t.after(() => cleanupDb(dbPath, db));
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 27);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 28);
   const row = createMailboxStore(db.raw, { botName: 'test' }).get('m_old');
   assert.equal(row.body, 'x');
   assert.equal(row.idem_key, null);
@@ -72,7 +94,7 @@ test('a database at version 25 upgrades to the current schema and keeps its syst
   legacy.close();
   const db = open(dbPath);
   t.after(() => cleanupDb(dbPath, db));
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 27);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 28);
   const row = createMailboxStore(db.raw, { botName: 'test' }).findByKey('system:agent-org', 'task:1');
   assert.deepEqual({ id: row.id, depth: row.depth, idem_key: row.idem_key, origin_name: row.origin_name }, { id: 'm_sys', depth: 1, idem_key: 'task:1', origin_name: null });
 });
@@ -100,7 +122,7 @@ test('a version 26 database keeps its origin and legacy hash with a NULL summary
   assert.equal(row.origin_name, 'Ivan');
   assert.equal(row.body_hash, 'legacy-hash');
   assert.equal(row.summary, null);
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 27);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 28);
 });
 
 test('a message is found by its sender and key, scoped to the bot', (t) => {
@@ -121,7 +143,7 @@ test('a stored message reads back with every field', (t) => {
   assert.deepEqual(store.get('m_0000000000000001'), {
     id: 'm_0000000000000001', bot_name: 'test', kind: 'ask', from_addr: 'role:orchestrator', to_addr: 'role:marketing',
     route_id: 'marketing', body: 'What is the campaign budget?', in_reply_to: null, depth: 1, body_hash: 'h1', notice_sent: 0, created_at: now(),
-    idem_key: null, ref: null, origin_name: null, summary: null,
+    idem_key: null, ref: null, origin_name: null, summary: null, from_label: null, to_label: null,
   });
   assert.equal(store.get('m_missing'), null);
 });
