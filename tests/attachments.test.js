@@ -262,6 +262,17 @@ describe('filterAttachments — rc.68 widened MIME allowlist', () => {
     assert.equal(rejected.length, 0);
   });
 
+  test('CSV exports under legacy MIME aliases are accepted (export tools send text/comma-separated-values)', () => {
+    // A bank/export tool sent resultFile_*.csv as text/comma-separated-values;
+    // the user saw "mime not allowed" for a plain CSV the agent reads natively.
+    for (const mime of ['text/comma-separated-values', 'application/csv', 'text/x-csv']) {
+      const atts = [{ name: 'resultFile_20261123_195903.csv', mime_type: mime, size: 100 }];
+      const { accepted, rejected } = filterAttachments(atts);
+      assert.equal(accepted.length, 1, `${mime} should be accepted`);
+      assert.equal(rejected.length, 0, `${mime} should not be rejected`);
+    }
+  });
+
   test('extension fallback: missing MIME + .md is accepted', () => {
     const atts = [{ name: 'README.md', size: 100 }]; // no mime_type field
     const { accepted, rejected } = filterAttachments(atts);
