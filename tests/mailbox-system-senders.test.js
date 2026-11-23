@@ -290,7 +290,8 @@ test('a system message is mirrored into the target topic once', async (t) => {
   f.mailbox.submit(submit());
   await settle();
   assert.deepEqual(f.posts.map((post) => post.params), [{ chat_id: '-1001', message_thread_id: '12',
-    parse_mode: 'HTML', text: '📨 <b>agent-org → marketing</b>\n<blockquote expandable>Task 42 is yours: draft the launch post</blockquote>' }]);
+    parse_mode: 'HTML', text: '📨 <b>agent-org → <a href="https://t.me/c/1/12">marketing</a></b>\n<blockquote expandable>Task 42 is yours: draft the launch post</blockquote>' }],
+    'the target role\'s name opens its topic; the system sender has none');
 });
 
 test('a disabled mailbox refuses submits', (t) => {
