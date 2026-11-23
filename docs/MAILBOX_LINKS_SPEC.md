@@ -144,9 +144,10 @@ messageLink({ chatId, threadId, messageId })    // → string | null
 heuristic `isForumChat`. polygram calls `bot.api.getChat` only when a card
 would name a General session, once per chat, and caches the answer for the
 life of the process, as the reaction allowlist already does. It does not go
-through `tg()`, which would record an outbound row. A failed call is not cached
-and means "not known to be a forum", so the General name renders as plain
-text.
+through `tg()`, which would record an outbound row. A card waits at most 3
+seconds for the answer. A failure or a timeout means "not known to be a
+forum", so the General name renders as plain text; it is remembered for 5
+minutes, so the cards after it do not wait again.
 
 Every link is `https://` and is built from digits alone. The inputs describe a
 destination, not a bot, so a peer's card can use the same builder later.
@@ -193,8 +194,9 @@ landed, a later config change never moves it.
 
 ### 3. Mirror order: target card first, then sender card
 
-`mirror(row)` becomes one async chain. It still starts after commit, so
-`send`, `reply` and `submit` return at once.
+Every card (target, sender copy, notice) goes through one in-order queue,
+started after commit, so `send`, `reply` and `submit` return at once and each
+topic reads in commit order, as it did when posts were issued in call order.
 
 1. Post the target card. If its location is verified, write `target_card`.
 2. In `"both"` mode, post the sender card. If step 1 verified a location, the
@@ -202,8 +204,9 @@ landed, a later config change never moves it.
    `target_card` failed.
 
 A failed target post is logged as it is today, and the sender card is still
-posted, without the twin link. The sender card waits one Telegram round trip;
-that delay is the price of its link. Cards are never edited.
+posted, without the twin link. A step that fails for any reason is logged by
+its code and the queue moves on. The sender card waits one Telegram round
+trip; that delay is the price of its link. Cards are never edited.
 
 ### 4. Links on each card
 
@@ -256,9 +259,13 @@ nothing, and agent-org needs no change for this link.
 keeps it only when it names a message this bot sent for that sender:
 
 - it parses as one of the two `messageLink` shapes;
+- its chat and thread are a configured role's topic, so a link can never
+  point into a chat no role lives in;
 - a `messages` row exists with this `bot_name`, `direction = 'out'` and
   `status = 'sent'`, the same `chat_id`, `thread_id` and `msg_id`, and
   `source` equal to the system sender's name.
+
+A database error during the check drops the link the same way.
 
 A link that fails the check is logged (`mailbox-link-dropped`), and the message
 is accepted without it, because `link` is display data.
@@ -272,10 +279,20 @@ is accepted without it, because `link` is display data.
 A forged or mistaken submit therefore cannot put an outside URL, another
 bot's chat, or a message the sender never posted into a card.
 
-**Residual risk.** The `messages` row stores the thread polygram *requested*.
-A server that silently drops the topic would leave that row wrong. agent-org's
-own landed-location check (see [agent-org changes](#agent-org-changes-a2))
-keeps such a card out of `link`.
+**Where a message landed.** A strict rich send (every card) now records the
+thread Telegram echoed back, not the one requested, so a card a server
+dropped into General can never prove a topic link.
+
+**Residual risk.** A send that is not strict, such as an IPC `sendMessage`,
+may retry into General when its topic is gone, and its row keeps the deleted
+topic. A link to it opens the right message id in a topic that no longer
+exists, never a different message. agent-org links only its rich cards, which
+are strict.
+
+**Who can mint a provable link.** Any process holding the IPC secret can send
+through IPC with any `source` and then submit as that sender. That gains
+nothing new: such a caller can already post into the bot's chats and submit
+as the sender. The role-topic rule keeps the link inside a role's topic.
 
 ### 7. Notice card (new)
 
@@ -745,3 +762,52 @@ Three read-only reviewers reviewed v1 independently, each through one lens.
   works for General roles such as cmo, which creates many tasks.
 - **Read the blocker from `runsDone` rather than `getTask`** (feasibility).
   This is moot while #11 is deferred.
+
+### Code review of P1 (polygram 0.50.0)
+
+Three read-only reviewers checked the P1 diff: correctness, failure modes and
+wrong-link risk, and tests. None found a wrong link in the main paths.
+
+**Folded in:**
+
+- **Cards in commit order.** Every card goes through one in-order queue.
+  Per-message chains had let an answer reach the asker's topic before the
+  asker's copies of earlier messages. A failed step is logged by its code,
+  and the queue moves on.
+- **The chain never rejects.** The destination is resolved inside the post's
+  `try`.
+- **`getChat` is bounded.** It waits at most 3 seconds, and a failure or
+  timeout is remembered for 5 minutes. A slow Bot API could otherwise hold
+  cards for up to three minutes.
+- **Strict rich sends record the landed thread** in the outbound history, so
+  `sentBy` can no longer prove a topic link to a card that landed in General.
+- **A DM or basic-group card no longer logs "landed outside".** `landedAt` is
+  a separate check from building the link.
+- **`proveLink` is tightened.**
+  - A link must point into a role's topic.
+  - A database error drops the link instead of refusing the submit.
+  - The log line names `mailbox-link-dropped`.
+- The HTML notice card shows the ask's summary.
+- A detached comment in `rules.js` was moved back to its function.
+- **Tests:**
+  - `getChat` failure and timeout, with card counts;
+  - the live `bot.api.getChat` default, called as a method;
+  - a notice card for an undelivered answer;
+  - the posted-once guard;
+  - a failed question lookup costing only that link;
+  - the header-cap boundary at 512 and 513;
+  - a DM card with no link and no warning;
+  - the mirror stub now echoes `chat` and the thread, so twin and question
+    links are pinned;
+  - the reply-order test asserts one global commit order again.
+
+**Declined:**
+
+- **Expiring the cached forum answer after an hour.** If a forum turns its
+  topics off, polygram's topic sessions break anyway, and a restart probes
+  again. The reaction allowlist caches the same way.
+- **Clearing the thread on the non-strict thread fallback in `api.js`.** That
+  is the general send path, outside this feature. The residual risk above is
+  a deleted topic, never a different message.
+- **A test that injects a database error into `sentBy`.** The guard is a
+  plain `try`, and a test would need a database proxy for one line.
