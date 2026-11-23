@@ -1,7 +1,7 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { topicLink, messageLink, parseMessageLink, verifiedMessageLink } = require('../lib/telegram/links');
+const { topicLink, messageLink, parseMessageLink, landedAt } = require('../lib/telegram/links');
 
 // A wrong link is worse than none: a reader who follows it lands somewhere
 // unrelated. Every case that cannot be proven right must return null.
@@ -47,17 +47,18 @@ test('a message link parses back to its chat, thread and message', () => {
   }
 });
 
-test('a card links only where Telegram says it landed', () => {
+test('a receipt proves a card landed only where it was sent', () => {
   const sent = { message_id: 991, chat: { id: -1004292131077 }, message_thread_id: 732 };
-  assert.equal(verifiedMessageLink(sent, { chatId: '-1004292131077', threadId: '732' }), 'https://t.me/c/4292131077/732/991',
-    'a numeric echo matches string config ids');
-  assert.equal(verifiedMessageLink({ message_id: 5, chat: { id: -1004462674958 } }, { chatId: '-1004462674958', threadId: null }),
-    'https://t.me/c/4462674958/5', 'General has no thread on either side');
-  // A dropped topic lands the card in General: the link would point at the wrong place.
-  assert.equal(verifiedMessageLink({ message_id: 5, chat: { id: -1004292131077 } }, { chatId: '-1004292131077', threadId: '732' }), null);
-  assert.equal(verifiedMessageLink({ ...sent, message_thread_id: 733 }, { chatId: '-1004292131077', threadId: '732' }), null);
-  assert.equal(verifiedMessageLink({ ...sent, chat: { id: -1009999999999 } }, { chatId: '-1004292131077', threadId: '732' }), null);
-  assert.equal(verifiedMessageLink({ message_id: 991 }, { chatId: '-1004292131077', threadId: null }), null, 'no chat in the receipt');
-  assert.equal(verifiedMessageLink({ chat: { id: -1004292131077 } }, { chatId: '-1004292131077', threadId: null }), null, 'no message id');
-  assert.equal(verifiedMessageLink(null, { chatId: '-1004292131077', threadId: null }), null);
+  assert.equal(landedAt(sent, { chatId: '-1004292131077', threadId: '732' }), true, 'a numeric echo matches string config ids');
+  assert.equal(landedAt({ message_id: 5, chat: { id: -1004462674958 } }, { chatId: '-1004462674958', threadId: null }), true,
+    'General has no thread on either side');
+  assert.equal(landedAt({ message_id: 5, chat: { id: 68861949 } }, { chatId: '68861949', threadId: null }), true,
+    'a DM card landed where it was sent, though it can have no link');
+  // A dropped topic lands the card in General: a link would point at the wrong place.
+  assert.equal(landedAt({ message_id: 5, chat: { id: -1004292131077 } }, { chatId: '-1004292131077', threadId: '732' }), false);
+  assert.equal(landedAt({ ...sent, message_thread_id: 733 }, { chatId: '-1004292131077', threadId: '732' }), false);
+  assert.equal(landedAt({ ...sent, chat: { id: -1009999999999 } }, { chatId: '-1004292131077', threadId: '732' }), false);
+  assert.equal(landedAt({ message_id: 991 }, { chatId: '-1004292131077', threadId: null }), false, 'no chat in the receipt');
+  assert.equal(landedAt({ chat: { id: -1004292131077 } }, { chatId: '-1004292131077', threadId: null }), false, 'no message id');
+  assert.equal(landedAt(null, { chatId: '-1004292131077', threadId: null }), false);
 });

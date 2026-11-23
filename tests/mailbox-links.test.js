@@ -33,7 +33,7 @@ const NOTION_URL = 'https://www.notion.so/2b1f4e6a0c3d4f5e8a9b1c2d3e4f5a6b';
 
 // Real external jobs and mailbox over one SQLite file; Telegram is a stub
 // whose receipt echoes the destination, as the Bot API does.
-function fixture(t, { mailbox = {}, fail = () => false, receipt = (r) => r, forum = {}, turn } = {}) {
+function fixture(t, { mailbox = {}, fail = () => false, receipt = (r) => r, forum = {}, turn, forumProbeMs, liveBot, failGet = false } = {}) {
   const { db, dbPath } = freshDb('mailbox-links');
   const config = { bot: { externalJobs: { enabled: true, routes: structuredClone(routes) }, mailbox: {
     enabled: true, roles: { orchestrator: {}, marketing: {}, cmo: {}, ads: {} },
@@ -54,9 +54,11 @@ function fixture(t, { mailbox = {}, fail = () => false, receipt = (r) => r, foru
   const getChat = async (chatId) => {
     f.getChats.push(chatId);
     if (forum[chatId] instanceof Error) throw forum[chatId];
+    if (forum[chatId] === 'never') return new Promise(() => {});
     return { id: Number(chatId), is_forum: forum[chatId] === true };
   };
-  f.mailbox = createMailboxService({ config, db, botName: 'test', jobs: f.jobs, resolveTarget, bot: {}, tg, sendRich, getChat,
+  f.mailbox = createMailboxService({ config, db: failGet ? failingReads(db, f) : db, botName: 'test', jobs: f.jobs, resolveTarget, tg, sendRich,
+    ...(liveBot ? { bot: liveBot } : { bot: {}, getChat }), ...(forumProbeMs ? { forumProbeMs } : {}),
     logger: { error: (m) => f.logs.push(m), warn: (m) => f.logs.push(m) } });
   f.jobs.start(); f.mailbox.start();
   t.after(() => { f.mailbox.stop(); f.jobs.stop(); cleanupDb(dbPath, db); });
@@ -65,6 +67,23 @@ function fixture(t, { mailbox = {}, fail = () => false, receipt = (r) => r, foru
   f.cards = () => f.posts.filter((p) => p.method === 'sendRichMessage').map((p, i) => ({
     chatId: p.params.chat_id, threadId: p.params.message_thread_id ?? null, ...card(p.params.rich_message.blocks) }));
   return f;
+}
+
+// The database as the service sees it, with the read of message f.failGet
+// failing, so a broken lookup can be shown to cost only its own link.
+function failingReads(db, f) {
+  const raw = new Proxy(db.raw, { get(target, prop) {
+    if (prop !== 'prepare') { const value = Reflect.get(target, prop); return typeof value === 'function' ? value.bind(target) : value; }
+    return (sql) => {
+      const statement = target.prepare(sql);
+      if (!sql.startsWith('SELECT * FROM mailbox_messages WHERE id=?')) return statement;
+      return { get: (id, ...rest) => {
+        if (id === f.failGet) throw Object.assign(new Error('disk I/O error'), { code: 'SQLITE_IOERR' });
+        return statement.get(id, ...rest);
+      } };
+    };
+  } });
+  return { ...db, raw };
 }
 
 // The header's link nodes and the card's shape.
@@ -167,12 +186,14 @@ test('a General name stays plain when the chat is not a forum or Telegram cannot
     await settle();
     f.mailbox.send(f.token('orchestrator'), { to: 'cmo', kind: 'tell', body: 'two' });
     await settle();
-    for (const target of f.cards().filter((c) => c.chatId === MARKET)) {
-      assert.deepEqual(target.links.map(([label]) => label), ['orchestrator'], String(status));
+    const targets = f.cards().filter((c) => c.chatId === MARKET);
+    assert.equal(targets.length, 2, String(status));
+    assert.equal(f.cards().length, 4, `${status}: every card is still posted, sender copies included`);
+    for (const target of targets) {
+      assert.deepEqual(target.links, [['orchestrator', topic('orchestrator')]], String(status));
       assert.match(target.text, /orchestrator → cmo/);
     }
-    // Two messages, each with a target card and a sender copy naming cmo.
-    assert.equal(f.getChats.length, status instanceof Error ? 4 : 1, 'a failure is asked again by every card, an answer is kept');
+    assert.equal(f.getChats.length, 1, `${status}: the answer, a failure too, is remembered, so later cards do not ask again`);
   }
 });
 
@@ -221,18 +242,22 @@ test('a submitted link is kept only when polygram sent that message for the send
   assert.deepEqual(f.cards()[0].links.slice(1), [['↗ Notion', NOTION_URL], ['↗ open', link]], 'Notion first, then the jump');
   const job = f.db.raw.prepare('SELECT task, payload FROM external_jobs WHERE request_id=?').get(`mailbox:${kept.id}`);
   assert.ok(!`${job.task}${job.payload}`.includes('t.me'), 'the link is display data and never reaches the role');
+  f.mailbox.submit({ sender: 'agent-org', to: 'orchestrator', body: 'No link', key: 'final:2' });
+  assert.equal(f.logs.filter((line) => /mailbox-link-dropped/.test(line)).length, 0, 'a message without a link drops nothing');
 });
 
 test('a link the sender did not post through this bot is dropped, and the message still goes through', async (t) => {
   const f = fixture(t);
   sentByAgentOrg(f);
   sentByAgentOrg(f, { msg_id: 777, source: 'ipc' });
+  sentByAgentOrg(f, { msg_id: 888, thread_id: '999' });
   const dropped = [
     'https://t.me/c/4292131077/142/777', // sent, but by another client
     'https://t.me/c/4292131077/732/555', // a real message id in another topic
     'https://t.me/c/4292131077/142/556', // never sent
     'https://t.me/c/4292131077/142', // a topic's shape, not a sent card
     'https://t.me/c/4462674958/142/555', // another chat
+    'https://t.me/c/4292131077/999/888', // sent by agent-org, but not into a role's topic
     'https://evil.example/c/4292131077/142/555',
     'javascript:alert(1)',
     42,
@@ -243,8 +268,9 @@ test('a link the sender did not post through this bot is dropped, and the messag
     assert.equal(f.row(result.id).link, null, String(link));
   }
   await settle();
+  assert.equal(f.cards().length, dropped.length, 'every message still gets its card');
   for (const c of f.cards()) assert.ok(!c.links.some(([label]) => label === '↗ open'));
-  assert.equal(f.logs.filter((line) => /link dropped/.test(line)).length, dropped.length);
+  assert.equal(f.logs.filter((line) => /mailbox-link-dropped/.test(line)).length, dropped.length);
 });
 
 test('a retry under the same key keeps the first link and returns the first receipt', async (t) => {
@@ -288,9 +314,9 @@ test('an open bot links only into the card\'s own chat', async (t) => {
   const OTHER = '-1009000000001';
   const config = { bot: { externalJobs: { enabled: true, routes: {} }, mailbox: { enabled: true, mirror: 'both' } },
     chats: { [HOME]: { name: 'Home', isolateTopics: true, topics: { 3: { name: 'Music' }, 4: { name: 'Admin' } } },
-      [OTHER]: { name: 'Partner', isolateTopics: true, topics: { 7: { name: 'Ads' } } } } };
+      [OTHER]: { name: 'Partner', isolateTopics: true, topics: { 7: { name: 'Ads' } } }, 68861949: { name: 'Ivan DM' } } };
   const { db, dbPath } = freshDb('mailbox-links-open');
-  const posts = [];
+  const posts = []; const logs = [];
   const tg = async (_bot, method, params) => { posts.push(params); return { message_id: posts.length, chat: { id: Number(params.chat_id) },
     ...(params.message_thread_id == null ? {} : { message_thread_id: Number(params.message_thread_id) }) }; };
   const resolve = createExternalJobTargetResolver({ config, getSessionKey });
@@ -298,7 +324,7 @@ test('an open bot links only into the card\'s own chat', async (t) => {
     dispatch: async () => ({ outcome: 'succeeded', inactive: true }), deliverPart: async () => ({}), logger: { error() {} } });
   const mailbox = createMailboxService({ config, db, botName: 'bot', jobs, resolveTarget: resolve, getSessionKey, tg, bot: {},
     sendRich: createRichSender({ tg, botName: 'bot', insertSentRow: (row) => db.insertMessage(row) }), getChat: async () => ({ is_forum: true }),
-    logger: { error() {}, warn() {} } });
+    logger: { error: (m) => logs.push(m), warn: (m) => logs.push(m) } });
   t.after(() => { mailbox.stop(); jobs.stop(); cleanupDb(dbPath, db); });
   const token = (key) => { mailbox.noteHumanPrompt(key, { operator: true }); return mailbox.scope(key); };
   mailbox.send(token(`${HOME}:3`), { to: 'admin', kind: 'tell', body: 'same chat' });
@@ -310,6 +336,15 @@ test('an open bot links only into the card\'s own chat', async (t) => {
   assert.deepEqual(sameSender.map(([label]) => label), ['music', 'admin', '↗ open']);
   assert.deepEqual(otherTarget, [['ads', 'https://t.me/c/9000000001/7']], 'the partner chat never sees the home chat\'s ids');
   assert.deepEqual(otherSender, [['music', 'https://t.me/c/3807211164/3']], 'nor the reverse');
+  // A DM has no message links: its card is delivered plainly, and landing
+  // where it was sent is no cause for a warning.
+  mailbox.send(token(`${HOME}:3`), { to: 'ivan-dm', kind: 'tell', body: 'dm' });
+  await settle();
+  const [dmTarget, dmSender] = posts.slice(4);
+  assert.equal(dmTarget.chat_id, '68861949');
+  assert.deepEqual(richLinks(dmTarget.rich_message.blocks), []);
+  assert.deepEqual(richLinks(dmSender.rich_message.blocks), [['music', 'https://t.me/c/3807211164/3']], 'no twin link to a DM');
+  assert.deepEqual(logs, []);
 });
 
 test('rendering: a row without links renders exactly as before', () => {
@@ -366,7 +401,97 @@ test('rendering: notice cards name each reason and link the question in both for
     assert.ok(!blocks[0].blocks[1].blocks[0].text.includes('Budget?'), 'the details hold polygram\'s own sentence, not the ask');
     const html = envelope.renderNoticeCardHtml(ask, reason, links);
     assert.deepEqual(htmlLinks(html), richLinks(blocks), reason);
+    assert.ok(html.includes('<blockquote expandable>Q3 budget\n'), 'the fallback names the ask too');
     assert.match(html, new RegExp(`^⚠️ <b>${word} · `));
   }
   assert.throws(() => envelope.renderNoticeCard(ask, 'bogus', links), /No notice card/);
+});
+
+test('a strict rich send records the thread it landed in, so a dropped topic is never provable', async (t) => {
+  const { db, dbPath } = freshDb('mailbox-links-landed');
+  t.after(() => cleanupDb(dbPath, db));
+  // The server ignores the topic and the card lands in General.
+  let next = 76;
+  const tg = async (_bot, _method, params) => ({ message_id: ++next, chat: { id: Number(params.chat_id) } });
+  const sendRich = createRichSender({ tg, botName: 'test', insertSentRow: (row) => db.insertMessage(row) });
+  const sent = await sendRich({ bot: {}, chatId: PROD, threadId: '142', blocks: [{ type: 'paragraph', text: 'card' }], sourceText: 'card',
+    meta: { source: 'agent-org', strictDestination: true } });
+  assert.equal(sent.wentRich, true);
+  const row = db.raw.prepare('SELECT thread_id FROM messages WHERE msg_id=77').get();
+  assert.equal(row.thread_id, null, 'the history says General, where the message is');
+  const store = require('../lib/mailbox/store').createMailboxStore(db.raw, { botName: 'test' });
+  assert.equal(store.sentBy('agent-org', { chatId: PROD, threadId: '142', messageId: 77 }), false);
+  // A send that is not strict keeps recording the thread it asked for.
+  await sendRich({ bot: {}, chatId: PROD, threadId: '142', blocks: [{ type: 'paragraph', text: 'reply' }], sourceText: 'reply', meta: { source: 'bot-reply' } });
+  assert.equal(db.raw.prepare("SELECT thread_id FROM messages WHERE source='bot-reply'").get().thread_id, '142');
+});
+
+test('a slow forum probe costs the General link, never the card', async (t) => {
+  const f = fixture(t, { forum: { [MARKET]: 'never' }, forumProbeMs: 20 });
+  f.mailbox.send(f.token('orchestrator'), { to: 'cmo', kind: 'tell', body: 'one' });
+  await new Promise((resolve) => setTimeout(resolve, 80)); await settle();
+  f.mailbox.send(f.token('orchestrator'), { to: 'cmo', kind: 'tell', body: 'two' });
+  await settle();
+  const targets = f.cards().filter((c) => c.chatId === MARKET);
+  assert.equal(targets.length, 2);
+  for (const target of targets) assert.deepEqual(target.links, [['orchestrator', topic('orchestrator')]]);
+  assert.equal(f.getChats.length, 1, 'a timed-out answer is remembered, so the next card does not wait');
+  assert.match(f.logs.join('\n'), /target name link for m_\w+ left out: FORUM_PROBE_TIMEOUT/);
+});
+
+test('without an explicit probe, the bot\'s own Bot API client answers, called as a method', async (t) => {
+  const api = { calls: [], async getChat(chatId) { this.calls.push(chatId); return { id: Number(chatId), is_forum: true }; } };
+  const f = fixture(t, { liveBot: { api } });
+  f.mailbox.send(f.token('orchestrator'), { to: 'cmo', kind: 'tell', body: 'one' });
+  await settle();
+  assert.deepEqual(f.cards().find((c) => c.chatId === MARKET).links[1], ['cmo', 'https://t.me/c/4462674958/1']);
+  assert.deepEqual(api.calls, [MARKET]);
+});
+
+test('an answer that was not delivered gets a notice card linking the question', async (t) => {
+  let replyId = null;
+  const f = fixture(t, { mailbox: { mirror: 'target' },
+    turn: async (job) => (replyId && job.requestId === `mailbox:${replyId}` ? { outcome: 'failed', error: 'boom', inactive: true } : { outcome: 'succeeded', text: '', inactive: true }) });
+  const ask = f.mailbox.send(f.token('orchestrator'), { to: 'marketing', kind: 'ask', body: 'Budget?' });
+  await settle();
+  const question = f.row(ask.id).target_card;
+  replyId = f.mailbox.reply(f.token('marketing'), { inReplyTo: ask.id, body: '12k' }).id;
+  for (let n = 0; n < 3; n++) { await f.jobs.tick(); await f.mailbox.tick(); await settle(); }
+  const notices = f.cards().filter((c) => c.text.startsWith('⚠️'));
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].threadId, '732', 'the asker hears it');
+  assert.equal(notices[0].text, '⚠️ Answer undelivered · orchestrator → marketing · ↗ question');
+  assert.deepEqual(notices[0].links.at(-1), ['↗ question', question]);
+});
+
+test('a notice job that already exists posts no second card', async (t) => {
+  const f = fixture(t, { mailbox: { mirror: 'target' } });
+  const ask = f.mailbox.send(f.token('orchestrator'), { to: 'marketing', kind: 'ask', body: 'Budget?' });
+  await settle();
+  f.jobs.submit({ routeId: 'orchestrator', requestId: `mailbox-notice:${ask.id}`, task: 'An earlier notice', payload: {} });
+  for (let n = 0; n < 2; n++) { await f.jobs.tick(); await f.mailbox.tick(); await settle(); }
+  assert.equal(f.row(ask.id).notice_sent, 1, 'the ask is marked notified');
+  assert.equal(f.cards().filter((c) => c.text.startsWith('⚠️')).length, 0);
+});
+
+test('a failed lookup of the question costs only that link', async (t) => {
+  const f = fixture(t, { failGet: true });
+  const ask = f.mailbox.send(f.token('orchestrator'), { to: 'marketing', kind: 'ask', body: 'Budget?' });
+  await settle();
+  f.mailbox.reply(f.token('marketing'), { inReplyTo: ask.id, body: '12k' });
+  f.failGet = ask.id;
+  await settle();
+  const answer = f.cards()[2];
+  assert.equal(answer.threadId, '732', 'the answer card is still posted');
+  assert.deepEqual(answer.links, [['marketing', topic('marketing')], ['orchestrator', topic('orchestrator')]]);
+  assert.match(f.logs.join('\n'), /jump link for m_\w+ left out: SQLITE_IOERR/);
+});
+
+test('rendering: the header cap counts every link label', () => {
+  const links = { from: 'https://t.me/c/1/3', to: 'https://t.me/c/1/9', extra: [{ label: '↗ open', url: 'https://t.me/c/1/9/12' }] };
+  const row = (n) => ({ id: 'm_1', kind: 'tell', from_addr: 'session:-1001:3', from_label: 'x'.repeat(n), to_addr: 'role:ops', body: 'Hi' });
+  assert.equal(richLinks(envelope.renderRichMirror(row(483), links)).length, 3, 'a 512-unit header keeps its links');
+  assert.equal(htmlLinks(envelope.renderMirror(row(483), links)).length, 3);
+  assert.deepEqual(envelope.renderRichMirror(row(484), links), envelope.renderRichMirror(row(484)), 'one unit more renders as before');
+  assert.equal(envelope.renderMirror(row(484), links), envelope.renderMirror(row(484)));
 });

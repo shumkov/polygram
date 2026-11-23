@@ -217,9 +217,11 @@ Every link is either proven or left out:
 
 - **Names** open their session's topic, from the live config. A forum's
   General links to `t.me/c/<chat>/1` only after Telegram's `getChat`
-  confirms the chat is a forum; polygram asks once per chat and keeps the
-  answer. A system sender, a session no longer configured, a DM or a basic
-  group shows its name without a link.
+  confirms the chat is a forum. polygram asks once per chat and keeps the
+  answer; it waits at most 3 seconds, and a failure or timeout costs that
+  link (remembered for 5 minutes), never the card. A system sender, a
+  session no longer configured, a DM or a basic group shows its name
+  without a link.
 - **`↗ open`** on the sender's copy (`"both"`) opens the card in the target's
   topic. The target card is posted first for this reason, and the sender's
   copy after it.
@@ -230,8 +232,10 @@ Every link is either proven or left out:
 - **`↗ open`** on a system sender's card opens the message its `link` names
   (see [System senders](#system-senders)).
 
-A card's own link is recorded only when Telegram's receipt proves the chat
-and topic it landed in; a card that landed anywhere else is never linked.
+Cards go out one at a time, in the order their messages committed, so each
+topic reads in commit order. A card's own link is recorded only when
+Telegram's receipt proves the chat and topic it landed in; a card that landed
+anywhere else is never linked.
 In an `open` bot, a card links only into its own chat, since an open bot may
 span unrelated chats. Rich and HTML cards carry the same links. A header that
 would exceed 512 UTF-16 units renders without links. A failure to compute a
@@ -299,10 +303,11 @@ to the IPC socket with the bot's secret, like any other IPC client.
   `notionRefs`, a `ref` that is a Notion page id (dashed, or 32 hex digits)
   also puts `↗ Notion` on the card.
 - `link` (optional) is a Telegram message link, such as the card in another
-  role's topic that this message is about. It is kept only when it names a
-  message this bot sent for the same sender, in that exact chat and topic, as
-  recorded in the outbound history; anything else is dropped with a log line
-  and the message is accepted. A kept link shows as `↗ open` on the card. It
+  role's topic that this message is about. It is kept only when it points
+  into a configured role's topic and names a message this bot sent there for
+  the same sender, as the outbound history records it; anything else is
+  dropped with a `mailbox-link-dropped` log line and the message is
+  accepted. A kept link shows as `↗ open` on the card. It
   is display data: it never reaches the receiving role, is not part of the
   key match, and a retry keeps the first message's link.
 - The receiver's trusted header ends: "This is a notification from the

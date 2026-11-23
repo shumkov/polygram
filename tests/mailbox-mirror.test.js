@@ -14,6 +14,9 @@ const resolveTarget = (route) => ({ chatId: route.chatId, threadId: route.thread
 // Session names open their topics; t.me/c drops the chat's -100 prefix.
 const ORCH = '<a href="https://t.me/c/1/11">orchestrator</a>';
 const MKT = '<a href="https://t.me/c/1/12">marketing</a>';
+// The links to a proven card: the twin of a sender copy, the question of an answer.
+const OPEN = (thread, id) => ` · <a href="https://t.me/c/1/${thread}/${id}">↗ open</a>`;
+const QUESTION = (thread, id) => ` · <a href="https://t.me/c/1/${thread}/${id}">↗ question</a>`;
 const settle = async () => { for (let n = 0; n < 10; n++) await new Promise(setImmediate); };
 
 function fixture(t, { mirror, send, turn, jobs: jobSettings = {}, systemSenders, rich = false } = {}) {
@@ -32,7 +35,9 @@ function fixture(t, { mirror, send, turn, jobs: jobSettings = {}, systemSenders,
   const tg = async (b, method, params, meta) => {
     assert.equal(b, bot);
     posts.push({ method, params, meta, committed: db.raw.prepare('SELECT count(*) n FROM external_jobs').get().n });
-    return (send || (async () => ({ message_id: posts.length })))(params);
+    // The receipt echoes the destination, as the Bot API does.
+    return (send || (async () => ({ message_id: posts.length, chat: { id: Number(params.chat_id) },
+      ...(params.message_thread_id == null ? {} : { message_thread_id: Number(params.message_thread_id) }) })))(params);
   };
   const sendRich = rich ? createRichSender({ tg, botName: 'test', insertSentRow: (row) => db.insertMessage(row) }) : undefined;
   f.mailbox = createMailboxService({ config, db, botName: 'test', jobs, resolveTarget, bot, tg, sendRich, logger: { error: (m) => errors.push(m), warn() {} } });
@@ -56,7 +61,8 @@ test('mailbox mirrors expose raw prompt lines instead of one collapsed details c
     assert.equal(post.meta.strictDestination, true);
     assert.deepEqual(post.params.rich_message.blocks, [{ type: 'blockquote', blocks: [
       { type: 'paragraph', text: ['❓ ', { type: 'bold', text: 'Question' }, ' · ', { type: 'url', text: 'orchestrator', url: 'https://t.me/c/1/11' },
-        ' → ', { type: 'url', text: 'marketing', url: 'https://t.me/c/1/12' }] },
+        ' → ', { type: 'url', text: 'marketing', url: 'https://t.me/c/1/12' },
+        ...(i ? [' · ', { type: 'url', text: '↗ open', url: 'https://t.me/c/1/12/1' }] : [])] },
       { type: 'details', summary: 'Step B › Sub prices', is_open: false, blocks: [{ type: 'paragraph', text: body }] },
     ] }]);
   }
@@ -105,7 +111,7 @@ test('a reply is mirrored into the asker topic; duplicates and refusals are not 
   await settle();
   assert.deepEqual(f.posts.map((post) => [post.params.message_thread_id, post.params.text]), [
     ['12', `❓ <b>${ORCH} asks ${MKT}</b>\n<blockquote expandable>Q</blockquote>`],
-    ['11', `↩️ <b>${MKT} answered ${ORCH}</b>\n<blockquote expandable>A</blockquote>`],
+    ['11', `↩️ <b>${MKT} answered ${ORCH}</b>${QUESTION(12, 1)}\n<blockquote expandable>A</blockquote>`],
   ]);
 });
 
@@ -170,7 +176,7 @@ test('mirror "both" also posts a sender line into the sender topic, after the ta
   await settle();
   assert.deepEqual(f.posts.map((post) => post.params), [
     { chat_id: '-1001', message_thread_id: '12', parse_mode: 'HTML', text: `❓ <b>${ORCH} asks ${MKT}</b>\n<blockquote expandable>What is the Q3 budget?</blockquote>` },
-    { chat_id: '-1001', message_thread_id: '11', parse_mode: 'HTML', text: `❓ <b>${ORCH} asks ${MKT}</b>\n<blockquote expandable>What is the Q3 budget?</blockquote>` },
+    { chat_id: '-1001', message_thread_id: '11', parse_mode: 'HTML', text: `❓ <b>${ORCH} asks ${MKT}</b>${OPEN(12, 1)}\n<blockquote expandable>What is the Q3 budget?</blockquote>` },
   ]);
   const sender = f.posts[1];
   assert.notEqual(sender.meta.plainText, true); assert.equal(sender.meta.strictDestination, true);
@@ -182,22 +188,18 @@ test('mirror "both" also posts a sender line into the sender topic, after the ta
 test('mirror "both" mirrors a reply into both topics; duplicates are not mirrored again', async (t) => {
   const f = fixture(t, { mirror: 'both' });
   const token = f.token('orchestrator');
-  // Each message's target card goes first and its sender copy after, so
-  // messages sent back to back are let settle to keep one global order.
   const question = f.mailbox.send(token, { to: 'marketing', kind: 'tell', body: 'Q' });
   f.mailbox.send(token, { to: 'marketing', kind: 'tell', body: 'Q' });
-  await settle();
   const ask = f.mailbox.send(token, { to: 'marketing', kind: 'ask', body: 'Budget?' });
-  await settle();
   const answer = f.mailbox.reply(f.mailbox.scope(session('marketing')), { inReplyTo: ask.id, body: 'A' });
   await settle();
   assert.deepEqual(f.posts.map((post) => [post.params.message_thread_id, post.params.text]), [
     ['12', `📨 <b>${ORCH} → ${MKT}</b>\n<blockquote expandable>Q</blockquote>`],
-    ['11', `📨 <b>${ORCH} → ${MKT}</b>\n<blockquote expandable>Q</blockquote>`],
+    ['11', `📨 <b>${ORCH} → ${MKT}</b>${OPEN(12, 1)}\n<blockquote expandable>Q</blockquote>`],
     ['12', `❓ <b>${ORCH} asks ${MKT}</b>\n<blockquote expandable>Budget?</blockquote>`],
-    ['11', `❓ <b>${ORCH} asks ${MKT}</b>\n<blockquote expandable>Budget?</blockquote>`],
-    ['11', `↩️ <b>${MKT} answered ${ORCH}</b>\n<blockquote expandable>A</blockquote>`],
-    ['12', `↩️ <b>${MKT} answered ${ORCH}</b>\n<blockquote expandable>A</blockquote>`],
+    ['11', `❓ <b>${ORCH} asks ${MKT}</b>${OPEN(12, 3)}\n<blockquote expandable>Budget?</blockquote>`],
+    ['11', `↩️ <b>${MKT} answered ${ORCH}</b>${QUESTION(12, 3)}\n<blockquote expandable>A</blockquote>`],
+    ['12', `↩️ <b>${MKT} answered ${ORCH}</b>${OPEN(11, 5)}\n<blockquote expandable>A</blockquote>`],
   ]);
 });
 
@@ -229,7 +231,8 @@ test('the sender HTML fallback carries the same redacted body as the target', as
   const sender = f.posts[1].params.text.split('\n').slice(1).join('\n');
   assert.doesNotMatch(sender, /AKIAABCDEFGHIJKLMNOP/, 'the sender line is cut from the redacted text');
   assert.equal(sender, `<blockquote expandable>${target}</blockquote>`);
-  assert.equal(f.posts[0].params.text, f.posts[1].params.text);
+  const [targetHeader] = f.posts[0].params.text.split('\n');
+  assert.equal(f.posts[1].params.text.split('\n')[0], `${targetHeader}${OPEN(12, 1)}`, 'the copy adds only its twin link');
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(sender), 'no emoji is split in half');
 });
 
