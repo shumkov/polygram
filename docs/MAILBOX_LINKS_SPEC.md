@@ -1,6 +1,7 @@
 # Jump links on communication cards
 
-Status: v2, 2026-11-24. Spec only; nothing is implemented yet. It covers
+Status: v2.1, 2026-11-24. Phase P1 (polygram 0.50.0) is implemented with this
+spec; phase A2 (agent-org) is not. It covers
 polygram's mailbox mirror cards and agent-org's task cards. Three independent
 reviews have been folded in (feasibility, simplicity and scope, failure modes
 and privacy); see the [review log](#review-log).
@@ -140,10 +141,12 @@ messageLink({ chatId, threadId, messageId })    // → string | null
 - Otherwise: `t.me/c/<ch>/<msg>`.
 
 **Forum status** for a General link comes from Telegram, not from the config
-heuristic `isForumChat`. polygram calls `getChat` once per chat, only when a
-card would name a General session, and caches the promise for the life of the
-process. A failed call means "not known to be a forum", and the General name
-renders as plain text.
+heuristic `isForumChat`. polygram calls `bot.api.getChat` only when a card
+would name a General session, once per chat, and caches the answer for the
+life of the process, as the reaction allowlist already does. It does not go
+through `tg()`, which would record an outbound row. A failed call is not cached
+and means "not known to be a forum", so the General name renders as plain
+text.
 
 Every link is `https://` and is built from digits alone. The inputs describe a
 destination, not a bot, so a peer's card can use the same builder later.
@@ -176,10 +179,13 @@ are numbered in the order they ship, so that layer takes the next number.
 
 **A card's location is "verified"** when all of these hold:
 
-- the result has a safe-integer `message_id`;
+- the result has a positive safe-integer `message_id`;
 - `String(result.chat?.id)` equals the requested chat;
-- `String(result.message_thread_id ?? '')` equals `String(threadId ?? '')`;
-- with a thread, `result.is_topic_message === true`.
+- `String(result.message_thread_id ?? '')` equals `String(threadId ?? '')`.
+
+This is the same receipt proof `lib/telegram/api.js` already applies to
+recorded deliveries (`requireRecording`). A card is never a reply, so an echoed
+thread can only be the topic.
 
 Only a verified card gets a link, built from the result. Anything else is
 logged and links nowhere. Because the link records where the card actually
@@ -222,12 +228,12 @@ that delay is the price of its link. Cards are never edited.
 
 **Cross-chat links.**
 
-- In a **roles** bot, a name may link to another chat of the same bot. The
-  operator chose each role's chat.
-- In an **open** bot, a name links only when its chat is the card's own chat.
-  An open bot may span unrelated chats, such as partner groups, so their ids
-  must not appear in each other's cards.
-- Twin and question links always point to the other side of the same message.
+- In a **roles** bot, any link may point into another chat of the same bot.
+  The operator chose each role's chat.
+- In an **open** bot, every Telegram link on a card (names, twin, question)
+  is kept only when it points into the card's own chat. An open bot may span
+  unrelated chats, such as partner groups, so their ids must not appear in
+  each other's cards.
 
 **Errors** while computing any link (a missing chat entry, a failed
 `getChat`, a database read) render the card without that link, and never
@@ -351,16 +357,16 @@ link that already exists.
 
 | # | Situation (agent-org code) | Card, where it is posted | Links → targets | Data source | Phase |
 |---|---|---|---|---|---|
-| 1 | Role A creates a task for role B (`tasks create --to`, `anchors.created`) | A1 `➡️ Handed over · A → B`, in A's topic, posted first | Notion only. B1 does not exist yet, and A gets B's exact card at #9. | none | none |
-| 2 | same | B1 `📌 New task · B`, in B's topic; Chat := B1 | Notion; **`↗ from A`** → A1 | A1's verified link, from `post()` in the same call | A2 |
+| 1 | Role A creates a task for role B (`tasks create --to`, `anchors.created`) | A1 `➡️ Handed over · A → B`, in A's topic, posted first | Notion; **B's name** → B's topic. B1 does not exist yet, and A gets B's exact card at #9. | `topics[B]`; a General B also needs its forum status proven | A2 |
+| 2 | same | B1 `📌 New task · B`, in B's topic; Chat := B1 | Notion; **`↗ from A`** → A1. B's name is the card's own topic, so it stays plain. | A1's verified link, from `post()` in the same call | A2 |
 | 3 | Task for a person (`--for`), or for oneself | one `📌 New task` card, in A's topic | Notion only: there is no other side | none | none |
 | 4 | Dispatched, first round or rework (`tick` dispatch → submit) | polygram mirror `📨 Message · agent-org → B`, in B's topic | **B's name** → its topic; **`↗ Notion`** | live config; `ref` = task id + `notionRefs` | P1 |
 | 5 | Nudge (`stall`) | polygram mirror, in B's topic | **name**; **`↗ Notion`** | as #4 | P1 |
 | 6 | Comment relayed from Notion (human origin) | polygram mirror `… · from Ivan`, in B's topic | **name**; **`↗ Notion`** | as #4 | P1 |
-| 7 | Submitted for review (`tasks submit`) | `👀 Ready for review · B`, in B's topic; Chat := it | Notion only (B's own topic) | none | none |
+| 7 | Submitted for review (`tasks submit`) | `👀 Ready for review · B`, in B's topic; Chat := it | Notion only. B's name is the card's own topic, so it stays plain. | none | none |
 | 8 | Review ping (`reviewPing`) | Notion comment; a `reviewNotify` card only if configured (unset in UMI) | Notion only; see [deferred](#deferred) | none | none |
 | 9 | Done / final: the creator role is told (`final` → submit) | polygram mirror `📨 Message · agent-org → A`, in A's topic | **name**; **`↗ Notion`**; **`↗ open`** → B's latest card, normally Ready for review with B's result above it | `ref`; `link` = Chat, sent only if it lies in B's configured topic and proven by polygram (decision 6) | P1 renders, A2 sends |
-| 10 | Done anchor (`announce(done)`) | `🏁 Done · B`, in B's topic; Chat := it | Notion only | none | none |
+| 10 | Done anchor (`announce(done)`) | `🏁 Done · B`, in B's topic; Chat := it | Notion only. B's name is the card's own topic, so it stays plain. A person task's Done card sits in the creator's topic and names people, who have no topic. | none | none |
 | 11 | Blocked follow-up promoted (`promote`) | `📌 New task`, in B's topic | Notion only; see [deferred](#deferred) | none | none |
 | 12 | Created while blocked (backlog) | as #1–#2 | as #1–#2 | as #1–#2 | A2 |
 | 13 | Planning (`plan-apply`; run tasks enter ToDo) | `📌 New task`, in each step's role topic | Notion only; see [deferred](#deferred) | none | none |
@@ -378,8 +384,9 @@ mailbox rule (target first, sender card links to the twin) for three reasons:
 - The reader who needs the exact message is in B, looking for the point where
   A created the task. That point sinks quickly in A's topic, while B's topic
   is where the latest work is.
-- A message link works for General roles too. A topic link from agent-org
-  cannot tell a forum's General from a plain chat.
+- A message link works for General roles too. A topic link to a General
+  role needs its forum status proven first, so a creator such as cmo could get
+  no link at all.
 
 A's reader gets B's exact card at #9.
 
@@ -406,6 +413,20 @@ These are considered and left out of A2:
   message's `chat.id` and `message_thread_id` match the topic. For General,
   both must be absent; ids are compared as strings. This is the same check as
   polygram's decision 2. Anything else returns null.
+- **Clickable role names.** A role name in a card's context links to that
+  role's topic, as on polygram's mirror cards. Today that is B in A1's
+  `A → B`.
+  - A role whose topic has a `threadId` links to `t.me/c/<ch>/<thread>`.
+  - A role in a General topic (no `threadId`) links to `t.me/c/<ch>/1` only
+    when the chat is proven to be a forum. agent-org learns that from
+    `result.chat.is_forum` on the replies to its own sends into that chat, and
+    keeps it in memory. Until then, and for any chat it cannot prove, the name
+    stays plain.
+  - A role with no configured topic, or a name that is the card's own topic,
+    stays plain.
+  - `card()` accepts `context` as a string or as parts, where a part is a
+    string or `{text, url}`. The rich text and the HTML fallback link the same
+    parts.
 - **`card()`** gains an optional `jump: {text, url}`.
   - It renders in the existing link line, after the Notion link
     (`<title> · ↗ from ops`), with the same `<a>` in the HTML fallback.
@@ -543,7 +564,6 @@ Write each behaviour test-first: red, then green.
 **Verified location**
 
 - The chat or thread echo differs: nothing is recorded.
-- A thread is set but `is_topic_message` is missing: nothing is recorded.
 - `chat` or `message_id` is missing: nothing is recorded.
 
 **Envelope**
@@ -601,8 +621,7 @@ Write each behaviour test-first: red, then green.
 - `tests/mailbox-mirror.test.js` pins exact card output at lines 54, 69, 88,
   102, 167, 186 and 209. Its fixture uses chat `-1001` with threads 11 and 12,
   so name links appear in those cards.
-- The fixture's `tg` stub must also return `chat`, `message_thread_id` and
-  `is_topic_message`.
+- The fixture's `tg` stub must also return `chat` and `message_thread_id`.
 - `tests/mailbox-store.test.js:40` lists the columns after `slice(16)`.
 - `user_version === 28` is pinned in `tests/db.test.js:44` and
   `tests/mailbox-store.test.js:38,54,80`.
@@ -617,6 +636,10 @@ Write each behaviour test-first: red, then green.
 - `final` passes `link` only for a Chat in `topics[task.agent]`, with string
   and number ids both handled.
 - The unknown-field fallback drops `link`.
+- Role names in a card's context link to threaded topics; a General role links
+  only after a send into that chat returned `chat.is_forum: true`; an unknown
+  topic or the card's own topic stays plain; rich and HTML link the same
+  parts.
 
 ### Gates
 
@@ -679,7 +702,9 @@ Three read-only reviewers reviewed v1 independently, each through one lens.
 - One `target_card` column replaces the `mailbox_cards` table with sides.
 - No `MAILBOX_INVALID_LINK`: a bad link is dropped and logged.
 - #8 dropped; #11 and #13 deferred, with reasons.
-- agent-org topic links and `topicLink` removed.
+- agent-org topic links and `topicLink` removed from v2. The coordinator
+  later restored clickable role names in agent-org cards, under the same
+  proof rules as polygram's names.
 - The ordering choice at #1–#2 is stated explicitly.
 - The notice card is named as an addition, and `Expired` moved to later
   phases.
@@ -693,7 +718,7 @@ Three read-only reviewers reviewed v1 independently, each through one lens.
 - The agent-org echo check.
 - `link` must name a real message the sender sent (`messages` row).
 - The General link needs `getChat` `is_forum`, not the config heuristic.
-- Ids are normalized for the echo, and `is_topic_message` is required.
+- Ids are normalized to strings for the echo.
 - Link errors never block a card.
 - Cross-chat links only in roles bots.
 - `notionRefs` opt-in.
@@ -702,6 +727,11 @@ Three read-only reviewers reviewed v1 independently, each through one lens.
 
 ### Declined, with reasons
 
+- **Require `is_topic_message === true` on the receipt** (failure modes).
+  Nothing in the codebase reads that field, and `api.js` already proves a
+  destination by the message id, chat and thread echo alone. A card is never
+  a reply, so an echoed thread can only be its topic. Requiring a field the
+  rich server might omit would quietly disable every link.
 - **Merge the no-change rows of the table** (simplicity). The brief asks for
   every situation to be listed. The rows are kept and kept short.
 - **Plain-text names when the stored and live labels differ** (failure
