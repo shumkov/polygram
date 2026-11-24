@@ -93,3 +93,7 @@ test('a tainted assistant\'s new turn needs the same idle proof external jobs us
   assert.match(handle.slice(note, note + 200), /idle: assistantIdle,/);
 });
 
+test('the history scope asks the mailbox whether an assistant may read a role topic', () => {
+  assert.match(src, /historyService = createHistoryService\(\{[\s\S]*?canReadTopic: \(sessionKey, place\) => mailboxService\?\.canReadRoleTopic\(sessionKey, place\) \?\? false,\s*readsRoleTopics: \(sessionKey\) => mailboxService\?\.isAssistant\(sessionKey\) \?\? false \}\);/);
+});
+

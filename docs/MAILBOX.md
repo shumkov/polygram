@@ -189,6 +189,8 @@ person's direct chat, whose id is the person's Telegram user id:
 - **`mailbox_identify`** for an assistant returns
   `{assistant, chatId, depth, roles}`. `roles` lists the roles whose group has
   the person as a confirmed member.
+- **History.** An assistant's history command may also read the topic of a
+  role its person can reach (`canReadRoleTopic`); see the history skill.
 - **`mailbox_submit` to an assistant.** `to: "person:<key>"` needs `role`, the
   configured role the message is about.
   - It is accepted only while the person is a member of that role's group.

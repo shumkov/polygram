@@ -55,9 +55,18 @@ brings a fresh admin command.
 Trade-off: the operator's session takes in foreign content (forwarded
 messages, web pages, mailbox replies), so a prompt-injected operator session
 can read any chat through this path. Ivan chose that reach for his own chat;
-every other session keeps the own-chat scope. Reading the topics of a role's
-group for its members is left to the membership table of the personal
-assistants work.
+every other session keeps the own-chat scope.
+
+### A person's assistant reads its roles' topics
+
+In a bot with people's assistants (`mailbox.assistants`), an assistant may
+also read one role topic at a time: the topic of a role whose Telegram group
+has its person as a confirmed member, from the mailbox's membership table
+(`canReadRoleTopic`; see `UMI_PERSONAL_ASSISTANTS_SPEC.md`). The read is
+bound to that topic (or, for a role in a group's General, to rows without a
+thread). A whole group, another topic of it, `--chat all` and other people's
+direct chats stay refused, so each direct chat is private to its owner and
+the admin chat.
 
 The operator's chat in the UMI bot runs on Codex. Codex prompts come from the
 same `formatPrompt`, so the command reaches its turns. Codex runs commands

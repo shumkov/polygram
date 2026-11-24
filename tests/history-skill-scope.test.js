@@ -339,7 +339,7 @@ describe('history skill wiring in the daemon', () => {
     assert.match(format, /historyService\?\.instructions\(sessionKey\)/);
   });
   test('external jobs carry it too, and the IPC server serves the same service', () => {
-    assert.match(src, /historyService = createHistoryService\(\{ config, db, botName: BOT_NAME, ipcDir: ipcRuntimeDir \}\)/);
+    assert.match(src, /historyService = createHistoryService\(\{ config, db, botName: BOT_NAME, ipcDir: ipcRuntimeDir,/);
     assert.match(src, /createExternalJobDispatch\(\{[\s\S]*?getHistory: \(\) => historyService,/);
     assert.match(src, /createIpcHandlers\(\{[\s\S]*?history: historyService,/);
   });

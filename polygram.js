@@ -4658,7 +4658,11 @@ async function main() {
     ipcDir: ipcRuntimeDir, sendRich: (args) => richSendMessage(args),
     resolveBackend: ({ chatId, threadId }) => resolvePromptBackend({ config, chatId, threadId }), getSessionKey,
   });
-  historyService = createHistoryService({ config, db, botName: BOT_NAME, ipcDir: ipcRuntimeDir });
+  // A person's assistant may also read the topic of a role its person can
+  // reach; the mailbox owns that membership answer.
+  historyService = createHistoryService({ config, db, botName: BOT_NAME, ipcDir: ipcRuntimeDir,
+    canReadTopic: (sessionKey, place) => mailboxService?.canReadRoleTopic(sessionKey, place) ?? false,
+    readsRoleTopics: (sessionKey) => mailboxService?.isAssistant(sessionKey) ?? false });
   // 0.12.0 post-turn edit re-delivery: constructed AFTER dispatchHandleMessage is assigned (above).
   // Claude keeps its same-message fold behavior. Codex defers edits to the
   // exact live generation's idle boundary and then re-dispatches them as

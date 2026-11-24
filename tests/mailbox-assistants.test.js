@@ -476,6 +476,7 @@ test('history: an assistant may read a role topic only while its person is in th
   assert.equal(f.service.canReadRoleTopic(MAI, { chatId: MARK }), true, 'a role in a forum\'s General');
   assert.equal(f.service.canReadRoleTopic(MAI, { chatId: MARK, threadId: '999' }), false, 'a topic that is no role\'s place');
   assert.equal(f.service.canReadRoleTopic(FINANCE, { chatId: MGMT, threadId: '732' }), false, 'only assistants read this way');
+  assert.deepEqual([f.service.isAssistant(DINA), f.service.isAssistant(FINANCE), f.service.isAssistant(GROUP)], [true, false, false]);
   f.setMembers({});
   await f.service.refreshMembership();
   assert.equal(f.service.canReadRoleTopic(DINA, { chatId: MGMT, threadId: '1041' }), false, 'leaving the group ends it');
