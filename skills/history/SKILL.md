@@ -13,14 +13,19 @@ The command carries this session's scope token. The daemon maps the token to
 the session and reads only that session's own chat: its DM, its group, or, for
 a chat with isolated topics, its own topic (the General topic reads only
 messages outside any topic). The token, never an argument, the working
-directory or an environment variable, decides the scope, so no other chat is
-reachable through this skill, the operator's chat included. Tokens expire when
-the daemon restarts; the next prompt brings a new command.
+directory or an environment variable, decides the scope. Tokens expire when
+the daemon restarts, and each prompt brings a new command; use the current one.
 
 A chat or thread named with `--chat` / `--thread` (or the old positional
 chat and thread arguments) is only checked against the session's scope: the
 read is refused when it names another chat or topic. A chat-wide session may
 use `--thread` to narrow to one topic of its own chat.
+
+The one exception is the operator's own private chat with the bot (the bot's
+`adminChatId`). That session may read any chat of the bot with
+`--chat <chat_id>` (any topic, `--thread` narrows), or every chat at once with
+`--chat all` for `search`, `by-user` and `stats`. The daemon decides this from
+the session the token was minted for; the command line cannot claim it.
 
 Subcommands return JSON unless `--format pretty`.
 

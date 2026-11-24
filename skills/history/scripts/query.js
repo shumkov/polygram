@@ -11,8 +11,9 @@
  * daemon over the authenticated IPC socket, together with the scope token
  * from the command polygram put in the current turn. The daemon maps the
  * token to the calling session and reads only that session's chat (and, for
- * an isolated topic, only that topic). A chat or thread given here is checked
- * against that scope and refused when it differs; it can never widen it.
+ * an isolated topic, only that topic); only the operator's private chat with
+ * the bot may name another chat. A chat or thread given here is checked by the
+ * daemon against what the session may read, never trusted on its own.
  *
  * Default output: JSON (one row per message). Pass --format pretty for
  * human-readable lines.

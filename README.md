@@ -355,8 +355,10 @@ minted; the agent runs it with a subcommand:
 The script never opens the database. The daemon maps the token to the
 session and reads only its own chat (for an isolated topic, only that
 topic). No argument, working directory or environment variable widens the
-scope, and no session, the operator's included, reads another chat this
-way. See [docs/history-session-scope.md](docs/history-session-scope.md).
+scope. The one exception is the operator's own private chat with the bot
+(the bot's `adminChatId`), which may read any chat of the bot with
+`--chat <chat_id>` or `--chat all`. See
+[docs/history-session-scope.md](docs/history-session-scope.md).
 
 ## Approvals
 

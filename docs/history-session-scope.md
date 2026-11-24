@@ -35,13 +35,30 @@ the notifications skill uses for its own-conversation tool.
   applied in SQL (not by filtering after `LIMIT`), for `around`, `search`,
   `by-user`, `msg` and `stats`; `recent` already had `scopeThread`.
 
-### No cross-chat read for the operator's chat
+### The operator's chat reads every chat (admin tier)
 
-The operator's DM session gets the same own-chat scope. A session's context
-can carry foreign content (forwarded messages, web pages, mailbox asks), so a
-cross-chat grant would make any prompt-injected operator session a way to
-read every DM of the bot. The operator can read the DB on the host directly
-when needed; there is no agent path for it.
+The operator's own private chat with the bot, the bot's `adminChatId`, may
+read any chat of the bot: `--chat <chat_id>` (all topics; `--thread`
+narrows) or `--chat all` for `search`, `by-user` and `stats` (`recent`,
+`around` and `msg` need one chat). Admin is decided from the session the
+token was minted for, re-read from the live config on every call, so
+removing `adminChatId` revokes it at once. Only a private chat (a positive
+id) qualifies: a group set as `adminChatId` would hand the grant to every
+member of the group, so it grants nothing.
+
+Trade-off: the operator's session takes in foreign content (forwarded
+messages, web pages, mailbox replies), so a prompt-injected operator session
+can read any chat through this path. Ivan chose that reach for his own chat;
+every other session keeps the own-chat scope. Reading the topics of a role's
+group for its members is left to the membership table of the personal
+assistants work.
+
+The operator's chat in the UMI bot runs on Codex. Codex prompts come from the
+same `formatPrompt`, so the command reaches its turns. Codex runs commands
+with a bare environment (`HOME`, `TMPDIR`, `PATH` only), which the command
+does not depend on: it carries `POLYGRAM_IPC_DIR`, and the script reads the
+socket secret from that directory. The Codex profile grants the service
+user's filesystem rights with network enabled, so the socket is reachable.
 
 ## Alternatives rejected
 
@@ -84,9 +101,13 @@ with the real service, and runs the script as the injected command does:
 - the old shared-cwd invocation exits with a usage error and prints no rows
   (red before the change: it returned the operator's DM rows);
 - a member session reads only its DM, and is refused for the operator's chat
-  through positional, `--chat`, `search`, `msg` (message ids repeat across
-  chats) and `around`;
-- the operator's session cannot read the member's DM;
+  through positional, `--chat`, `--chat all`, `search`, `msg` (message ids
+  repeat across chats) and `around`;
+- the operator's DM reads the member's DM, a forum topic and `--chat all`
+  (red before the admin tier, green after), but a group set as `adminChatId`
+  grants nothing and removing `adminChatId` revokes the tier at once;
+- the injected command runs through `/bin/sh` with a Codex-style bare
+  environment;
 - an isolated topic cannot reach a sibling topic or the General topic, and
   the General topic reads only threadless rows;
 - forged tokens, a chat id passed as the token, environment overrides and

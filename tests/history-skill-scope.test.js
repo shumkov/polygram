@@ -35,7 +35,9 @@ before(() => {
   polygramDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hs-polygram-')));
   sharedCwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hs-cwd-')));
   config = {
-    bots: { [BOT]: {} },
+    bots: { [BOT]: { adminChatId: Number(OPERATOR_DM) } },
+    // The daemon's view of its own bot section, as config.bot is set at boot.
+    bot: { adminChatId: Number(OPERATOR_DM) },
     chats: {
       [OPERATOR_DM]: { bot: BOT, cwd: sharedCwd },
       [MEMBER_DM]: { bot: BOT, cwd: sharedCwd },
@@ -138,11 +140,12 @@ describe('history skill: the daemon binds every read to the calling session', ()
     assert.notEqual(service.scope(MEMBER_DM), service.scope(OPERATOR_DM), 'each session has its own token');
   });
 
-  test('the injected command line runs as written through a shell, with no IPC location in the environment', async () => {
+  test('the injected command line runs as written through a shell with a Codex-style bare environment', async () => {
+    // Codex runs commands with inherit = "none": only HOME, TMPDIR and PATH,
+    // none of them the daemon's. The command must carry everything else.
     const block = service.instructions(MEMBER_DM);
     const command = block.slice(block.indexOf('run ') + 4, block.indexOf(' recent ['));
-    const env = { ...process.env, POLYGRAM_IPC_SECRET: '' };
-    delete env.POLYGRAM_IPC_DIR;
+    const env = { HOME: otherCwd, TMPDIR: otherCwd, PATH: '/usr/bin:/bin' };
     const { stdout } = await promisify(execFile)('/bin/sh', ['-c', `${command} search shifts`], { cwd: otherCwd, env });
     assert.deepEqual(JSON.parse(stdout).map((row) => row.text), ['memberown question about shifts']);
   });
@@ -198,10 +201,40 @@ describe('history skill: the daemon binds every read to the calling session', ()
     plain(await run(MEMBER_DM, ['dump']), /unknown subcommand: dump/);
   });
 
-  test('the operator\'s own DM session gets no cross-chat read either', async () => {
-    assert.deepEqual(texts(await run(OPERATOR_DM, ['recent'])), ['operatorsecret salary figures']);
-    refused(await run(OPERATOR_DM, ['recent', MEMBER_DM]), /only its own chat/);
-    assert.deepEqual(texts(await run(OPERATOR_DM, ['search', 'memberown'])), []);
+  test('Ivan\'s admin DM reads any chat of the bot, while a member DM still cannot', async () => {
+    // The admin chat is the bot's adminChatId; the daemon knows which session
+    // a token was minted for, so no argument can claim it.
+    assert.deepEqual(texts(await run(OPERATOR_DM, ['recent'])), ['operatorsecret salary figures'], 'without --chat the admin reads its own chat');
+    assert.deepEqual(texts(await run(OPERATOR_DM, ['recent', '--chat', MEMBER_DM])), ['memberown question about shifts']);
+    assert.deepEqual(texts(await run(OPERATOR_DM, ['recent', MEMBER_DM])), ['memberown question about shifts'], 'the legacy positional chat id works for the admin');
+    assert.deepEqual(texts(await run(OPERATOR_DM, ['search', 'invoice', '--chat', FORUM, '--thread', '12'])), ['billingtopic invoice']);
+    assert.deepEqual(texts(await run(OPERATOR_DM, ['search', 'memberown', '--chat', 'all'])), ['memberown question about shifts']);
+    assert.deepEqual(texts(await run(OPERATOR_DM, ['msg', '1', '--chat', MEMBER_DM])), ['memberown question about shifts']);
+    refused(await run(MEMBER_DM, ['recent', '--chat', OPERATOR_DM]), /only its own chat/);
+    refused(await run(MEMBER_DM, ['search', 'operatorsecret', '--chat', 'all']), /only its own chat/);
+  });
+
+  test('the admin tier has edges: one chat for recent/around/msg, only the bot\'s chats, and it follows the live config', async () => {
+    const plain = (result, pattern) => { assert.equal(result.code, 1); assert.match(result.stderr, pattern); };
+    plain(await run(OPERATOR_DM, ['recent', '--chat', 'all']), /name one chat/);
+    plain(await run(OPERATOR_DM, ['search', 'invoice', '--chat', 'all', '--thread', '11']), /--thread needs one chat/);
+    refused(await run(OPERATOR_DM, ['recent', '--chat', '999999']), /Not a chat of this bot/);
+    assert.deepEqual(texts(await run(OPERATOR_DM, ['search', 'invoice', '--chat', 'all'])).sort(), ['billingtopic invoice', 'ordertopic invoice']);
+    assert.match(service.instructions(OPERATOR_DM), /--chat all/);
+    assert.doesNotMatch(service.instructions(MEMBER_DM), /--chat/);
+    // Revoking adminChatId in the live config revokes the tier at once.
+    const live = JSON.parse(JSON.stringify(config));
+    const svc = createHistoryServiceFor(live);
+    const token = svc.scope(OPERATOR_DM);
+    assert.equal(svc.query(token, { sub: 'recent', chatId: MEMBER_DM }).rows.length, 1);
+    delete live.bot.adminChatId;
+    assert.throws(() => svc.query(token, { sub: 'recent', chatId: MEMBER_DM }), /only its own chat/);
+  });
+
+  test('a group set as adminChatId grants no cross-chat read to its sessions', () => {
+    const svc = createHistoryServiceFor({ ...config, bot: { adminChatId: Number(FORUM) } });
+    assert.throws(() => svc.query(svc.scope(FORUM), { sub: 'recent', chatId: MEMBER_DM }), /only its own chat/);
+    assert.throws(() => svc.query(svc.scope(`${FORUM}:11`), { sub: 'search', query: 'operatorsecret', chatId: 'all' }), /only its own chat/);
   });
 
   test('an isolated topic reads only its topic, and the General topic only rows without a thread', async () => {

@@ -174,7 +174,7 @@ All gated on `config.bot.allowConfigCommands` (default off — partner bots igno
   - `/plugin marketplace add https://github.com/shumkov/polygram.git`
   - `/plugin install polygram@shumkov`
   - Adds slash commands at `/`: `/polygram:status`, `/polygram:logs <bot>`, `/polygram:pair-code`, `/polygram:approvals [bot]`.
-- **Bundled `history` skill** lets Claude query the transcript directly when asked about chat activity. Each read is bound to the calling session by a daemon-minted token and covers only that session's own chat or topic.
+- **Bundled `history` skill** lets Claude query the transcript directly when asked about chat activity. Each read is bound to the calling session by a daemon-minted token and covers only that session's own chat or topic; the operator's private chat with the bot (`adminChatId`) may read any chat of the bot.
 - **Bundled `polygram-send` skill** for out-of-turn IPC sends with file-upload validation.
 
 ---
