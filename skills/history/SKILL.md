@@ -27,6 +27,13 @@ The one exception is the operator's own private chat with the bot (the bot's
 `--chat all` for `search`, `by-user` and `stats`. The daemon decides this from
 the session the token was minted for; the command line cannot claim it.
 
+A person's assistant (their direct chat in a bot with people's assistants) may
+also read the topic of a role its person can reach: `--chat <chat_id>
+--thread <topic_id>`, or `--chat <chat_id>` alone for a role in a group's
+General. That needs the person to be a member of the role's Telegram group;
+a whole group, another topic of it, and other people's direct chats stay out
+of reach.
+
 Subcommands return JSON unless `--format pretty`.
 
 ## recent
