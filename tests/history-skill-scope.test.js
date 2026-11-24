@@ -178,6 +178,17 @@ describe('history skill: the daemon binds every read to the calling session', ()
     assert.deepEqual(texts(await run(SECOND_DM, ['recent', '--include-outbound', 'false'])), ['seconddm inbound']);
   });
 
+  test('a deferred external job reuses its token on every retry, so a long human turn keeps its command', () => {
+    const tokenOf = (block) => /"([0-9a-f-]{36})"/.exec(block)[1];
+    const human = tokenOf(service.instructions(MEMBER_DM));
+    const job = { routeId: 'session:1002', requestId: 'mailbox:m_0000000000000001' };
+    const retries = Array.from({ length: 10 }, () => tokenOf(service.instructions(MEMBER_DM, job)));
+    assert.equal(new Set(retries).size, 1, 'every retry of one job carries the same token');
+    assert.equal(service.query(human, { sub: 'recent' }).rows.length, 1, 'the human turn\'s command still reads');
+    const other = tokenOf(service.instructions(MEMBER_DM, { ...job, requestId: 'mailbox:m_0000000000000002' }));
+    assert.notEqual(other, retries[0], 'another job gets its own token');
+  });
+
   test('unquoted words, unknown flags and stray arguments are refused with a hint, not read as another chat', async () => {
     const plain = (result, pattern) => { assert.equal(result.code, 1); assert.match(result.stderr, pattern); };
     plain(await run(MEMBER_DM, ['by-user', 'Member', 'Ivanova']), /quote a multi-word term or name/);

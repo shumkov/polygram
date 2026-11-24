@@ -22,7 +22,7 @@ test('the dispatched prompt carries every instruction block for the target sessi
   const f = fixture({
     notifications: { instructions: (key) => { sessions.push(key); return '\n[notify]'; } },
     mailbox: { instructions: (key) => { sessions.push(key); return '\n[mailbox]'; }, noteJobSend() {}, enabled: true },
-    history: { instructions: (key) => { sessions.push(key); return '\n[history]'; } },
+    history: { instructions: (key, forJob) => { sessions.push(key); assert.equal(forJob, job, 'retries of one job reuse its history token'); return '\n[history]'; } },
   });
   await f.dispatch(job, {});
   assert.equal(f.calls.runtime[0].job.task, 'Envelope\n[notify]\n[mailbox]\n[history]');
