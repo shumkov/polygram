@@ -149,6 +149,7 @@ const { buildHistoryBlock } = require('./lib/history-preload');
 const { createNotificationService } = require('./lib/external-jobs/notifications');
 const { createExternalJobDispatch } = require('./lib/external-jobs/dispatch');
 const { createMailboxService } = require('./lib/mailbox/service');
+const { createHistoryService } = require('./lib/history-scope');
 const { formatContextReply, maybeContextFullHint } = require('./lib/context-format');
 // appendDisplayHint moved with buildSdkOptions extraction (commit 18) —
 // only consumer of that import is now lib/sdk/build-options.js itself.
@@ -621,7 +622,7 @@ function formatPrompt(msg, sessionCtx, attachments = [], { sessionKey = null } =
     sessionCtx,
     attachments,
     replyTo: resolveReplyTo(msg),
-    polygramHistory: polygramHistory + (notificationService?.context(sessionKey, msg.reply_to_message?.message_id) || '') + (notificationService?.instructions(sessionKey) || '') + (mailboxService?.instructions(sessionKey) || ''),
+    polygramHistory: polygramHistory + (notificationService?.context(sessionKey, msg.reply_to_message?.message_id) || '') + (notificationService?.instructions(sessionKey) || '') + (mailboxService?.instructions(sessionKey) || '') + (historyService?.instructions(sessionKey) || ''),
     backend: resolvePromptBackend({ config, chatId, threadId }),
     // Only advertise stickers this bot actually has — empty for a bot with no
     // sticker set, so its prompt never mentions stickers.
@@ -1101,6 +1102,7 @@ let dispatchExternalEvent = null;
 let externalJobService = null;
 let notificationService = null;
 let mailboxService = null;
+let historyService = null;
 let attemptAutoResume = null;
 let errorReplyText = null;
 let queueWarnThreshold = null;
@@ -4595,6 +4597,7 @@ async function main() {
     dispatch: createExternalJobDispatch({
       dispatchExternalEvent: (origin, run) => dispatchExternalEvent(origin, run),
       runtime: externalRuntime,
+      getHistory: () => historyService,
       getNotifications: () => notificationService,
       getMailbox: () => mailboxService,
       logger: console, logEvent,
@@ -4612,6 +4615,7 @@ async function main() {
     ipcDir: ipcRuntimeDir, sendRich: (args) => richSendMessage(args),
     resolveBackend: ({ chatId, threadId }) => resolvePromptBackend({ config, chatId, threadId }), getSessionKey,
   });
+  historyService = createHistoryService({ config, db, botName: BOT_NAME, ipcDir: ipcRuntimeDir });
   // 0.12.0 post-turn edit re-delivery: constructed AFTER dispatchHandleMessage is assigned (above).
   // Claude keeps its same-message fold behavior. Codex defers edits to the
   // exact live generation's idle boundary and then re-dispatches them as
@@ -5054,6 +5058,7 @@ async function main() {
         externalJobs: externalJobService,
         notifications: notificationService,
         mailbox: mailboxService,
+        history: historyService,
         botName: BOT_NAME,
         daemonIdentity,
         getInFlightHandlers: () => inFlightHandlers,

@@ -1,46 +1,27 @@
 #!/usr/bin/env node
+'use strict';
 /**
- * telegram-history skill CLI.
+ * history skill CLI.
  *
- *   node query.js <subcmd> [positional args] [--flag value]
+ *   node query.js <bot> <token> <subcmd> [positional args] [--flag value]
  *
  * Subcommands: recent | around | search | by-user | msg | stats
  *
- * Opens bridge.db read-only. Bot scope is derived from process.cwd() —
- * each bot's Claude project dir maps to a chat.cwd in config.json, so a
- * partner-spawned skill invocation cannot escape its bot's chat allowlist via
- * this skill. Scope is cwd-only — no env override (POLYGRAM_ADMIN /
- * CLAUDE_CHANNEL_BOT were removed as agent-settable backdoors, #4). For an
- * explicit other file use POLYGRAM_DB=/abs/path.db, or sqlite3 directly.
+ * The script never opens a database. It sends the parsed request to the
+ * daemon over the authenticated IPC socket, together with the scope token
+ * from the command polygram put in the current turn. The daemon maps the
+ * token to the calling session and reads only that session's chat (and, for
+ * an isolated topic, only that topic). A chat or thread given here is checked
+ * against that scope and refused when it differs; it can never widen it.
  *
  * Default output: JSON (one row per message). Pass --format pretty for
  * human-readable lines.
  */
 
-const fs = require('fs');
-const path = require('path');
-const Database = require('better-sqlite3');
+const { call, readSecret, socketPathFor } = require('../../../lib/ipc/client');
+const { formatPretty } = require('../../../lib/history');
 
-// The history helpers live at the PACKAGE ROOT lib/ (one source of truth, shared
-// with the daemon's history-preload) — NOT a skill-local copy. The old
-// `../lib/history` pointed at skills/history/lib/history.js, which has never
-// existed in the repo or the published package, so EVERY `query.js` invocation
-// crashed with MODULE_NOT_FOUND (the history skill was entirely non-functional;
-// found in the 0.12.5–0.12.7 ultra-review). `../../../lib` = <pkg-root>/lib in
-// both the repo and the npm install (which ships skills/ + lib/ as siblings).
-const history = require('../../../lib/history');
-
-const POLYGRAM_DIR = process.env.POLYGRAM_DIR || path.resolve(__dirname, '../../../../polygram');
-const CONFIG_PATH = process.env.POLYGRAM_CONFIG || path.join(POLYGRAM_DIR, 'config.json');
-// POLYGRAM_DB overrides auto-resolution. Otherwise the skill reads one DB per
-// bot (<bot>.db) when the bot scope is known, or all bot DBs for admin.
-// Legacy `bridge.db` is used as a fallback when per-bot DBs don't exist yet.
-const DB_OVERRIDE = process.env.POLYGRAM_DB || null;
-
-function die(msg, code = 1) {
-  process.stderr.write(`history: ${msg}\n`);
-  process.exit(code);
-}
+const USAGE = 'Usage: query.js <bot> <token> <recent|around|search|by-user|msg|stats> [args]; use the history command from your current turn';
 
 function parseArgs(argv) {
   const positional = [];
@@ -63,233 +44,45 @@ function parseArgs(argv) {
   return { positional, flags };
 }
 
-function loadConfig() {
-  try {
-    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-  } catch (err) {
-    die(`cannot read config at ${CONFIG_PATH}: ${err.message}`);
-  }
-}
+const value = (v) => (v === undefined || v === true ? undefined : v);
 
-/**
- * Derive bot scope from the current working directory.
- * Each chat in config.json has a `cwd` pointing at the bot's Claude project
- * root. process.cwd() is set by polygram when it spawns Claude, so this
- * cannot be spoofed from inside a prompt. Fails closed: if no chat's cwd
- * matches and no admin override is set, we refuse to run.
- */
-function deriveBotScope(cfg) {
-  const cwd = path.resolve(process.cwd());
-  const matching = Object.entries(cfg.chats || {})
-    .filter(([, c]) => c.cwd && path.resolve(c.cwd) === cwd);
-
-  if (matching.length) {
-    const bots = new Set(matching.map(([, c]) => c.bot).filter(Boolean));
-    if (bots.size !== 1) {
-      die(`cwd ${cwd} maps to multiple bots (${[...bots].join(', ')}) — refusing`);
-    }
-    return {
-      bot: [...bots][0],
-      allowedChatIds: matching.map(([id]) => id),
-    };
-  }
-
-  // No cwd match. SECURITY (#4, review 2026-06-15): scope derives ONLY from the
-  // spawn-time cwd. The old POLYGRAM_ADMIN=1 / CLAUDE_CHANNEL_BOT env overrides
-  // assumed "polygram never sets these, so a bot can't trigger them" — but a
-  // bot-spawned agent's Bash CAN set arbitrary env on a subprocess
-  // (`POLYGRAM_ADMIN=1 node query.js …`), making them an agent-reachable
-  // cross-chat/cross-bot read backdoor. Removed. Operators who need a specific
-  // other file use the explicit `POLYGRAM_DB=/abs/path.db` override or sqlite3
-  // directly on the box. (NOTE: this is best-effort against ACCIDENTAL over-reads
-  // via the sanctioned skill — a determined same-uid agent can still `cd` to
-  // another chat's cwd or raw-`sqlite3` the file until denyRead/privsep lands.)
-  die(`cannot determine bot scope for cwd ${cwd}; run from a mapped chat cwd, or use POLYGRAM_DB=/abs/path.db for an explicit file`);
-}
-
-function openDbReadOnly(dbPath) {
-  if (!fs.existsSync(dbPath)) die(`polygram DB not found at ${dbPath}`);
-  const raw = new Database(dbPath, { readonly: true, fileMustExist: true });
-  return { raw };
-}
-
-/**
- * Post-Phase-8: pick the right DB file(s) to query.
- *  - If POLYGRAM_DB is set, use it (explicit override).
- *  - If bot scope is known and <bot>.db exists, use that single file.
- *  - If bot scope is known but per-bot DB is missing, fall back to legacy
- *    bridge.db (pre-cutover state).
- *  - If admin (bot null): open every <bot>.db that exists; if none, fall
- *    back to bridge.db.
- */
-function resolveDbPaths(cfg, bot) {
-  if (DB_OVERRIDE) return [DB_OVERRIDE];
-  const perBot = (b) => path.join(POLYGRAM_DIR, `${b}.db`);
-  const legacy = path.join(POLYGRAM_DIR, 'bridge.db');
-
-  if (bot) {
-    const p = perBot(bot);
-    if (fs.existsSync(p)) return [p];
-    if (fs.existsSync(legacy)) return [legacy];
-    die(`no DB found for bot "${bot}" (tried ${p} and ${legacy})`);
-  }
-
-  // Admin: union across all bots that have a DB.
-  const paths = Object.keys(cfg.bots || {})
-    .map(perBot)
-    .filter((p) => fs.existsSync(p));
-  if (paths.length) return paths;
-  if (fs.existsSync(legacy)) return [legacy];
-  die(`no per-bot DBs found in ${POLYGRAM_DIR} and no legacy bridge.db either`);
-}
-
-/**
- * Call a history helper once per DB and merge results.
- *  - For array-returning helpers (recent/around/search/by-user/stats),
- *    concat, re-sort by ts desc, and re-apply the requested limit.
- *  - For single-row helpers (msg), return the first non-null hit.
- */
-function queryAcross(dbs, fn, { limit } = {}) {
-  const out = [];
-  for (const db of dbs) {
-    const rows = fn(db);
-    if (Array.isArray(rows)) out.push(...rows);
-    else if (rows) return rows;
-  }
-  if (!out.length) return out;
-  if (out[0] && typeof out[0].ts === 'number') {
-    out.sort((a, b) => b.ts - a.ts);
-  }
-  if (limit && out.length > limit) out.length = limit;
-  return out;
-}
-
-function emit(rows, format) {
-  if (format === 'pretty') {
-    if (!Array.isArray(rows)) { process.stdout.write(JSON.stringify(rows, null, 2) + '\n'); return; }
-    process.stdout.write(history.formatPretty(rows) + '\n');
-    return;
-  }
-  process.stdout.write(JSON.stringify(rows, null, 2) + '\n');
-}
-
-function runSub(sub, positional, flags, dbs, allowedChatIds) {
-  const format = flags.format || 'json';
-  const limit = flags.limit ? Number(flags.limit) : undefined;
-
+// Positional chat and thread arguments keep the old argument order, so a
+// command written for the old skill still parses; the daemon refuses them
+// unless they name the session's own chat and topic.
+function buildRequest(sub, positional, flags) {
+  const common = { chatId: value(flags.chat), threadId: value(flags.thread), limit: value(flags.limit) };
   switch (sub) {
-    case 'recent': {
-      const chatId = positional[0];
-      const threadId = positional[1] || null;
-      if (!chatId) die('recent: <chat_id> required');
-      const rows = queryAcross(dbs, (db) => history.recent(db, {
-        chatId,
-        threadId,
-        limit: flags.limit,
-        since: flags.since || null,
-        includeOutbound: flags['include-outbound'] !== false && flags['include-outbound'] !== 'false',
-        allowedChatIds,
-      }), { limit });
-      return emit(rows, format);
-    }
-
-    case 'around': {
-      const chatId = flags.chat;
-      const msgId = Number(flags['msg-id']);
-      if (!chatId) die('around: --chat required');
-      if (!msgId) die('around: --msg-id required');
-      const rows = queryAcross(dbs, (db) => history.around(db, {
-        chatId,
-        msgId,
-        before: Number(flags.before) || 5,
-        after: Number(flags.after) || 5,
-        allowedChatIds,
-      }));
-      return emit(rows, format);
-    }
-
-    case 'search': {
-      const query = positional[0];
-      const chatId = positional[1] || flags.chat || null;
-      const threadId = positional[2] || flags.thread || null;
-      if (!query) die('search: <term> required');
-      const rows = queryAcross(dbs, (db) => history.search(db, {
-        query,
-        chatId,
-        threadId,
-        user: flags.user || null,
-        days: flags.days ? Number(flags.days) : null,
-        limit: flags.limit,
-        allowedChatIds,
-      }), { limit });
-      return emit(rows, format);
-    }
-
-    case 'by-user': {
-      const user = positional[0];
-      const chatId = positional[1] || flags.chat || null;
-      const threadId = positional[2] || flags.thread || null;
-      if (!user) die('by-user: <user> required');
-      const rows = queryAcross(dbs, (db) => history.byUser(db, {
-        user,
-        chatId,
-        threadId,
-        days: flags.days !== undefined ? Number(flags.days) : 7,
-        limit: flags.limit,
-        allowedChatIds,
-      }), { limit });
-      return emit(rows, format);
-    }
-
-    case 'msg': {
-      const msgId = Number(positional[0]);
-      const chatId = positional[1] || flags.chat || null;
-      if (!msgId) die('msg: <msg_id> required');
-      const row = queryAcross(dbs, (db) => history.getMsg(db, { msgId, chatId, allowedChatIds }));
-      return emit(row ? [row] : [], format);
-    }
-
-    case 'stats': {
-      const chatId = positional[0] || flags.chat || null;
-      const threadId = positional[1] || flags.thread || null;
-      // stats returns aggregates — merging naively concatenates the per-DB
-      // breakdown. That's what we want when admin queries across bots.
-      const rows = queryAcross(dbs, (db) => history.stats(db, {
-        chatId,
-        threadId,
-        days: flags.days !== undefined ? Number(flags.days) : 7,
-        allowedChatIds,
-      }));
-      return emit(rows, format);
-    }
-
+    case 'recent':
+      return { ...common, chatId: positional[0] ?? common.chatId, threadId: positional[1] ?? common.threadId, since: value(flags.since),
+        includeOutbound: flags['include-outbound'] !== false && flags['include-outbound'] !== 'false' };
+    case 'around':
+      return { chatId: common.chatId, msgId: value(flags['msg-id']), before: value(flags.before), after: value(flags.after) };
+    case 'search':
+      return { ...common, query: positional[0], chatId: positional[1] ?? common.chatId, threadId: positional[2] ?? common.threadId, user: value(flags.user), days: value(flags.days) };
+    case 'by-user':
+      return { ...common, user: positional[0], chatId: positional[1] ?? common.chatId, threadId: positional[2] ?? common.threadId, days: value(flags.days) };
+    case 'msg':
+      return { msgId: positional[0], chatId: positional[1] ?? common.chatId };
+    case 'stats':
+      return { chatId: positional[0] ?? common.chatId, threadId: positional[1] ?? common.threadId, days: value(flags.days) };
     default:
-      die(`unknown subcommand: ${sub}. Try: recent|around|search|by-user|msg|stats`);
+      return null;
   }
 }
 
-function main() {
-  const argv = process.argv.slice(2);
-  if (!argv.length || argv[0] === '-h' || argv[0] === '--help') {
-    process.stdout.write(`usage: query.js <recent|around|search|by-user|msg|stats> [args]\n`);
-    process.exit(0);
-  }
-  const sub = argv[0];
-  const { positional, flags } = parseArgs(argv.slice(1));
-
-  const cfg = loadConfig();
-  const { bot, allowedChatIds } = deriveBotScope(cfg);
-  const dbPaths = resolveDbPaths(cfg, bot);
-  const dbs = dbPaths.map(openDbReadOnly);
-  try {
-    runSub(sub, positional, flags, dbs, allowedChatIds);
-  } finally {
-    for (const db of dbs) { try { db.raw.close(); } catch {} }
-  }
+async function main() {
+  const [botName, token, sub, ...rest] = process.argv.slice(2);
+  if (!botName || !token || !sub || botName.startsWith('-') || token.startsWith('-')) throw new Error(USAGE);
+  const { positional, flags } = parseArgs(rest);
+  const request = buildRequest(sub, positional, flags);
+  if (!request) throw new Error(`unknown subcommand: ${sub}. ${USAGE}`);
+  const payload = { sub, token };
+  for (const [key, v] of Object.entries(request)) if (v !== undefined) payload[key] = v;
+  const result = await call({ path: socketPathFor(botName), secret: readSecret(botName), op: 'history_query', payload });
+  if (!result.ok) throw new Error(result.error || 'History query failed');
+  const rows = Array.isArray(result.rows) ? result.rows : [];
+  if (flags.format === 'pretty' && sub !== 'stats') process.stdout.write(formatPretty(rows) + '\n');
+  else process.stdout.write(JSON.stringify(rows, null, 2) + '\n');
 }
 
-// Exported for tests (the #4 scope-derivation security boundary needs a
-// regression pin). Only auto-run when invoked as the CLI, not when require()'d.
-module.exports = { deriveBotScope, resolveDbPaths, loadConfig };
-
-if (require.main === module) main();
+main().catch((error) => { process.stderr.write(`history: ${error.message}\n`); process.exitCode = 1; });
