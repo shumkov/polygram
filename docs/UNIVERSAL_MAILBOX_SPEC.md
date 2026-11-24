@@ -720,23 +720,20 @@ mirrored.
 
 ## 6. Codex sessions
 
-- **Until phase 4, a Codex session gets no grant and no instructions,** and a
-  send to it is refused with `MAILBOX_BACKEND_UNSUPPORTED`. A Codex ask could
-  never receive its reply: `reply` would fail in the resolver
-  (`runtime.js:24`), and notices to it would be held.
-- **Phase 4 adds a Codex admission path to the external-jobs runtime:**
-  - **Idle proof:** the Codex process's `state` and `inFlight`, which
-    `lib/handlers/abort.js:116-124` already reads. No Orchestra API is needed
-    for it.
-  - **The real work:** a mailbox turn must go through the Codex attempt ledger
-    (`codex_turn_attempts`, keyed by Telegram message id) and the dispatch
-    generation (`polygram.js:1004-1013`). `runtime.dispatch` bypasses both today.
-  - **Report:** the final text, which is how Codex delivers anyway.
-- **Sending** then needs nothing new: Codex prompts already pass through
-  `formatPrompt` (`polygram.js:1554`), and the trusted Codex profile can run
-  `msg.js`.
-- **Covered by phase 4:** shumorobot's Orchestra topic, and Ivan's VPS DM if it
-  is on Codex.
+Phase 4 is designed in [`CODEX_MAILBOX_SPEC.md`](./CODEX_MAILBOX_SPEC.md),
+which replaces the earlier plan here:
+
+- Codex is an external-job backend next to the Claude CLI. A Codex session is
+  receivable, gets grants and instructions like any other session, and its
+  job turns are admitted only when its process is idle.
+- A job turn goes through the ordinary Codex queue with no Telegram source.
+  The attempt ledger accepts that; the runtime settles the attempt as soon as
+  the turn resolves, so a later retirement never waits on it.
+- After `/stop` kills a Codex process, the Process Manager's no-process
+  status proves the session inactive, so recovery never spawns.
+- The report is the final text, which is how Codex delivers anyway.
+- **Covered:** shumorobot's Orchestra topic. Ivan's DM in shumabit takes part
+  only once it is a role, as for Claude.
 - **SDK sessions** stay unsupported; no bot uses them for these chats.
 
 ## 7. Safety
@@ -1046,7 +1043,33 @@ Built by whichever of phases 2 and 3 ships first:
   `noteHumanPrompt` for any operator message, which is harmless while nothing
   sets taint. Once taint is wired, an operator message folded into a running
   tainted turn must not clear it, so the clear moves to the point where a new
-  turn is dispatched.
+  turn is dispatched. For a Codex session a new turn means the process is
+  `Idle` and not `inFlight`: a turn the app server starts on its own runs in
+  `BackgroundWorking`, possibly with `inFlight` false.
+- the option C gate for Codex sessions. The pinned Codex 0.167.2 has
+  `PreToolUse` with `permissionDecision: "deny"` plus a reason, and "exit 2
+  with a reason on stderr", but no `ask`, `allow` or `onFailure`. The carrier
+  is a `PreToolUse` command hook in polygram's protected, trust-verified Codex
+  hook bundle (`lib/codex/hook-*.js`), calling the same `mailbox_tool_gate`
+  op and answering only deny or nothing. A real-Codex spike must answer, before
+  a Codex session may start a cross-zone message:
+  1. whether a hook that fails, times out or is missing blocks the call;
+  2. whether `PreToolUse` fires for every acting tool: shell and unified exec,
+     `apply_patch`, MCP tools, and tool calls inside child threads (Codex has
+     subagents), and with which id the daemon can map them;
+  3. whether a config layer the agent can write (it has full write access)
+     can disable the hook, for example with `disableAllHooks` or an async
+     mode;
+  4. how long a hook may block, against the turn timeouts and `maxTurn`;
+  5. `web_search = "live"` is a hosted tool no command hook sees, and changing
+     it mid-thread trips settings-drift containment, so it must be off for
+     the whole session in any sender session.
+
+  Until that spike passes, starting a cross-zone ask or tell is refused when
+  the sender's live backend is Codex, checked at start time (not only at
+  boot, since `/config` can switch a session's runtime), and `/config`
+  refuses Codex for a session listed in `senders`. A Codex session can still
+  receive a cross-zone ask and reply to it.
 
 ### Phase 2: federation, personal → UMI
 
@@ -1063,10 +1086,11 @@ Built by whichever of phases 2 and 3 ships first:
 
 ### Phase 4: Codex delivery
 
-- The Codex admission path from section 6.
+- The Codex admission path from section 6
+  ([`CODEX_MAILBOX_SPEC.md`](./CODEX_MAILBOX_SPEC.md)), in polygram 0.51.0.
 - Independent of phases 2 and 3.
-- **Ships:** the Orchestra topic, and Ivan's VPS DM if it is on Codex, can
-  receive and send.
+- **Ships:** the Orchestra topic can receive and send; Ivan's VPS DM can once
+  it is a role.
 
 ## Data model
 
