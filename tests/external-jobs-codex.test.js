@@ -244,3 +244,23 @@ test('a resolver limited to the Claude CLI refuses a Codex destination, so a not
   const cliOnly = createExternalJobTargetResolver({ config, getSessionKey, resolveBackend: () => 'codex', backends: ['cli'] });
   assert.throws(() => cliOnly(route), /require the Claude CLI backend/);
 });
+
+test('a Codex job turn carries its own history command, and a deferred retry keeps the same token', async () => {
+  const { createExternalJobDispatch } = require('../lib/external-jobs/dispatch');
+  const { createHistoryService } = require('../lib/history-scope');
+  const history = createHistoryService({ config: { chats: { '-1001': { isolateTopics: true } } }, db: { raw: {} }, botName: 'shumorobot', ipcDir: '/ipc' });
+  let busy = true;
+  const entry = codexEntry();
+  const f = fixture({ pm: { get: () => (busy ? codexEntry({ state: 'Active' }) : entry), getModelSettingsStatus: async () => ({ outcome: 'loaded' }) },
+    getOrSpawnForChat: async () => entry });
+  const dispatch = createExternalJobDispatch({ dispatchExternalEvent: (_origin, run) => run(), runtime: f.runtime, getHistory: () => history,
+    getMailbox: () => ({ enabled: true, instructions: () => '', noteJobSend: () => {} }) });
+  assert.equal((await dispatch(job)).deferred, true, 'the busy Codex session defers the first attempt');
+  busy = false;
+  assert.equal((await dispatch(job)).outcome, 'succeeded');
+  const prompt = f.calls[0][1];
+  const token = /history\/scripts\/query\.js" "shumorobot" "([0-9a-f-]{36})"/.exec(prompt)?.[1];
+  assert.ok(token, 'the Codex prompt carries the same history command a Claude job turn gets');
+  assert.match(prompt, /POLYGRAM_IPC_DIR="\/ipc"/, 'a Codex shell inherits no environment, so the command names the IPC directory itself');
+  assert.equal(history.scope(target.sessionKey), token, 'the retry reused the deferred attempt\'s token instead of minting another');
+});
