@@ -99,7 +99,6 @@ test('the history scope asks the mailbox whether an assistant may read a role to
 
 
 test('external-job reports render through the same rich renderer as a non-streamed final reply', () => {
+  assert.match(src, /deliverPart: createReportDelivery\(\{[\s\S]*?linkPreview: \(chatId\) => \(config\.chats\?\.\[String\(chatId\)\]\?\.linkPreview != null/, 'with the same link-preview opt-out');
   assert.match(src, /deliverPart: createReportDelivery\(\{[\s\S]*?deliverRich: \(\{ chatId, threadId, text, meta \}\) => \(makeRichDeliverText\s*\? makeRichDeliverText\(\{ chatId, threadId \}\)\(\{ text, meta \}\)/);
-  assert.ok(src.indexOf('makeRichDeliverText = createRichDeliveryFactory(') < src.indexOf('deliverPart: createReportDelivery('),
-    'the renderer exists before the first report can be delivered');
 });

@@ -737,3 +737,10 @@ test('a decline says whether the rich send may have landed, so a durable caller 
   const notTried = build({ getRichKnownUnsupported: () => true });
   assert.equal((await deliver(notTried.factory, TABLE)).ambiguous === true, false, 'nothing was attempted');
 });
+
+test('a rich send Telegram definitely refused is not ambiguous; a server error or a lost receipt still is', async () => {
+  for (const [apiErrorCode, ambiguous] of [[429, false], [400, false], [403, false], [502, true], [undefined, true]]) {
+    const { factory } = build({ sendRich: async () => ({ wentRich: false, fallback: 'error', ...(apiErrorCode ? { apiErrorCode } : {}) }) });
+    assert.equal((await deliver(factory, TABLE)).ambiguous, ambiguous, String(apiErrorCode));
+  }
+});

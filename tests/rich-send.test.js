@@ -692,3 +692,15 @@ test('a throwing verdict callback never costs a delivered bubble', async () => {
   assert.equal(out.wentRich, true);
   assert.equal(attempts.length, 1);
 });
+
+test('a failure Telegram answered with an API code carries that code, so a durable caller can tell a refusal from a lost receipt', async () => {
+  const limited = makeSender({ tg: async () => { throw err('Too Many Requests: retry after 5', { error_code: 429 }); } });
+  const out = await limited.sendRich(baseArgs);
+  assert.equal(out.wentRich, false);
+  assert.equal(out.fallback, 'error');
+  assert.equal(out.apiErrorCode, 429);
+  const reset = makeSender({ tg: async () => { throw err('socket hang up', { code: 'ECONNRESET' }); } });
+  const lost = await reset.sendRich(baseArgs);
+  assert.equal(lost.fallback, 'error');
+  assert.equal(lost.apiErrorCode, undefined, 'no API answer, no code: the send may have landed');
+});

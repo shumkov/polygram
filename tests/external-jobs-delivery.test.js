@@ -108,3 +108,41 @@ test('a rich report that definitely did not land falls back to HTML; one that ma
     assert.equal(calls.length, 0);
   }
 });
+
+test('a report part that is only a local image becomes a placeholder instead of an empty message that retries forever', async () => {
+  const calls = [];
+  const bot = { api: { raw: { sendMessage: async (params) => { calls.push({ ...params }); return { message_id: 43, message_thread_id: 22 }; } } } };
+  const plain = createReportDelivery({ bot, botName: 'test', tg: viaRealSend(bot) });
+  assert.equal((await plain(job, { text: '![](/Users/x/shot.png)' })).messageId, 43);
+  assert.equal(calls[0].text, '(media unavailable)');
+  assert.doesNotMatch(JSON.stringify(calls), /\/Users\/x/, 'a local path never reaches the chat');
+  const richChat = createReportDelivery({ bot, botName: 'test', tg: viaRealSend(bot), deliverRich: async () => ({ handled: false, text: '' }) });
+  assert.equal((await richChat(job, { text: '![](/Users/x/shot.png)' })).messageId, 43);
+  assert.equal(calls[1].text, '(media unavailable)', 'the rich path\'s empty body is used, never the raw text with its path');
+});
+
+test('only an HTML refusal is retried as plain; any other 400 or a lost receipt is not', async () => {
+  for (const [error, definitelyNotSent] of [
+    [Object.assign(new Error('Bad Request: chat not found'), { error_code: 400 }), true],
+    [Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }), false],
+  ]) {
+    const calls = [];
+    const bot = { api: { raw: { sendMessage: async (params) => { calls.push({ ...params }); throw error; } } } };
+    const deliver = createReportDelivery({ bot, botName: 'test', tg: viaRealSend(bot) });
+    await assert.rejects(deliver(job, { text: REPORT }), (e) => e.definitelyNotSent === definitelyNotSent);
+    assert.equal(calls.length, 1, error.message);
+  }
+});
+
+test('a chat that turned link previews off gets none under a report, as under a normal reply', async () => {
+  const calls = [];
+  const bot = { api: { raw: { sendMessage: async (params) => { calls.push({ ...params }); return { message_id: 44, message_thread_id: 22 }; } } } };
+  const deliver = createReportDelivery({ bot, botName: 'test', tg: viaRealSend(bot), linkPreview: (chatId) => (chatId === '-1001' ? false : undefined) });
+  await deliver(job, { text: REPORT });
+  assert.deepEqual(calls[0].link_preview_options, { is_disabled: true });
+  const rich = [];
+  const richChat = createReportDelivery({ botName: 'test', tg: async () => ({ message_id: 1 }), linkPreview: () => false,
+    deliverRich: async (args) => { rich.push(args); return { handled: true, results: [{ message_id: 2, message_thread_id: 22 }] }; } });
+  await richChat(job, { text: REPORT });
+  assert.equal(rich[0].meta.linkPreview, false);
+});

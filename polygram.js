@@ -4645,6 +4645,10 @@ async function main() {
     // renderer in a rich-enabled chat, text-only (no media roots), else HTML.
     deliverPart: createReportDelivery({
       bot, tg, botName: BOT_NAME, logger: console,
+      // The same link-preview opt-out as a normal reply: chat level, then bot.
+      linkPreview: (chatId) => (config.chats?.[String(chatId)]?.linkPreview != null
+        ? config.chats[String(chatId)].linkPreview
+        : config.bot?.linkPreview),
       deliverRich: ({ chatId, threadId, text, meta }) => (makeRichDeliverText
         ? makeRichDeliverText({ chatId, threadId })({ text, meta })
         : { handled: false }),
