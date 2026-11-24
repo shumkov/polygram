@@ -142,9 +142,12 @@ describe('Codex main-loop steering wiring', () => {
       "steered.outcome === 'accepted-persistence-ambiguous'",
     );
     const primaryGuard = steering.indexOf(
-      'if (shouldDispatchPrimaryAfterAutosteer({',
+      'const dispatchPrimary = shouldDispatchPrimaryAfterAutosteer({',
     );
+    const primaryBranch = steering.indexOf('if (dispatchPrimary) {');
     const primarySend = steering.indexOf('sendToProcess(sessionKey, prompt,');
+    assert.ok(primaryGuard >= 0 && primaryBranch > primaryGuard && primaryBranch < primarySend,
+      'the primary send runs only on the guard\'s decision');
     const reaction = steering.indexOf("reactor.setState('AUTOSTEERED')");
     assert.ok(
       settlement >= 0

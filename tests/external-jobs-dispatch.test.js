@@ -76,3 +76,10 @@ test('kill switch: every withdrawal is logged and recorded as an event', async (
   await g.dispatch(job, {});
   assert.deepEqual([g.calls.warnings, g.calls.logged], [[], []], 'normal dispatch records nothing');
 });
+
+test('a job\'s turn ends its own mailbox turn when it settles, so a person\'s assistant cannot act on its grant afterwards', async () => {
+  const ended = [];
+  const f = fixture({ mailbox: { enabled: true, instructions: () => '', noteJobSend() {}, noteTurnEnd: (key, owner) => ended.push([key, owner]) } });
+  await f.dispatch(job, {});
+  assert.deepEqual(ended, [['-1001:12', `job:marketing\0${job.requestId}`]]);
+});

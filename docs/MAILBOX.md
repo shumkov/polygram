@@ -68,6 +68,7 @@ rules.
 | `limits.perPairPerHour` | Asks and tells per (from, to) pair in the last hour. Default 10. |
 | `limits.maxBodyBytes` | Body size in UTF-8 bytes, before and after redaction. Default and maximum 3500, so a mirror fits one Telegram message. |
 | `limits.systemPerHour` | Messages per system sender in the last hour. Default 60. |
+| `assistants` | People's assistants in a `roles` bot (see [People's assistants](#peoples-assistants)): `{ "<key>": "<the person's direct chat id>" }`. The key matches `^[a-z][a-z0-9_-]*$` and is not a role name; the chat is a configured direct chat (a positive id) that is not a role's session, listed once. |
 
 External jobs now run different conversations concurrently, up to
 `externalJobs.maxConcurrent` (default 4). Each conversation still runs one job
@@ -122,6 +123,67 @@ not start with `session:`, `peer:` or `orca:`, and the IPC ops
 `external_job_submit` and `external_jobs_status` refuse those ids, so outside
 clients cannot use them. `/automation` and the stop-to-pause rule still apply
 only to configured routes.
+
+## People's assistants
+
+In a `roles` bot, a person's direct chat with the bot can be their assistant
+inside the organization. Each entry of `assistants` maps a key to the
+person's direct chat, whose id is the person's Telegram user id:
+
+```json
+"assistants": { "dina": "451328391", "mai": "8744283195", "ivan": "68861949" }
+```
+
+- **Address.** The stored address is `session:<chatId>`, labelled
+  "Dina's assistant". Agents type `dina` or `person:dina`.
+- **Access mirrors Telegram groups.** A role and an assistant reach each other
+  only while the person is a member of the role's group. polygram asks
+  Telegram (`getChatMember`) at start and every 5 minutes. An answer older than
+  10 minutes, a lookup error, `left`, `kicked`, or `restricted` without
+  `is_member` all mean "not a member". Assistants reach each other freely.
+  `"*"` in `allow` never reaches an assistant.
+- **Only in its person's own turn.** An assistant starts an ask or tell,
+  replies, or passes `mailbox_identify` at depth 0 only with the grant of a
+  turn its person started.
+  - Every prompt another session's message, a notice or any other job starts
+    in an assistant taints it, and so does a restart.
+  - Only the person's own message that starts a new turn clears the taint. The
+    decision is made at dispatch, so a message folded into a running turn
+    joins that turn and keeps it.
+  - A grant ends with its turn, so a wakeup or background task cannot act
+    afterwards.
+  - So a role's ask is answered this way: the assistant tells its person in
+    the direct chat; the person answers in their own turn; the assistant then
+    replies. `open` lists the asks waiting for the caller's reply under
+    `toAnswer`.
+- **A person outside a role's group.** Their assistant can never ask, tell or
+  reach that role. The role may send their assistant a one-way `tell` (never an
+  ask), and only after a go.
+  - `send` returns `{id, state: "awaiting-go"}`, stores nothing, and posts a
+    card with **Send** and **Drop** in the role's own topic.
+  - Only a person listed in `assistants` who is a confirmed member of the
+    role's group may press them.
+  - Send stores the message with `approved_by` and delivers it; its cards say
+    `· go: <Name>`. Drop discards it.
+  - A go expires after 24 hours, at most 5 wait per role, and a restart
+    forgets them (the role sends again).
+- **Cards.** The person's direct chat always gets the full card for a message
+  their assistant sends or receives, whatever `mirror` says (unless `false`). A
+  card in a group topic about such a message shows only who wrote to whom.
+- **Codex.** A Codex direct chat cannot receive yet. Its assistant may `tell`
+  and create tasks, but not `ask`, and nothing can be sent to it
+  (`MAILBOX_BACKEND_UNSUPPORTED`).
+- **`mailbox_identify`** for an assistant returns
+  `{assistant, chatId, depth, roles}`. `roles` lists the roles whose group has
+  the person as a confirmed member.
+- **`mailbox_submit` to an assistant.** `to: "person:<key>"` needs `role`, the
+  configured role the message is about.
+  - It is accepted only while the person is a member of that role's group.
+  - It is refused with an `origin` (`MAILBOX_INVALID_ORIGIN`), so a relayed
+    text never passes for the person asking.
+  - The turn it starts is tainted.
+
+Design: [`UMI_PERSONAL_ASSISTANTS_SPEC.md`](./UMI_PERSONAL_ASSISTANTS_SPEC.md).
 
 ## What agents do
 
@@ -394,7 +456,7 @@ contract and do not change:
 | `MAILBOX_KEY_CONFLICT` | The key was used for a different target, body, origin or summary. | No. |
 | `MAILBOX_INVALID_ORIGIN` | `origin` is not exactly `{kind:"human", name}` with a name of 1 to 64 characters and no control characters. | No. |
 | `MAILBOX_UNKNOWN_ADDRESS` | In an open bot, `to` names no session; in any bot, a name that matches several sessions (the candidates are listed). A roles bot keeps `MAILBOX_UNKNOWN_ROLE` for a name that matches nothing. | No. |
-| `MAILBOX_NOT_ALLOWED` | The allowlist or the bot's mode refuses this start, the command was replaced by a newer prompt, or the grant has seen foreign content. | No; use the current turn's command. |
+| `MAILBOX_NOT_ALLOWED` | The allowlist or the bot's mode refuses this start, the person is not a confirmed member of the role's group, an assistant is not in its person's own turn, the command was replaced by a newer prompt, or the grant has seen foreign content. | No; use the current turn's command. |
 | `MAILBOX_BACKEND_UNSUPPORTED` | The target cannot receive (an SDK session). | No. |
 
 A refusal from the external-jobs queue keeps its own code, for example

@@ -61,3 +61,23 @@ test('Codex job turns are settled through the controller, the login gate asks ab
 test('notification consumers resolve their destinations on the Claude CLI only', () => {
   assert.match(src, /notificationService = createNotificationService\(\{[\s\S]*?resolveTarget: createExternalJobTargetResolver\(\{\s*config, getSessionKey, backends: \['cli'\],/);
 });
+
+test('a person\'s assistant learns, under the dispatch latch, whether its person\'s message starts a new turn', () => {
+  const handle = body('handleMessage');
+  const latch = handle.indexOf('const releaseIntent = await intentLock.acquire(sessionKey);');
+  const note = handle.indexOf('mailboxService?.noteHumanDispatch(sessionKey, {');
+  const decide = handle.indexOf('const dispatchPrimary = shouldDispatchPrimaryAfterAutosteer({');
+  const send = handle.indexOf('sendPromise = sendToProcess(sessionKey, prompt, {');
+  assert.ok(latch >= 0 && decide > latch && note > decide && send > note, 'the note uses the real fold-or-turn decision, before the send, inside the latch');
+  assert.match(handle, /newTurn: dispatchPrimary,\s*owner: mailboxHumanTurn\(chatId, msg\.message_id\),/);
+});
+
+test('an assistant turn ends when its primary turn settles, or at once when no turn was dispatched', () => {
+  const handle = body('handleMessage');
+  assert.match(handle, /const result = await sendPromise;\s*\/\/[^\n]*\n\s*mailboxService\?\.noteTurnEnd\(sessionKey, mailboxHumanTurn\(chatId, msg\.message_id\)\);/);
+  assert.match(handle, /releaseIntent\(\);[\s\S]{0,200}if \(!sendPromise\) mailboxService\?\.noteTurnEnd\(sessionKey, mailboxHumanTurn\(chatId, msg\.message_id\)\);/);
+});
+
+test('go-card presses reach the mailbox', () => {
+  assert.match(src, /data\.startsWith\('mbx:'\)\) \{\s*if \(mailboxService\) await mailboxService\.handleGoCallback\(ctx\);/);
+});

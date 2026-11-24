@@ -148,7 +148,7 @@ const {
 const { buildHistoryBlock } = require('./lib/history-preload');
 const { createNotificationService } = require('./lib/external-jobs/notifications');
 const { createExternalJobDispatch } = require('./lib/external-jobs/dispatch');
-const { createMailboxService } = require('./lib/mailbox/service');
+const { createMailboxService, humanTurn: mailboxHumanTurn } = require('./lib/mailbox/service');
 const { createHistoryService } = require('./lib/history-scope');
 const { formatContextReply, maybeContextFullHint } = require('./lib/context-format');
 // appendDisplayHint moved with buildSdkOptions extraction (commit 18) —
@@ -2288,10 +2288,20 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
       logEvent,
       logger: console,
     });
-    if (shouldDispatchPrimaryAfterAutosteer({
+    const dispatchPrimary = shouldDispatchPrimaryAfterAutosteer({
       steered,
       codexDispatchDecision,
-    })) {
+    });
+    // A person's assistant learns here, under the latch, whether its person's
+    // message starts a new turn or folds into the running one: only a new
+    // turn can clear the taint another session's message left.
+    mailboxService?.noteHumanDispatch(sessionKey, {
+      newTurn: dispatchPrimary,
+      owner: mailboxHumanTurn(chatId, msg.message_id),
+      fromId: msg.from?.id ?? null,
+      isBot: msg.from?.is_bot === true,
+    });
+    if (dispatchPrimary) {
       if (codexDispatchDecision === 'queue') {
         reactor.setState('THINKING');
       }
@@ -2352,6 +2362,9 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
     }
   } finally {
     releaseIntent();
+    // No primary turn was dispatched, so the assistant turn noted above (if
+    // any) has already ended.
+    if (!sendPromise) mailboxService?.noteTurnEnd(sessionKey, mailboxHumanTurn(chatId, msg.message_id));
   }
   if (codexDispatchDecision === 'duplicate') {
     stopTyping();
@@ -2438,6 +2451,8 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
   let deliveryFinalizer = null;
   try {
     const result = await sendPromise;
+    // The turn is over: a person's assistant can no longer act on its grants.
+    mailboxService?.noteTurnEnd(sessionKey, mailboxHumanTurn(chatId, msg.message_id));
     // sendToProcess failures are captured (not thrown) so the latch
     // always releases; re-throw here into the existing handler.
     if (result && result.__sendError) throw result.__sendError;
@@ -3493,6 +3508,9 @@ function createBot(token) {
         }
       } else if (data.startsWith('q:')) {
         if (questionHandlers) await questionHandlers.handleQuestionCallback(ctx);
+      } else if (data.startsWith('mbx:')) {
+        if (mailboxService) await mailboxService.handleGoCallback(ctx);
+        else await ctx.answerCallbackQuery({ text: 'Stale or invalid button.' }).catch(() => {});
       } else {
         await handleApprovalCallback(ctx);
       }
