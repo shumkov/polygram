@@ -89,9 +89,11 @@ describe('makeSessionStartHook — fresh sessions inject history', () => {
     const hook = makeSessionStartHook({ db, chatId: '12345', since: null });
     const result = await hook({ source: 'startup' });
     const ctx = result.hookSpecificOutput.additionalContext;
-    assert.match(ctx, /skills\/history\/scripts\/query\.js/);
-    assert.match(ctx, /recent <chat_id>/);
-    assert.match(ctx, /search <term>/);
+    // The hint points at the per-turn command, which carries the session's
+    // scope; a bare script path with a chat id argument invited cross-chat reads.
+    assert.match(ctx, /own-chat history command from this turn/);
+    assert.match(ctx, /recent, search/);
+    assert.doesNotMatch(ctx, /<chat_id>|query\.js/);
   });
 
   test('chronological order — oldest preloaded message first', async () => {

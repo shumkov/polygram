@@ -340,20 +340,25 @@ is an error. Both transports keep the same chat/topic. See the
 If the bot process is down, the call throws. This is intentional — cron
 failures should surface.
 
-## The `telegram-history` skill
+## The `history` skill
 
-A Claude skill that queries the transcript:
+A Claude skill that queries the calling conversation's own transcript.
+Every prompt carries a per-session command with a scope token the daemon
+minted; the agent runs it with a subcommand:
 
 ```bash
-node skills/history/scripts/query.js recent -1000000000001 --since 24h
-node skills/history/scripts/query.js search "invoice" --user Maria
-node skills/history/scripts/query.js around --chat -100... --msg-id 12345 --before 10
+<command from this turn> recent --since 24h
+<command from this turn> search "invoice" --user Maria
+<command from this turn> around --msg-id 12345 --before 10
 ```
 
-Bot scope is derived from `process.cwd()` — the skill refuses to run if
-the cwd doesn't match a chat in config, unless `POLYGRAM_ADMIN=1` is set.
-With per-bot DBs the skill opens only the current bot's file; in admin
-mode it unions across all `<bot>.db` files.
+The script never opens the database. The daemon maps the token to the
+session and reads only its own chat (for an isolated topic, only that
+topic). No argument, working directory or environment variable widens the
+scope. The one exception is the operator's own private chat with the bot
+(the bot's `adminChatId`), which may read any chat of the bot with
+`--chat <chat_id>` or `--chat all`. See
+[docs/history-session-scope.md](docs/history-session-scope.md).
 
 ## Approvals
 

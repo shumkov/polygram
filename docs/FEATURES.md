@@ -113,7 +113,7 @@ All gated on `config.bot.allowConfigCommands` (default off — partner bots igno
 
 - **Per-bot DB.** `~/polygram/<bot>.db`. Bot is the only writer to its own file.
 - **WAL mode** for concurrent readers (history skill, polygram-doctor) without blocking the writer.
-- **FTS5 index** on `messages.text` — full-text search via `node skills/history/scripts/query.js search "invoice"`.
+- **FTS5 index** on `messages.text` — full-text search through the `history` skill (`<command from this turn> search "invoice"`).
 - **Numbered migrations** (`migrations/NNN-*.sql`), guarded by `user_version`. 10 migrations applied at boot.
 - **Tables**:
   - `messages` — every inbound + outbound + IPC-posted message, with `direction`, `status` (pending/sent/failed for outbound), `handler_status` for inbound lifecycle.
@@ -174,7 +174,7 @@ All gated on `config.bot.allowConfigCommands` (default off — partner bots igno
   - `/plugin marketplace add https://github.com/shumkov/polygram.git`
   - `/plugin install polygram@shumkov`
   - Adds slash commands at `/`: `/polygram:status`, `/polygram:logs <bot>`, `/polygram:pair-code`, `/polygram:approvals [bot]`.
-- **Bundled `history` skill** lets Claude query the transcript directly when asked about chat activity. Scope by `process.cwd()` — refuses unmapped directories unless `POLYGRAM_ADMIN=1`.
+- **Bundled `history` skill** lets Claude query the transcript directly when asked about chat activity. Each read is bound to the calling session by a daemon-minted token and covers only that session's own chat or topic; the operator's private chat with the bot (`adminChatId`) may read any chat of the bot.
 - **Bundled `polygram-send` skill** for out-of-turn IPC sends with file-upload validation.
 
 ---

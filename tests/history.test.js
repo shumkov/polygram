@@ -496,3 +496,39 @@ describe('formatPretty', () => {
     assert.ok(!out.includes('\n'));
   });
 });
+
+// A session bound to one topic passes threadScope; it must hold on every
+// query path, in SQL, so LIMIT and aggregates never see another topic.
+describe('threadScope', () => {
+  beforeEach(() => {
+    ({ db, dbPath } = freshDb('history-thread-scope'));
+    seed(db, [
+      { chat_id: '-100', thread_id: null, msg_id: 1, user: 'Ann', text: 'general note', ts: 1000 },
+      { chat_id: '-100', thread_id: '7', msg_id: 2, user: 'Ann', text: 'topic seven note', ts: 2000 },
+      { chat_id: '-100', thread_id: '8', msg_id: 3, user: 'Ann', text: 'topic eight note', ts: 3000 },
+    ]);
+  });
+  afterEach(() => cleanupDb(dbPath, db));
+  const texts = (rows) => rows.map((row) => row.text);
+
+  test('a thread id keeps only that thread on search, byUser, getMsg, stats and around', () => {
+    const scope = { allowedChatIds: ['-100'], threadScope: '7' };
+    assert.deepEqual(texts(history.search(db, { query: 'note', ...scope })), ['topic seven note']);
+    assert.deepEqual(texts(history.byUser(db, { user: 'Ann', days: 0, ...scope })), ['topic seven note']);
+    assert.equal(history.getMsg(db, { msgId: 3, ...scope }), null);
+    assert.deepEqual(history.stats(db, { days: 100000, ...scope }).map((row) => row.count), [1]);
+    assert.deepEqual(texts(history.around(db, { chatId: '-100', msgId: 2, before: 5, after: 5, ...scope })), ['topic seven note']);
+    assert.deepEqual(history.around(db, { chatId: '-100', msgId: 3, ...scope }), [], 'an anchor in another thread is not found');
+  });
+
+  test('null keeps only rows without a thread (the General topic)', () => {
+    const scope = { allowedChatIds: ['-100'], threadScope: null };
+    assert.deepEqual(texts(history.search(db, { query: 'note', ...scope })), ['general note']);
+    assert.deepEqual(texts(history.around(db, { chatId: '-100', msgId: 1, before: 5, after: 5, ...scope })), ['general note']);
+  });
+
+  test('without threadScope every thread of the chat is returned, as before', () => {
+    assert.equal(history.search(db, { query: 'note', allowedChatIds: ['-100'] }).length, 3);
+    assert.equal(history.around(db, { chatId: '-100', msgId: 2, before: 5, after: 5 }).length, 3);
+  });
+});
