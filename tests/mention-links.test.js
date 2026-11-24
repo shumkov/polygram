@@ -9,7 +9,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { toTelegramHtml } = require('../lib/telegram/format');
-const { needsRichRendering } = require('../lib/telegram/rich');
+const { needsRichRendering, toTelegramRichBlocks } = require('../lib/telegram/rich');
 
 const LINH = '[Linh](tg://user?id=8616081456)';
 
@@ -39,6 +39,19 @@ describe('a mention link reaches Telegram as a text mention', () => {
   test('a list without a mention still renders rich', () => {
     assert.equal(needsRichRendering('- one\n- two'), true);
   });
+
+  test('a table or a details block keeps the rich path: losing the mention costs less than losing the structure', () => {
+    // The HTML path renders a table as <pre>, where Telegram allows no link,
+    // and shows <details> as literal tags.
+    assert.equal(needsRichRendering(`| Owner | Task |\n|---|---|\n| ${LINH} | ads |`), true);
+    assert.equal(needsRichRendering(`<details><summary>Plan</summary>\n\n${LINH} owns the ads\n\n</details>`), true);
+  });
+
+  test('when no image of a list-and-mention reply resolves, the reply goes plain so the mention survives', () => {
+    const reply = `${LINH}, before Friday:\n\n- the budget\n- the creatives\n\n![banner](/tmp/missing.png)`;
+    const rendered = toTelegramRichBlocks(reply, { partial: false, resolveMedia: (descriptors) => descriptors.map(() => null) });
+    assert.equal(rendered.usedRich, false);
+  });
 });
 
 describe('only web links and person mentions become clickable', () => {
@@ -61,6 +74,18 @@ describe('only web links and person mentions become clickable', () => {
     const { text } = toTelegramHtml('![shot](tg://proxy?server=1)');
     assert.doesNotMatch(text, /<a\b/);
     assert.match(text, /shot/);
+  });
+
+  test('an image without a caption never prints a local path as text', () => {
+    const { text } = toTelegramHtml('See ![](/Users/x/secret.png) here');
+    assert.doesNotMatch(text, /secret\.png/);
+  });
+
+  test('a mention with no visible label is dropped, so nobody is pinged invisibly', () => {
+    for (const label of ['\u200b', ' ', '\u2060\u200d']) {
+      const { text } = toTelegramHtml(`Hello [${label}](tg://user?id=1) team`);
+      assert.doesNotMatch(text, /<a\b/, JSON.stringify(label));
+    }
   });
 
   test('http and https links are unchanged', () => {
