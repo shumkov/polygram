@@ -11,7 +11,7 @@ const lockfile = require('../package-lock.json');
 const orchestra = require('@shumkov/orchestra');
 const orchestraPackage = require('@shumkov/orchestra/package.json');
 
-const REQUIRED_ORCHESTRA_VERSION = '0.12.5';
+const REQUIRED_ORCHESTRA_VERSION = '0.12.6';
 
 test('installed Orchestra exactly matches the reviewed Codex contract', () => {
   assert.equal(
@@ -75,8 +75,17 @@ test('installed Orchestra exactly matches the reviewed Codex contract', () => {
   );
   // skills/changed fires on any write under the workspace skills directory
   // (a model-run script's __pycache__, a cron job's state file); if Orchestra
-  // faulted on it, every such write would kill the chat's Codex turn.
-  for (const method of ['hook/started', 'hook/completed', 'skills/changed']) {
+  // faulted on it, every such write would kill the chat's Codex turn. The
+  // model/* methods are provider cyber-safety signals (reroute, verification,
+  // safety buffering) that can arrive on any turn while it keeps running.
+  for (const method of [
+    'hook/started',
+    'hook/completed',
+    'skills/changed',
+    'model/rerouted',
+    'model/verification',
+    'model/safetyBuffering/updated',
+  ]) {
     assert.equal(
       orchestra.codexProtocolSchema.droppedServerNotifications.includes(method),
       true,
