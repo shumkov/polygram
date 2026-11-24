@@ -158,7 +158,7 @@ test('assistants get a grant, a Codex one too, while every other chat of a roles
   assert.throws(() => f.service.send(f.person(DINA).token, { to: 'umi-group', kind: 'tell', body: 'x' }), coded('MAILBOX_UNKNOWN_ROLE'));
   assert.equal(f.service.roleForSession(DINA), null, 'an assistant is not a role, so stop and pause policy is unchanged');
   assert.equal(f.service.receivesMail(DINA), true);
-  assert.equal(f.service.receivesMail(IVAN), false, 'a Codex chat cannot receive yet, so a stop there takes no mailbox lock');
+  assert.equal(f.service.receivesMail(IVAN), true, 'a Codex chat receives like any Codex session');
 });
 
 test('an assistant asks a role its person can reach, and the role\'s answer comes back to it', async (t) => {
@@ -225,17 +225,39 @@ test('a person who leaves the group loses access on the next refresh, and an err
   }
 });
 
-test('Ivan\'s Codex chat may tell and create tasks but cannot ask or be asked until Codex can receive', async (t) => {
+test('a Codex assistant takes full part: it asks, is asked, replies, and hears about its person\'s tasks', async (t) => {
   const f = await fixture(t);
-  const token = f.person(IVAN).token;
-  assert.throws(() => f.service.send(token, { to: 'finance', kind: 'ask', body: 'x' }), coded('MAILBOX_BACKEND_UNSUPPORTED'));
-  assert.equal(f.service.send(token, { to: 'finance', kind: 'tell', body: 'Budget approved.' }).state, 'queued');
-  for (const kind of ['ask', 'tell']) {
-    assert.throws(() => f.service.send(f.person(DINA).token, { to: 'ivan', kind, body: 'x' }), coded('MAILBOX_BACKEND_UNSUPPORTED'), `assistant ${kind}`);
-    assert.throws(() => f.service.send(f.roleTurn(FINANCE), { to: 'ivan', kind, body: 'x' }), coded('MAILBOX_BACKEND_UNSUPPORTED'), `role ${kind}`);
-  }
+  const ask = f.service.send(f.person(IVAN).token, { to: 'finance', kind: 'ask', body: 'Runway?' });
+  assert.equal(ask.state, 'queued');
+  const answer = f.service.reply(f.roleTurn(FINANCE), { inReplyTo: ask.id, body: 'Seven months.' });
+  assert.ok(f.jobFor(answer.id), 'the reply is delivered into the Codex chat');
+  const fromDina = f.service.send(f.person(DINA).token, { to: 'ivan', kind: 'ask', body: 'Shoot budget?' });
+  const fromOps = f.service.send(f.roleTurn(OPS), { to: 'ivan', kind: 'ask', body: 'Plan ok?' });
+  assert.deepEqual([f.row(fromDina.id).to_addr, f.row(fromOps.id).to_addr], [`session:${IVAN}`, `session:${IVAN}`]);
+  assert.equal(f.service.submit({ sender: 'agent-org', to: 'person:ivan', role: 'finance', body: 'Task done.', key: 'k-ivan' }).state, 'queued');
+  assert.equal(f.service.reply(f.person(IVAN).token, { inReplyTo: fromDina.id, body: 'Approved.' }).state, 'queued');
   assert.deepEqual(f.service.identify({ token: f.person(IVAN).token }), { assistant: 'ivan', chatId: IVAN, depth: 0, roles: ['ops', 'finance', 'cmo', 'ads'] });
-  assert.doesNotMatch(f.service.instructions(IVAN), /reply '/, 'a Codex assistant is not offered a reply it could never receive');
+  assert.match(f.service.instructions(IVAN), /reply '/);
+});
+
+test('an assistant chat moved off the CLI and Codex while running stops receiving and may only tell', async (t) => {
+  let ivanBackend = 'codex';
+  const f = await fixture(t, { resolveBackend: ({ chatId }) => (String(chatId) === IVAN ? ivanBackend : 'cli') });
+  ivanBackend = 'sdk';
+  assert.throws(() => f.service.send(f.person(IVAN).token, { to: 'finance', kind: 'ask', body: 'x' }), coded('MAILBOX_BACKEND_UNSUPPORTED'));
+  assert.equal(f.service.send(f.person(IVAN).token, { to: 'finance', kind: 'tell', body: 'x' }).state, 'queued');
+  assert.throws(() => f.service.send(f.person(DINA).token, { to: 'ivan', kind: 'tell', body: 'x' }), coded('MAILBOX_BACKEND_UNSUPPORTED'));
+  assert.throws(() => f.service.submit({ sender: 'agent-org', to: 'person:ivan', role: 'finance', body: 'x', key: 'k' }), coded('MAILBOX_BACKEND_UNSUPPORTED'));
+  assert.doesNotMatch(f.service.instructions(IVAN), /reply '/);
+});
+
+test('nothing assumes a particular person is configured: a DM left out of assistants stays unaddressed', async (t) => {
+  const f = await fixture(t, { config: umiConfig({ assistants: { dina: DINA, mai: MAI } }) });
+  assert.equal(f.service.scope(IVAN), null, 'Ivan\'s Codex DM gets no grant');
+  assert.throws(() => f.service.send(f.roleTurn(FINANCE), { to: 'ivan', kind: 'tell', body: 'x' }), coded('MAILBOX_UNKNOWN_ROLE'));
+  assert.throws(() => f.service.submit({ sender: 'agent-org', to: 'person:ivan', role: 'finance', body: 'x', key: 'k' }), coded('MAILBOX_UNKNOWN_ADDRESS'));
+  assert.deepEqual(f.service.directory(f.person(MAI).token, {}).targets.map((x) => x.to).sort(), ['ads', 'cmo', 'dina']);
+  assert.equal(f.service.send(f.person(DINA).token, { to: 'finance', kind: 'ask', body: 'Runway?' }).state, 'queued');
 });
 
 test('a turn another session started can only tell the person: it cannot message, reply or create a task', async (t) => {
@@ -333,7 +355,6 @@ test('a system sender tells an assistant about a role\'s task only if the person
   assert.equal(submit({ to: 'person:mai', role: 'cmo' }).state, 'queued');
   assert.throws(() => submit({ to: 'person:dina', role: 'finance', origin: { kind: 'human', name: 'Ivan' } }), coded('MAILBOX_INVALID_ORIGIN'));
   assert.throws(() => submit({ to: 'person:dina' }), coded('MAILBOX_UNKNOWN_ROLE'));
-  assert.throws(() => submit({ to: 'person:ivan', role: 'finance' }), coded('MAILBOX_BACKEND_UNSUPPORTED'));
   assert.throws(() => submit({ to: 'person:nobody', role: 'finance' }), coded('MAILBOX_UNKNOWN_ADDRESS'));
   assert.throws(() => submit({ to: 'finance', role: 'finance' }), /role applies only/);
 });

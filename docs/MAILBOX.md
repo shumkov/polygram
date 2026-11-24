@@ -183,9 +183,10 @@ person's direct chat, whose id is the person's Telegram user id:
   there.
 - **Replies** between a role and an assistant need the person's membership
   too, so someone who left the group neither gets nor gives a late answer.
-- **Codex.** A Codex direct chat cannot receive yet. Its assistant may `tell`
-  and create tasks, but not `ask`, and nothing can be sent to it
-  (`MAILBOX_BACKEND_UNSUPPORTED`).
+- **Codex.** An assistant whose direct chat runs on Codex takes full part,
+  like any Codex session: it asks, tells, replies and receives. Nothing
+  assumes a particular person is configured; leaving someone out of
+  `assistants` leaves their direct chat unaddressed.
 - **`mailbox_identify`** for an assistant returns
   `{assistant, chatId, depth, roles}`. `roles` lists the roles whose group has
   the person as a confirmed member.
