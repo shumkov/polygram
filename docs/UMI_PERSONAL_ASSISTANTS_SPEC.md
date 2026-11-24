@@ -1,8 +1,9 @@
 # Personal assistants in UMI
 
-Status: v2, 2026-11-24. Research and spec only; nothing here is built.
+Status: v3, 2026-11-24. Ivan answered the open questions ([Decisions by
+Ivan](#decisions-by-ivan-2026-11-24)); phases 0 and 1 are being implemented.
 
-Three independent read-only reviews have been folded in: feasibility against
+Three independent read-only reviews were folded into v2: feasibility against
 both codebases, simplicity and scope, and security, privacy and loops. See the
 [review log](#review-log).
 
@@ -179,8 +180,8 @@ fail closed, and making the bot an admin fixes it.
 
 | From \ To | Role R | Assistant of P | Assistant of Q |
 |---|---|---|---|
-| **Role S** | `allow` rules (unchanged) | P is a member of S's group | — |
-| **Assistant of P** | P is a member of R's group | — | allowed |
+| **Role S** | `allow` rules (unchanged) | P is a member of S's group: ask or tell. P is not a member: a one-way `tell`, sent only after a go from a member (section 3a) | — |
+| **Assistant of P** | P is a member of R's group; otherwise **never** (no ask, tell or task) | — | allowed |
 
 **An assistant's mailbox actions need its person's own turn.** Starting an
 ask or tell, replying to an ask, and `tasks create` are allowed only with the
@@ -206,8 +207,60 @@ started (section 4).
     Codex DM refuses without a lookup.
 
 This is stricter than "assistants answer on their own": an assistant never
-answers another session without its person. Open question 2 asks Ivan to
-confirm it.
+answers another session without its person. Ivan confirmed it as the default.
+
+### 3a. A tell to a non-member's assistant needs a member's go
+
+Ivan's intent: Mai, Linh, Nastya and Sasha must not be able to give a
+management role a task, ask it to change anything, or pull management
+information out of it through their assistant. A management role may at most
+send a non-member's assistant a confirmation, with Ivan's or Dina's go.
+
+- **The non-member's side.** An assistant whose person is not in the role's
+  group can never start anything to that role, and a tell cannot be answered.
+  So the channel is one way.
+- **The role's side.** When role S sends a `tell` to the assistant of a
+  person outside S's group, polygram stores nothing and delivers nothing yet.
+  It keeps the message pending in memory and posts a go card in S's own topic.
+  - The card shows the full text, the target ("Mai's assistant") and two
+    buttons, **Send** and **Drop**.
+  - S's `send` returns `{id, state: "awaiting-go"}`.
+  - An `ask` in this direction is refused with `MAILBOX_NOT_ALLOWED`.
+- **Who may press Send.** A person listed in `assistants` (their Telegram id is
+  their DM chat id) who is a confirmed member of S's group. For the management
+  group that is Ivan and Dina; it follows the membership table, like every
+  other access rule. Any other press is refused with a toast, and nothing
+  changes.
+- **On Send:**
+  - the message is stored with `approved_by` (the approver's key), delivered,
+    and mirrored like any assistant message;
+  - the cards say `· go: Ivan`;
+  - the go card is edited to "✅ Sent with Ivan's go".
+- **On Drop:** the pending message is discarded, and the card is edited to
+  "🚫 Dropped by Dina".
+- **Limits:**
+  - a go expires after 24 hours;
+  - at most 5 messages may wait per sending role;
+  - the same text to the same target while one is waiting returns the waiting
+    one;
+  - a restart drops pending messages, and a press on an old card answers that
+    it expired and the role should send again.
+- **Recorded:** `mailbox_messages.approved_by`, migration `030`.
+
+Why this mechanism:
+
+- **The go is per message and shows the exact text.** A rule that only
+  requires "Ivan or Dina started this turn" would not stop a role adding
+  management data to a confirmation.
+- **The approvers are already in the right place.** The card goes to the
+  role's own topic, and in UMI management only Ivan and Dina can see it; the
+  click is still checked by user id.
+- **Simpler than the alternatives.**
+  - The tool-approval store (`pending_approvals`) is shaped for tool calls: a
+    tool name, an input digest, "always" buttons and the admin chat.
+  - `UNIVERSAL_MAILBOX_SPEC.md` option C is not built.
+  - A small `mbx:` callback beside the existing `cfg:`, `cxr:` and `q:`
+    prefixes is less code than adapting either.
 
 ### 4. Grants and taint for assistant sessions
 
@@ -346,9 +399,10 @@ mention form, groups, and assistant. polygram does not need it.
 - **Use the assistant** (`ask person:<key>`) only when answers must be
   collected or followed up, or the matter is private. Do not restate private
   content in your topic.
-- **Person not in your group:** neither a mention nor their assistant is
-  allowed. Ask a role in a group they are in; management roles ask cmo. Never
-  send management-only data there.
+- **Person not in your group:** no mention and no ask. A short confirmation
+  is possible as a `tell` to their assistant, once Ivan or Dina presses Send on
+  its card (section 3a); put nothing management-only in it. Anything else goes
+  through a role in their group (management roles ask cmo).
 
 ## agent-org: tasks from an assistant
 
@@ -425,7 +479,7 @@ among sessions you already trust with each other's topics":
 - **The history skill reads every chat.** It scopes reads by cwd
   (`skills/history/scripts/query.js:81-95`), and every shumabit chat shares
   `/home/shumabit/shumabit-claude`. So each DM agent can already read every
-  other DM's history today (open question 3).
+  other DM's history today. A separate PR fixes it, shipped with phase 0.
 - **Tools in tainted turns.** A member DM agent runs tools, so text in a tainted
   turn could steer one: Canva AI for Dina, for example. The gift-card flow is
   safe, because it needs a one-time code typed back by the person.
@@ -450,8 +504,12 @@ Each phase ships on its own. Fixes are PATCH, features MINOR.
   (section 8), test first (red, then green).
 - **shumabit-claude `skills/organization/SKILL.md`:** the People table and the
   mention guidance, including "mention through the reply tool".
+- **The history-skill fix** (each session reads only its own chat) is a separate
+  PR from another worker, with no version bump; the coordinator bundles it into
+  this release.
 - **Ships:** roles mention anyone, Linh included, reliably. The HTML path stops
-  passing `tg://` schemes other than the user link.
+  passing `tg://` schemes other than the user link. A DM agent can no longer
+  read other chats' history.
 
 ### Phase 1: assistants in the mailbox (polygram 0.51.0, MINOR)
 
@@ -465,6 +523,8 @@ Each phase ships on its own. Fixes are PATCH, features MINOR.
   - section 6's card rules;
   - `identify` for assistants;
   - `mailbox_submit` to assistants (with `role` and the membership check);
+  - the go card for a tell to a non-member's assistant (section 3a) and
+    migration `030` (`approved_by`);
   - Codex send-only, if the spike passes.
 - **Preconditions before the config goes live (Ivan's go):**
   - **Codex spike.** It runs in Ivan's DM; see section 7.
@@ -584,8 +644,18 @@ phases 0 to 2 has to change for it.
   - refused without `role`, for a non-member, with `origin`, or to the Codex
     DM;
   - the delivered turn is tainted.
-- **Privileged scripts:** `apply.js` refuses a tainted turn's token and an
-  assistant token for another person.
+- **Go card (section 3a):**
+  - a management role's tell to Mai's assistant waits, posts the card in the
+    role's topic, and returns `awaiting-go`;
+  - an ask in that direction is refused;
+  - Send pressed by Mai or a non-member is refused;
+  - Send pressed by Ivan or Dina stores the row with `approved_by` and
+    delivers it;
+  - Drop discards;
+  - a go expires after 24 hours, a restart forgets it, and the cap of 5 per
+    role holds.
+- **Privileged scripts** (shumabit-claude): `apply.js` refuses a tainted turn's
+  token and an assistant token for another person.
 
 **agent-org, phase 2:**
 
@@ -639,24 +709,16 @@ phases 0 to 2 has to change for it.
   (`UNIVERSAL_MAILBOX_SPEC.md`). Ending an assistant's grant with its turn is
   simpler and covers wakeups and copied tokens too.
 
-## Open questions
+## Decisions by Ivan (2026-11-24)
 
-1. **Rule 1 versus "the person is not in the group".** Ivan listed "not in the
-   group" as a reason to use the assistant, but rule 1 forbids a role and a
-   non-member's assistant from talking. The spec follows rule 1: management
-   roles reach Mai, Linh, Nastya or Sasha through cmo. Confirm, or name the
-   exception.
-2. **Assistants answer only with their person's say-so.** The spec lets an
-   assistant reply to a role or another assistant only in a turn its person
-   started. This closes injected replies and leaks of management or private
-   data through a member's assistant, but an assistant never answers on its
-   own. The alternative, autonomous answers about work facts, would rely on
-   prompt rules for privacy. Confirm the stricter default.
-3. **History is readable across chats today.** This is pre-existing and not
-   caused by this design. Every shumabit chat shares one cwd, so the `history`
-   skill lets any DM agent read every other DM and every group. Fix it before
-   phase 1, as a separate PATCH (scope reads to the caller's own chat, or give
-   each DM its own cwd)? Recommended: yes.
+1. **People outside a role's group.** Their assistants can never give a
+   management role a task, ask it anything, or tell it anything. A management
+   role may send such an assistant a one-way confirmation (a `tell`) only after
+   Ivan's or Dina's go for that message (section 3a).
+2. **Assistants answer only with their person's say-so.** Confirmed as the
+   default (section 3).
+3. **The history-skill leak** is fixed in a separate PR and ships with phase 0
+   (0.50.3).
 
 ## Review log
 
@@ -696,14 +758,14 @@ phases 0 to 2 has to change for it.
   - taint is cleared at dispatch under the intent lock;
   - boot taints every assistant;
   - an assistant's grant ends with its turn;
-  - assistants reply only in their person's turn (open question 2);
+  - assistants reply only in their person's turn (Ivan's decision 2);
   - group-topic cards are header-only for assistant traffic;
   - script-backed person privileges check `identify` (phase 1 precondition);
   - `final()` submits carry `role`, and polygram checks the person's membership
     against it;
   - the HTML path filters link targets like the rich path;
   - the "Not enforced" section states the pre-existing gaps, including the
-    shared-cwd history read (open question 3);
+    shared-cwd history read (Ivan's decision 3);
   - assistants restate the exact action before any paid step.
 
 ### Declined, with reasons
