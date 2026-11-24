@@ -231,6 +231,27 @@ describe('history skill: the daemon binds every read to the calling session', ()
     assert.throws(() => svc.query(token, { sub: 'recent', chatId: MEMBER_DM }), /only its own chat/);
   });
 
+  test('a job turn in the admin chat gets own-chat reach only, and its send demotes the admin\'s earlier commands', () => {
+    // Any same-user process can submit an external job or mailbox message into
+    // the admin chat, so a job-started turn must not carry the admin tier.
+    const tokenOf = (block) => /"([0-9a-f-]{36})"/.exec(block)[1];
+    const humanBlock = service.instructions(OPERATOR_DM);
+    const human = tokenOf(humanBlock);
+    const job = { routeId: 'session:1001', requestId: 'external:probe-1', target: { sessionKey: OPERATOR_DM } };
+    const jobBlock = service.instructions(OPERATOR_DM, job);
+    const jobToken = tokenOf(jobBlock);
+    assert.doesNotMatch(jobBlock, /--chat/, 'a job prompt does not advertise admin reach');
+    assert.throws(() => service.query(jobToken, { sub: 'search', query: 'memberown', chatId: 'all' }), /only its own chat/);
+    assert.equal(service.query(jobToken, { sub: 'recent' }).rows.length, 1, 'the job turn still reads its own chat');
+    // Deferred, the job has not reached the session: the human turn keeps admin.
+    assert.equal(service.query(human, { sub: 'recent', chatId: MEMBER_DM }).rows.length, 1);
+    service.noteJobSend(job);
+    assert.throws(() => service.query(human, { sub: 'recent', chatId: MEMBER_DM }), /only its own chat/,
+      'once the job prompt is sent, an older command in the session context no longer reaches other chats');
+    const next = tokenOf(service.instructions(OPERATOR_DM));
+    assert.equal(service.query(next, { sub: 'recent', chatId: MEMBER_DM }).rows.length, 1, 'the next human prompt brings admin reach back');
+  });
+
   test('a group set as adminChatId grants no cross-chat read to its sessions', () => {
     const svc = createHistoryServiceFor({ ...config, bot: { adminChatId: Number(FORUM) } });
     assert.throws(() => svc.query(svc.scope(FORUM), { sub: 'recent', chatId: MEMBER_DM }), /only its own chat/);
