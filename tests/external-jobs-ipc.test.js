@@ -19,7 +19,7 @@ test('public external-job operations remove transport metadata and expose no dom
 
 test('disabled external jobs advertise incompatibility without accepting work', async () => {
   const handlers = createIpcHandlers();
-  assert.deepEqual(await handlers.external_jobs_info({}), { protocolVersion: 1, enabled: false, supportedBackends: ['cli'] });
+  assert.deepEqual(await handlers.external_jobs_info({}), { protocolVersion: 1, enabled: false, supportedBackends: ['cli', 'codex'] });
   await assert.rejects(async () => handlers.external_job_submit({}), /not enabled/);
 });
 

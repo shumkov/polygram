@@ -243,6 +243,20 @@ directories. Both are removed at exit, together with the sessions'
 `~/.claude/projects` entries. Run it before deploying mailbox changes and on
 every pin bump. See `docs/session-mailbox-spec.md`.
 
+`codex-mailbox.mjs` runs one session on the pinned Codex binary under
+Orchestra's `CodexProcess`, provisioned with polygram's production profile
+(`polygram-trusted`, `inherit = "none"`, the IPC directory as a daemon-secret
+root), against the real mailbox, external-jobs runtime and IPC over a temp
+SQLite DB; the other session is a recording stand-in. The model is a loopback
+Responses provider with a synthetic key (no credentials, no model call) that
+scripts code-mode `exec_command` calls with the exact injected `msg.js`
+command. It checks `directory` and an ask from a Codex turn, a reply and an
+ask running as Codex job turns (Codex replying with the job's command), a job
+deferring while a Codex turn runs, and a superseded command being refused.
+Pass `--binary <pinned codex>` and `--probe-root <non-temporary dir>`. Run it
+before deploying mailbox changes and on every Codex pin bump. See
+`docs/CODEX_MAILBOX_SPEC.md`.
+
 `clean-restart-resume.mjs` is the opt-in, authenticated gate for the
 clean-restart resume-plus-`continue` rollout. It verifies the exact installed
 Orchestra contract, retires a live eight-step CLI turn after step five, strictly

@@ -1,7 +1,7 @@
 'use strict';
 // Universal addresses inside one bot: in an `intra: "open"` bot every Claude
-// CLI session can message every other one by a readable alias, with no
-// configured role or route. A bot with roles keeps today's rules exactly.
+// CLI or Codex session can message every other one by a readable alias, with
+// no configured role or route. A bot with roles keeps today's rules exactly.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { freshDb, cleanupDb } = require('./helpers/db-fixture');
@@ -36,14 +36,16 @@ function homeConfig(mailbox = {}) {
   };
 }
 const backendOf = ({ chatId, threadId }) => (chatId === HOME && String(threadId) === '5' ? 'codex' : 'cli');
+// The same bot with its Ops group on the SDK backend.
+const sdkGroupBackendOf = (where) => (where.chatId === GROUP ? 'sdk' : backendOf(where));
 
-function fixture(t, { config = homeConfig(), posts = null } = {}) {
+function fixture(t, { config = homeConfig(), posts = null, backends = backendOf } = {}) {
   const { db, dbPath } = freshDb('mailbox-universal');
-  const resolveTarget = createExternalJobTargetResolver({ config, getSessionKey, resolveBackend: backendOf });
+  const resolveTarget = createExternalJobTargetResolver({ config, getSessionKey, resolveBackend: backends });
   const jobs = createExternalJobService({ config, db, botName: 'shumorobot', resolveTarget,
     dispatch: async () => ({ outcome: 'succeeded', inactive: true }), deliverPart: async () => ({}), logger: { error() {} } });
   const tg = posts ? async (_bot, method, params) => { posts.push({ method, params }); return { message_id: posts.length }; } : null;
-  const service = createMailboxService({ config, db, botName: 'shumorobot', jobs, resolveTarget, resolveBackend: backendOf, getSessionKey,
+  const service = createMailboxService({ config, db, botName: 'shumorobot', jobs, resolveTarget, resolveBackend: backends, getSessionKey,
     tg, bot: {}, sendRich: async () => ({ wentRich: false, fallback: 'unsupported' }),
     logger: { error() {}, warn() {} } });
   t.after(() => { service.stop(); jobs.stop(); cleanupDb(dbPath, db); });
@@ -54,10 +56,10 @@ function fixture(t, { config = homeConfig(), posts = null } = {}) {
 }
 const coded = (code) => (error) => error?.code === code;
 
-test('an open bot gives every Claude CLI session a grant, and Codex sessions none', (t) => {
+test('an open bot gives every Claude CLI and Codex session a grant, with the command in its prompt', (t) => {
   const f = fixture(t);
-  for (const key of [GENERAL, MUSIC, ADMIN, UNNAMED]) assert.match(f.service.scope(key), /^[0-9a-f-]{36}$/, key);
-  assert.equal(f.service.scope(CODEX), null, 'a Codex session cannot receive its replies yet, so it gets no grant');
+  for (const key of [GENERAL, MUSIC, ADMIN, UNNAMED, CODEX]) assert.match(f.service.scope(key), /^[0-9a-f-]{36}$/, key);
+  assert.match(f.service.instructions(CODEX), /msg\.js" "shumorobot" "[0-9a-f-]{36}" send/, 'a Codex session can send and reply, so its prompt carries the command');
   assert.equal(f.service.scope('-555'), null, 'an unconfigured chat is not a session of this bot');
   assert.equal(f.service.roleForSession(MUSIC), null, 'sessions are not roles, so stop and pause policy is unchanged');
 });
@@ -112,9 +114,23 @@ test('every session\'s label names only it, so a header never points at the wron
   assert.match(envelope.renderTask(f.row(fromGroup.id)), new RegExp(`from=session:${GROUP} `));
 });
 
-test('a Codex session is refused as a target until Codex can receive', (t) => {
+test('a Codex session receives like any other: an ask to it is a job on its implicit route, and it answers with its own grant', (t) => {
   const f = fixture(t);
-  assert.throws(() => f.service.send(f.human(GENERAL), { to: 'orchestra', kind: 'ask', body: 'x' }), coded('MAILBOX_BACKEND_UNSUPPORTED'));
+  const sent = f.service.send(f.human(GENERAL), { to: 'orchestra', kind: 'ask', body: 'What changed in Orchestra?' });
+  assert.deepEqual(sent, { id: sent.id, state: 'queued' });
+  assert.equal(f.row(sent.id).to_addr, `session:${CODEX}`);
+  assert.equal(f.job(`session:${CODEX}`, `mailbox:${sent.id}`).state, 'queued', 'delivered by the same external-job path as a Claude session');
+  const answer = f.service.reply(f.human(CODEX), { inReplyTo: sent.id, body: 'A new release.' });
+  assert.equal(f.row(answer.id).from_addr, `session:${CODEX}`);
+  assert.equal(f.row(answer.id).to_addr, `session:${GENERAL}`);
+  const asked = f.service.send(f.human(CODEX), { to: 'music', kind: 'ask', body: 'Anything new?' });
+  assert.equal(f.row(asked.id).from_addr, `session:${CODEX}`, 'a Codex session can start a conversation too');
+});
+
+test('an SDK session is still refused as a target, with a stable code', (t) => {
+  const f = fixture(t, { backends: sdkGroupBackendOf });
+  assert.equal(f.service.scope(GROUP), null, 'it cannot run the mailbox command, so it gets no grant');
+  assert.throws(() => f.service.send(f.human(GENERAL), { to: `session:${GROUP}`, kind: 'ask', body: 'x' }), coded('MAILBOX_BACKEND_UNSUPPORTED'));
   assert.equal(f.db.raw.prepare('SELECT count(*) n FROM mailbox_messages').get().n, 0);
 });
 
@@ -130,7 +146,7 @@ test('directory lists whom the caller may message, by the name to use, including
   const byAddress = Object.fromEntries(listed.targets.map((entry) => [entry.address, entry]));
   assert.equal(byAddress[`session:${GENERAL}`], undefined, 'the caller is not listed');
   assert.deepEqual(byAddress[`session:${MUSIC}`], { to: 'music', address: `session:${MUSIC}`, name: 'Shumabit@HOME / Music', canReceive: true });
-  assert.deepEqual(byAddress[`session:${CODEX}`], { to: 'orchestra', address: `session:${CODEX}`, name: 'Shumabit@HOME / Orchestra', canReceive: false });
+  assert.deepEqual(byAddress[`session:${CODEX}`], { to: 'orchestra', address: `session:${CODEX}`, name: 'Shumabit@HOME / Orchestra', canReceive: true });
   assert.equal(byAddress[`session:${OPS_TOPIC}`].to, 't40', 'an ambiguous alias gives way to one that names only this session');
   assert.equal(byAddress[`session:${GROUP}`].to, `session:${GROUP}`, 'with no unique alias left, the canonical address');
   assert.equal(byAddress[`session:${UNNAMED}`].to, 't3528');
@@ -193,6 +209,26 @@ function rolesConfig() {
   config.bot.externalJobs.routes.music = { chatId: HOME, threadId: '3' };
   return config;
 }
+
+test('roles bot: a role may run on Codex, and its deliveries travel on its configured route', (t) => {
+  const config = rolesConfig();
+  config.bot.mailbox.roles.orchestra = { about: 'Runs releases' };
+  config.bot.externalJobs.routes.orchestra = { chatId: HOME, threadId: '5' };
+  const f = fixture(t, { config });
+  assert.match(f.service.scope(CODEX), /^[0-9a-f-]{36}$/, 'a Codex role gets its grant like any role');
+  const sent = f.service.send(f.human(GENERAL), { to: 'orchestra', kind: 'ask', body: 'Ready to ship?' });
+  assert.equal(f.row(sent.id).route_id, 'orchestra');
+  assert.equal(f.row(sent.id).to_addr, 'role:orchestra');
+});
+
+test('roles bot: a role on an SDK session still fails boot', () => {
+  const config = rolesConfig();
+  config.bot.mailbox.roles.ops = { about: 'Ops' };
+  config.bot.externalJobs.routes.ops = { chatId: GROUP };
+  const resolveTarget = createExternalJobTargetResolver({ config, getSessionKey, resolveBackend: sdkGroupBackendOf });
+  assert.throws(() => createMailboxService({ config, db: null, botName: 'shumorobot', jobs: {}, resolveTarget, resolveBackend: sdkGroupBackendOf, getSessionKey }),
+    /Mailbox role ops: External jobs require the Claude CLI or Codex backend/);
+});
 
 test('roles bot: other sessions get no grant, and roles cannot reach them', (t) => {
   const f = fixture(t, { config: rolesConfig() });

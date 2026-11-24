@@ -4587,10 +4587,18 @@ async function main() {
     resolveBackend: ({ chatId, threadId }) => resolvePromptBackend({ config, chatId, threadId }),
     isPaused: (sessionKey) => externalJobService.isPaused(sessionKey),
     isShuttingDown: () => isShuttingDown,
-    needsAuth: () => needsNativeClaudeAuth(config.bot, 'cli'),
+    needsAuth: (backend) => needsNativeClaudeAuth(config.bot, backend),
     checkAuth: checkClaudeAuthHealth,
     awaitSessionRecovery: (sessionKey) => cleanReplaySessionCoordinator.wait(sessionKey, null),
-    getOrSpawnForChat, sendToProcess, logger: console,
+    // A Codex job turn has no Telegram reply to finalize, so the runtime
+    // settles its ledger attempt directly once the turn resolves.
+    settleResult: (sessionKey, result, disposition) => {
+      if (!codexRuntimeController) {
+        throw Object.assign(new Error('A Codex result cannot be settled without its runtime controller'), { code: 'CODEX_DELIVERY_CONTROLLER_MISSING' });
+      }
+      return codexRuntimeController.settleTelegramDelivery(sessionKey, result, { disposition });
+    },
+    getOrSpawnForChat, sendToProcess, logEvent, logger: console,
   });
   externalJobService = createExternalJobService({
     config, db, botName: BOT_NAME, resolveTarget: resolveExternalTarget,
@@ -4607,8 +4615,15 @@ async function main() {
     prepareReport,
     deliverPart: createReportDelivery({ bot, tg, botName: BOT_NAME }),
   });
+  // A notification consumer's tool command does not carry the IPC directory,
+  // which a Codex shell needs, so its destinations stay Claude CLI only and a
+  // Codex consumer fails loudly at boot instead of failing every tool call.
   notificationService = createNotificationService({
-    config, db, botName: BOT_NAME, jobs: externalJobService, resolveTarget: resolveExternalTarget, bot, tg,
+    config, db, botName: BOT_NAME, jobs: externalJobService, bot, tg,
+    resolveTarget: createExternalJobTargetResolver({
+      config, getSessionKey, backends: ['cli'],
+      resolveBackend: ({ chatId, threadId }) => resolvePromptBackend({ config, chatId, threadId }),
+    }),
   });
   mailboxService = createMailboxService({
     config, db, botName: BOT_NAME, jobs: externalJobService, resolveTarget: resolveExternalTarget, bot, tg,
