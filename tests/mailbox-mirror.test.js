@@ -11,6 +11,12 @@ const { createRichSender } = require('../lib/telegram/rich-send');
 const routes = { orchestrator: { chatId: '-1001', threadId: '11' }, marketing: { chatId: '-1001', threadId: '12' } };
 const session = (role) => `${routes[role].chatId}:${routes[role].threadId}`;
 const resolveTarget = (route) => ({ chatId: route.chatId, threadId: route.threadId, sessionKey: `${route.chatId}:${route.threadId}` });
+// Session names open their topics; t.me/c drops the chat's -100 prefix.
+const ORCH = '<a href="https://t.me/c/1/11">orchestrator</a>';
+const MKT = '<a href="https://t.me/c/1/12">marketing</a>';
+// The links to a proven card: the twin of a sender copy, the question of an answer.
+const OPEN = (thread, id) => ` · <a href="https://t.me/c/1/${thread}/${id}">↗ open</a>`;
+const QUESTION = (thread, id) => ` · <a href="https://t.me/c/1/${thread}/${id}">↗ question</a>`;
 const settle = async () => { for (let n = 0; n < 10; n++) await new Promise(setImmediate); };
 
 function fixture(t, { mirror, send, turn, jobs: jobSettings = {}, systemSenders, rich = false } = {}) {
@@ -29,7 +35,9 @@ function fixture(t, { mirror, send, turn, jobs: jobSettings = {}, systemSenders,
   const tg = async (b, method, params, meta) => {
     assert.equal(b, bot);
     posts.push({ method, params, meta, committed: db.raw.prepare('SELECT count(*) n FROM external_jobs').get().n });
-    return (send || (async () => ({ message_id: posts.length })))(params);
+    // The receipt echoes the destination, as the Bot API does.
+    return (send || (async () => ({ message_id: posts.length, chat: { id: Number(params.chat_id) },
+      ...(params.message_thread_id == null ? {} : { message_thread_id: Number(params.message_thread_id) }) })))(params);
   };
   const sendRich = rich ? createRichSender({ tg, botName: 'test', insertSentRow: (row) => db.insertMessage(row) }) : undefined;
   f.mailbox = createMailboxService({ config, db, botName: 'test', jobs, resolveTarget, bot, tg, sendRich, logger: { error: (m) => errors.push(m), warn() {} } });
@@ -52,13 +60,15 @@ test('mailbox mirrors expose raw prompt lines instead of one collapsed details c
     assert.equal(post.params.message_thread_id, i ? '11' : '12');
     assert.equal(post.meta.strictDestination, true);
     assert.deepEqual(post.params.rich_message.blocks, [{ type: 'blockquote', blocks: [
-      { type: 'paragraph', text: ['❓ ', { type: 'bold', text: 'Question' }, ' · orchestrator → marketing'] },
+      { type: 'paragraph', text: ['❓ ', { type: 'bold', text: 'Question' }, ' · ', { type: 'url', text: 'orchestrator', url: 'https://t.me/c/1/11' },
+        ' → ', { type: 'url', text: 'marketing', url: 'https://t.me/c/1/12' },
+        ...(i ? [' · ', { type: 'url', text: '↗ open', url: 'https://t.me/c/1/12/1' }] : [])] },
       { type: 'details', summary: 'Step B › Sub prices', is_open: false, blocks: [{ type: 'paragraph', text: body }] },
     ] }]);
   }
   const rows = f.db.raw.prepare('SELECT text, source FROM messages').all();
   assert.equal(rows.length, 2);
-  for (const row of rows) { assert.match(row.text, /Question.*orchestrator → marketing/); assert.ok(row.text.replace(/\n> /g, '\n').includes(body)); }
+  for (const row of rows) { assert.match(row.text, /Question · \[orchestrator\]\(https:\/\/t\.me\/c\/1\/11\) → \[marketing\]/); assert.ok(row.text.replace(/\n> /g, '\n').includes(body)); }
 });
 
 test('rich mailbox content rejection sends one HTML fallback with the full stored body', async (t) => {
@@ -66,7 +76,7 @@ test('rich mailbox content rejection sends one HTML fallback with the full store
   f.mailbox.send(f.token('orchestrator'), { to: 'marketing', kind: 'tell', body: 'Text <&>' });
   await settle();
   assert.deepEqual(f.posts.map((p) => p.method), ['sendRichMessage', 'sendMessage']);
-  assert.equal(f.posts[1].params.text, '📨 <b>orchestrator → marketing</b>\n<blockquote expandable>Text &lt;&amp;&gt;</blockquote>');
+  assert.equal(f.posts[1].params.text, `📨 <b>${ORCH} → ${MKT}</b>\n<blockquote expandable>Text &lt;&amp;&gt;</blockquote>`);
   assert.equal(f.posts[1].meta.strictDestination, true);
 });
 
@@ -85,7 +95,7 @@ test('each message is mirrored once, as an HTML card, into the target topic afte
   assert.equal(f.posts.length, 1);
   const [post] = f.posts;
   assert.equal(post.method, 'sendMessage');
-  assert.deepEqual(post.params, { chat_id: '-1001', message_thread_id: '12', parse_mode: 'HTML', text: '❓ <b>orchestrator asks marketing</b>\n<blockquote expandable>What is the Q3 budget?</blockquote>' });
+  assert.deepEqual(post.params, { chat_id: '-1001', message_thread_id: '12', parse_mode: 'HTML', text: `❓ <b>${ORCH} asks ${MKT}</b>\n<blockquote expandable>What is the Q3 budget?</blockquote>` });
   assert.notEqual(post.meta.plainText, true); assert.equal(post.meta.strictDestination, true);
   assert.equal(post.meta.source, 'mailbox-mirror'); assert.equal(post.meta.sessionKey, session('marketing'));
   assert.equal(post.committed, 1, 'the post happens only after the row and its job are committed');
@@ -100,8 +110,8 @@ test('a reply is mirrored into the asker topic; duplicates and refusals are not 
   const answer = f.mailbox.reply(f.mailbox.scope(session('marketing')), { inReplyTo: question.id, body: 'A' });
   await settle();
   assert.deepEqual(f.posts.map((post) => [post.params.message_thread_id, post.params.text]), [
-    ['12', '❓ <b>orchestrator asks marketing</b>\n<blockquote expandable>Q</blockquote>'],
-    ['11', '↩️ <b>marketing answered orchestrator</b>\n<blockquote expandable>A</blockquote>'],
+    ['12', `❓ <b>${ORCH} asks ${MKT}</b>\n<blockquote expandable>Q</blockquote>`],
+    ['11', `↩️ <b>${MKT} answered ${ORCH}</b>${QUESTION(12, 1)}\n<blockquote expandable>A</blockquote>`],
   ]);
 });
 
@@ -165,8 +175,8 @@ test('mirror "both" also posts a sender line into the sender topic, after the ta
   const sent = f.mailbox.send(f.token('orchestrator'), { to: 'marketing', kind: 'ask', body: 'What is the Q3 budget?' });
   await settle();
   assert.deepEqual(f.posts.map((post) => post.params), [
-    { chat_id: '-1001', message_thread_id: '12', parse_mode: 'HTML', text: '❓ <b>orchestrator asks marketing</b>\n<blockquote expandable>What is the Q3 budget?</blockquote>' },
-    { chat_id: '-1001', message_thread_id: '11', parse_mode: 'HTML', text: '❓ <b>orchestrator asks marketing</b>\n<blockquote expandable>What is the Q3 budget?</blockquote>' },
+    { chat_id: '-1001', message_thread_id: '12', parse_mode: 'HTML', text: `❓ <b>${ORCH} asks ${MKT}</b>\n<blockquote expandable>What is the Q3 budget?</blockquote>` },
+    { chat_id: '-1001', message_thread_id: '11', parse_mode: 'HTML', text: `❓ <b>${ORCH} asks ${MKT}</b>${OPEN(12, 1)}\n<blockquote expandable>What is the Q3 budget?</blockquote>` },
   ]);
   const sender = f.posts[1];
   assert.notEqual(sender.meta.plainText, true); assert.equal(sender.meta.strictDestination, true);
@@ -184,12 +194,12 @@ test('mirror "both" mirrors a reply into both topics; duplicates are not mirrore
   const answer = f.mailbox.reply(f.mailbox.scope(session('marketing')), { inReplyTo: ask.id, body: 'A' });
   await settle();
   assert.deepEqual(f.posts.map((post) => [post.params.message_thread_id, post.params.text]), [
-    ['12', '📨 <b>orchestrator → marketing</b>\n<blockquote expandable>Q</blockquote>'],
-    ['11', '📨 <b>orchestrator → marketing</b>\n<blockquote expandable>Q</blockquote>'],
-    ['12', '❓ <b>orchestrator asks marketing</b>\n<blockquote expandable>Budget?</blockquote>'],
-    ['11', '❓ <b>orchestrator asks marketing</b>\n<blockquote expandable>Budget?</blockquote>'],
-    ['11', '↩️ <b>marketing answered orchestrator</b>\n<blockquote expandable>A</blockquote>'],
-    ['12', '↩️ <b>marketing answered orchestrator</b>\n<blockquote expandable>A</blockquote>'],
+    ['12', `📨 <b>${ORCH} → ${MKT}</b>\n<blockquote expandable>Q</blockquote>`],
+    ['11', `📨 <b>${ORCH} → ${MKT}</b>${OPEN(12, 1)}\n<blockquote expandable>Q</blockquote>`],
+    ['12', `❓ <b>${ORCH} asks ${MKT}</b>\n<blockquote expandable>Budget?</blockquote>`],
+    ['11', `❓ <b>${ORCH} asks ${MKT}</b>${OPEN(12, 3)}\n<blockquote expandable>Budget?</blockquote>`],
+    ['11', `↩️ <b>${MKT} answered ${ORCH}</b>${QUESTION(12, 3)}\n<blockquote expandable>A</blockquote>`],
+    ['12', `↩️ <b>${MKT} answered ${ORCH}</b>${OPEN(11, 5)}\n<blockquote expandable>A</blockquote>`],
   ]);
 });
 
@@ -207,7 +217,7 @@ test('a system sender has no topic, so "both" posts only the target mirror', asy
   const sent = f.mailbox.submit({ sender: 'agent-org', to: 'marketing', body: 'Task 42 is yours', key: 'k1' });
   await settle();
   assert.deepEqual(f.posts.map((post) => [post.params.message_thread_id, post.params.text]), [
-    ['12', '📨 <b>agent-org → marketing</b>\n<blockquote expandable>Task 42 is yours</blockquote>'],
+    ['12', `📨 <b>agent-org → ${MKT}</b>\n<blockquote expandable>Task 42 is yours</blockquote>`],
   ]);
 });
 
@@ -221,7 +231,8 @@ test('the sender HTML fallback carries the same redacted body as the target', as
   const sender = f.posts[1].params.text.split('\n').slice(1).join('\n');
   assert.doesNotMatch(sender, /AKIAABCDEFGHIJKLMNOP/, 'the sender line is cut from the redacted text');
   assert.equal(sender, `<blockquote expandable>${target}</blockquote>`);
-  assert.equal(f.posts[0].params.text, f.posts[1].params.text);
+  const [targetHeader] = f.posts[0].params.text.split('\n');
+  assert.equal(f.posts[1].params.text.split('\n')[0], `${targetHeader}${OPEN(12, 1)}`, 'the copy adds only its twin link');
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(sender), 'no emoji is split in half');
 });
 
@@ -265,7 +276,7 @@ test('a relayed human origin appears on the system tell card and its body remain
   f.mailbox.submit({ sender: 'agent-org', to: 'marketing', body: 'Use AKIAABCDEFGHIJKLMNOP', key: 'human', origin: { kind: 'human', name: 'Ivan' } });
   await settle();
   assert.equal(f.posts.length, 1);
-  assert.match(f.posts[0].params.text, /^📨 <b>agent-org → marketing · from Ivan<\/b>/);
+  assert.ok(f.posts[0].params.text.startsWith(`📨 <b>agent-org → ${MKT} · from Ivan</b>`));
   assert.doesNotMatch(f.posts[0].params.text, /AKIAABCDEFGHIJKLMNOP/);
 });
 

@@ -33,15 +33,59 @@ test('migrations 025 through 027 add idempotency, origin and summary columns', (
   assert.deepEqual(columns.slice(12, 16), ['idem_key', 'ref', 'origin_name', 'summary']);
 });
 
-test('migration 028 adds display labels for session addresses and bumps the schema version', (t) => {
+test('migration 028 adds display labels for session addresses', (t) => {
   const { db, store } = fixture(t);
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 28);
   const columns = db.raw.prepare('PRAGMA table_info(mailbox_messages)').all().map((c) => c.name);
-  assert.deepEqual(columns.slice(16), ['from_label', 'to_label']);
+  assert.deepEqual(columns.slice(16, 18), ['from_label', 'to_label']);
   store.insert(message({ id: 'm_s', from: 'session:-1:3', to: 'session:-1', routeId: 'session:-1', fromLabel: 'music', toLabel: 'general' }));
   assert.deepEqual([store.get('m_s').from_label, store.get('m_s').to_label], ['music', 'general']);
   store.insert(message({ id: 'm_r' }));
   assert.deepEqual([store.get('m_r').from_label, store.get('m_r').to_label], [null, null], 'a row without labels renders as before');
+});
+
+// Later cards link to the target card, and a system sender's jump link is
+// kept only once proven; rows from before either feature have neither.
+test('migration 029 records the target card and a proven link, and bumps the schema version', (t) => {
+  const { db, store } = fixture(t);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 29);
+  const columns = db.raw.prepare('PRAGMA table_info(mailbox_messages)').all().map((c) => c.name);
+  assert.deepEqual(columns.slice(18), ['target_card', 'link']);
+  store.insert(message({ id: 'm_l', link: 'https://t.me/c/1/2/3' }));
+  assert.deepEqual([store.get('m_l').target_card, store.get('m_l').link], [null, 'https://t.me/c/1/2/3']);
+  store.setTargetCard('m_l', 'https://t.me/c/1/12/99');
+  assert.equal(store.get('m_l').target_card, 'https://t.me/c/1/12/99');
+  store.insert(message({ id: 'm_n' }));
+  assert.deepEqual([store.get('m_n').target_card, store.get('m_n').link], [null, null], 'a row without links renders as before');
+});
+
+test('sentBy proves only a message this bot sent for that source, in that exact place', (t) => {
+  const { db, store } = fixture(t);
+  const sent = (over) => db.insertMessage({ chat_id: '-1001', thread_id: '12', msg_id: 5, direction: 'out', status: 'sent', source: 'agent-org', bot_name: 'test', ts: 1, ...over });
+  sent({});
+  sent({ msg_id: 6, status: 'failed' });
+  sent({ msg_id: 7, direction: 'in' });
+  sent({ msg_id: 8, bot_name: 'other' });
+  sent({ msg_id: 9, thread_id: null });
+  const at = (messageId, threadId = '12', chatId = '-1001') => ({ chatId, threadId, messageId });
+  assert.equal(store.sentBy('agent-org', at(5)), true);
+  assert.equal(store.sentBy('ipc', at(5)), false, 'another source');
+  assert.equal(store.sentBy('agent-org', at(5, '11')), false, 'another thread');
+  assert.equal(store.sentBy('agent-org', at(5, null)), false, 'General is not the topic');
+  assert.equal(store.sentBy('agent-org', at(5, '12', '-1002')), false, 'another chat');
+  assert.equal(store.sentBy('agent-org', at(9, null)), true, 'a General message');
+  for (const id of [6, 7, 8, 10]) assert.equal(store.sentBy('agent-org', at(id)), false, String(id));
+});
+
+test('a version 28 database upgrades with its messages intact and no card or link', (t) => {
+  const { dbPath, legacy } = legacyDb(28);
+  legacy.prepare(`INSERT INTO mailbox_messages(id,bot_name,kind,from_addr,to_addr,route_id,body,depth,body_hash,created_at,from_label)
+    VALUES ('m_28','test','ask','session:-1:3','role:b','b','x',1,'h',1,'music')`).run();
+  legacy.close();
+  const db = open(dbPath);
+  t.after(() => cleanupDb(dbPath, db));
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 29);
+  const row = createMailboxStore(db.raw, { botName: 'test' }).get('m_28');
+  assert.deepEqual([row.body, row.from_label, row.target_card, row.link], ['x', 'music', null, null]);
 });
 
 test('a version 27 database upgrades with its messages intact and no labels', (t) => {
@@ -51,7 +95,7 @@ test('a version 27 database upgrades with its messages intact and no labels', (t
   legacy.close();
   const db = open(dbPath);
   t.after(() => cleanupDb(dbPath, db));
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 28);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 29);
   const row = createMailboxStore(db.raw, { botName: 'test' }).get('m_27');
   assert.deepEqual([row.summary, row.from_label, row.to_label], ['Sum', null, null]);
 });
@@ -77,7 +121,7 @@ test('a database at version 24 upgrades to the current schema and keeps its mess
   legacy.close();
   const db = open(dbPath);
   t.after(() => cleanupDb(dbPath, db));
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 28);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 29);
   const row = createMailboxStore(db.raw, { botName: 'test' }).get('m_old');
   assert.equal(row.body, 'x');
   assert.equal(row.idem_key, null);
@@ -94,7 +138,7 @@ test('a database at version 25 upgrades to the current schema and keeps its syst
   legacy.close();
   const db = open(dbPath);
   t.after(() => cleanupDb(dbPath, db));
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 28);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 29);
   const row = createMailboxStore(db.raw, { botName: 'test' }).findByKey('system:agent-org', 'task:1');
   assert.deepEqual({ id: row.id, depth: row.depth, idem_key: row.idem_key, origin_name: row.origin_name }, { id: 'm_sys', depth: 1, idem_key: 'task:1', origin_name: null });
 });
@@ -122,7 +166,7 @@ test('a version 26 database keeps its origin and legacy hash with a NULL summary
   assert.equal(row.origin_name, 'Ivan');
   assert.equal(row.body_hash, 'legacy-hash');
   assert.equal(row.summary, null);
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 28);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 29);
 });
 
 test('a message is found by its sender and key, scoped to the bot', (t) => {
@@ -143,7 +187,7 @@ test('a stored message reads back with every field', (t) => {
   assert.deepEqual(store.get('m_0000000000000001'), {
     id: 'm_0000000000000001', bot_name: 'test', kind: 'ask', from_addr: 'role:orchestrator', to_addr: 'role:marketing',
     route_id: 'marketing', body: 'What is the campaign budget?', in_reply_to: null, depth: 1, body_hash: 'h1', notice_sent: 0, created_at: now(),
-    idem_key: null, ref: null, origin_name: null, summary: null, from_label: null, to_label: null,
+    idem_key: null, ref: null, origin_name: null, summary: null, from_label: null, to_label: null, target_card: null, link: null,
   });
   assert.equal(store.get('m_missing'), null);
 });
