@@ -11,11 +11,11 @@ A bot runs in one of two modes (`intra`):
 
 - **`roles`** (today's organization): only configured role sessions take part,
   and each starts messages only to the roles on its allowlist.
-- **`open`**: every Claude CLI session of the bot has an address and may ask
-  or tell any other, with no role or route to configure.
+- **`open`**: every Claude CLI or Codex session of the bot has an address and
+  may ask or tell any other, with no role or route to configure.
 
-Messages stay inside one bot on one host, and only Claude CLI sessions can
-receive them.
+Messages stay inside one bot on one host. Claude CLI and Codex sessions send,
+receive and reply alike; SDK sessions cannot take part.
 
 ## Requirements
 
@@ -24,7 +24,7 @@ receive them.
 
 In a `roles` bot, also:
 
-- Each role is an existing session on the CLI backend: a non-forum chat, an
+- Each role is an existing session on the Claude CLI or Codex backend: a non-forum chat, an
   isolated topic (`isolateTopics: true`), or a forum's General topic. Topics
   in groups that run with `isolateTopics: false` don't qualify; give the
   organization its own forum group.
@@ -105,8 +105,16 @@ so renaming a topic never redirects a message already sent. Trusted headers
 and mirror cards show the name the session had when the message was sent
 (`from_label`, `to_label`), never the raw session key.
 
-A session that can only receive later (Codex, SDK) has an address, gets no
-command, and a send to it is refused with `MAILBOX_BACKEND_UNSUPPORTED`.
+An SDK session has an address, gets no command, and a send to it is refused
+with `MAILBOX_BACKEND_UNSUPPORTED`.
+
+A Codex session takes a delivery only when its process is idle, as a Claude
+session does, and its final text is the job report. A delivery spawns the
+session's Codex process if needed, which holds the daemon's single Codex
+generation as a human message would; while another Codex session holds it,
+the delivery waits. After `/stop` kills a Codex process, the next delivery
+still runs: polygram proves the session idle without a process. Design:
+[`CODEX_MAILBOX_SPEC.md`](./CODEX_MAILBOX_SPEC.md).
 
 A delivery to a session that is not a role travels on an implicit external-job
 route whose id is its address, `session:<sessionKey>`. Configured route ids may
@@ -387,7 +395,7 @@ contract and do not change:
 | `MAILBOX_INVALID_ORIGIN` | `origin` is not exactly `{kind:"human", name}` with a name of 1 to 64 characters and no control characters. | No. |
 | `MAILBOX_UNKNOWN_ADDRESS` | In an open bot, `to` names no session; in any bot, a name that matches several sessions (the candidates are listed). A roles bot keeps `MAILBOX_UNKNOWN_ROLE` for a name that matches nothing. | No. |
 | `MAILBOX_NOT_ALLOWED` | The allowlist or the bot's mode refuses this start, the command was replaced by a newer prompt, or the grant has seen foreign content. | No; use the current turn's command. |
-| `MAILBOX_BACKEND_UNSUPPORTED` | The target cannot receive yet (Codex, SDK). | No. |
+| `MAILBOX_BACKEND_UNSUPPORTED` | The target cannot receive (an SDK session). | No. |
 
 A refusal from the external-jobs queue keeps its own code, for example
 `EXTERNAL_JOB_QUEUE_FULL` (retry later) or `EXTERNAL_JOB_ROUTE_UNAVAILABLE`.

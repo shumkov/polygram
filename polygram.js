@@ -4587,9 +4587,17 @@ async function main() {
     resolveBackend: ({ chatId, threadId }) => resolvePromptBackend({ config, chatId, threadId }),
     isPaused: (sessionKey) => externalJobService.isPaused(sessionKey),
     isShuttingDown: () => isShuttingDown,
-    needsAuth: () => needsNativeClaudeAuth(config.bot, 'cli'),
+    needsAuth: (backend) => needsNativeClaudeAuth(config.bot, backend),
     checkAuth: checkClaudeAuthHealth,
     awaitSessionRecovery: (sessionKey) => cleanReplaySessionCoordinator.wait(sessionKey, null),
+    // A Codex job turn has no Telegram reply to finalize, so the runtime
+    // settles its ledger attempt directly once the turn resolves.
+    settleResult: (sessionKey, result, disposition) => {
+      if (!codexRuntimeController) {
+        throw Object.assign(new Error('Codex runtime controller is unavailable'), { code: 'CODEX_RUNTIME_UNAVAILABLE' });
+      }
+      return codexRuntimeController.settleTelegramDelivery(sessionKey, result, { disposition });
+    },
     getOrSpawnForChat, sendToProcess, logger: console,
   });
   externalJobService = createExternalJobService({

@@ -19,7 +19,11 @@ the forum's General topic. General is the session polygram keys by the bare
 chat id, and its reports post without `message_thread_id`. The flag must be
 exactly `true`, and a route may not combine it with a `threadId`. In a forum
 without `isolateTopics`, every topic shares that session, but `/automation`
-only works when sent in General. Version 1 dispatch supports Claude CLI only.
+only works when sent in General. Version 1 dispatch supports the Claude CLI and
+Codex backends; a Codex destination is admitted only while its process is idle
+(or proven idle with no process), and its final text is the report. Mailbox
+deliveries are the tested Codex use; a notification consumer on Codex is not
+supported yet.
 Route names and request IDs are nonempty bounded strings; request IDs must be
 stable across transport retries. The `mailbox:` and `mailbox-notice:` request
 ID prefixes are reserved for the [session mailbox](./MAILBOX.md); jobs using
@@ -31,7 +35,7 @@ acceptance.
 All successful responses have the IPC envelope `ok: true`.
 
 - `external_jobs_info` with no payload returns `protocolVersion: 1`, `enabled`
-  and `supportedBackends: ["cli"]`.
+  and `supportedBackends: ["cli", "codex"]`.
 - `external_job_submit` takes `routeId`, `requestId`, `task` (trusted text) and
   `payload` (untrusted JSON object). Returns `accepted: true`, `duplicate`,
   and `job`.
