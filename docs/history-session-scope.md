@@ -46,6 +46,12 @@ removing `adminChatId` revokes it at once. Only a private chat (a positive
 id) qualifies: a group set as `adminChatId` would hand the grant to every
 member of the group, so it grants nothing.
 
+A turn started by an external job or a mailbox message is not the operator
+asking (any same-user process can submit one), so it reads only its own
+chat: its job token has no admin reach, and once its prompt is sent the
+session's earlier commands lose admin reach too. The next human prompt
+brings a fresh admin command.
+
 Trade-off: the operator's session takes in foreign content (forwarded
 messages, web pages, mailbox replies), so a prompt-injected operator session
 can read any chat through this path. Ivan chose that reach for his own chat;
