@@ -150,8 +150,8 @@ A new optional key `mailbox.assistants` extends a `roles` bot. There is no new
   - `mayStart`: a role, or an assistant on either backend;
   - `receivesMail` is `mayStart && receivable`, so a `/stop` in the Codex DM
     does not take the mailbox intent lock (`polygram.js:4523`).
-- **Rollback.** 0.50.x refuses the unknown key (`rules.js:62`). Add the key
-  only after 0.51.0 is deployed, and remove it before rolling back.
+- **Rollback.** 0.51.x and older refuse the unknown key (`rules.js:62`). Add the key
+  only after 0.52.0 is deployed, and remove it before rolling back.
 
 ### 2. Access check: Telegram membership, refreshed in the background
 
@@ -363,9 +363,12 @@ for assistants only.
   `tasks` CLI must work. The latter needs its config and the Notion token. If
   either fails, phase 1 ships without the Codex part, and Ivan's DM keeps no
   grant.
-- **Waits for the Codex phase** (`UNIVERSAL_MAILBOX_SPEC.md` phase 4): asks
-  from and to Ivan's assistant, replies, and agent-org finals. Until then he
-  sees answers and 🏁 cards in the role topics; he is in both groups.
+- **Waits for the Codex phase** (`UNIVERSAL_MAILBOX_SPEC.md` phase 4, polygram
+  PR #150): asks from and to Ivan's assistant, replies, and agent-org finals.
+  Until then he sees answers and 🏁 cards in the role topics; he is in both
+  groups. The code keys these limits on the session's `receivable` flag, so
+  once Codex sessions can receive, Ivan's assistant takes full part with no
+  change here.
 
 ### 8. Mentions
 
@@ -511,7 +514,7 @@ Each phase ships on its own. Fixes are PATCH, features MINOR.
   passing `tg://` schemes other than the user link. A DM agent can no longer
   read other chats' history.
 
-### Phase 1: assistants in the mailbox (polygram 0.51.0, MINOR)
+### Phase 1: assistants in the mailbox (polygram 0.52.0, MINOR; 0.51.0 is PR #150, Codex mailbox parity)
 
 - **polygram:**
   - `assistants` config and its checks;
@@ -533,7 +536,7 @@ Each phase ships on its own. Fixes are PATCH, features MINOR.
     agent-supplied argument. Today that is
     `skills/translation-review/scripts/apply.js` (`--by`). The gift-card
     script already has its one-time code.
-- **Config (VPS):** `bots.shumabit.mailbox.assistants`, added after 0.51.0 is
+- **Config (VPS):** `bots.shumabit.mailbox.assistants`, added after 0.52.0 is
   live.
 - **shumabit-claude:**
   - **`AGENTS.md`:** replace "If you are not a role" with "If you are a person's
@@ -565,7 +568,7 @@ Each phase ships on its own. Fixes are PATCH, features MINOR.
 
 ### Phase 2: tasks from assistants (agent-org, next minor after PR #13: 0.4.0 if #13 ships as 0.3.0)
 
-- **Needs** polygram ≥ 0.51.0.
+- **Needs** polygram ≥ 0.52.0.
 - **agent-org:**
   - the `create` path for assistants and `person:` Requested by;
   - A1 in the DM and B1 "from <name>";
@@ -745,7 +748,7 @@ phases 0 to 2 has to change for it.
   - `assistants` maps key to chat id, with the label from the key;
   - `unconfirmed` is cut;
   - no custom header tail;
-  - Codex send-only is conditional on the spike and does not block 0.51.0;
+  - Codex send-only is conditional on the spike and does not block 0.52.0;
   - the Codex open question is cut (rule 5 decides it);
   - the reviewer question is decided as unchanged;
   - no new agent-org refusal code (one test);
