@@ -179,3 +179,68 @@ test('a live process of the other backend fails the job instead of sending into 
   assert.equal((await g.runtime.dispatch(job)).outcome, 'failed');
   assert.equal(g.calls.length, 0);
 });
+
+test('the turn is settled right after it resolves: after the send, before the end-of-turn inactivity check', async () => {
+  const f = fixture();
+  f.deps.awaitSessionRecovery = async () => { f.events.push('recovery'); };
+  const runtime = createExternalJobRuntime(f.deps);
+  await runtime.dispatch(job);
+  assert.deepEqual(f.events, ['recovery', 'send', ['settle', target.sessionKey, codexResult(), 'delivered'], 'recovery']);
+});
+
+test('a failed settlement is reported with its code and the job and attempt ids, never the error text', async () => {
+  const logged = [];
+  const recorded = [];
+  const f = fixture({
+    settleResult: async () => { throw Object.assign(new Error('ledger write failed: secret detail'), { code: 'CODEX_DURABILITY_FAILED' }); },
+    logger: { warn: (line) => logged.push(line), error: (line) => logged.push(line) },
+    logEvent: (kind, detail) => recorded.push([kind, detail]),
+  });
+  assert.equal((await f.runtime.dispatch(job)).outcome, 'succeeded');
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /CODEX_DURABILITY_FAILED/);
+  assert.doesNotMatch(logged[0], /secret detail/);
+  assert.deepEqual(recorded, [['codex-external-job-settlement-failed', {
+    request_id: job.requestId, session_key: target.sessionKey, generation_id: 'gen-1', attempt_id: 'attempt-1', disposition: 'delivered', code: 'CODEX_DURABILITY_FAILED',
+  }]], 'an unsettled attempt quarantines the lease at the next retirement, so the events table must show why');
+});
+
+test('the no-process proof rereads the process after the status, so a process spawned meanwhile is never declared idle', async () => {
+  let current;
+  const f = fixture({ pm: { get: () => current, getModelSettingsStatus: async () => { current = codexEntry({ state: 'Active' }); return { outcome: 'not-loaded' }; } } });
+  assert.equal(await f.runtime.checkInactive(job), false);
+});
+
+test('a status call stuck behind the session\'s lifecycle gate gives no proof instead of stalling the job queue', async () => {
+  const f = fixture({ pm: { get: () => undefined, getModelSettingsStatus: () => new Promise(() => {}) }, statusTimeoutMs: 20 });
+  const started = Date.now();
+  assert.equal(await f.runtime.checkInactive(job), false);
+  assert.ok(Date.now() - started < 1000);
+});
+
+test('recovery confirms nothing when the session is paused or switched away from Codex during the proof', async () => {
+  let paused = false;
+  const f = fixture({ isPaused: () => paused, pm: { get: () => undefined, getModelSettingsStatus: async () => { paused = true; return { outcome: 'not-loaded' }; } } });
+  assert.equal(await f.runtime.recoverInactive(job, () => { throw new Error('must not confirm'); }), false);
+  let backend = 'codex';
+  const g = fixture({ resolveBackend: () => backend, pm: { get: () => undefined, getModelSettingsStatus: async () => { backend = 'cli'; return { outcome: 'not-loaded' }; } } });
+  assert.equal(await g.runtime.recoverInactive(job, () => { throw new Error('must not confirm'); }), false);
+});
+
+test('with the production login rule, an expired Claude login neither delays nor blocks recovery of Codex mail', async () => {
+  const { needsNativeClaudeAuth } = require('../lib/ops/claude-auth-health');
+  const needsAuth = (backend) => needsNativeClaudeAuth({}, backend);
+  let current;
+  const f = fixture({ needsAuth, checkAuth: () => ({ state: 'expired' }), pm: { get: () => current, getModelSettingsStatus: async () => ({ outcome: 'not-loaded' }) },
+    getOrSpawnForChat: async () => { current = codexEntry(); return current; } });
+  let confirmed = 0;
+  assert.equal(await f.runtime.recoverInactive(job, () => { confirmed++; }), true, 'needsAuth must receive the backend: without it the production rule throws');
+  assert.equal(confirmed, 1);
+  assert.equal((await f.runtime.dispatch(job)).outcome, 'succeeded');
+});
+
+test('a resolver limited to the Claude CLI refuses a Codex destination, so a notification consumer there fails loudly', () => {
+  const config = { chats: { '-1001': { isolateTopics: true, topics: { 5: {} } } } };
+  const cliOnly = createExternalJobTargetResolver({ config, getSessionKey, resolveBackend: () => 'codex', backends: ['cli'] });
+  assert.throws(() => cliOnly(route), /require the Claude CLI backend/);
+});

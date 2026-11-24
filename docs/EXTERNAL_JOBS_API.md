@@ -22,8 +22,8 @@ without `isolateTopics`, every topic shares that session, but `/automation`
 only works when sent in General. Version 1 dispatch supports the Claude CLI and
 Codex backends; a Codex destination is admitted only while its process is idle
 (or proven idle with no process), and its final text is the report. Mailbox
-deliveries are the tested Codex use; a notification consumer on Codex is not
-supported yet.
+deliveries are the tested Codex use; a notification consumer on a Codex
+route fails at boot.
 Route names and request IDs are nonempty bounded strings; request IDs must be
 stable across transport retries. The `mailbox:` and `mailbox-notice:` request
 ID prefixes are reserved for the [session mailbox](./MAILBOX.md); jobs using

@@ -35,17 +35,17 @@ function homeConfig(mailbox = {}) {
     },
   };
 }
-const backendOf = ({ chatId, threadId }) => (chatId === HOME && String(threadId) === '5' ? 'codex' : chatId === GROUP ? sdkGroup.backend : 'cli');
-// The Ops group runs the Claude CLI unless a test switches it to SDK.
-const sdkGroup = { backend: 'cli' };
+const backendOf = ({ chatId, threadId }) => (chatId === HOME && String(threadId) === '5' ? 'codex' : 'cli');
+// The same bot with its Ops group on the SDK backend.
+const sdkGroupBackendOf = (where) => (where.chatId === GROUP ? 'sdk' : backendOf(where));
 
-function fixture(t, { config = homeConfig(), posts = null } = {}) {
+function fixture(t, { config = homeConfig(), posts = null, backends = backendOf } = {}) {
   const { db, dbPath } = freshDb('mailbox-universal');
-  const resolveTarget = createExternalJobTargetResolver({ config, getSessionKey, resolveBackend: backendOf });
+  const resolveTarget = createExternalJobTargetResolver({ config, getSessionKey, resolveBackend: backends });
   const jobs = createExternalJobService({ config, db, botName: 'shumorobot', resolveTarget,
     dispatch: async () => ({ outcome: 'succeeded', inactive: true }), deliverPart: async () => ({}), logger: { error() {} } });
   const tg = posts ? async (_bot, method, params) => { posts.push({ method, params }); return { message_id: posts.length }; } : null;
-  const service = createMailboxService({ config, db, botName: 'shumorobot', jobs, resolveTarget, resolveBackend: backendOf, getSessionKey,
+  const service = createMailboxService({ config, db, botName: 'shumorobot', jobs, resolveTarget, resolveBackend: backends, getSessionKey,
     tg, bot: {}, sendRich: async () => ({ wentRich: false, fallback: 'unsupported' }),
     logger: { error() {}, warn() {} } });
   t.after(() => { service.stop(); jobs.stop(); cleanupDb(dbPath, db); });
@@ -128,9 +128,7 @@ test('a Codex session receives like any other: an ask to it is a job on its impl
 });
 
 test('an SDK session is still refused as a target, with a stable code', (t) => {
-  sdkGroup.backend = 'sdk';
-  t.after(() => { sdkGroup.backend = 'cli'; });
-  const f = fixture(t);
+  const f = fixture(t, { backends: sdkGroupBackendOf });
   assert.equal(f.service.scope(GROUP), null, 'it cannot run the mailbox command, so it gets no grant');
   assert.throws(() => f.service.send(f.human(GENERAL), { to: `session:${GROUP}`, kind: 'ask', body: 'x' }), coded('MAILBOX_BACKEND_UNSUPPORTED'));
   assert.equal(f.db.raw.prepare('SELECT count(*) n FROM mailbox_messages').get().n, 0);
@@ -211,6 +209,26 @@ function rolesConfig() {
   config.bot.externalJobs.routes.music = { chatId: HOME, threadId: '3' };
   return config;
 }
+
+test('roles bot: a role may run on Codex, and its deliveries travel on its configured route', (t) => {
+  const config = rolesConfig();
+  config.bot.mailbox.roles.orchestra = { about: 'Runs releases' };
+  config.bot.externalJobs.routes.orchestra = { chatId: HOME, threadId: '5' };
+  const f = fixture(t, { config });
+  assert.match(f.service.scope(CODEX), /^[0-9a-f-]{36}$/, 'a Codex role gets its grant like any role');
+  const sent = f.service.send(f.human(GENERAL), { to: 'orchestra', kind: 'ask', body: 'Ready to ship?' });
+  assert.equal(f.row(sent.id).route_id, 'orchestra');
+  assert.equal(f.row(sent.id).to_addr, 'role:orchestra');
+});
+
+test('roles bot: a role on an SDK session still fails boot', () => {
+  const config = rolesConfig();
+  config.bot.mailbox.roles.ops = { about: 'Ops' };
+  config.bot.externalJobs.routes.ops = { chatId: GROUP };
+  const resolveTarget = createExternalJobTargetResolver({ config, getSessionKey, resolveBackend: sdkGroupBackendOf });
+  assert.throws(() => createMailboxService({ config, db: null, botName: 'shumorobot', jobs: {}, resolveTarget, resolveBackend: sdkGroupBackendOf, getSessionKey }),
+    /Mailbox role ops: External jobs require the Claude CLI or Codex backend/);
+});
 
 test('roles bot: other sessions get no grant, and roles cannot reach them', (t) => {
   const f = fixture(t, { config: rolesConfig() });

@@ -1,8 +1,9 @@
 # Codex sessions as full mailbox participants
 
-Status: v2, 2026-11-24, after three independent reviews (feasibility against
-the code, failure modes and security, simplicity); see [Review
-log](#review-log). Phase 4 of
+Status: v3, 2026-11-24, implemented in polygram 0.51.0. Three independent spec
+reviews (feasibility against the code, failure modes and security,
+simplicity) and three code reviews (correctness and concurrency, silent
+failures, tests) are folded in; see [Review log](#review-log). Phase 4 of
 [`UNIVERSAL_MAILBOX_SPEC.md`](./UNIVERSAL_MAILBOX_SPEC.md). Builds on
 [`MAILBOX.md`](./MAILBOX.md) and [`EXTERNAL_JOBS_API.md`](./EXTERNAL_JOBS_API.md).
 
@@ -68,11 +69,12 @@ does, with the same safety.
 one list the target resolver, the runtime, `external_jobs_info` (service and
 the IPC default) and the mailbox address list read. SDK stays unsupported.
 
-Mailbox deliveries are what this change is for and what is tested. Other
-jobs (notifications, `external_job_submit`) on a Codex route are admitted by
-the same path but unverified; a notification consumer on Codex is not
-supported yet, because its tool command carries no `POLYGRAM_IPC_DIR` and a
-Codex shell inherits no environment.
+Mailbox deliveries are what this change is for and what is tested.
+`external_job_submit` on a Codex route is admitted by the same path but
+unverified. A notification consumer on a Codex route fails at boot: its tool
+command carries no `POLYGRAM_IPC_DIR` and a Codex shell inherits no
+environment, so the notification service resolves its destinations with
+`backends: ['cli']`.
 
 ### 2. Admission: idle only
 
@@ -108,8 +110,11 @@ The runtime takes `settleResult(sessionKey, result, disposition)`;
 polygram.js wires it to `codexRuntimeController.settleTelegramDelivery`,
 which ignores a non-Codex result. Right after the turn resolves, before
 anything else, the runtime settles `delivered` when `result.error == null`
-and `failed` otherwise. Its error is logged by code and never changes the
-job's outcome.
+and `failed` otherwise. A settlement error never changes the job's outcome;
+it is logged by code and recorded as the event
+`codex-external-job-settlement-failed` with the request, generation and
+attempt ids, because the next retirement of that generation will wait on the
+attempt and quarantine the lease.
 
 `delivered` here means the job ledger took the result; the report's own
 delivery is tracked by the job's `report_state`. Settling at once keeps a
@@ -124,7 +129,10 @@ process proves nothing" would leave every later job queued until a human
 writes. For Codex, when there is no live process and the session selects
 Codex, `getModelSettingsStatus` answering `not-loaded` or `daemon-busy`
 proves no turn of this session can run: the lease is released only after a
-verified retirement, and a quarantined lease answers `containment`.
+verified retirement, and a quarantined lease answers `containment`. The
+status call waits on the session's lifecycle gate, which a spawn may hold for
+minutes, and the drain checks jobs one at a time, so an answer slower than
+1 s counts as no proof. A check that throws is logged once per job and code.
 
 - `checkInactive`: a live process passes `isIdle`; otherwise the status proof.
 - `recoverInactive` (unknown jobs, under the intent lock): the same proofs,
@@ -279,6 +287,24 @@ Three read-only reviews of v1.
 - The spike section now matches the script; tests flip the existing
   fixtures instead of duplicating them; the IPC default and the refusal text
   read the shared list (feasibility, simplicity).
+
+**Code review of the implementation (three read-only reviews):** no
+correctness bug found. Folded in: the settlement-failure event with job and
+attempt ids, logged at error level (silent failures, correctness); the 1 s
+status timeout (correctness); notification consumers kept on the Claude CLI
+so a Codex consumer fails loudly (correctness); one log line per job and
+error code for a failing inactivity check (silent failures); tests for the
+settle order, the re-read after the status call, recovery when the session
+is paused or switched mid-proof, the production login rule in recovery, a
+Codex role and an SDK role in a roles bot, the logged code, and source
+checks of the polygram.js wiring (tests). Declined: recording each job's
+backend so the Codex proof applies only to jobs that ran on Codex (silent
+failures): a runtime switch through `/config` retires the Claude process
+first, so only a config edit plus a restart during a Claude job reaches it,
+and the Claude session would then be an orphan the tmux sweep owns; and
+mapping `INTERRUPTED` only without a turn id (silent failures): Codex never
+reports a turn id to the runtime, and Orchestra 0.12.x emits that code only
+before a send; the spike re-checks the turn path on every Codex pin bump.
 
 **Declined, with reasons:**
 

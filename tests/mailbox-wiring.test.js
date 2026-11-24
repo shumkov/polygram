@@ -50,3 +50,14 @@ test('the depth reset runs for every human prompt, not only when a fresh session
   const reset = format.indexOf('mailboxService?.noteHumanPrompt(sessionKey, { operator: isAutomationOperator(config, msg), newTurn: !pm?.get(sessionKey)?.inFlight })');
   assert.ok(reset > blockEnd, 'noteHumanPrompt must sit after the fresh-session block, where every prompt passes');
 });
+
+test('Codex job turns are settled through the controller, the login gate asks about the job\'s backend, and failures reach the events table', () => {
+  assert.match(src, /needsAuth: \(backend\) => needsNativeClaudeAuth\(config\.bot, backend\),/);
+  assert.match(src, /settleResult: \(sessionKey, result, disposition\) => \{[\s\S]*?return codexRuntimeController\.settleTelegramDelivery\(sessionKey, result, \{ disposition \}\);/,
+    'the disposition travels as an option: a bare string would silently settle every turn as delivered');
+  assert.match(src, /createExternalJobRuntime\(\{[\s\S]*?getOrSpawnForChat, sendToProcess, logEvent, logger: console,/);
+});
+
+test('notification consumers resolve their destinations on the Claude CLI only', () => {
+  assert.match(src, /notificationService = createNotificationService\(\{[\s\S]*?resolveTarget: createExternalJobTargetResolver\(\{\s*config, getSessionKey, backends: \['cli'\],/);
+});
