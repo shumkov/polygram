@@ -11,7 +11,7 @@ const lockfile = require('../package-lock.json');
 const orchestra = require('@shumkov/orchestra');
 const orchestraPackage = require('@shumkov/orchestra/package.json');
 
-const REQUIRED_ORCHESTRA_VERSION = '0.12.4';
+const REQUIRED_ORCHESTRA_VERSION = '0.12.5';
 
 test('installed Orchestra exactly matches the reviewed Codex contract', () => {
   assert.equal(
@@ -73,7 +73,10 @@ test('installed Orchestra exactly matches the reviewed Codex contract', () => {
       stateChanging: false,
     },
   );
-  for (const method of ['hook/started', 'hook/completed']) {
+  // skills/changed fires on any write under the workspace skills directory
+  // (a model-run script's __pycache__, a cron job's state file); if Orchestra
+  // faulted on it, every such write would kill the chat's Codex turn.
+  for (const method of ['hook/started', 'hook/completed', 'skills/changed']) {
     assert.equal(
       orchestra.codexProtocolSchema.droppedServerNotifications.includes(method),
       true,
