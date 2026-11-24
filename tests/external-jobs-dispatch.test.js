@@ -83,3 +83,16 @@ test('a job\'s turn ends its own mailbox turn when it settles, so a person\'s as
   await f.dispatch(job, {});
   assert.deepEqual(ended, [['-1001:12', `job:marketing\0${job.requestId}`]]);
 });
+
+test('the job\'s turn ends after the send point, and also when the turn fails', async () => {
+  const order = [];
+  const mailbox = { enabled: true, instructions: () => '', noteJobSend: () => order.push('send'), noteTurnEnd: () => order.push('end') };
+  const failing = createExternalJobDispatch({
+    dispatchExternalEvent: (_origin, run) => run(),
+    runtime: { dispatch: async (_job, hooks) => { hooks.onSend?.(); order.push('turn'); throw new Error('turn failed'); } },
+    getMailbox: () => mailbox,
+  });
+  await assert.rejects(failing(job, {}), /turn failed/);
+  assert.deepEqual(order, ['send', 'turn', 'end']);
+});
+

@@ -615,7 +615,7 @@ function formatPrompt(msg, sessionCtx, attachments = [], { sessionKey = null } =
     }
   }
 
-  mailboxService?.noteHumanPrompt(sessionKey, { operator: isAutomationOperator(config, msg), newTurn: !pm?.get(sessionKey)?.inFlight });
+  mailboxService?.noteHumanPrompt(sessionKey, { operator: isAutomationOperator(config, msg), newTurn: !pm?.get(sessionKey)?.inFlight, owner: mailboxHumanTurn(chatId, msg.message_id) });
   return buildPrompt({
     msg,
     topicName,
@@ -2294,9 +2294,19 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
     });
     // A person's assistant learns here, under the latch, whether its person's
     // message starts a new turn or folds into the running one: only a new
-    // turn can clear the taint another session's message left.
+    // turn can clear the taint another session's message left. The Claude CLI
+    // folds a message into any cycle it is running, including one polygram
+    // did not start (a background task finishing), so a tainted assistant
+    // also needs the same idle proof external jobs use.
+    let assistantIdle = true;
+    if (dispatchPrimary && mailboxService?.needsIdleProof(sessionKey)) {
+      assistantIdle = !current || current.closed || (current.backend === 'cli'
+        ? typeof current.probeBusyState === 'function' && await current.probeBusyState().then((probe) => probe?.busy === false, () => false)
+        : !current.inFlight);
+    }
     mailboxService?.noteHumanDispatch(sessionKey, {
       newTurn: dispatchPrimary,
+      idle: assistantIdle,
       owner: mailboxHumanTurn(chatId, msg.message_id),
       fromId: msg.from?.id ?? null,
       isBot: msg.from?.is_bot === true,

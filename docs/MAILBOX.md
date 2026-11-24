@@ -68,7 +68,7 @@ rules.
 | `limits.perPairPerHour` | Asks and tells per (from, to) pair in the last hour. Default 10. |
 | `limits.maxBodyBytes` | Body size in UTF-8 bytes, before and after redaction. Default and maximum 3500, so a mirror fits one Telegram message. |
 | `limits.systemPerHour` | Messages per system sender in the last hour. Default 60. |
-| `assistants` | People's assistants in a `roles` bot (see [People's assistants](#peoples-assistants)): `{ "<key>": "<the person's direct chat id>" }`. The key matches `^[a-z][a-z0-9_-]*$` and is not a role name; the chat is a configured direct chat (a positive id) that is not a role's session, listed once. |
+| `assistants` | People's assistants in a `roles` bot (see [People's assistants](#peoples-assistants)): `{ "<key>": "<the person's direct chat id>" }`. The key matches `^[a-z][a-z0-9_-]*$` and is not a role name; the chat is a configured direct chat (a positive id) on the Claude CLI or Codex that is not a role's session, listed once. Needs `mirror` on. |
 
 External jobs now run different conversations concurrently, up to
 `externalJobs.maxConcurrent` (default 4). Each conversation still runs one job
@@ -141,7 +141,11 @@ person's direct chat, whose id is the person's Telegram user id:
   Telegram (`getChatMember`) at start and every 5 minutes. An answer older than
   10 minutes, a lookup error, `left`, `kicked`, or `restricted` without
   `is_member` all mean "not a member". Assistants reach each other freely.
-  `"*"` in `allow` never reaches an assistant.
+  `"*"` in `allow` never reaches an assistant. Telegram guarantees
+  `getChatMember` for other users only when the bot is a group admin. It works
+  for a plain member today; if it stops, access fails closed with a
+  `mailbox-membership-unconfirmed` warning, and making the bot an admin fixes
+  it.
 - **Only in its person's own turn.** An assistant starts an ask or tell,
   replies, or passes `mailbox_identify` at depth 0 only with the grant of a
   turn its person started.
@@ -149,9 +153,13 @@ person's direct chat, whose id is the person's Telegram user id:
     in an assistant taints it, and so does a restart.
   - Only the person's own message that starts a new turn clears the taint. The
     decision is made at dispatch, so a message folded into a running turn
-    joins that turn and keeps it.
+    joins that turn and keeps it. The Claude CLI folds a message into any
+    cycle it is running, including one polygram did not start, so a tainted
+    assistant's new turn also needs the idle proof external jobs use, and no
+    other turn of the assistant may still be open.
   - A grant ends with its turn, so a wakeup or background task cannot act
-    afterwards.
+    afterwards. A follow-up the Claude CLI runs as a fresh cycle after its
+    turn stopped has lost its grant too, so the person sends it again.
   - So a role's ask is answered this way: the assistant tells its person in
     the direct chat; the person answers in their own turn; the assistant then
     replies. `open` lists the asks waiting for the caller's reply under
@@ -168,8 +176,13 @@ person's direct chat, whose id is the person's Telegram user id:
   - A go expires after 24 hours, at most 5 wait per role, and a restart
     forgets them (the role sends again).
 - **Cards.** The person's direct chat always gets the full card for a message
-  their assistant sends or receives, whatever `mirror` says (unless `false`). A
-  card in a group topic about such a message shows only who wrote to whom.
+  their assistant sends or receives, in any mirror mode; `mirror: false` with
+  `assistants` fails boot. A card in a group topic about such a message shows
+  only who wrote to whom. The receiving role's own final text is still posted
+  in its topic as the job report, so a role does not restate a private matter
+  there.
+- **Replies** between a role and an assistant need the person's membership
+  too, so someone who left the group neither gets nor gives a late answer.
 - **Codex.** A Codex direct chat cannot receive yet. Its assistant may `tell`
   and create tasks, but not `ask`, and nothing can be sent to it
   (`MAILBOX_BACKEND_UNSUPPORTED`).

@@ -15,7 +15,7 @@ const body = (name) => {
 
 test('every human prompt resets the session depth and carries the mailbox instructions', () => {
   const format = body('formatPrompt');
-  const reset = format.indexOf('mailboxService?.noteHumanPrompt(sessionKey, { operator: isAutomationOperator(config, msg), newTurn: !pm?.get(sessionKey)?.inFlight })');
+  const reset = format.indexOf('mailboxService?.noteHumanPrompt(sessionKey, { operator: isAutomationOperator(config, msg), newTurn: !pm?.get(sessionKey)?.inFlight, owner: mailboxHumanTurn(chatId, msg.message_id) })');
   const instructions = format.indexOf('mailboxService?.instructions(sessionKey)');
   assert.ok(reset >= 0 && instructions > reset, 'depth is reset before the instructions are rendered');
 });
@@ -47,7 +47,7 @@ test('the depth reset runs for every human prompt, not only when a fresh session
     else if (format[i] === '}' && --depth === 0) { blockEnd = i; break; }
   }
   assert.ok(blockEnd > blockStart, 'the block closes');
-  const reset = format.indexOf('mailboxService?.noteHumanPrompt(sessionKey, { operator: isAutomationOperator(config, msg), newTurn: !pm?.get(sessionKey)?.inFlight })');
+  const reset = format.indexOf('mailboxService?.noteHumanPrompt(sessionKey, { operator: isAutomationOperator(config, msg), newTurn: !pm?.get(sessionKey)?.inFlight, owner: mailboxHumanTurn(chatId, msg.message_id) })');
   assert.ok(reset > blockEnd, 'noteHumanPrompt must sit after the fresh-session block, where every prompt passes');
 });
 
@@ -68,8 +68,10 @@ test('a person\'s assistant learns, under the dispatch latch, whether its person
   const note = handle.indexOf('mailboxService?.noteHumanDispatch(sessionKey, {');
   const decide = handle.indexOf('const dispatchPrimary = shouldDispatchPrimaryAfterAutosteer({');
   const send = handle.indexOf('sendPromise = sendToProcess(sessionKey, prompt, {');
-  assert.ok(latch >= 0 && decide > latch && note > decide && send > note, 'the note uses the real fold-or-turn decision, before the send, inside the latch');
-  assert.match(handle, /newTurn: dispatchPrimary,\s*owner: mailboxHumanTurn\(chatId, msg\.message_id\),/);
+  const branch = handle.indexOf('if (dispatchPrimary) {');
+  assert.ok(latch >= 0 && decide > latch && note > decide && branch > note && send > branch,
+    'the note uses the real fold-or-turn decision, inside the latch, before the primary branch, so folds are noted too');
+  assert.match(handle, /newTurn: dispatchPrimary,\s*idle: assistantIdle,\s*owner: mailboxHumanTurn\(chatId, msg\.message_id\),/);
 });
 
 test('an assistant turn ends when its primary turn settles, or at once when no turn was dispatched', () => {
@@ -81,3 +83,13 @@ test('an assistant turn ends when its primary turn settles, or at once when no t
 test('go-card presses reach the mailbox', () => {
   assert.match(src, /data\.startsWith\('mbx:'\)\) \{\s*if \(mailboxService\) await mailboxService\.handleGoCallback\(ctx\);/);
 });
+
+test('a tainted assistant\'s new turn needs the same idle proof external jobs use before its taint can clear', () => {
+  const handle = body('handleMessage');
+  const proof = handle.indexOf('if (dispatchPrimary && mailboxService?.needsIdleProof(sessionKey)) {');
+  const note = handle.indexOf('mailboxService?.noteHumanDispatch(sessionKey, {');
+  assert.ok(proof >= 0 && note > proof, 'the proof runs before the note');
+  assert.match(handle.slice(proof, note), /current\.probeBusyState\(\)\.then\(\(probe\) => probe\?\.busy === false, \(\) => false\)/);
+  assert.match(handle.slice(note, note + 200), /idle: assistantIdle,/);
+});
+
