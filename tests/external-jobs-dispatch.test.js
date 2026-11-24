@@ -22,9 +22,12 @@ test('the dispatched prompt carries every instruction block for the target sessi
   const f = fixture({
     notifications: { instructions: (key) => { sessions.push(key); return '\n[notify]'; } },
     mailbox: { instructions: (key) => { sessions.push(key); return '\n[mailbox]'; }, noteJobSend() {}, enabled: true },
-    history: { instructions: (key, forJob) => { sessions.push(key); assert.equal(forJob, job, 'retries of one job reuse its history token'); return '\n[history]'; } },
+    history: { instructions: (key, forJob) => { sessions.push(key); assert.equal(forJob, job, 'retries of one job reuse its history token'); return '\n[history]'; },
+      noteJobSend: (sent) => sessions.push(['history-sent', sent.requestId]) },
   });
   await f.dispatch(job, {});
+  assert.deepEqual(sessions.at(-1), ['history-sent', job.requestId], 'the send point demotes the session\'s admin history reach');
+  sessions.pop();
   assert.equal(f.calls.runtime[0].job.task, 'Envelope\n[notify]\n[mailbox]\n[history]');
   assert.deepEqual(sessions, ['-1001:12', '-1001:12', '-1001:12']);
   assert.deepEqual(f.calls.events, [{ ...target, eventId: job.requestId }]);
