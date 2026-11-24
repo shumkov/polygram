@@ -24,6 +24,7 @@ const BOT = 'testbot';
 const OPERATOR_DM = '1001';
 const MEMBER_DM = '1002';
 const FORUM = '-1003';
+const SECOND_DM = '1004';
 
 let polygramDir;
 let sharedCwd;
@@ -39,6 +40,7 @@ before(() => {
       [OPERATOR_DM]: { bot: BOT, cwd: sharedCwd },
       [MEMBER_DM]: { bot: BOT, cwd: sharedCwd },
       [FORUM]: { bot: BOT, cwd: sharedCwd, isolateTopics: true },
+      [SECOND_DM]: { bot: BOT, cwd: sharedCwd },
     },
   };
   fs.writeFileSync(path.join(polygramDir, 'config.json'), JSON.stringify(config));
@@ -50,6 +52,8 @@ before(() => {
     { chat_id: FORUM, thread_id: null, msg_id: 1, user: 'Member', text: 'generaltopic hello', ts: now - 3000 },
     { chat_id: FORUM, thread_id: '11', msg_id: 2, user: 'Member', text: 'ordertopic invoice', ts: now - 2000 },
     { chat_id: FORUM, thread_id: '12', msg_id: 3, user: 'Member', text: 'billingtopic invoice', ts: now - 1000 },
+    { chat_id: SECOND_DM, msg_id: 1, user: 'Second', text: 'seconddm inbound', ts: now - 900 },
+    { chat_id: SECOND_DM, msg_id: 2, user: null, text: 'seconddm reply', direction: 'out', ts: now - 800 },
   ];
   for (const r of rows) {
     db.insertMessage({ thread_id: null, user_id: null, direction: 'in', source: 'polygram', bot_name: BOT, ...r });
@@ -76,6 +80,11 @@ describe('history skill scope', () => {
     // The removed environment overrides and an explicit DB path do not reopen it.
     const widened = await runLegacy(['recent', OPERATOR_DM], { POLYGRAM_ADMIN: '1', CLAUDE_CHANNEL_BOT: BOT, POLYGRAM_DB: path.join(polygramDir, `${BOT}.db`) });
     assert.doesNotMatch(widened.stdout, /operatorsecret/, `an env override widened the scope:\n${widened.stdout}`);
+    // Refused outright, not merely empty: a crash would also print nothing.
+    for (const result of [asked, searched, widened]) {
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, /Usage: query\.js <bot> <token>/);
+    }
   });
 });
 
@@ -127,7 +136,25 @@ describe('history skill: the daemon binds every read to the calling session', ()
     assert.ok(block.includes(JSON.stringify(service.scope(MEMBER_DM))));
     assert.ok(block.includes(`POLYGRAM_IPC_DIR=${JSON.stringify(ipcDir)}`));
     assert.notEqual(service.scope(MEMBER_DM), service.scope(OPERATOR_DM), 'each session has its own token');
-    assert.equal(service.scope(MEMBER_DM), service.scope(MEMBER_DM), 'a session keeps its token for the daemon lifetime');
+  });
+
+  test('the injected command line runs as written through a shell, with no IPC location in the environment', async () => {
+    const block = service.instructions(MEMBER_DM);
+    const command = block.slice(block.indexOf('run ') + 4, block.indexOf(' recent ['));
+    const env = { ...process.env, POLYGRAM_IPC_SECRET: '' };
+    delete env.POLYGRAM_IPC_DIR;
+    const { stdout } = await promisify(execFile)('/bin/sh', ['-c', `${command} search shifts`], { cwd: otherCwd, env });
+    assert.deepEqual(JSON.parse(stdout).map((row) => row.text), ['memberown question about shifts']);
+  });
+
+  test('every prompt mints a new token; the last few still read and older ones are refused', async () => {
+    const minted = Array.from({ length: 6 }, () => /"([0-9a-f-]{36})"/.exec(service.instructions(SECOND_DM))[1]);
+    assert.equal(new Set(minted).size, 6, 'each prompt carries a fresh token');
+    assert.equal(service.scope(SECOND_DM), minted.at(-1));
+    refused(await run(SECOND_DM, ['recent'], { token: minted[0] }), /use the history command from your current turn/);
+    for (const token of minted.slice(1)) {
+      assert.equal(service.query(token, { sub: 'recent' }).rows.length, 2, 'a recent command keeps working');
+    }
   });
 
   test('a member DM session reads its own chat and nothing else', async () => {
@@ -146,6 +173,20 @@ describe('history skill: the daemon binds every read to the calling session', ()
     assert.deepEqual(stats.rows.map((row) => row.user), ['Member']);
   });
 
+  test('--include-outbound false drops the bot\'s own messages', async () => {
+    assert.deepEqual(texts(await run(SECOND_DM, ['recent'])), ['seconddm inbound', 'seconddm reply']);
+    assert.deepEqual(texts(await run(SECOND_DM, ['recent', '--include-outbound', 'false'])), ['seconddm inbound']);
+  });
+
+  test('unquoted words, unknown flags and stray arguments are refused with a hint, not read as another chat', async () => {
+    const plain = (result, pattern) => { assert.equal(result.code, 1); assert.match(result.stderr, pattern); };
+    plain(await run(MEMBER_DM, ['by-user', 'Member', 'Ivanova']), /quote a multi-word term or name/);
+    plain(await run(MEMBER_DM, ['search', 'invoice', 'march']), /quote a multi-word term or name/);
+    plain(await run(MEMBER_DM, ['recent', '--topic', '12']), /unknown flag --topic/);
+    plain(await run(MEMBER_DM, ['around', '1']), /use --msg-id N/);
+    plain(await run(MEMBER_DM, ['dump']), /unknown subcommand: dump/);
+  });
+
   test('the operator\'s own DM session gets no cross-chat read either', async () => {
     assert.deepEqual(texts(await run(OPERATOR_DM, ['recent'])), ['operatorsecret salary figures']);
     refused(await run(OPERATOR_DM, ['recent', MEMBER_DM]), /only its own chat/);
@@ -160,6 +201,12 @@ describe('history skill: the daemon binds every read to the calling session', ()
     refused(await run(orders, ['stats', '--thread', '12']), /only its own topic/);
     assert.deepEqual(texts(await run(orders, ['msg', '3'])), [], 'a sibling topic\'s message is not reachable by id');
     assert.deepEqual(texts(await run(orders, ['around', '--msg-id', '2', '--before', '50', '--after', '50'])), ['ordertopic invoice']);
+    assert.deepEqual(texts(await run(orders, ['by-user', 'Member', '--days', '30'])), ['ordertopic invoice']);
+    const stats = await run(orders, ['stats', '--days', '30']);
+    assert.equal(stats.code, 0, stats.stderr);
+    assert.deepEqual(stats.rows.map((row) => [row.user, row.count]), [['Member', 1]]);
+    assert.deepEqual(texts(await run(FORUM, ['msg', '2'])), [], 'the General topic cannot fetch a topic message by id');
+    assert.deepEqual(texts(await run(FORUM, ['by-user', 'Member', '--days', '30'])), ['generaltopic hello']);
     assert.deepEqual(texts(await run(FORUM, ['recent'])), ['generaltopic hello']);
     assert.deepEqual(texts(await run(FORUM, ['search', 'invoice'])), []);
     refused(await run(FORUM, ['recent', '--thread', '11']), /only its own topic/);

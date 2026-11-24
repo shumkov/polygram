@@ -17,7 +17,10 @@ the notifications skill uses for its own-conversation tool.
 
 - `lib/history-scope.js` keeps `token → sessionKey` in daemon memory. Every
   prompt (human messages through `formatPrompt`, external jobs through the
-  dispatch wrapper) appends one line with the session's command:
+  dispatch wrapper) appends one line with the session's command and a freshly
+  minted token; the session's four previous tokens keep working, older ones
+  are refused, so a command copied into a shared file (the chats of one cwd
+  share auto-memory and CLAUDE.md) or handed to another session expires:
   `POLYGRAM_IPC_DIR=… node …/query.js <bot> <token> <subcmd> [args]`.
 - `query.js` is a thin IPC client. It never opens a database; it sends the
   parsed request to the `history_query` IPC op with the token.
@@ -59,6 +62,7 @@ when needed; there is no agent path for it.
 
 - Daemon restart: tokens are in memory, so old commands fail with "History
   scope is not valid"; the next prompt carries a new command.
+- Stale command: a token more than four prompts old gets the same refusal.
 - IPC server failed to start: the command fails to connect; nothing is read.
 - Chat removed from the config: its token is refused at once.
 - No database: no command is injected.
@@ -77,8 +81,8 @@ the open item from `docs/0.13-history-read-permission-spec.md`.
 and a forum with isolated topics) on a real DB, starts the real IPC server
 with the real service, and runs the script as the injected command does:
 
-- the old shared-cwd invocation returns nothing (red before the change: it
-  returned the operator's DM rows);
+- the old shared-cwd invocation exits with a usage error and prints no rows
+  (red before the change: it returned the operator's DM rows);
 - a member session reads only its DM, and is refused for the operator's chat
   through positional, `--chat`, `search`, `msg` (message ids repeat across
   chats) and `around`;
