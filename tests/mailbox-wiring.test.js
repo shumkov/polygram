@@ -97,3 +97,8 @@ test('the history scope asks the mailbox whether an assistant may read a role to
   assert.match(src, /historyService = createHistoryService\(\{[\s\S]*?canReadTopic: \(sessionKey, place\) => mailboxService\?\.canReadRoleTopic\(sessionKey, place\) \?\? false,\s*readsRoleTopics: \(sessionKey\) => mailboxService\?\.isAssistant\(sessionKey\) \?\? false \}\);/);
 });
 
+
+test('external-job reports render through the same rich renderer as a non-streamed final reply', () => {
+  assert.match(src, /deliverPart: createReportDelivery\(\{[\s\S]*?linkPreview: \(chatId\) => \(config\.chats\?\.\[String\(chatId\)\]\?\.linkPreview != null/, 'with the same link-preview opt-out');
+  assert.match(src, /deliverPart: createReportDelivery\(\{[\s\S]*?deliverRich: \(\{ chatId, threadId, text, meta \}\) => \(makeRichDeliverText\s*\? makeRichDeliverText\(\{ chatId, threadId \}\)\(\{ text, meta \}\)/);
+});

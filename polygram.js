@@ -4641,7 +4641,18 @@ async function main() {
     checkInactive: externalRuntime.checkInactive,
     recoverInactive: externalRuntime.recoverInactive,
     prepareReport,
-    deliverPart: createReportDelivery({ bot, tg, botName: BOT_NAME }),
+    // Reports render like a normal non-streamed final reply: the same rich
+    // renderer in a rich-enabled chat, text-only (no media roots), else HTML.
+    deliverPart: createReportDelivery({
+      bot, tg, botName: BOT_NAME, logger: console,
+      // The same link-preview opt-out as a normal reply: chat level, then bot.
+      linkPreview: (chatId) => (config.chats?.[String(chatId)]?.linkPreview != null
+        ? config.chats[String(chatId)].linkPreview
+        : config.bot?.linkPreview),
+      deliverRich: ({ chatId, threadId, text, meta }) => (makeRichDeliverText
+        ? makeRichDeliverText({ chatId, threadId })({ text, meta })
+        : { handled: false }),
+    }),
   });
   // A notification consumer's tool command does not carry the IPC directory,
   // which a Codex shell needs, so its destinations stay Claude CLI only and a

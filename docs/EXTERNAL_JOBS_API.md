@@ -58,7 +58,13 @@ Completed identities remain retained. Unknown execution is never replayed by
 Polygram. Callers query or retry the original identity after a lost reply.
 
 Reports use the destination's Telegram/Channels routing. Ordinary report parts
-are sent as plain text to the frozen destination, without chat-root fallback. Ordinary
+render like a non-streamed final reply: rich in a rich-enabled chat, otherwise
+Telegram HTML, with one plain-text retry when Telegram refuses the HTML. They
+go to the frozen destination without chat-root fallback; a rich send into a
+deleted topic lands in General and its receipt records that. A rich attempt
+whose outcome is unknown is never followed by another send. Unlike a rich
+reply, which is one message, a long report is split into parts of up to 3500
+characters first, and each part renders as its own message. Ordinary
 reports are durably split into parts before sending; only definitively unsent
 parts may retry. Sending with a lost receipt becomes `unknown`. Channels
 acknowledgement alone does not prove final-report completion.
