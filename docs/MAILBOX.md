@@ -139,8 +139,10 @@ person's direct chat, whose id is the person's Telegram user id:
 - **Access mirrors Telegram groups.** A role and an assistant reach each other
   only while the person is a member of the role's group. polygram asks
   Telegram (`getChatMember`) at start and every 5 minutes. An answer older than
-  10 minutes, a lookup error, `left`, `kicked`, or `restricted` without
-  `is_member` all mean "not a member". Assistants reach each other freely.
+  10 minutes or a lookup error means membership is unknown: the start, reply
+  or system message is refused with the transient `MAILBOX_MEMBERSHIP_UNKNOWN`
+  and nothing is delivered. `left`, `kicked`, or `restricted` without
+  `is_member` is a proven non-member (`MAILBOX_NOT_ALLOWED`). Assistants reach each other freely.
   `"*"` in `allow` never reaches an assistant. Telegram guarantees
   `getChatMember` for other users only when the bot is a group admin. It works
   for a plain member today; if it stops, access fails closed with a
@@ -474,6 +476,7 @@ contract and do not change:
 | `MAILBOX_UNKNOWN_ADDRESS` | In an open bot, `to` names no session; in any bot, a name that matches several sessions (the candidates are listed). A roles bot keeps `MAILBOX_UNKNOWN_ROLE` for a name that matches nothing. | No. |
 | `MAILBOX_NOT_ALLOWED` | The allowlist or the bot's mode refuses this start, the person is not a confirmed member of the role's group, an assistant is not in its person's own turn, the command was replaced by a newer prompt, or the grant has seen foreign content. | No; use the current turn's command. |
 | `MAILBOX_BACKEND_UNSUPPORTED` | The target cannot receive (an SDK session). | No. |
+| `MAILBOX_MEMBERSHIP_UNKNOWN` | Whether the person is a member of the role's group is not known yet: not fetched since the daemon started, the last lookup failed, or the answer is older than two refreshes. Nothing was stored or delivered. A proven non-member gets `MAILBOX_NOT_ALLOWED` instead. | Yes, in a few minutes (the table refreshes every 5 minutes). |
 
 A refusal from the external-jobs queue keeps its own code, for example
 `EXTERNAL_JOB_QUEUE_FULL` (retry later) or `EXTERNAL_JOB_ROUTE_UNAVAILABLE`.

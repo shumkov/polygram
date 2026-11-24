@@ -193,35 +193,53 @@ test('a role asks a member\'s assistant by key or person:<key>; "*" in its allow
     'ops allows "*", but Mai is not in UMI management');
 });
 
-test('membership fails closed: before the first refresh, on a lookup error, for a non-member restriction, and when stale', async (t) => {
+// Membership not loaded yet (never fetched since boot, the last lookup failed,
+// or the answer went stale) is transient: the caller may retry. Only a proven
+// non-member is refused for good. Either way nothing is delivered.
+test('membership not loaded yet refuses with a transient code and delivers nothing: before the first refresh, after a failed lookup, when stale', async (t) => {
   const early = await fixture(t, { refresh: false });
-  assert.throws(() => early.service.send(early.person(DINA).token, { to: 'finance', kind: 'ask', body: 'x' }), coded('MAILBOX_NOT_ALLOWED'));
+  assert.throws(() => early.service.send(early.person(DINA).token, { to: 'finance', kind: 'ask', body: 'x' }), coded('MAILBOX_MEMBERSHIP_UNKNOWN'));
+  assert.throws(() => early.service.send(early.roleTurn(FINANCE), { to: 'mai', kind: 'tell', body: 'x' }), coded('MAILBOX_MEMBERSHIP_UNKNOWN'),
+    'no go card while it is unknown whether Mai is a member');
+  assert.throws(() => early.service.submit({ sender: 'agent-org', to: 'person:dina', role: 'finance', body: 'Done.', key: 'k1' }), coded('MAILBOX_MEMBERSHIP_UNKNOWN'),
+    'a task final waiting for membership can be retried, not dropped');
+  assert.equal(early.rows().length, 0);
+  await early.service.refreshMembership();
+  assert.equal(early.service.submit({ sender: 'agent-org', to: 'person:dina', role: 'finance', body: 'Done.', key: 'k1' }).state, 'queued', 'the retry succeeds');
 
   const broken = await fixture(t, { getChatMember: async () => { throw Object.assign(new Error('Bad Gateway'), { error_code: 502 }); } });
-  assert.throws(() => broken.service.send(broken.person(DINA).token, { to: 'cmo', kind: 'ask', body: 'x' }), coded('MAILBOX_NOT_ALLOWED'));
+  assert.throws(() => broken.service.send(broken.person(DINA).token, { to: 'cmo', kind: 'ask', body: 'x' }), coded('MAILBOX_MEMBERSHIP_UNKNOWN'));
 
+  const stale = await fixture(t);
+  stale.advance(11 * 60000);
+  assert.throws(() => stale.service.send(stale.person(DINA).token, { to: 'finance', kind: 'ask', body: 'x' }), coded('MAILBOX_MEMBERSHIP_UNKNOWN'),
+    'an answer older than two refreshes no longer counts');
+});
+
+test('a proven non-member is refused for good: left, kicked, or restricted without membership', async (t) => {
+  const f = await fixture(t);
+  assert.throws(() => f.service.send(f.person(MAI).token, { to: 'finance', kind: 'ask', body: 'x' }), coded('MAILBOX_NOT_ALLOWED'));
+  assert.throws(() => f.service.submit({ sender: 'agent-org', to: 'person:mai', role: 'finance', body: 'x', key: 'k' }), coded('MAILBOX_NOT_ALLOWED'));
   const restricted = await fixture(t, { getChatMember: async (chatId, userId) => (String(userId) === DINA
     ? { status: 'restricted', is_member: chatId === MARK } : { status: 'member' }) });
   assert.deepEqual(restricted.service.identify({ token: restricted.person(DINA).token }).roles, ['cmo', 'ads'],
     'restricted counts only while still a member');
-
-  const stale = await fixture(t);
-  stale.advance(11 * 60000);
-  assert.throws(() => stale.service.send(stale.person(DINA).token, { to: 'finance', kind: 'ask', body: 'x' }), coded('MAILBOX_NOT_ALLOWED'),
-    'an answer older than two refreshes no longer counts');
+  assert.throws(() => restricted.service.send(restricted.person(DINA).token, { to: 'finance', kind: 'ask', body: 'x' }), coded('MAILBOX_NOT_ALLOWED'));
 });
 
-test('a person who leaves the group loses access on the next refresh, and an error on refresh does not keep the old answer', async (t) => {
-  for (const next of [
-    async (chatId, userId) => ({ status: chatId === MGMT && String(userId) === DINA ? 'left' : 'member' }),
-    async (chatId, userId) => { if (chatId === MGMT && String(userId) === DINA) throw new Error('timeout'); return { status: 'member' }; },
+test('a person who leaves the group loses access on the next refresh; a failed refresh makes it unknown, never keeps the old answer', async (t) => {
+  for (const [next, code] of [
+    [async (chatId, userId) => ({ status: chatId === MGMT && String(userId) === DINA ? 'left' : 'member' }), 'MAILBOX_NOT_ALLOWED'],
+    [async (chatId, userId) => { if (chatId === MGMT && String(userId) === DINA) throw new Error('timeout'); return { status: 'member' }; }, 'MAILBOX_MEMBERSHIP_UNKNOWN'],
   ]) {
     let lookup = async () => ({ status: 'member' });
     const f = await fixture(t, { getChatMember: (chatId, userId) => lookup(chatId, userId) });
+    const open = f.service.send(f.roleTurn(FINANCE), { to: 'dina', kind: 'ask', body: 'Approve?' });
     assert.equal(f.service.send(f.person(DINA).token, { to: 'finance', kind: 'tell', body: 'one' }).state, 'queued');
     lookup = next;
     await f.service.refreshMembership();
-    assert.throws(() => f.service.send(f.person(DINA).token, { to: 'finance', kind: 'tell', body: 'two' }), coded('MAILBOX_NOT_ALLOWED'));
+    assert.throws(() => f.service.send(f.person(DINA).token, { to: 'finance', kind: 'tell', body: 'two' }), coded(code));
+    assert.throws(() => f.service.reply(f.person(DINA).token, { inReplyTo: open.id, body: 'Yes.' }), coded(code), 'replies too');
   }
 });
 
@@ -537,5 +555,24 @@ test('only a tainted assistant pays for an idle proof', async (t) => {
   f.person(DINA);
   assert.equal(f.service.needsIdleProof(DINA), false);
   assert.equal(f.service.needsIdleProof(FINANCE), false, 'roles never need it');
+});
+
+test('a member\'s press while membership is unknown keeps the tell waiting and asks to press again', async (t) => {
+  let fail = false;
+  const f = await fixture(t, { getChatMember: async (chatId, userId) => {
+    if (fail) throw new Error('timeout');
+    return { status: MEMBERS[chatId]?.[String(userId)] ?? 'left' };
+  } });
+  const waiting = f.service.send(f.roleTurn(FINANCE), { to: 'mai', kind: 'tell', body: 'Approved.' });
+  await f.settle();
+  const card = f.posts.find((p) => p.method === 'sendMessage' && p.meta?.source === 'mailbox-go');
+  const go = { from: DINA, data: `mbx:go:${waiting.id}`, chatId: MGMT, messageId: card.messageId };
+  fail = true;
+  await f.service.refreshMembership();
+  assert.match(await f.press(go), /not confirmed yet/);
+  assert.equal(f.rows().length, 0);
+  fail = false;
+  await f.service.refreshMembership();
+  assert.equal(await f.press(go), 'Sent.');
 });
 
