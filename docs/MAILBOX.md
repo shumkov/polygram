@@ -190,8 +190,12 @@ person's direct chat, whose id is the person's Telegram user id:
   assumes a particular person is configured; leaving someone out of
   `assistants` leaves their direct chat unaddressed.
 - **`mailbox_identify`** for an assistant returns
-  `{assistant, chatId, depth, roles}`. `roles` lists the roles whose group has
-  the person as a confirmed member.
+  `{assistant, chatId, depth, roles, unconfirmed}`. `roles` lists the roles
+  whose group has the person as a confirmed member; `unconfirmed` lists the
+  roles whose membership is not known yet (never fetched since the daemon
+  started, the last lookup failed, or the answer is stale). A proven
+  non-member's roles are in neither. `identify` never refuses for unknown
+  membership; a caller treats `unconfirmed` as "retry later".
 - **History.** An assistant's history command may also read the topic of a
   role its person can reach (`canReadRoleTopic`); see the history skill.
 - **`mailbox_submit` to an assistant.** `to: "person:<key>"` needs `role`, the

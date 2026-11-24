@@ -254,7 +254,7 @@ test('a Codex assistant takes full part: it asks, is asked, replies, and hears a
   assert.deepEqual([f.row(fromDina.id).to_addr, f.row(fromOps.id).to_addr], [`session:${IVAN}`, `session:${IVAN}`]);
   assert.equal(f.service.submit({ sender: 'agent-org', to: 'person:ivan', role: 'finance', body: 'Task done.', key: 'k-ivan' }).state, 'queued');
   assert.equal(f.service.reply(f.person(IVAN).token, { inReplyTo: fromDina.id, body: 'Approved.' }).state, 'queued');
-  assert.deepEqual(f.service.identify({ token: f.person(IVAN).token }), { assistant: 'ivan', chatId: IVAN, depth: 0, roles: ['ops', 'finance', 'cmo', 'ads'] });
+  assert.deepEqual(f.service.identify({ token: f.person(IVAN).token }), { assistant: 'ivan', chatId: IVAN, depth: 0, roles: ['ops', 'finance', 'cmo', 'ads'], unconfirmed: [] });
   assert.match(f.service.instructions(IVAN), /reply '/);
 });
 
@@ -359,7 +359,7 @@ test('a role is never tainted by its deliveries, so a role turn another role sta
 
 test('identify: an assistant gets its key, chat, depth and reachable roles; a role gets exactly what it got before', async (t) => {
   const f = await fixture(t);
-  assert.deepEqual(f.service.identify({ token: f.person(DINA).token }), { assistant: 'dina', chatId: DINA, depth: 0, roles: ['ops', 'finance', 'cmo', 'ads'] });
+  assert.deepEqual(f.service.identify({ token: f.person(DINA).token }), { assistant: 'dina', chatId: DINA, depth: 0, roles: ['ops', 'finance', 'cmo', 'ads'], unconfirmed: [] });
   assert.deepEqual(f.service.identify({ token: f.roleTurn(OPS) }), { role: 'ops', depth: 0 });
 });
 
@@ -574,5 +574,29 @@ test('a member\'s press while membership is unknown keeps the tell waiting and a
   fail = false;
   await f.service.refreshMembership();
   assert.equal(await f.press(go), 'Sent.');
+});
+
+// agent-org's tasks CLI tells "not reachable" from "not known yet" by this
+// field, and retries only the latter.
+test('identify lists the roles whose membership is not known yet as unconfirmed, and never throws for it', async (t) => {
+  const early = await fixture(t, { refresh: false });
+  assert.deepEqual(early.service.identify({ token: early.person(DINA).token }),
+    { assistant: 'dina', chatId: DINA, depth: 0, roles: [], unconfirmed: ['ops', 'finance', 'cmo', 'ads'] }, 'before the first refresh');
+
+  const partial = await fixture(t, { getChatMember: async (chatId, userId) => {
+    if (chatId === MGMT) throw new Error('timeout');
+    return { status: MEMBERS[chatId]?.[String(userId)] ?? 'left' };
+  } });
+  assert.deepEqual(partial.service.identify({ token: partial.person(DINA).token }),
+    { assistant: 'dina', chatId: DINA, depth: 0, roles: ['cmo', 'ads'], unconfirmed: ['ops', 'finance'] }, 'a failed lookup');
+  const mai = partial.service.identify({ token: partial.person(MAI).token });
+  assert.deepEqual([mai.roles, mai.unconfirmed], [['cmo', 'ads'], ['ops', 'finance']]);
+
+  const known = await fixture(t);
+  assert.deepEqual(known.service.identify({ token: known.person(MAI).token }).unconfirmed, [],
+    'a proven non-member is neither reachable nor unconfirmed');
+  known.advance(11 * 60000);
+  assert.deepEqual(known.service.identify({ token: known.person(MAI).token }).unconfirmed, ['ops', 'finance', 'cmo', 'ads'], 'a stale answer');
+  assert.deepEqual(known.service.identify({ token: known.roleTurn(OPS) }), { role: 'ops', depth: 0 }, 'a role gets exactly what it got before');
 });
 
