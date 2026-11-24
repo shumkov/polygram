@@ -264,3 +264,42 @@ test('a Codex job turn carries its own history command, and a deferred retry kee
   assert.match(prompt, /POLYGRAM_IPC_DIR="\/ipc"/, 'a Codex shell inherits no environment, so the command names the IPC directory itself');
   assert.equal(history.scope(target.sessionKey), token, 'the retry reused the deferred attempt\'s token instead of minting another');
 });
+
+test('a Codex job turn in the admin chat gets own-chat history reach only, and its send demotes the admin\'s earlier commands', async (t) => {
+  // Any same-user process can submit a job or mailbox message into the admin
+  // DM, and Codex now takes them, so a Codex job turn must not carry the
+  // operator's cross-chat history reach.
+  const { freshDb, cleanupDb } = require('./helpers/db-fixture');
+  const { createExternalJobDispatch } = require('../lib/external-jobs/dispatch');
+  const { createHistoryService } = require('../lib/history-scope');
+  const { db, dbPath } = freshDb('codex-admin-history');
+  t.after(() => cleanupDb(dbPath, db));
+  const ADMIN = '68861949';
+  const config = { bot: { adminChatId: Number(ADMIN), externalJobs: { enabled: true, routes: {} } },
+    chats: { [ADMIN]: { name: 'Ivan DM', pm: 'codex' }, '-1001': { isolateTopics: true, topics: { 5: {} } } } };
+  const history = createHistoryService({ config, db, botName: 'shumabit', ipcDir: '/ipc' });
+  const tokenOf = (text) => /history\/scripts\/query\.js" "shumabit" "([0-9a-f-]{36})"/.exec(text)?.[1];
+  const human = tokenOf(history.instructions(ADMIN));
+  assert.ok(Array.isArray(history.query(human, { sub: 'recent', chatId: '-1001' }).rows), 'the operator\'s own prompt reaches other chats');
+
+  const adminJob = { ...job, routeId: `session:${ADMIN}`, target: { chatId: ADMIN, threadId: null, sessionKey: ADMIN } };
+  const entry = codexEntry();
+  let busy = true;
+  const f = fixture({ config, pm: { get: () => (busy ? codexEntry({ state: 'Active' }) : entry), getModelSettingsStatus: async () => ({ outcome: 'loaded' }) },
+    getOrSpawnForChat: async () => entry });
+  const dispatch = createExternalJobDispatch({ dispatchExternalEvent: (_origin, run) => run(), runtime: f.runtime, getHistory: () => history,
+    getMailbox: () => ({ enabled: true, instructions: () => '', noteJobSend: () => {} }) });
+  assert.equal((await dispatch(adminJob)).deferred, true);
+  assert.ok(Array.isArray(history.query(human, { sub: 'recent', chatId: '-1001' }).rows), 'a deferred job never reached the session, so nothing is demoted');
+
+  busy = false;
+  assert.equal((await dispatch(adminJob)).outcome, 'succeeded');
+  const prompt = f.calls[0][1];
+  const jobToken = tokenOf(prompt);
+  assert.ok(jobToken && jobToken !== human);
+  assert.doesNotMatch(prompt, /--chat/, 'the Codex job prompt does not advertise admin reach');
+  assert.throws(() => history.query(jobToken, { sub: 'search', query: 'x', chatId: 'all' }), /only its own chat/);
+  assert.ok(Array.isArray(history.query(jobToken, { sub: 'recent' }).rows), 'the job turn still reads its own chat');
+  assert.throws(() => history.query(human, { sub: 'recent', chatId: '-1001' }), /only its own chat/,
+    'once the Codex job prompt is sent, the older command in its context no longer reaches other chats');
+});
