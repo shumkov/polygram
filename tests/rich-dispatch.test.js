@@ -717,3 +717,23 @@ test('a reply whose RAW text is over the cap is refused before the filesystem is
   assert.equal(resolverCalls, 0, 'and no descriptor was ever resolved');
   assert.equal(sendCalls.length, 0);
 });
+
+test('a decline says whether the rich send may have landed, so a durable caller never sends it twice', async () => {
+  // Interactive replies resend plain either way and ignore the flag; an
+  // external-job report must not resend when the outcome is unknown.
+  for (const [sendRich, ambiguous] of [
+    [async () => ({ wentRich: false, fallback: 'error' }), true],
+    [async () => ({ wentRich: false, fallback: 'no-message-id' }), true],
+    [async () => { throw new Error('boom'); }, true],
+    [async () => ({ wentRich: false, fallback: 'capability' }), false],
+    [async () => ({ wentRich: false, fallback: 'content-error' }), false],
+    [async () => ({ wentRich: false }), false],
+  ]) {
+    const { factory } = build({ sendRich });
+    const out = await deliver(factory, TABLE);
+    assert.equal(out.handled, false);
+    assert.equal(out.ambiguous === true, ambiguous, String(sendRich));
+  }
+  const notTried = build({ getRichKnownUnsupported: () => true });
+  assert.equal((await deliver(notTried.factory, TABLE)).ambiguous === true, false, 'nothing was attempted');
+});
