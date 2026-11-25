@@ -50,7 +50,7 @@ const {
 } = require('./lib/ops/systemd-invocation');
 const { createDaemonIdentity } = require('./lib/ops/daemon-identity');
 const packageMetadata = require('./package.json');
-const { filterAttachments, resolveFileCaps, resolveMaxFileOverride, MAX_TOTAL_BYTES } = require('./lib/attachments');
+const { filterAttachments, inboundFilterOpts, resolveFileCaps, resolveMaxFileOverride } = require('./lib/attachments');
 // 0.9.0: SDK ProcessManager is the only pm. CLI pm
 // (lib/process-manager.js) deleted in commit 6.
 // Both implementations expose the same public API (constructor +
@@ -1481,10 +1481,7 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
     localApi: !!config.bot?.apiRoot,
     override: resolveMaxFileOverride(config, chatId, threadIdStr || null),
   });
-  const { accepted, rejected } = filterAttachments(rawAtts, {
-    maxFileBytes: _fileCaps.inBytes,
-    maxTotalBytes: Math.max(_fileCaps.inBytes, MAX_TOTAL_BYTES),
-  });
+  const { accepted, rejected } = filterAttachments(rawAtts, inboundFilterOpts(_fileCaps));
   for (const { att, reason } of rejected) {
     console.log(`[${label}] attachment skipped: ${att.name} (${reason})`);
     logEvent('attachment-skipped', { chat_id: chatId, msg_id: msg.message_id, name: att.name, reason });

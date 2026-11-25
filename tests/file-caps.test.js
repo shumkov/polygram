@@ -119,3 +119,31 @@ test('dispatcher sends a file UNDER the cap', async () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('photographer album: 7 originals of ~19MB under a 100MB local-API cap all pass', () => {
+  // Production symptom: a photographer sent a 7-photo album of full-size
+  // JPEGs (18–20.5 MB each, ~135 MB in total) to a chat with
+  // maxFileBytes=100MB on a local Bot API server. Every file was within the
+  // per-file cap, yet the last photos were skipped with "exceeds total size
+  // cap (104857600 bytes)": the per-message budget equalled ONE file's cap.
+  // A Telegram album holds at most 10 items, so the budget must fit a full
+  // album of files that each pass the per-file cap.
+  const { filterAttachments, inboundFilterOpts } = require('../lib/attachments');
+  const caps = resolveFileCaps({ localApi: true, override: 100 * MB });
+  const sizesMb = [19.1, 19.3, 18.1, 19.3, 19.2, 20.5, 19.4];
+  const album = sizesMb.map((mb, i) => ({
+    name: `1Q2A${5000 + i}.jpg`, mime_type: 'image/jpeg', size: Math.round(mb * MB),
+  }));
+  const { accepted, rejected } = filterAttachments(album, inboundFilterOpts(caps));
+  assert.deepEqual(rejected.map((r) => `${r.att.name}: ${r.reason}`), []);
+  assert.equal(accepted.length, album.length);
+});
+
+test('album budget: 10 files at the per-file cap, never above the 2GB local ceiling', () => {
+  // Cloud: 10 × 20MB. A 100MB local override: 10 × 100MB. A local server
+  // with no override already allows a 2GB file; multiplying that would let one
+  // album write 20GB to the local server's disk, so it stays at 2GB.
+  assert.equal(resolveFileCaps({ localApi: false }).totalInBytes, 200 * MB);
+  assert.equal(resolveFileCaps({ localApi: true, override: 100 * MB }).totalInBytes, 1000 * MB);
+  assert.equal(resolveFileCaps({ localApi: true }).totalInBytes, LOCAL_MAX_BYTES);
+});
