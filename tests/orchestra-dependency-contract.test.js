@@ -11,7 +11,7 @@ const lockfile = require('../package-lock.json');
 const orchestra = require('@shumkov/orchestra');
 const orchestraPackage = require('@shumkov/orchestra/package.json');
 
-const REQUIRED_ORCHESTRA_VERSION = '0.12.6';
+const REQUIRED_ORCHESTRA_VERSION = '0.13.0';
 
 test('installed Orchestra exactly matches the reviewed Codex contract', () => {
   assert.equal(
@@ -39,6 +39,8 @@ test('installed Orchestra exactly matches the reviewed Codex contract', () => {
     'characterizePinnedSessionLauncher',
     'resolveCodexTargetPin',
     'reattestCodexStaticPolicy',
+    // Boot cleanup of mcp-config files left by dead CLI sessions.
+    'sweepStaleMcpConfigs',
   ]) {
     assert.equal(typeof orchestra[name], 'function', name);
   }
