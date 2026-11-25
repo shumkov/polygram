@@ -186,6 +186,7 @@
       "_comment_topics": "rc.48: each topic entry is EITHER a string (legacy: just a label) OR an object with optional fields {name, agent, cwd, model, effort, permissionMode, isolateUserConfig}. Object form lets a topic override chat-level config. Per-topic permissionMode overrides chat-level — typical use: scope one topic to permissionMode:'default' (so settings.json gates apply) while the rest of the chat stays on bypassPermissions. Object form requires isolateTopics: true (each topic gets its own SDK Query); polygram emits a startup warning otherwise.",
       "_comment_isolateUserConfig": "0.10.0, tmux backend only: isolateUserConfig:true spawns the topic's claude TUI cut off from the user-level ~/.claude config — passes --strict-mcp-config (zero MCP servers load) and --setting-sources project,local (drops ~/.claude/settings.json; the spawn cwd's own .claude/settings.json still loads). Use it when a topic's agent would otherwise inherit slow user-global MCP servers whose cold-start (tens of seconds) wedges the TUI before it can accept a prompt. Settable at chat OR topic level (topic wins). Default false.",
       "_comment_pm": "'pm' selects the session runtime. Canonical values: 'sdk' (default Claude API SDK), 'cli' (subscription-priced Claude CLI in tmux + Channels bridge), and 'codex' (subscription-backed pinned Codex app-server, no tmux). Settable at bot, chat, or topic scope (topic > chat > bot). Claude aliases 'channels' and 'tmux' still resolve to 'cli'. Codex uses separate codexModel/codexEffort fields and never consumes Claude model/effort values.",
+      "_comment_mcpServers": "CLI backend only (pm 'cli'): MCP servers this chat's or topic's Claude sessions get next to the bridge, in Claude's own mcpServers shape. A topic's value replaces the chat's ({} drops it). Entries are validated strictly; a bad one is skipped with a warning. An OAuth server reuses an existing `claude mcp add` login only when the name, type, exact URL (no trailing-slash change) and headers all match; its authenticate tools are denied, so an operator re-logs in interactively. Read at boot; a session picks it up on its next spawn (/reload, /new, restart). The SDK backend ignores the chat-level key; Codex and tmux ignore it entirely.",
       "topics": {
         "100": "Customer A",
         "200": {
@@ -196,6 +197,12 @@
           "effort": "high",
           "permissionMode": "default",
           "isolateUserConfig": true
+        },
+        "300": {
+          "name": "Design",
+          "mcpServers": {
+            "canva": { "type": "http", "url": "https://mcp.canva.com/mcp" }
+          }
         }
       }
     },

@@ -258,6 +258,17 @@ Per-chat flags:
   replies to bot messages. Paired users bypass this.
 - `topics: { "<thread_id>": "<name>" }` — human-readable topic labels
   included in the prompt.
+- `mcpServers: { "<name>": { "type": "http", "url": "..." } }` — CLI
+  backend only: MCP servers the chat's Claude sessions get next to the
+  bridge (Claude's own `mcpServers` shape). Settable on a topic too; a
+  topic's value replaces the chat's (`{}` drops it) and needs
+  `isolateTopics: true`. An OAuth server reuses an existing `claude mcp
+  add` login only with the same name, type, exact URL and headers; its
+  `authenticate` tools are denied, so an operator logs in interactively.
+  Invalid entries are skipped with a warning. Read at boot; a session
+  picks it up on its next spawn (`/reload`, `/new`, a restart). The SDK
+  backend ignores the chat-level key. Design:
+  `docs/CLI_MCP_SERVERS_SPEC.md`.
 
 Per-bot flags:
 
