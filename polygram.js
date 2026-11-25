@@ -85,6 +85,7 @@ const {
 } = require('./lib/process/claude-environment');
 const { createTmuxRunner } = require('@shumkov/orchestra');
 const { sweepTmuxOrphans } = require('@shumkov/orchestra').orphanSweep;
+const { sweepStaleMcpConfigs } = require('@shumkov/orchestra');
 // rc.42: autosteer-buffer module deleted. Native SDK priority push
 // (pm.injectUserMessage) replaces the buffer + PostToolBatch detour.
 const { createAutosteeredRefs } = require('./lib/autosteered-refs');
@@ -3756,6 +3757,15 @@ async function main() {
   } catch (err) {
     sweepError = err;
     console.warn?.(`[orphan-sweep] failed: ${err.message}`);
+  }
+  // CLI sessions write a 0600 mcp-config (bridge secret, configured MCP server
+  // headers) that a clean teardown removes; a killed daemon leaves it behind.
+  // Files whose session socket still accepts belong to a live daemon (another
+  // bot under the same user) and stay. Best-effort: never blocks boot.
+  try {
+    await sweepStaleMcpConfigs({ sessionPrefix: 'polygram', logger: console });
+  } catch (err) {
+    console.warn?.(`[mcp-config-sweep] failed: ${err.message}`);
   }
   // When we are forbidden from creating the tmux server, an unreachable one is
   // terminal: every tmux-backed turn would fail while systemd still reported
