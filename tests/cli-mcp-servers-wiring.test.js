@@ -30,6 +30,9 @@ describe('CLI MCP servers wiring', () => {
     const claudeReturn = spawn.slice(spawn.lastIndexOf('return {'));
     assert.match(claudeReturn, /^return \{\s*chatConfig,/);
     assert.doesNotMatch(claudeReturn, /chatConfig:\s*\{/);
+    // Orchestra picks the topic's mcpServers with chatConfig.topics[threadId]:
+    // without the thread id a topic-scoped server (Canva in topic 1306) is lost.
+    assert.match(claudeReturn, /^return \{\s*chatConfig,\s*chatId,\s*threadId: threadId \|\| null,/);
   });
 
   test('boot removes mcp-config files left by dead sessions, after the tmux orphan sweep', () => {
