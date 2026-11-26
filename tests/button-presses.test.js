@@ -120,6 +120,37 @@ test('an owner tag that is not a plain short token is logged as invalid', async 
   assert.deepEqual(owners, ['invalid', 'invalid']);
 });
 
+test('callback data longer than Telegram allows is refused and not stored', async (t) => {
+  // Telegram caps callback_data at 64 bytes; a forged query is not held to
+  // that by anything but polygram.
+  const f = fixture(t);
+  const at64 = 'ext:ao:' + 'é'.repeat(28) + 'x';
+  assert.equal(Buffer.byteLength(at64), 64);
+  await f.press({ id: 'cbq-1', data: at64 });
+  await f.press({ id: 'cbq-2', data: at64 + 'x' });
+  assert.deepEqual(f.rows().map((r) => r.callback_query_id), ['cbq-1']);
+  assert.deepEqual(f.answers, [{ text: 'Received' }, { text: 'Stale or invalid button.' }]);
+  const [event] = f.events('button-press-oversized');
+  assert.equal(JSON.parse(event.detail_json).bytes, 65);
+});
+
+test('the toast is still sent when telemetry itself fails', async (t) => {
+  const answers = [];
+  const handle = createHandleExtButtonCallback({
+    db: { insertButtonPress: () => { throw new Error('locked'); } }, botName: 'test',
+    ownsChat: (chatId) => chatId === String(OWNED),
+    logEvent: () => { throw new Error('events table gone'); },
+    logger: { error: () => { throw new Error('stderr closed'); } },
+  });
+  const press = (chat) => handle({
+    callbackQuery: { id: 'cbq-1', from: { id: 1 }, data: DATA, message: { chat: { id: chat }, message_id: 1, date: 1 } },
+    answerCallbackQuery: async (opts) => { answers.push(opts); },
+  });
+  await press(OWNED);
+  await press(FOREIGN);
+  assert.deepEqual(answers, [{ text: 'Not recorded, try again' }, { text: 'Stale or invalid button.' }]);
+});
+
 // ── migration ────────────────────────────────────────────────────────────
 
 function legacyDb(version) {
