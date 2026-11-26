@@ -338,7 +338,7 @@ await tell('admin-bot', 'sendMessage', {
 ```
 
 Allowed methods: `sendMessage`, `sendRichMessage`, `sendPhoto`, `sendDocument`, `sendSticker`,
-`sendChatAction`, `editMessageText`, `setMessageReaction`. The socket
+`sendChatAction`, `editMessageText`, `editMessageReplyMarkup`, `setMessageReaction`. The socket
 server rejects others. Cross-bot sends are rejected (chat must belong
 to the bot on the other end of the socket).
 
