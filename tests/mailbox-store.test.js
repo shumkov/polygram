@@ -47,7 +47,7 @@ test('migration 028 adds display labels for session addresses', (t) => {
 // kept only once proven; rows from before either feature have neither.
 test('migration 029 records the target card and a proven link, and bumps the schema version', (t) => {
   const { db, store } = fixture(t);
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 30);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 31);
   const columns = db.raw.prepare('PRAGMA table_info(mailbox_messages)').all().map((c) => c.name);
   assert.deepEqual(columns.slice(18, 20), ['target_card', 'link']);
   store.insert(message({ id: 'm_l', link: 'https://t.me/c/1/2/3' }));
@@ -83,7 +83,7 @@ test('a version 28 database upgrades with its messages intact and no card or lin
   legacy.close();
   const db = open(dbPath);
   t.after(() => cleanupDb(dbPath, db));
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 30);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 31);
   const row = createMailboxStore(db.raw, { botName: 'test' }).get('m_28');
   assert.deepEqual([row.body, row.from_label, row.target_card, row.link], ['x', 'music', null, null]);
 });
@@ -95,7 +95,7 @@ test('a version 27 database upgrades with its messages intact and no labels', (t
   legacy.close();
   const db = open(dbPath);
   t.after(() => cleanupDb(dbPath, db));
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 30);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 31);
   const row = createMailboxStore(db.raw, { botName: 'test' }).get('m_27');
   assert.deepEqual([row.summary, row.from_label, row.to_label], ['Sum', null, null]);
 });
@@ -121,7 +121,7 @@ test('a database at version 24 upgrades to the current schema and keeps its mess
   legacy.close();
   const db = open(dbPath);
   t.after(() => cleanupDb(dbPath, db));
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 30);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 31);
   const row = createMailboxStore(db.raw, { botName: 'test' }).get('m_old');
   assert.equal(row.body, 'x');
   assert.equal(row.idem_key, null);
@@ -138,7 +138,7 @@ test('a database at version 25 upgrades to the current schema and keeps its syst
   legacy.close();
   const db = open(dbPath);
   t.after(() => cleanupDb(dbPath, db));
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 30);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 31);
   const row = createMailboxStore(db.raw, { botName: 'test' }).findByKey('system:agent-org', 'task:1');
   assert.deepEqual({ id: row.id, depth: row.depth, idem_key: row.idem_key, origin_name: row.origin_name }, { id: 'm_sys', depth: 1, idem_key: 'task:1', origin_name: null });
 });
@@ -166,7 +166,7 @@ test('a version 26 database keeps its origin and legacy hash with a NULL summary
   assert.equal(row.origin_name, 'Ivan');
   assert.equal(row.body_hash, 'legacy-hash');
   assert.equal(row.summary, null);
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 30);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 31);
 });
 
 test('a message is found by its sender and key, scoped to the bot', (t) => {
@@ -281,7 +281,7 @@ test('undelivered replies are failed, interrupted or uncertain replies without t
 // pressed Send, and records whose go sent it.
 test('migration 030 records whose go sent a message, and bumps the schema version', (t) => {
   const { db, store } = fixture(t);
-  assert.equal(db.raw.pragma('user_version', { simple: true }), 30);
+  assert.equal(db.raw.pragma('user_version', { simple: true }), 31);
   const columns = db.raw.prepare('PRAGMA table_info(mailbox_messages)').all().map((c) => c.name);
   assert.equal(columns.at(-1), 'approved_by');
   store.insert(message({ id: 'm_g', approvedBy: 'ivan' }));

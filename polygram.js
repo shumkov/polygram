@@ -548,6 +548,7 @@ const { extractAttachments } = require('./lib/handlers/extract-attachments');
 const { createRecordInbound } = require('./lib/handlers/record-inbound');
 const { createHandleSendOverIpc } = require('./lib/handlers/ipc-send');
 const { createCallbackQueryHandler } = require('./lib/handlers/callback-router');
+const { createHandleExtButtonCallback } = require('./lib/handlers/ext-button');
 const { createDispatcher } = require('./lib/handlers/dispatcher');
 const { createPollLoop } = require('./lib/handlers/poll');
 
@@ -3496,12 +3497,16 @@ function createBot(token) {
     await dispatchRegularMessage(ctx.message);
   });
 
+  const handleExtButtonCallback = createHandleExtButtonCallback({
+    db, ownsChat: knownChat, logEvent, botName: BOT_NAME,
+  });
   bot.on('callback_query:data', createCallbackQueryHandler({
     botName: BOT_NAME,
     logEvent,
     isWellFormedCallbackQuery,
     // Read per query: most of these are wired after createBot runs.
     routes: () => ({
+      extButton: handleExtButtonCallback,
       config: handleConfigCallback,
       codexReconciliation: handleCodexReconciliationCallback,
       question: questionHandlers ? (ctx) => questionHandlers.handleQuestionCallback(ctx) : null,

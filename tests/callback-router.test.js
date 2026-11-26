@@ -20,6 +20,7 @@ function fixture(routeOverrides = {}) {
   const routes = {
     config: route('config'), codexReconciliation: route('codexReconciliation'),
     question: route('question'), mailbox: route('mailbox'), approval: route('approval'),
+    extButton: route('extButton'),
     ...routeOverrides,
   };
   const handle = createCallbackQueryHandler({
@@ -39,6 +40,9 @@ test('each prefix reaches its own handler and anything else reaches the tool app
   const cases = [
     ['cfg:model:opus', 'config'], ['cxr:keep:1', 'codexReconciliation'], ['q:1:a', 'question'],
     ['mbx:go:m_1', 'mailbox'], ['approve:12:tok', 'approval'], ['anything', 'approval'],
+    ['ext:ao:ap:Rmwxarwe7db8def', 'extButton'], ['ext:', 'extButton'],
+    // Only the exact prefix belongs to an external owner.
+    ['extra:1', 'approval'], ['EXT:ao:x', 'approval'],
   ];
   for (const [data, expected] of cases) {
     const f = fixture();
@@ -74,4 +78,25 @@ test('a handler that throws is logged and does not escape into grammy', async ()
   const f = fixture({ approval: async () => { throw new Error('boom'); } });
   await f.press(query('approve:12:tok'));
   assert.deepEqual(f.errors, ['[test] callback_query error: boom']);
+});
+
+test('an external-owner press on a bot without that route gets the stale toast', async () => {
+  const f = fixture({ extButton: null });
+  await f.press(query('ext:ao:ap:R1'));
+  assert.deepEqual(f.calls, []);
+  assert.deepEqual(f.answers, [{ text: STALE_BUTTON }]);
+});
+
+test('an inline-mode external-owner press is still refused before routing', async () => {
+  const f = fixture();
+  const inline = query('ext:ao:ap:R1'); delete inline.message; inline.inline_message_id = 'AAAA';
+  await f.press(inline);
+  assert.deepEqual(f.calls, []);
+  assert.deepEqual(f.answers, [{ text: STALE_BUTTON }]);
+});
+
+test('the daemon routes external-owner presses through its own chat ownership check', () => {
+  const src = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'polygram.js'), 'utf8');
+  assert.match(src, /createHandleExtButtonCallback\(\{\s*db, ownsChat: knownChat, logEvent, botName: BOT_NAME,\s*\}\)/);
+  assert.match(src, /routes: \(\) => \(\{\s*extButton: handleExtButtonCallback,/);
 });
