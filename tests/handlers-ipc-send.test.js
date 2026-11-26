@@ -165,3 +165,13 @@ describe('createHandleSendOverIpc — bot readiness', () => {
     );
   });
 });
+
+describe('createHandleSendOverIpc — inline keyboards', () => {
+  test('a plain sendMessage keeps its inline keyboard', async () => {
+    // External owners (agent-org) put their own buttons on cards they send.
+    const { handler, calls } = fixture({ chats: { '111': {} } });
+    const reply_markup = { inline_keyboard: [[{ text: '✅ Approve', callback_data: 'ext:ao:ap:R1' }]] };
+    await handler({ method: 'sendMessage', params: { chat_id: '111', text: 'card', reply_markup } });
+    assert.deepEqual(calls[0].params.reply_markup, reply_markup);
+  });
+});

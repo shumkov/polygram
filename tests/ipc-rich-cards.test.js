@@ -79,3 +79,40 @@ test('rich ownership and malformed fallback are checked before any send', async 
   await assert.rejects(f.handler(invalid), /blocks/);
   assert.equal(f.calls.length, 0);
 });
+
+// An owner such as agent-org puts its approval button on a rich card. A
+// keyboard that the rich send carries but its HTML fallback drops leaves the
+// card without its button on exactly the servers that cannot render rich.
+const markup = { inline_keyboard: [[{ text: '✅ Approve', callback_data: 'ext:ao:ap:Rmwxarwe7db8def' }]] };
+const withMarkup = (req) => { req.params.reply_markup = markup; return req; };
+
+test('a rich card keeps its inline keyboard', async (t) => {
+  const f = fixture(t);
+  assert.equal((await f.handler(withMarkup(request()))).rich, true);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].method, 'sendRichMessage');
+  assert.deepEqual(f.calls[0].params.reply_markup, markup);
+});
+
+test('the HTML fallback carries the same inline keyboard as the rich attempt', async (t) => {
+  const f = fixture(t, (method) => { if (method === 'sendRichMessage') throw { error_code: 400, description: 'Bad Request: invalid rich message block' }; });
+  assert.equal((await f.handler(withMarkup(request()))).rich, false);
+  assert.deepEqual(f.calls.map((c) => c.method), ['sendRichMessage', 'sendMessage']);
+  assert.deepEqual(f.calls[0].params.reply_markup, markup);
+  assert.deepEqual(f.calls[1].params.reply_markup, markup);
+});
+
+test('a rich card without a keyboard sends none on either transport', async (t) => {
+  const f = fixture(t, (method) => { if (method === 'sendRichMessage') throw { error_code: 400, description: 'Bad Request: invalid rich message block' }; });
+  await f.handler(request());
+  for (const c of f.calls) assert.equal('reply_markup' in c.params, false);
+});
+
+test('a reply_markup that is not an object is refused before any send', async (t) => {
+  const f = fixture(t);
+  for (const bad of ['{"inline_keyboard":[]}', [], null, 5]) {
+    const req = request(); req.params.reply_markup = bad;
+    await assert.rejects(f.handler(req), /reply_markup/);
+  }
+  assert.equal(f.calls.length, 0);
+});
