@@ -274,9 +274,11 @@ describe('Codex main-loop steering wiring', () => {
       source,
       /if \(text === '\/config' && isCodexRuntimeView\(runtimeView\)\) \{[\s\S]*?db\.listUnresolvedCodexAttempts\(\{[\s\S]*?session_key: sessionKey,[\s\S]*?buildCodexReconciliationView\(attempt\)/,
     );
+    // The router sends `cxr:` data to this route; tests/callback-router.test.js
+    // covers the routing itself.
     assert.match(
       source,
-      /else if \(data\.startsWith\('cxr:'\)\) \{[\s\S]*?handleCodexReconciliationCallback\(ctx\)/,
+      /codexReconciliation: handleCodexReconciliationCallback,/,
     );
     assert.match(
       source,

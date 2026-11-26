@@ -703,11 +703,35 @@ describe('MESSAGE_NOT_MODIFIED filter', () => {
     assert.ok(ev, 'expected telegram-edit-skip-not-modified event');
   });
 
+  test('editMessageReplyMarkup: a repeated keyboard removal is a success, not an error', async () => {
+    // An IPC owner removes its button once a request closes and retries
+    // until the removal lands. A retry after an unseen success gets this
+    // 400; reported as an error, the owner would retry forever.
+    const bot = {
+      api: {
+        raw: new Proxy({}, {
+          get: () => () => {
+            throw new Error('Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message');
+          },
+        }),
+      },
+    };
+    const res = await send({
+      bot, method: 'editMessageReplyMarkup',
+      params: { chat_id: '1', message_id: 42, reply_markup: { inline_keyboard: [] } },
+      db, logger: silentLogger(),
+    });
+    assert.equal(res.message_id, 42);
+    assert.equal(res._notModified, true);
+    // Counted apart from the streamer's no-op text edits.
+    const ev = db.raw.prepare("SELECT detail_json FROM events WHERE kind = 'telegram-edit-skip-not-modified'").get();
+    assert.equal(JSON.parse(ev.detail_json).method, 'editMessageReplyMarkup');
+  });
+
   test('sendMessage: not-modified error is NOT swallowed (sendMessage cannot produce it)', async () => {
     // If a sendMessage somehow returns this error, treat it like any
-    // other 400 — propagate. The filter is editMessageText-specific
-    // because the streamer's debounced edit loop is the only path that
-    // generates spurious no-op edits.
+    // other 400 — propagate. The filter covers only editMessageText and
+    // editMessageReplyMarkup, the calls that repeat a change already made.
     const bot = {
       api: {
         raw: new Proxy({}, {

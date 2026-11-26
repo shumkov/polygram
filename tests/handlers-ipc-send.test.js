@@ -165,3 +165,50 @@ describe('createHandleSendOverIpc — bot readiness', () => {
     );
   });
 });
+
+describe('createHandleSendOverIpc — inline keyboards', () => {
+  test('a plain sendMessage keeps its inline keyboard', async () => {
+    // External owners (agent-org) put their own buttons on cards they send.
+    const { handler, calls } = fixture({ chats: { '111': {} } });
+    const reply_markup = { inline_keyboard: [[{ text: '✅ Approve', callback_data: 'ext:ao:ap:R1' }]] };
+    await handler({ method: 'sendMessage', params: { chat_id: '111', text: 'card', reply_markup } });
+    assert.deepEqual(calls[0].params.reply_markup, reply_markup);
+  });
+});
+
+describe('createHandleSendOverIpc — editMessageReplyMarkup', () => {
+  // The owner of a button removes it once its request closes. The edit must
+  // be held to the same ownership guard as editMessageText, or one bot's
+  // owner could strip buttons from another bot's chats.
+  const remove = { inline_keyboard: [] };
+
+  test('is allowed on a chat this bot owns', async () => {
+    const { handler, calls } = fixture({ chats: { '111': {} } });
+    await handler({ method: 'editMessageReplyMarkup', params: { chat_id: '111', message_id: 5, reply_markup: remove } });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, 'editMessageReplyMarkup');
+    assert.deepEqual(calls[0].params, { chat_id: '111', message_id: 5, reply_markup: remove });
+  });
+
+  test('is refused on a chat this bot does not own', async () => {
+    const { handler, calls } = fixture({ chats: { '111': {} } });
+    await assert.rejects(
+      () => handler({ method: 'editMessageReplyMarkup', params: { chat_id: '222', message_id: 5, reply_markup: remove } }),
+      /chat not owned by testbot: 222/,
+    );
+    assert.equal(calls.length, 0);
+  });
+
+  test('is refused without a chat id, and with an inline message id', async () => {
+    const { handler, calls } = fixture({ chats: { '111': {} } });
+    await assert.rejects(
+      () => handler({ method: 'editMessageReplyMarkup', params: { message_id: 5, reply_markup: remove } }),
+      /editMessageReplyMarkup requires chat_id/,
+    );
+    await assert.rejects(
+      () => handler({ method: 'editMessageReplyMarkup', params: { inline_message_id: 'AAAA', reply_markup: remove } }),
+      /inline_message_id editing not supported/,
+    );
+    assert.equal(calls.length, 0);
+  });
+});

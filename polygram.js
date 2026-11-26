@@ -547,6 +547,8 @@ let recordInbound = null;
 const { extractAttachments } = require('./lib/handlers/extract-attachments');
 const { createRecordInbound } = require('./lib/handlers/record-inbound');
 const { createHandleSendOverIpc } = require('./lib/handlers/ipc-send');
+const { createCallbackQueryHandler } = require('./lib/handlers/callback-router');
+const { createHandleExtButtonCallback } = require('./lib/handlers/ext-button');
 const { createDispatcher } = require('./lib/handlers/dispatcher');
 const { createPollLoop } = require('./lib/handlers/poll');
 
@@ -3495,37 +3497,23 @@ function createBot(token) {
     await dispatchRegularMessage(ctx.message);
   });
 
-  bot.on('callback_query:data', async (ctx) => {
-    if (!isWellFormedCallbackQuery(ctx.callbackQuery)) {
-      logEvent('malformed-update', {
-        bot: BOT_NAME,
-        update_id: ctx.update?.update_id,
-        reason: 'callback_query missing message/from/data or inline-mode',
-      });
-      // Best-effort ack so Telegram stops re-sending. May fail silently.
-      await ctx.answerCallbackQuery({ text: 'Stale or invalid button.' }).catch(() => {});
-      return;
-    }
-    try {
-      const data = ctx.callbackQuery.data;
-      if (data.startsWith('cfg:')) {
-        await handleConfigCallback(ctx);
-      } else if (data.startsWith('cxr:')) {
-        if (handleCodexReconciliationCallback) {
-          await handleCodexReconciliationCallback(ctx);
-        }
-      } else if (data.startsWith('q:')) {
-        if (questionHandlers) await questionHandlers.handleQuestionCallback(ctx);
-      } else if (data.startsWith('mbx:')) {
-        if (mailboxService) await mailboxService.handleGoCallback(ctx);
-        else await ctx.answerCallbackQuery({ text: 'Stale or invalid button.' }).catch(() => {});
-      } else {
-        await handleApprovalCallback(ctx);
-      }
-    } catch (err) {
-      console.error(`[${BOT_NAME}] callback_query error: ${err.message}`);
-    }
+  const handleExtButtonCallback = createHandleExtButtonCallback({
+    db, ownsChat: knownChat, logEvent, botName: BOT_NAME,
   });
+  bot.on('callback_query:data', createCallbackQueryHandler({
+    botName: BOT_NAME,
+    logEvent,
+    isWellFormedCallbackQuery,
+    // Read per query: most of these are wired after createBot runs.
+    routes: () => ({
+      extButton: handleExtButtonCallback,
+      config: handleConfigCallback,
+      codexReconciliation: handleCodexReconciliationCallback,
+      question: questionHandlers ? (ctx) => questionHandlers.handleQuestionCallback(ctx) : null,
+      mailbox: mailboxService ? (ctx) => mailboxService.handleGoCallback(ctx) : null,
+      approval: handleApprovalCallback,
+    }),
+  }));
 
   bot.on('edited_message', async (ctx) => {
     if (!isWellFormedMessage(ctx.editedMessage)) {
