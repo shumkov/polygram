@@ -81,7 +81,9 @@ test('an assistant turn ends when its primary turn settles, or at once when no t
 });
 
 test('go-card presses reach the mailbox', () => {
-  assert.match(src, /data\.startsWith\('mbx:'\)\) \{\s*if \(mailboxService\) await mailboxService\.handleGoCallback\(ctx\);/);
+  // The router sends `mbx:` data to this route; tests/callback-router.test.js
+  // covers the routing itself.
+  assert.match(src, /mailbox: mailboxService \? \(ctx\) => mailboxService\.handleGoCallback\(ctx\) : null,/);
 });
 
 test('a tainted assistant\'s new turn needs the same idle proof external jobs use before its taint can clear', () => {
