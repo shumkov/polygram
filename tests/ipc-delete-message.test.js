@@ -15,6 +15,8 @@
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const { createHandleSendOverIpc, IPC_SEND_ALLOWED_METHODS } = require('../lib/handlers/ipc-send');
 
 const OWN = { direction: 'out', bot_name: 'testbot', source: 'agent-org' };
@@ -74,5 +76,20 @@ describe('deleteMessage over IPC', () => {
     );
     const gone = fixture({ fail: 'Bad Request: message to delete not found' });
     await assert.rejects(() => del(gone.handler, { chat_id: '111', message_id: 501 }), /deleteMessage: message to delete not found/);
+  });
+});
+
+// polygram.js runs main() on require, so the daemon's wiring is checked in
+// its source, like the other *-wiring tests. Without the message lookup the
+// guard finds no row, and every edit and deletion of an IPC sender's own
+// message is refused.
+describe('the daemon wires the IPC handler', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'polygram.js'), 'utf8');
+  const start = source.indexOf('handleSendOverIpc = createHandleSendOverIpc({');
+  const wiring = source.slice(start, source.indexOf('});', start));
+
+  test('with the database\'s message lookup', () => {
+    assert.notEqual(start, -1, 'polygram.js no longer builds handleSendOverIpc');
+    assert.match(wiring, /getMessage: \(chatId, msgId\) => db\.getMessage\(chatId, msgId\),/);
   });
 });

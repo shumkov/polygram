@@ -22,6 +22,7 @@ const { InputFile } = require('grammy');
 const { createHandleSendOverIpc, IPC_SEND_ALLOWED_METHODS } = require('../lib/handlers/ipc-send');
 const { coerceFileParams } = require('../lib/telegram/input-file');
 const { send } = require('../lib/telegram/api');
+const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 
 const OWN = { direction: 'out', bot_name: 'testbot', source: 'agent-org' };
 function fixture({ rows = { 501: OWN } } = {}) {
@@ -126,6 +127,30 @@ describe('the media of an edit is uploaded and capped like a send', () => {
       assert.equal(calls.length, 0);
     } finally {
       fs.rmSync(file, { force: true });
+    }
+  });
+});
+
+describe('the edits and the deletion leave the message\'s history row alone', () => {
+  // The ownership guard reads the row the original send wrote. An edit that
+  // wrote a row of its own would put a second copy of the card in the chat's
+  // history (Telegram answers an edit with the same message_id), so these
+  // methods stay off the tracked list in lib/telegram/api.js.
+  test('after a send, its picture and caption edits and its deletion, the one row is the send\'s', async () => {
+    const { db, dbPath } = freshDb('ipc-edit-media');
+    try {
+      const raw = new Proxy({}, { get: (_, method) => async () => (method === 'deleteMessage' ? true : { message_id: 501, date: 1 }) });
+      const bot = { api: { raw } };
+      const meta = { source: 'agent-org', botName: 'testbot' };
+      const logger = { log() {}, error() {} };
+      await send({ bot, method: 'sendPhoto', params: { chat_id: '111', photo: 'https://example.com/card.png', caption: 'Card' }, db, meta, logger });
+      await send({ bot, method: 'editMessageMedia', params: { chat_id: '111', message_id: 501, media: { type: 'photo', media: 'https://example.com/preview.png', caption: 'Preview' } }, db, meta, logger });
+      await send({ bot, method: 'editMessageCaption', params: { chat_id: '111', message_id: 501, caption: 'Approved' }, db, meta, logger });
+      await send({ bot, method: 'deleteMessage', params: { chat_id: '111', message_id: 501 }, db, meta, logger });
+      const rows = db.raw.prepare('SELECT msg_id, text, source, status FROM messages').all();
+      assert.deepEqual(rows.map((r) => ({ ...r })), [{ msg_id: 501, text: 'Card', source: 'agent-org', status: 'sent' }]);
+    } finally {
+      cleanupDb(dbPath, db);
     }
   });
 });
