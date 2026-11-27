@@ -327,6 +327,22 @@ test('a spaced path inside a collage is refused with a reason that does not loop
   assert.equal(h.sentAnything(), false);
 });
 
+test('a renamed collage path keeps working with its <…> still on', async () => {
+  // The collage refusal says "rename the file". An agent that renames it and
+  // leaves the angle brackets must not be refused again, for a third reason.
+  const cwd = workspace();
+  const a = writeImage(cwd, 'a.png');
+  const b = writeImage(cwd, 'b.png');
+  const h = build();
+
+  const res = await reply(h, `## Pair\n\n<tg-collage>\n![a](<${a}>)\n![b](${b})\n</tg-collage>`, { sessionCwd: cwd });
+
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const rich = h.tgCalls.find((c) => c.method === 'sendRichMessage');
+  const uploads = JSON.stringify(rich?.params.rich_message.blocks);
+  assert.ok(uploads.includes(fs.realpathSync(a)) && uploads.includes(fs.realpathSync(b)), uploads);
+});
+
 // ─── Loss after the text went out ──────────────────────────────────────────
 
 test('media lost after the text was delivered is reported with the delivered message_id', async () => {
