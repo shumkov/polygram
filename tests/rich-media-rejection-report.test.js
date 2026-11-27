@@ -453,4 +453,7 @@ test('the display hint teaches copying right before each send, names without spa
   assert.match(hint, /<\/abs\/path with spaces\.png>/);
   assert.doesNotMatch(hint, /it will not error/i, 'a rejected image now errors, and the hint must say so');
   assert.doesNotMatch(hint, /dropped silently/i);
+  assert.match(hint, /reply tool refuses/i, 'the refusal is the reply tool\'s, not every path\'s');
+  assert.match(hint, /says the text was delivered, do not send the text again/i);
+  assert.match(hint, /inside `<tg-collage>`.*cannot contain spaces/i);
 });
