@@ -361,6 +361,28 @@ test('media lost after the text was delivered is reported with the delivered mes
   assert.equal(res.message_id, 4242);
 });
 
+test('a streamed reply\'s lost image is reported with advice that works', async () => {
+  const dispatcher = createChannelsToolDispatcher({
+    bot: fakeBot,
+    send: async () => ({ message_id: 1 }),
+    chunkText: (text) => [text],
+    deliverReplies: async () => ({ sent: [], failed: [], results: [] }),
+    parseResponse: passthroughParse,
+    sanitizeAssistantReply: passthroughSanitize,
+    logger: quietLogger,
+    makeDeliverText: () => async () => ({
+      handled: true, sent: [77], failed: [], results: [],
+      mediaRejected: [{ src: '/w/chart.png', caption: 'chart', reason: 'streamed' }],
+    }),
+  });
+  const res = await dispatcher({
+    sessionKey: 'sess-loud', chatId: '1', threadId: null, toolName: 'reply',
+    text: '![chart](/w/chart.png)', files: null,
+  });
+  assert.equal(res.ok, false);
+  assert.ok(res.error.includes('/w/chart.png (a streamed reply cannot carry images; send the image alone with files:)'), res.error);
+});
+
 // ─── Pieces ────────────────────────────────────────────────────────────────
 
 test('inventoryImageSyntax separates what will render from what marked leaves as text', () => {
