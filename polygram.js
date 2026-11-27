@@ -4570,6 +4570,8 @@ async function main() {
   });
   handleSendOverIpc = createHandleSendOverIpc({
     config, bot, tg, botName: BOT_NAME, sendRich: (args) => richSendMessage(args),
+    // editMessageMedia/Caption may change only a message the same IPC sender sent.
+    getMessage: (chatId, msgId) => db.getMessage(chatId, msgId),
   });
   ({
     dispatchHandleMessage,
