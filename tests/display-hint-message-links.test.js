@@ -84,3 +84,24 @@ test('the SDK options use the hint builder they are given', () => {
   assert.deepEqual(seen, [['-1004462674958', '1306']]);
   assert.match(out.systemPrompt.append, /## The one hint/);
 });
+
+test('the session\'s hint follows what the mailbox says about that chat and topic', () => {
+  // Runs polygram's own sessionDisplayHint against a stub mailbox, so the
+  // hint is proven to ask usesMailboxIn, and to ask it about this session.
+  const polygram = fs.readFileSync(path.join(__dirname, '..', 'polygram.js'), 'utf8');
+  const source = /function sessionDisplayHint\(chatId, threadId\) \{\n[\s\S]*?\n\}/.exec(polygram)?.[0];
+  assert.ok(source, 'sessionDisplayHint not found');
+  const { resolveRichTextEnabled } = require('../lib/telegram/rich');
+  const hintFor = (usesMailbox) => {
+    const asked = [];
+    const mailboxService = { usesMailboxIn: (chatId, threadId) => { asked.push([chatId, threadId]); return usesMailbox; } };
+    const config = { defaults: {}, bot: {}, chats: { '-1004462674958': { isolateTopics: true } } };
+    const hint = new Function('buildPolygramDisplayHint', 'resolveRichTextEnabled', 'config', 'mailboxService',
+      `${source}\nreturn sessionDisplayHint('-1004462674958', '2148');`)(buildPolygramDisplayHint, resolveRichTextEnabled, config, mailboxService);
+    return { hint, asked };
+  };
+  const on = hintFor(true);
+  assert.deepEqual(on.asked, [['-1004462674958', '2148']]);
+  assert.match(on.hint, /give its `link` from the mailbox directory/, 'a mailbox session gets the mailbox lines');
+  assert.doesNotMatch(hintFor(false).hint, /mailbox/i, 'any other session does not');
+});
