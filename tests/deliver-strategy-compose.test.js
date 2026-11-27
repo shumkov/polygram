@@ -404,6 +404,32 @@ describe('what a consumed reply may deliver', () => {
     assert.ok(h.finalized[0].includes('the chart'), 'the caption survives');
   });
 
+  test('media a consumed reply could not carry is reported, not dropped silently', async () => {
+    // The preview consumed the reply and its images became captions. The
+    // agent must hear that, or it tells the user the pictures went out.
+    const h = harnessWithProjection();
+    await h.streamer.onChunk('Working on the chart');
+
+    const out = await h.makeDeliverText({
+      sessionKey: 'chat:1', chatId: '1', threadId: null, interim: false, turnId: null,
+    })({ text: `## Results\n\n![the chart](${h.file})` });
+
+    assert.equal(out.handled, true);
+    assert.deepEqual(out.mediaRejected?.map((m) => m.reason), ['streamed']);
+  });
+
+  test('a consumed reply without media reports nothing', async () => {
+    const h = harnessWithProjection();
+    await h.streamer.onChunk('Working on the chart');
+
+    const out = await h.makeDeliverText({
+      sessionKey: 'chat:1', chatId: '1', threadId: null, interim: false, turnId: null,
+    })({ text: '## Results\n\nAll done.' });
+
+    assert.equal(out.handled, true);
+    assert.equal(out.mediaRejected, undefined);
+  });
+
   test('a declining preview hands the NEXT strategy the text as authored', async () => {
     // The projection is about what this branch delivers, not about what the
     // reply is. Rich delivery must still see the media it is allowed to
