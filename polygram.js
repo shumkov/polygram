@@ -149,6 +149,7 @@ const {
 const { buildHistoryBlock } = require('./lib/history-preload');
 const { createNotificationService } = require('./lib/external-jobs/notifications');
 const { createExternalJobDispatch } = require('./lib/external-jobs/dispatch');
+const { createJobPresence } = require('./lib/external-jobs/presence');
 const { createMailboxService, humanTurn: mailboxHumanTurn } = require('./lib/mailbox/service');
 const { createHistoryService } = require('./lib/history-scope');
 const { formatContextReply, maybeContextFullHint } = require('./lib/context-format');
@@ -4631,6 +4632,9 @@ async function main() {
     },
     getOrSpawnForChat, sendToProcess, logEvent, logger: console,
   });
+  const jobPresence = createJobPresence({
+    bot, tg, botName: BOT_NAME, getAllowlist: (chatId) => getReactionAllowlist(bot, chatId), logEvent, logger: console,
+  });
   externalJobService = createExternalJobService({
     config, db, botName: BOT_NAME, resolveTarget: resolveExternalTarget,
     dispatch: createExternalJobDispatch({
@@ -4639,6 +4643,9 @@ async function main() {
       getHistory: () => historyService,
       getNotifications: () => notificationService,
       getMailbox: () => mailboxService,
+      // While a job's turn runs its chat shows typing, and the card it came
+      // from gets the status reactions a human message gets.
+      getPresence: () => jobPresence,
       logger: console, logEvent,
     }),
     checkInactive: externalRuntime.checkInactive,

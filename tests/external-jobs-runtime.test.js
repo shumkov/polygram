@@ -204,3 +204,90 @@ test('a failed recovery attempt logs its cause by code before reporting no idle 
   assert.match(warnings[0], /job-one.*request-one.*SPAWN_FAILED/);
   assert.doesNotMatch(warnings[0], /private/, 'codes only, never message text');
 });
+
+// A job's working state (typing, card reactions) shows only while its turn
+// really runs: from the moment the exact process takes the prompt until the
+// turn settles, however it settles. It rides the turn context the way a human
+// turn's typing and reactor do, and it never changes the job's outcome.
+function presenceProbe({ throwOn = null } = {}) {
+  const probe = { log: [], context: { reactor: { setState() {} }, typing: { pause() {}, resume() {} } } };
+  probe.begin = () => { probe.log.push('begin'); if (throwOn === 'begin') throw new Error('typing exploded'); };
+  probe.end = (outcome, error = null) => { probe.log.push(['end', outcome, ...(error ? [error.code ?? error.message] : [])]); if (throwOn === 'end') throw new Error('reaction exploded'); };
+  return probe;
+}
+const freshRoutes = (f) => { f.deps.config.bot.externalJobs.routes = { daily: { chatId: '-1001', threadId: '2995' } }; return f; };
+
+test('presence begins when the process takes the prompt and ends with the turn outcome', async () => {
+  for (const [settled, outcome] of [[{ text: '' }, 'succeeded'], [{ error: 'provider rejected' }, 'failed'], [{ aborted: true }, 'interrupted']]) {
+    const presence = presenceProbe();
+    const order = [];
+    const f = freshRoutes(fixture({ sendToProcess: async (...args) => {
+      order.push('send');
+      assert.equal(args[2].reactor, presence.context.reactor, 'the reactor rides the turn context');
+      assert.equal(args[2].typing, presence.context.typing, 'so does typing');
+      assert.deepEqual(presence.log, [], 'nothing shows before the process commits the send');
+      args[3].onDispatched();
+      order.push(...presence.log);
+      return settled;
+    } }));
+    const result = await f.runtime.dispatch(job, { onSend: () => order.push('hook'), presence });
+    assert.equal(result.outcome, outcome);
+    assert.deepEqual(order, ['hook', 'send', 'begin']);
+    assert.deepEqual(presence.log, ['begin', ['end', outcome]], outcome);
+  }
+});
+
+test('presence ends with the send error when the turn rejects, so a failed or timed-out turn shows as one', async () => {
+  const presence = presenceProbe();
+  const f = freshRoutes(fixture({ sendToProcess: async (...args) => { args[3].onDispatched(); throw Object.assign(new Error('Turn exceeded 1800s'), { code: 'TURN_MAX_EXCEEDED' }); } }));
+  assert.equal((await f.runtime.dispatch(job, { presence })).outcome, 'unknown');
+  assert.deepEqual(presence.log, ['begin', ['end', 'unknown', 'TURN_MAX_EXCEEDED']]);
+  const early = presenceProbe();
+  const g = freshRoutes(fixture({ sendToProcess: async () => { throw new Error('bridge down'); } }));
+  assert.equal((await g.runtime.dispatch(job, { presence: early })).outcome, 'unknown');
+  assert.deepEqual(early.log, [['end', 'unknown', 'bridge down']], 'end without begin shows nothing');
+});
+
+test('presence ends as soon as the turn settles, before the ledger settlement and the idle probe', async () => {
+  const presence = presenceProbe();
+  const order = [];
+  const f = freshRoutes(fixture({ sendToProcess: async (...args) => { args[3].onDispatched(); return { text: 'ok' }; } }));
+  f.entry.probeBusyState = async () => { order.push(['probe', presence.log.length]); return { busy: false }; };
+  await f.runtime.dispatch(job, { presence });
+  const [, endedBefore] = order.at(-1);
+  assert.equal(endedBefore, 2, 'begin and end both ran before the post-turn idle probe');
+  assert.deepEqual(presence.log, ['begin', ['end', 'succeeded']], 'end runs exactly once');
+});
+
+test('a job waiting behind a busy, paused or refusing session never shows as working', async () => {
+  for (const overrides of [{ isPaused: () => true }, { pm: { get: () => ({ backend: 'cli', inFlight: true }) } },
+    { pm: { get: () => ({ backend: 'cli', probeBusyState: async () => ({ busy: true }) }) } }, { resolveBackend: () => 'sdk' }]) {
+    const presence = presenceProbe();
+    const f = freshRoutes(fixture(overrides));
+    await f.runtime.dispatch(job, { presence });
+    assert.equal(presence.log.includes('begin'), false, JSON.stringify(Object.keys(overrides)));
+    assert.equal(f.calls.length, 0);
+  }
+});
+
+test('a Codex job shows as working from the send too', async () => {
+  const presence = presenceProbe();
+  const entry = { backend: 'codex', inFlight: false, state: 'Idle', hasPendingDeliveryWork: () => false };
+  const f = freshRoutes(fixture({ resolveBackend: () => 'codex', pm: { get: () => entry }, getOrSpawnForChat: async () => entry,
+    sendToProcess: async (...args) => { args[3].onDispatched(); return { text: 'Done.', runtime: 'codex' }; } }));
+  assert.equal((await f.runtime.dispatch(job, { presence })).outcome, 'succeeded');
+  assert.deepEqual(presence.log, ['begin', ['end', 'succeeded']]);
+});
+
+test('a throwing presence is logged and never changes the job outcome', async () => {
+  for (const throwOn of ['begin', 'end']) {
+    const presence = presenceProbe({ throwOn });
+    const errors = [];
+    const f = freshRoutes(fixture({ logger: { error: (line) => errors.push(line), warn() {} } }));
+    const result = await f.runtime.dispatch(job, { presence });
+    assert.equal(result.outcome, 'succeeded', throwOn);
+    assert.equal(result.text, 'Completed');
+    assert.equal(errors.length, 1, throwOn);
+    assert.match(errors[0], /request-one/);
+  }
+});

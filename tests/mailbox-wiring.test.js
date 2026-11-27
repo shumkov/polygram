@@ -21,8 +21,12 @@ test('every human prompt resets the session depth and carries the mailbox instru
 });
 
 test('external jobs dispatch through the shared wrapper with both services', () => {
-  assert.match(src, /dispatch: createExternalJobDispatch\(\{[\s\S]*?getNotifications: \(\) => notificationService,[\s\S]*?getMailbox: \(\) => mailboxService,\s*logger: console, logEvent,/);
+  assert.match(src, /dispatch: createExternalJobDispatch\(\{[\s\S]*?getNotifications: \(\) => notificationService,[\s\S]*?getMailbox: \(\) => mailboxService,[\s\S]*?getPresence: \(\) => jobPresence,\s*logger: console, logEvent,/);
   assert.doesNotMatch(src, /externalRuntime\.dispatch\(\{ \.\.\.job, task: job\.task/, 'no second, unwrapped dispatch path remains');
+});
+
+test('job turns show typing and card reactions through the same Telegram helpers as human turns', () => {
+  assert.match(src, /const jobPresence = createJobPresence\(\{\s*bot, tg, botName: BOT_NAME, getAllowlist: \(chatId\) => getReactionAllowlist\(bot, chatId\), logEvent, logger: console,/);
 });
 
 test('the mailbox service is built from the external-jobs resolver and served over IPC', () => {
