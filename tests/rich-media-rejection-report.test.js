@@ -424,6 +424,20 @@ test('prose that merely contains "![" is not image syntax', () => {
   }
 });
 
+test('a destination that starts like a path but names no media file is prose', () => {
+  // A path-like start alone made these "attempted images" and refused them.
+  for (const text of [
+    'Toggle ![x] (/settings/page) to enable',
+    'Готово![1] (/tmp/report.md) лежит там',
+    'See![note](./docs/read me.md) first',
+  ]) {
+    assert.deepEqual(inventoryImageSyntax(text), { images: [], unparsed: [] }, text);
+  }
+  // The incident's shapes name a media file and stay refused.
+  assert.equal(inventoryImageSyntax('![1 UNTIL SUNDAY](/home/x/PREVIEW 1 until sunday.jpg)').unparsed.length, 1);
+  assert.equal(inventoryImageSyntax('unterminated ![u](/w/u.png').unparsed.length, 1);
+});
+
 test('a long unterminated construct is quoted, truncated, not its whole tail', () => {
   const tail = `![shot](/w/${'x'.repeat(200)}.png`;
   const [item] = inventoryImageSyntax(tail).unparsed;
