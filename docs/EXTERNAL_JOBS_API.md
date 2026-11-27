@@ -24,6 +24,13 @@ Codex backends; a Codex destination is admitted only while its process is idle
 (or proven idle with no process), and its final text is the report. Mailbox
 deliveries are the tested Codex use; a notification consumer on a Codex
 route fails at boot.
+Every job's task gets one more paragraph at dispatch, after the stored task:
+the final text is posted to the people in the chat, so the turn writes one only
+when a person there needs to know something (a result, a problem found, a
+decision they must make), to them and in their current language, and otherwise
+ends with no text. While the turn runs the chat shows typing; a mailbox job's
+card also gets the status reactions a human message gets, ending 👍. See
+[`JOB_TURN_VOICE_SPEC.md`](./JOB_TURN_VOICE_SPEC.md).
 Route names and request IDs are nonempty bounded strings; request IDs must be
 stable across transport retries. The `mailbox:` and `mailbox-notice:` request
 ID prefixes are reserved for the [session mailbox](./MAILBOX.md); jobs using
