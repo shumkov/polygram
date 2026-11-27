@@ -156,11 +156,19 @@ test('a bare `![alt` literal survives an edit projection', () => {
   assert.match(out.text, /the syntax is !\[alt/);
 });
 
-test('an unterminated fragment that DOES carry a path still dies', () => {
+test('an unterminated fragment naming a media file still dies, and takes only itself', () => {
   const { strategy } = build();
-  const out = plan(strategy, `${CHECKED}\n\nhere it is ![a](/Users/me/secret`);
+  const out = plan(strategy, `${CHECKED}\n\nhere it is ![a](/Users/me/secret.png and then more`);
   assert.doesNotMatch(out.text, /\/Users\/me\/secret/);
-  assert.match(out.text, /here it is/, 'only the fragment goes, not the line');
+  assert.match(out.text, /here it is a and then more/, 'only the fragment goes, not the line');
+});
+
+test('a fragment that names no media file is the author\'s text and stays', () => {
+  // An edit is finished text: nothing will complete "![a](/Users/me/notes",
+  // so it is prose that happens to hold a path — as any prose may.
+  const { strategy } = build();
+  const out = plan(strategy, `${CHECKED}\n\nsee ![a](/Users/me/notes for the rest`);
+  assert.match(out.text, /see !\[a\]\(\/Users\/me\/notes for the rest/);
 });
 
 // ─── media stays out ──────────────────────────────────────────────────────

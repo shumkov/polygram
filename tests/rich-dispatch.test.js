@@ -424,34 +424,33 @@ test('the send receives the preflight for this call, not a bare block tree', asy
   assert.equal(typeof sendCalls[0].mediaContext?.preflightMedia, 'function');
 });
 
-test('media outside the call\'s roots degrades to a caption, never a path', async () => {
+test('media outside the call\'s roots refuses the reply, and never reaches the chat', async () => {
   // Same rejection reply(files:) would give the same path — that parity is
   // the point, and it is enforced by both sides receiving one roots array.
+  // Degrading to a placeholder told the agent nothing; it reported a picture
+  // the user never got. The reply is refused instead, and names the item.
   const { dir } = mediaWorkspace();
   const outside = mediaWorkspace('secret.png');
   const { factory, sendCalls } = buildWithMedia();
 
   const out = await deliverIn(factory, `## Results\n\n![a shot](${outside.file})`, [dir]);
 
-  assert.equal(out.handled, true, 'the heading still carries the reply');
-  const payload = JSON.stringify(sendCalls[0].blocks);
-  assert.ok(!payload.includes(outside.dir), `path leaked into blocks: ${payload}`);
-  assert.ok(payload.includes('a shot (media unavailable)'),
-    `expected an honest placeholder, got ${payload}`);
+  assert.equal(out.refused, true);
+  assert.equal(sendCalls.length, 0, 'nothing is sent, so a corrected resend is not a duplicate');
+  assert.deepEqual(out.mediaRejected, [{ src: outside.file, caption: 'a shot', reason: 'outside-roots' }]);
+  assert.ok(!out.text.includes(outside.dir), 'the body a caller might still use is stripped');
 });
 
-test('a reply whose only media is unresolvable demotes to plain', async () => {
-  // A rich bubble whose entire point was stripped out of it is worse than a
-  // plain one. With no other trigger, the reply goes to the chunked path.
+test('a reply whose only media is unresolvable is refused the same way', async () => {
   const { dir } = mediaWorkspace();
   const outside = mediaWorkspace('secret.png');
   const { factory, sendCalls } = buildWithMedia();
 
   const out = await deliverIn(factory, `![a shot](${outside.file})`, [dir]);
 
-  assert.equal(out.handled, false);
+  assert.equal(out.refused, true);
   assert.equal(sendCalls.length, 0);
-  assert.equal(out.text, 'a shot', 'the caption is what the chunked path delivers');
+  assert.deepEqual(out.mediaRejected.map((m) => m.reason), ['outside-roots']);
 });
 
 test('without a media wiring, image syntax still cannot reach the renderer', async () => {
@@ -507,6 +506,8 @@ test('a file swapped mid-flight costs the media, not the structure', async () =>
   assert.ok(retried.includes('the chart (media unavailable)'),
     `the retry says so honestly: ${retried}`);
   assert.ok(retried.includes('Results'), 'and keeps the structure it was sent for');
+  assert.deepEqual(out.mediaRejected, [{ src: file, caption: 'the chart', reason: 'source-changed' }],
+    'and the agent hears which image the delivered reply went without');
 });
 
 test('an uncaptioned item that vanished renders the bare placeholder', async () => {
@@ -542,6 +543,8 @@ test('a media-only reply collapses the ladder to two steps', async () => {
   assert.equal(calls.length, 1, 'no second send: there is nothing rich left to send');
   assert.equal(out.handled, false);
   assert.equal(out.text, 'the chart', 'the chunked path delivers the caption');
+  assert.deepEqual(out.mediaRejected?.map((m) => m.reason), ['not-sent'],
+    'the caption goes out, and the agent is told the image did not');
 });
 
 test('a retry that also fails still delivers the reply', async () => {
@@ -588,6 +591,8 @@ test('a media wiring that throws costs media, never the reply', async () => {
 
   assert.equal(out.handled, true, 'the reply still goes out, just without its media');
   assert.ok(!JSON.stringify(sendCalls[0].blocks).includes(dir));
+  assert.deepEqual(out.mediaRejected, [{ src: file, caption: 'the chart', reason: 'rich-unavailable' }],
+    'and says so: the agent cannot fix a broken wiring, but it can send the file another way');
 });
 
 test('styled text cannot smuggle a path past the media guard', async () => {
@@ -629,6 +634,7 @@ test('a wiring missing its preflight is refused outright', async () => {
   const payload = JSON.stringify(sendCalls[0].blocks);
   assert.ok(!payload.includes('photo'), 'no media may be sent without a preflight');
   assert.ok(!payload.includes(dir));
+  assert.deepEqual(out.mediaRejected?.map((m) => m.reason), ['rich-unavailable']);
 });
 
 // ─── No branch renders a local path (the raw-render hazards) ───────────────
@@ -652,7 +658,9 @@ test('image syntax the parser rejects never reaches the chat as text', async () 
   const cases = {
     'spaces (real file, in roots)': `Here you go:\n\n![the shot](${real.file})`,
     parens: 'Here you go:\n\n![shot](/Users/ivan/Desktop/shot (1).png)',
-    'unterminated fragment': `${TABLE}\n\n![shot](/Users/ivan/Desktop/id_rsa`,
+    // A fragment is cut when it names a media file. One that does not
+    // ("…/id_rsa") is prose in a finished reply, as any path in prose is.
+    'unterminated fragment': `${TABLE}\n\n![shot](/Users/ivan/Desktop/shot 1.png`,
     'wrapper around an unparseable path':
       `## Results\n\n<tg-collage>\n\n![a](/Users/ivan/Desktop/a b.png)\n\n</tg-collage>`,
   };

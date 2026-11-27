@@ -404,6 +404,53 @@ describe('what a consumed reply may deliver', () => {
     assert.ok(h.finalized[0].includes('the chart'), 'the caption survives');
   });
 
+  test('media a consumed reply could not carry is reported, not dropped silently', async () => {
+    // The preview consumed the reply and its images became captions. The
+    // agent must hear that, or it tells the user the pictures went out.
+    const h = harnessWithProjection();
+    await h.streamer.onChunk('Working on the chart');
+
+    const out = await h.makeDeliverText({
+      sessionKey: 'chat:1', chatId: '1', threadId: null, interim: false, turnId: null,
+    })({ text: `## Results\n\n![the chart](${h.file})` });
+
+    assert.equal(out.handled, true);
+    assert.deepEqual(out.mediaRejected, [{ src: h.file, caption: 'the chart', reason: 'streamed' }],
+      'each image is named, as the reply tool names every other loss');
+  });
+
+  test('a consumed reply whose text the projection rewrote, but holds no image, reports nothing', async () => {
+    // stripMediaMarkdown also touches "![" that is not an image: syntax in a
+    // code span, `vec![]`, "Wow![1]". Reporting those makes a delivered
+    // text-only reply ok:false, which in Orchestra means no dedup and no turn
+    // binding: a retry double-posts and the Stop fallback adds a message.
+    for (const text of [
+      '## Usage\n\nWrite `![x](/y.png)` to embed an image.',
+      'Replaced vec![] with Vec::new() in src/lib.rs',
+      'Wow![1] neat — see /tmp/notes',
+    ]) {
+      const h = harnessWithProjection();
+      await h.streamer.onChunk('Working on it');
+      const out = await h.makeDeliverText({
+        sessionKey: 'chat:1', chatId: '1', threadId: null, interim: false, turnId: null,
+      })({ text });
+      assert.equal(out.handled, true, text);
+      assert.equal(out.mediaRejected, undefined, text);
+    }
+  });
+
+  test('a consumed reply without media reports nothing', async () => {
+    const h = harnessWithProjection();
+    await h.streamer.onChunk('Working on the chart');
+
+    const out = await h.makeDeliverText({
+      sessionKey: 'chat:1', chatId: '1', threadId: null, interim: false, turnId: null,
+    })({ text: '## Results\n\nAll done.' });
+
+    assert.equal(out.handled, true);
+    assert.equal(out.mediaRejected, undefined);
+  });
+
   test('a declining preview hands the NEXT strategy the text as authored', async () => {
     // The projection is about what this branch delivers, not about what the
     // reply is. Rich delivery must still see the media it is allowed to
