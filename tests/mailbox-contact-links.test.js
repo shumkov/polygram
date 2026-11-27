@@ -14,6 +14,7 @@ const { createExternalJobService } = require('../lib/external-jobs/service');
 const { createExternalJobDispatch } = require('../lib/external-jobs/dispatch');
 const { createMailboxService } = require('../lib/mailbox/service');
 const { createRichSender } = require('../lib/telegram/rich-send');
+const { createIpcHandlers } = require('../lib/ipc/handlers');
 
 // A forum with topics (photoroom's topic, cmo in its General), a supergroup
 // without topics (ops), and a person's direct chat (Ivan's assistant).
@@ -50,13 +51,15 @@ const settle = async () => { for (let n = 0; n < 30; n++) await new Promise(setI
 // Real external jobs, dispatch and mailbox over one SQLite file. Telegram is
 // a stub whose receipt echoes the destination, as the Bot API does; it says
 // MARK is a forum and PLAIN is not. Every prompt a session is sent is kept.
-async function fixture(t) {
+async function fixture(t, { cardWaitMs } = {}) {
   const { db, dbPath } = freshDb('mailbox-contact-links');
   const config = rolesConfig();
   const resolveBackend = () => 'cli';
   const resolveTarget = createExternalJobTargetResolver({ config, getSessionKey, resolveBackend });
   const f = { db, posts: [], prompts: [] };
+  // f.hold, when set, holds the next post until it resolves.
   const tg = async (_bot, method, params) => {
+    if (f.hold) { const hold = f.hold; f.hold = null; await hold; }
     f.posts.push({ method, params });
     return { message_id: 3400 + f.posts.length, chat: { id: Number(params.chat_id) },
       ...(params.message_thread_id == null ? {} : { message_thread_id: Number(params.message_thread_id) }) };
@@ -72,7 +75,7 @@ async function fixture(t) {
     checkInactive: async () => false, deliverPart: async () => ({ messageId: 1 }), logger: { error() {} } });
   f.mailbox = createMailboxService({ config, db, botName: 'test', jobs: f.jobs, resolveTarget, resolveBackend, getSessionKey, tg, sendRich, bot: {},
     getChat: async (chatId) => ({ id: Number(chatId), is_forum: String(chatId) === MARK }),
-    getChatMember: async () => ({ status: 'creator' }), logger: { error() {}, warn() {} } });
+    getChatMember: async () => ({ status: 'creator' }), ...(cardWaitMs ? { cardWaitMs } : {}), logger: { error() {}, warn() {} } });
   await f.mailbox.refreshMembership();
   f.jobs.start(); f.mailbox.start();
   t.after(() => { f.mailbox.stop(); f.jobs.stop(); cleanupDb(dbPath, db); });
@@ -106,4 +109,115 @@ test('the assistant\'s contacts list carries the same links', async (t) => {
   const contacts = byTo(await f.mailbox.directory(f.person(IVAN_DM), {}));
   assert.equal(contacts.photoroom.link, 'https://t.me/c/4462674958/1306');
   assert.equal(contacts.cmo.link, 'https://t.me/c/4462674958/1');
+});
+
+// The links line polygram adds to a delivered prompt, as [label, url] pairs.
+const linksOf = (task) => {
+  const line = /\nTelegram links: (.*)\. Point at these by link, never by a bare number\.\n/.exec(task)?.[1];
+  return line ? line.split('; ').map((part) => part.split(' https://').map((x, i) => (i ? `https://${x}` : x))) : [];
+};
+const promptFor = (f, id) => f.prompts.find((p) => p.requestId === `mailbox:${id}`);
+
+test('a delivered ask carries the link of its card in the receiving role\'s topic', async (t) => {
+  const f = await fixture(t);
+  const sent = f.mailbox.send(f.token(OPS), { to: 'photoroom', kind: 'ask', body: 'Where are the cutouts?' });
+  await settle();
+  const card = f.row(sent.id).target_card;
+  assert.match(card, /^https:\/\/t\.me\/c\/4462674958\/1306\/\d+$/, 'the card in photoroom\'s topic');
+  assert.deepEqual(linksOf(promptFor(f, sent.id).task), [['this message', card]]);
+});
+
+test('a delivered tell into a supergroup without topics links its card there', async (t) => {
+  const f = await fixture(t);
+  const sent = f.mailbox.send(f.token(PHOTOROOM), { to: 'ops', kind: 'tell', body: 'Cutouts are in the archive.' });
+  await settle();
+  const card = f.row(sent.id).target_card;
+  assert.match(card, /^https:\/\/t\.me\/c\/2400136088\/\d+$/);
+  assert.deepEqual(linksOf(promptFor(f, sent.id).task), [['this message', card]]);
+});
+
+test('a message delivered into a direct chat has no message link, and none is invented', async (t) => {
+  const f = await fixture(t);
+  const sent = f.mailbox.send(f.token(PHOTOROOM), { to: 'ivan', kind: 'tell', body: 'Cutouts are ready.' });
+  await settle();
+  assert.equal(f.row(sent.id).target_card, null, 'a direct chat has no message links');
+  const { task } = promptFor(f, sent.id);
+  assert.deepEqual(linksOf(task), []);
+  assert.doesNotMatch(task, /Telegram links:/);
+});
+
+test('a delivered answer links the answer and the question it answers', async (t) => {
+  const f = await fixture(t);
+  const ask = f.mailbox.send(f.token(OPS), { to: 'photoroom', kind: 'ask', body: 'Where are the cutouts?' });
+  await settle();
+  const answer = f.mailbox.reply(f.token(PHOTOROOM), { inReplyTo: ask.id, body: 'In the archive.' });
+  await settle();
+  assert.deepEqual(linksOf(promptFor(f, answer.id).task), [['this answer', f.row(answer.id).target_card], ['your question', f.row(ask.id).target_card]]);
+  assert.match(f.row(answer.id).target_card, /^https:\/\/t\.me\/c\/2400136088\/\d+$/, 'the answer card is in the asker\'s chat');
+});
+
+test('a system tell links its card and the original message it points at', async (t) => {
+  const f = await fixture(t);
+  const original = 'https://t.me/c/4462674958/1306/3459';
+  f.db.insertMessage({ chat_id: MARK, thread_id: '1306', msg_id: 3459, direction: 'out', status: 'sent', source: 'agent-org', bot_name: 'test', text: 'Archive', ts: 1 });
+  const sent = f.mailbox.submit({ sender: 'agent-org', to: 'photoroom', body: 'Task done', key: 'k1', link: original });
+  await settle();
+  assert.deepEqual(linksOf(promptFor(f, sent.id).task), [['this message', f.row(sent.id).target_card], ['the original', original]]);
+});
+
+test('the delivery waits for its card, so a slow Telegram post still yields the link', async (t) => {
+  const f = await fixture(t);
+  let release;
+  f.hold = new Promise((resolve) => { release = resolve; });
+  const sent = f.mailbox.send(f.token(OPS), { to: 'photoroom', kind: 'tell', body: 'slow card' });
+  await settle();
+  assert.equal(promptFor(f, sent.id), undefined, 'the prompt waits while the card is still being posted');
+  release();
+  await settle();
+  assert.deepEqual(linksOf(promptFor(f, sent.id).task), [['this message', f.row(sent.id).target_card]]);
+});
+
+test('a card that never comes delays the delivery only briefly, and the prompt goes out without its link', async (t) => {
+  const f = await fixture(t, { cardWaitMs: 20 });
+  f.hold = new Promise(() => {});
+  const sent = f.mailbox.send(f.token(OPS), { to: 'photoroom', kind: 'tell', body: 'stuck card' });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  await settle();
+  assert.ok(promptFor(f, sent.id), 'delivered anyway');
+  assert.deepEqual(linksOf(promptFor(f, sent.id).task), []);
+});
+
+test('receipts carry the card\'s link once Telegram has it', async (t) => {
+  const f = await fixture(t);
+  const handlers = createIpcHandlers({ mailbox: f.mailbox });
+  const sent = await handlers.mailbox_send({ token: f.token(OPS), to: 'photoroom', kind: 'ask', body: 'Where are the cutouts?' });
+  assert.equal(sent.state, 'queued');
+  assert.match(sent.link, /^https:\/\/t\.me\/c\/4462674958\/1306\/\d+$/);
+  assert.equal(sent.link, f.row(sent.id).target_card);
+  const replied = await handlers.mailbox_reply({ token: f.token(PHOTOROOM), inReplyTo: sent.id, body: 'In the archive.' });
+  assert.match(replied.link, /^https:\/\/t\.me\/c\/2400136088\/\d+$/);
+  const told = await handlers.mailbox_send({ token: f.token(PHOTOROOM), to: 'ivan', kind: 'tell', body: 'Ready.' });
+  assert.equal('link' in told, false, 'a card in a direct chat has no link');
+  const submitted = await handlers.mailbox_submit({ sender: 'agent-org', to: 'cmo', body: 'Done', key: 'k2' });
+  assert.match(submitted.link, /^https:\/\/t\.me\/c\/4462674958\/\d+$/, 'a card in a forum\'s General links straight to the chat');
+});
+
+test('open lists each ask with the link of its card', async (t) => {
+  const f = await fixture(t);
+  const ask = f.mailbox.send(f.token(OPS), { to: 'photoroom', kind: 'ask', body: 'Where are the cutouts?' });
+  await settle();
+  const card = f.row(ask.id).target_card;
+  assert.deepEqual(f.mailbox.open(f.token(OPS), {}).asks.map((a) => [a.id, a.link]), [[ask.id, card]]);
+  assert.deepEqual(f.mailbox.open(f.token(PHOTOROOM), {}).toAnswer.map((a) => [a.id, a.link]), [[ask.id, card]], 'the card in the answerer\'s own topic');
+});
+
+test('a notice about an unanswered ask links the question', async (t) => {
+  const f = await fixture(t);
+  const ask = f.mailbox.send(f.token(OPS), { to: 'photoroom', kind: 'ask', body: 'Where are the cutouts?' });
+  await settle();
+  await f.mailbox.tick();
+  await settle();
+  const notice = f.prompts.find((p) => p.requestId === `mailbox-notice:${ask.id}`);
+  assert.ok(notice, 'the asker got a notice');
+  assert.deepEqual(linksOf(notice.task), [['your question', f.row(ask.id).target_card]]);
 });
