@@ -964,7 +964,7 @@ async function buildSpawnContext(
     // in either argument is permanent drift, i.e. a respawn per message.
     displayHint: buildPolygramDisplayHint(
       resolveRichTextEnabled(config, chatId, threadId || null),
-      { inlineMedia: true },
+      { inlineMedia: true, chatId, threadId: threadId || null },
     ),
     // Pre-resolve through the SAME backend-aware resolver origin's CliProcess used, so
     // orchestra (which now uses opts.outboundCapOverride verbatim, without its own
@@ -4426,7 +4426,7 @@ async function main() {
     // the system prompt on a capability change — would respawn live sessions.
     displayHint: (chatId, threadId) => buildPolygramDisplayHint(
       resolveRichTextEnabled(config, chatId, threadId),
-      { inlineMedia: true },
+      { inlineMedia: true, chatId, threadId: threadId || null },
     ),
     // Backend-default outbound cap fallback (per-spawn buildSpawnContext override
     // normally supersedes this; kept so any context-less spawn still gets the backend
