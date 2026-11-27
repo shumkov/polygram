@@ -4570,8 +4570,10 @@ async function main() {
   });
   handleSendOverIpc = createHandleSendOverIpc({
     config, bot, tg, botName: BOT_NAME, sendRich: (args) => richSendMessage(args),
-    // editMessageMedia/Caption may change only a message the same IPC sender sent.
+    // editMessageMedia/Caption and deleteMessage may touch only a message the
+    // same IPC sender sent; each deletion is recorded in the events table.
     getMessage: (chatId, msgId) => db.getMessage(chatId, msgId),
+    logEvent,
   });
   ({
     dispatchHandleMessage,

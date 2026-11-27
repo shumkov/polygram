@@ -18,10 +18,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHandleSendOverIpc, IPC_SEND_ALLOWED_METHODS } = require('../lib/handlers/ipc-send');
+const { enforceEventDetailSchema } = require('../lib/db/event-detail-schema');
 
 const OWN = { direction: 'out', bot_name: 'testbot', source: 'agent-org' };
 function fixture({ rows = { 501: OWN }, fail = null } = {}) {
   const calls = [];
+  const events = [];
   const tg = async (_bot, method, params) => {
     calls.push({ method, params });
     if (fail) throw Object.assign(new Error(`Call to '${method}' failed! (400: ${fail})`), { description: fail, error_code: 400 });
@@ -30,8 +32,9 @@ function fixture({ rows = { 501: OWN }, fail = null } = {}) {
   const handler = createHandleSendOverIpc({
     config: { chats: { '111': {} } }, bot: {}, tg, botName: 'testbot',
     getMessage: (chatId, msgId) => (chatId === '111' ? rows[msgId] ?? null : null),
+    logEvent: (kind, detail) => events.push({ kind, ...detail }),
   });
-  return { handler, calls };
+  return { handler, calls, events };
 }
 const del = (handler, params, source = 'agent-org') => handler({ method: 'deleteMessage', source, params });
 
@@ -77,6 +80,31 @@ describe('deleteMessage over IPC', () => {
     const gone = fixture({ fail: 'Bad Request: message to delete not found' });
     await assert.rejects(() => del(gone.handler, { chat_id: '111', message_id: 501 }), /deleteMessage: message to delete not found/);
   });
+
+  test('every deletion leaves a record: the chat, the message, the sender and what Telegram said', async () => {
+    // A removed message is gone from the chat for good, so the events table
+    // is the only trace of who removed it and whether it went.
+    const cases = [
+      [null, { outcome: 'ok' }],
+      ['Bad Request: message can\'t be deleted for everyone', { outcome: 'refused', error_code: 400 }],
+      ['Bad Request: message to delete not found', { outcome: 'not-found', error_code: 400 }],
+      ['Bad Request: chat not found', { outcome: 'error', error_code: 400 }],
+    ];
+    for (const [fail, said] of cases) {
+      const { handler, events } = fixture({ fail });
+      await del(handler, { chat_id: '111', message_id: 501 }).catch(() => {});
+      assert.deepEqual(events, [{ kind: 'ipc-delete-message', chat_id: '111', msg_id: 501, source: 'agent-org', ...said }], said.outcome);
+      // Content-free: the events table's schema keeps every field.
+      const { kind, chat_id: _chat, ...detail } = events[0];
+      assert.equal(enforceEventDetailSchema(detail).droppedCount, 0, said.outcome);
+    }
+  });
+
+  test('a deletion the guard stops never reaches Telegram, so it is not recorded as one', async () => {
+    const { handler, events } = fixture();
+    await assert.rejects(() => del(handler, { chat_id: '111', message_id: 501 }, 'cron'), /was not sent by this IPC sender/);
+    assert.deepEqual(events, []);
+  });
 });
 
 // polygram.js runs main() on require, so the daemon's wiring is checked in
@@ -91,5 +119,9 @@ describe('the daemon wires the IPC handler', () => {
   test('with the database\'s message lookup', () => {
     assert.notEqual(start, -1, 'polygram.js no longer builds handleSendOverIpc');
     assert.match(wiring, /getMessage: \(chatId, msgId\) => db\.getMessage\(chatId, msgId\),/);
+  });
+
+  test('with the daemon\'s event log, so deletions are recorded', () => {
+    assert.match(wiring, /\blogEvent,/);
   });
 });
