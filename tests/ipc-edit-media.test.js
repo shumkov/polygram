@@ -85,6 +85,13 @@ describe('editMessageMedia and editMessageCaption over IPC', () => {
     const bad = [
       [undefined, /needs media/],
       [{ type: 'sticker', media: 'abc' }, /media\.type/],
+      // Only what IPC may send: a video, an animation or an audio can't be sent over IPC, so no edit makes one.
+      [{ type: 'video', media: { source: '/tmp/clip.mp4' } }, /media\.type must be one of photo, document/],
+      [{ type: 'animation', media: { source: '/tmp/a.gif' } }, /media\.type must be one of photo, document/],
+      [{ type: 'audio', media: { source: '/tmp/a.mp3' } }, /media\.type must be one of photo, document/],
+      // An inherited property name is not a type.
+      [{ type: 'constructor', media: { source: '/tmp/x' } }, /media\.type must be one of photo, document/],
+      [{ type: '__proto__', media: { source: '/tmp/x' } }, /media\.type must be one of photo, document/],
       [{ type: 'photo' }, /media\.media/],
       [{ type: 'photo', media: '/abs/preview.png' }, /bare file path not accepted/],
       [{ type: 'photo', media: 'http://localhost:8080/x.png' }, /localhost URLs/],
