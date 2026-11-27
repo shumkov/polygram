@@ -213,7 +213,7 @@ describe('polygram rich-message wiring', () => {
     // sendRichMessage is the only verb that can open a bubble rich; going
     // direct to tg() would bypass the latch, the transcript row and the
     // media preflight the primitive owns.
-    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload) => {');
+    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload, editOptions = {}) => {');
     assert.match(wiring, /sendRich: richSendMessage,/);
     assert.doesNotMatch(wiring, /'sendRichMessage'/,
       'the primitive owns the verb — this wiring must not call it directly');
@@ -229,7 +229,7 @@ describe('polygram rich-message wiring', () => {
     // A rich attempt that downgrades sends exactly one bubble. Attaching
     // reply_parameters to both would quote the user twice; attaching it to
     // neither would lose the anchor for the whole turn.
-    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload) => {');
+    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload, editOptions = {}) => {');
     assert.equal((wiring.match(/allow_sending_without_reply: true/g) || []).length, 1);
     assert.match(wiring, /const replyParams = hadReplyAnchor/);
     assert.match(wiring, /replyParams,/, 'the rich open reuses it');
@@ -443,7 +443,7 @@ describe('the streamed rich open stops probing a server that cannot serve it', (
 describe('polygram wiring for the open verdict', () => {
   test('the open holds its own verdict and never writes to the shared latches', () => {
     assert.match(source, /let richStreamOpenUnsupported = false;/);
-    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload) => {');
+    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload, editOptions = {}) => {');
     assert.match(wiring, /if \(openRich && !richStreamOpenUnsupported\)/,
       'a refused open must stop the next one from being attempted at all');
     assert.match(wiring, /if \(out\?\.fallback === 'capability'\) \{[\s\S]*?richStreamOpenUnsupported = true;/,
@@ -453,14 +453,14 @@ describe('polygram wiring for the open verdict', () => {
   });
 
   test('the open runs the same flatten-and-retry the reply path runs', () => {
-    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload) => {');
+    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload, editOptions = {}) => {');
     assert.match(wiring, /await sendRichWithStylingRetry\(\{/);
     assert.match(wiring, /onStylingRejected: \(\) => richStylingLatch\?\.recordStylingRejection\(\)/);
     assert.match(wiring, /onStylingAccepted: \(\) => richStylingLatch\?\.recordHealthyOutcome\(\)/);
   });
 
   test('a streamed open is distinguishable from a reply-tool send in the soak', () => {
-    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload) => {');
+    const wiring = sectionBetween('send: async (payload) => {', 'edit: async (messageId, payload, editOptions = {}) => {');
     assert.match(wiring, /source: 'bot-reply-stream-open-rich'/);
   });
 });

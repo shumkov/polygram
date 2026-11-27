@@ -166,12 +166,12 @@ const { transcribe: transcribeVoice, isVoiceAttachment, OPENAI_DEFAULT_MODEL } =
 const { createStreamer, DEFAULT_THROTTLE_MS } = require('./lib/telegram/streamer');
 const {
   createStreamerRegistry, createDeliverTextFactory, createTurnSettler,
-  resolveStreamPreviewEnabled,
+  resolveStreamPreviewEnabled, createLiveTextSanitizer,
 } = require('./lib/telegram/live-preview');
 const { chunkMarkdownText } = require('./lib/telegram/chunk');
 const {
   toTelegramRichBlocks, resolveRichTextEnabled, isRichCapabilityError, isRichContentError,
-  isRichCapabilityErrorExplicit, isRichMessageFieldRejection, stripMediaMarkdown,
+  isRichCapabilityErrorExplicit, isRichMessageFieldRejection, stripMediaMarkdown, projectStreamedText,
   isRichLimitError, blocksAreStyled,
 } = require('./lib/telegram/rich');
 const {
@@ -1681,26 +1681,17 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
     setDeliveryError: () => reactor?.setState('ERROR'),
     logger: { warn: (m) => console.error(`[${label}] ${m}`) },
   });
-  // Plain-path text hygiene for rich-enabled chats: the live preview
-  // streams PLAIN until the rich gate trips (and stays plain if the
-  // capability latch fires), so a reply's image markdown — including a
-  // still-incomplete trailing "![shot](/abs/pa…" fragment — would
-  // otherwise render its raw local path into the visible bubble.
-  // Degrade media markdown to caption text on every plain send/edit.
-  // The streamer's internal dedup state keeps the UNsanitized text on
-  // both sides of its comparisons, so this stays a display-only
-  // transform (same class as tg()'s markdown→HTML conversion).
-  const sanitizeLiveText = (text) => {
-    if (!resolveRichTextEnabled(config, chatId, threadId)) return text;
-    // A tick may end mid-construct, its path still arriving.
-    const clean = stripMediaMarkdown(text, { partial: true });
-    // An image-only chunk can sanitize to nothing; keep the bubble
-    // alive with a minimal placeholder rather than tripping tg()'s
-    // empty-text guard.
-    return clean.trim() ? clean : '…';
-  };
-
+  // Plain-path text hygiene for rich-enabled chats, by phase: a tick may end
+  // mid-construct, the final edit is a finished text. See
+  // createLiveTextSanitizer.
+  const liveText = createLiveTextSanitizer({
+    isRichEnabled: () => resolveRichTextEnabled(config, chatId, threadId),
+  });
+  const sanitizeLiveText = liveText.sanitize;
   const streamer = createStreamer({
+    // The final edit must show the finished projection even when the bubble
+    // already holds the same raw text from the last tick.
+    finalDisplayDiffers: liveText.finalDisplayDiffers,
     // rc.67: pre-process every chunk to strip recognised
     // [sticker:NAME] / [react:EMOJI] tags BEFORE the bubble or DB row
     // captures them. See stripInlineTagsForStreamer above.
@@ -1790,7 +1781,7 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
         ? { ...res, _hadReplyAnchor: hadReplyAnchor, wentRich: false }
         : res;
     },
-    edit: async (messageId, payload) => {
+    edit: async (messageId, payload, editOptions = {}) => {
       // The streamer emits either a plain string or a rich payload with
       // blocks and their source Markdown. Rich error classification and
       // fallback live in rich-edit.js so this wiring stays focused.
@@ -1815,7 +1806,7 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
         return await tg(bot, 'editMessageText', {
           chat_id: chatId,
           message_id: messageId,
-          text: sanitizeLiveText(text),
+          text: sanitizeLiveText(text, editOptions),
         }, { ...outMetaBase, source: 'bot-reply-stream-edit' });
       } catch (err) {
         // Stream-edit failures would otherwise be invisible — edits
@@ -3854,9 +3845,10 @@ async function main() {
       setRichKnownUnsupported: () => { richKnownUnsupported = true; },
       getApiRoot: () => config.bot?.apiRoot || null,
       stripUrlCreds: stripUrlCredentials,
-      // The streamer's fallback edits carry stream ticks, which may end
-      // mid-construct.
-      sanitizeFallbackText: (text) => stripMediaMarkdown(text, { partial: true }),
+      // One editor serves stream ticks, the streamer's final rich edit and its
+      // rescue, and the edit tool: only a tick may end mid-construct, so the
+      // plain fallback projects by the edit's phase.
+      sanitizeFallbackText: projectStreamedText,
       capabilityLatch: richCapabilityLatch,
       // The SAME verdict the reply-tool path feeds. One renderer, one
       // server, one answer — a latch reachable from only one path would let
