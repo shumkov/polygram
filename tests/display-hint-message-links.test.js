@@ -38,8 +38,8 @@ test('a supergroup without topics gets the chat-level base', () => {
 test('a private chat is told links do not exist there', () => {
   const hint = buildPolygramDisplayHint(true, { chatId: '123456789', threadId: null });
   assert.doesNotMatch(hint, /Links here:/);
-  assert.match(hint, /no message links in this chat/i);
-  assert.match(hint, /reply to the message|quote it/i);
+  assert.match(hint, /There are no message links in this chat: quote the message instead\./);
+  assert.doesNotMatch(hint, /reply_to/, 'the reply tool has no reply_to parameter to point at');
 });
 
 test('a basic group (no -100 prefix) gets no invented link either', () => {
