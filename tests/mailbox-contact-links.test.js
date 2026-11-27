@@ -221,3 +221,13 @@ test('a notice about an unanswered ask links the question', async (t) => {
   assert.ok(notice, 'the asker got a notice');
   assert.deepEqual(linksOf(notice.task), [['your question', f.row(ask.id).target_card]]);
 });
+
+test('the mailbox says which sessions use it, by chat and topic, for the display hint', async (t) => {
+  const f = await fixture(t);
+  assert.equal(f.mailbox.usesMailboxIn(MARK, '1306'), true, 'a role in a forum topic');
+  assert.equal(f.mailbox.usesMailboxIn(MARK, null), true, 'a role in a forum\'s General');
+  assert.equal(f.mailbox.usesMailboxIn(Number(PLAIN), null), true, 'a role in a supergroup without topics, by a numeric id too');
+  assert.equal(f.mailbox.usesMailboxIn(IVAN, null), true, 'a person\'s assistant');
+  assert.equal(f.mailbox.usesMailboxIn(MARK, '9999'), false, 'a topic that is no role of a roles bot');
+  assert.equal(f.mailbox.usesMailboxIn('-1001', null), false, 'a chat this bot does not have');
+});

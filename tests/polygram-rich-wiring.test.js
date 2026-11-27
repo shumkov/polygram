@@ -16,6 +16,9 @@ const {
   isRichContentError,
 } = require('../lib/telegram/rich');
 
+// The one function polygram builds a session's display hint with.
+const sessionHintSource = () => sectionBetween('function sessionDisplayHint(chatId, threadId) {', '\n}\n') + '\n}';
+
 function sectionBetween(startMarker, endMarker) {
   const start = source.indexOf(startMarker);
   assert.notEqual(start, -1, `missing start marker: ${startMarker}`);
@@ -136,7 +139,8 @@ describe('polygram rich-message wiring', () => {
     // string here means every cli chat is silently stuck in plain mode
     // regardless of its own richText config (the bug this test pins).
     const wiring = sectionBetween('const orchestraProcessFactory = createProcessFactory({', ');');
-    assert.match(wiring, /displayHint:\s*\(chatId, threadId\)\s*=>\s*buildPolygramDisplayHint\(\s*resolveRichTextEnabled\(config, chatId, threadId\),/);
+    assert.match(wiring, /displayHint:\s*sessionDisplayHint,/);
+    assert.match(sessionHintSource(), /buildPolygramDisplayHint\(\s*resolveRichTextEnabled\(config, chatId, threadId \|\| null\),/);
     assert.doesNotMatch(wiring, /displayHint:\s*require\('\.\/lib\/telegram\/display-hint'\)\.POLYGRAM_DISPLAY_HINT/);
   });
 
@@ -145,9 +149,8 @@ describe('polygram rich-message wiring', () => {
     // media syntax it teaches. It may only be on where the DELIVERING path
     // resolves media — for this backend, the reply-tool rich strategy.
     const wiring = sectionBetween('const orchestraProcessFactory = createProcessFactory({', ');');
-    // The whole option, up to wherever the next one starts.
-    const call = /displayHint:[\s\S]*?\n(?= {4}(?:\/\/|[a-zA-Z]))/.exec(wiring)?.[0] ?? '';
-    assert.match(call, /inlineMedia: true/,
+    assert.match(wiring, /displayHint:\s*sessionDisplayHint,/);
+    assert.match(sessionHintSource(), /inlineMedia: true/,
       'the CLI hint should teach the media syntax this backend delivers');
   });
 
@@ -163,7 +166,7 @@ describe('polygram rich-message wiring', () => {
     );
     assert.match(
       spawn,
-      /displayHint:\s*buildPolygramDisplayHint\(\s*resolveRichTextEnabled\(config, chatId,/,
+      /displayHint:\s*sessionDisplayHint\(chatId,/,
       'the context hint must be resolved fresh per build, not cached at boot',
     );
   });
@@ -263,36 +266,26 @@ describe('the spawn-context hint and the factory-resolver hint are the same stri
   const { buildPolygramDisplayHint } = require('../lib/telegram/display-hint');
   const { resolveRichTextEnabled } = require('../lib/telegram/rich');
 
-  // Pull the literal builder call out of each site and run it, rather than
-  // matching two regexes that could both drift in the same direction.
-  function hintCall(section, label) {
-    const start = section.indexOf('buildPolygramDisplayHint(');
-    assert.notEqual(start, -1, `${label}: no buildPolygramDisplayHint call found`);
-    let depth = 0;
-    for (let i = section.indexOf('(', start); i < section.length; i++) {
-      if (section[i] === '(') depth++;
-      else if (section[i] === ')' && --depth === 0) return section.slice(start, i + 1);
-    }
-    assert.fail(`${label}: unbalanced buildPolygramDisplayHint call`);
-  }
-
+  // Run each site's literal expression against polygram's own builder,
+  // rather than matching two regexes that could both drift the same way.
   const spawnSection = sectionBetween(
     'async function buildSpawnContext',
     'async function getOrSpawnForChat',
   );
-  const contextCall = hintCall(spawnSection, 'buildSpawnContext');
+  const contextCall = /displayHint:\s*(sessionDisplayHint\([^)]*\))/.exec(spawnSection)?.[1];
+  assert.ok(contextCall, 'buildSpawnContext: no sessionDisplayHint call found');
   // The context the factory receives — its threadId is what the resolver would
   // be called with on a spawn that has no hint to use.
   const returnBlock = spawnSection.slice(spawnSection.lastIndexOf('\n  return {'));
-  const factoryCall = hintCall(
+  const factoryResolver = /displayHint:\s*([^,\n]+),/.exec(
     sectionBetween('const orchestraProcessFactory = createProcessFactory({', ');'),
-    'createProcessFactory',
-  );
+  )?.[1];
+  const factoryCall = `(${factoryResolver})(chatId, threadId)`;
 
   const run = (expr, config, chatId, threadId) => new Function(
-    'buildPolygramDisplayHint', 'resolveRichTextEnabled', 'config', 'chatId', 'threadId',
-    `return ${expr};`,
-  )(buildPolygramDisplayHint, resolveRichTextEnabled, config, chatId, threadId);
+    'buildPolygramDisplayHint', 'resolveRichTextEnabled', 'config', 'chatId', 'threadId', 'mailboxService',
+    `${sessionHintSource()}\nreturn ${expr};`,
+  )(buildPolygramDisplayHint, resolveRichTextEnabled, config, chatId, threadId, null);
 
   for (const richText of [true, false]) {
     test(`identical with richText ${richText ? 'on' : 'off'}`, () => {
@@ -330,7 +323,7 @@ describe('the spawn-context hint and the factory-resolver hint are the same stri
     // side and not the other resolves two different chats' settings.
     const contextThread = /threadId:\s*([^,\n]+),/.exec(returnBlock)?.[1];
     assert.ok(contextThread, 'the returned context must carry a threadId');
-    const hintThread = /resolveRichTextEnabled\(config, chatId,\s*([^)]+)\)/
+    const hintThread = /sessionDisplayHint\(chatId,\s*([^)]+)\)/
       .exec(contextCall)?.[1];
     assert.ok(hintThread, 'the context hint must resolve richText for a thread');
 

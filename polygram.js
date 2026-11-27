@@ -835,6 +835,19 @@ async function resolveSessionRuntimeView({
   });
 }
 
+// A session's display hint, the one builder for every place that needs it:
+// the spawn context, the CLI factory's resolver and the SDK options. The hint
+// is spawn-time state compared on every message, so any difference between
+// those places would respawn the session each time. Inline media are on
+// because both delivery paths render them. A session that uses the mailbox
+// learns where its links to other roles and messages come from.
+function sessionDisplayHint(chatId, threadId) {
+  return buildPolygramDisplayHint(
+    resolveRichTextEnabled(config, chatId, threadId || null),
+    { inlineMedia: true, chatId, threadId: threadId || null, mailbox: mailboxService?.usesMailboxIn(chatId, threadId || null) === true },
+  );
+}
+
 async function buildSpawnContext(
   sessionKey,
   {
@@ -960,12 +973,9 @@ async function buildSpawnContext(
     // every context build. It is spawn-time state (woven into the appended
     // system prompt), so a warm session only picks up a rich-text toggle if the
     // context carries the new hint for getOrSpawn to notice the drift against.
-    // MUST be built exactly like the factory-side resolver below — a difference
-    // in either argument is permanent drift, i.e. a respawn per message.
-    displayHint: buildPolygramDisplayHint(
-      resolveRichTextEnabled(config, chatId, threadId || null),
-      { inlineMedia: true, chatId, threadId: threadId || null },
-    ),
+    // Built by sessionDisplayHint, as the factory-side resolver is: a
+    // difference between the two is permanent drift, i.e. a respawn per message.
+    displayHint: sessionDisplayHint(chatId, threadId || null),
     // Pre-resolve through the SAME backend-aware resolver origin's CliProcess used, so
     // orchestra (which now uses opts.outboundCapOverride verbatim, without its own
     // resolveFileCaps clamp) gets the backend default (2GB local / 50MB cloud) AND the
@@ -4175,6 +4185,7 @@ async function main() {
   });
   buildSdkOptions = createBuildSdkOptions({
     config,
+    displayHint: sessionDisplayHint,
     botName: BOT_NAME,
     childHome: CHILD_HOME,
     makeCanUseTool,
@@ -4424,10 +4435,7 @@ async function main() {
     // latched off, where replies degrade to plain text and captions. Accepted:
     // the latch is process-lifetime and rare, and the alternative — rebuilding
     // the system prompt on a capability change — would respawn live sessions.
-    displayHint: (chatId, threadId) => buildPolygramDisplayHint(
-      resolveRichTextEnabled(config, chatId, threadId),
-      { inlineMedia: true, chatId, threadId: threadId || null },
-    ),
+    displayHint: sessionDisplayHint,
     // Backend-default outbound cap fallback (per-spawn buildSpawnContext override
     // normally supersedes this; kept so any context-less spawn still gets the backend
     // default rather than orchestra's neutral 100MB).
