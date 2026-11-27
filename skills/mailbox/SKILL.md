@@ -24,7 +24,9 @@ state, which may already be `running`, `succeeded`, `failed`, `interrupted` or
 creates a new ask.
 
 `directory` (no argument) lists the sessions you may message, each with the
-name to use as `to` and whether it can receive yet. `open` (no argument) lists
+name to use as `to` and whether it can receive yet. A session in a group with
+links also has `link`, its topic in Telegram: give that link when you point
+someone at that role or topic. `open` (no argument) lists
 your asks still waiting for a reply, with their delivery state.
 
 An ask states the answer you need. Send summaries and file paths, never
