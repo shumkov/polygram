@@ -48,13 +48,60 @@ test('a basic group (no -100 prefix) gets no invented link either', () => {
   assert.match(hint, /no message links in this chat/i);
 });
 
-test('every place polygram builds the hint passes the chat and topic', () => {
+test('a mailbox session is told to point at roles and messages elsewhere by the links the mailbox gave', () => {
+  const at = { chatId: '-1004462674958', threadId: '1306' };
+  const hint = buildPolygramDisplayHint(true, { ...at, mailbox: true });
+  assert.match(hint, /another role or topic, give its `link` from the mailbox directory/);
+  assert.match(hint, /a message elsewhere, give the link the mailbox gave for it/);
+  assert.doesNotMatch(buildPolygramDisplayHint(true, at), /mailbox/i, 'a session without the mailbox hears nothing of it');
+  assert.equal(buildPolygramDisplayHint(true, { ...at, mailbox: true }), hint, 'the same inputs build the same hint');
+});
+
+test('every place polygram builds a session\'s hint uses the one builder, so they never drift', () => {
   // The spawn context and the factory's resolver must build the SAME hint, or
-  // every message is drift and a respawn; the SDK path builds its own.
+  // every message is drift and a respawn; the SDK path must agree with them.
+  // So polygram builds it in one function, and each site calls only that.
   const polygram = fs.readFileSync(path.join(__dirname, '..', 'polygram.js'), 'utf8');
-  const sdk = fs.readFileSync(path.join(__dirname, '..', 'lib', 'sdk', 'build-options.js'), 'utf8');
-  const calls = [...polygram.matchAll(/buildPolygramDisplayHint\(\n[^\n]*\n\s*(\{[^}\n]*\})/g)].map((m) => m[1]);
-  assert.equal(calls.length, 2, calls.join('\n---\n'));
-  for (const call of calls) assert.match(call, /\{ inlineMedia: true, chatId, threadId(?:: threadId \|\| null)? \}/, call);
-  assert.match(sdk, /\{ inlineMedia: true, chatId, threadId \}/);
+  const builds = [...polygram.matchAll(/buildPolygramDisplayHint\(/g)];
+  assert.equal(builds.length, 1, 'polygram.js builds the hint in exactly one place');
+  const builder = /function sessionDisplayHint\(chatId, threadId\) \{\n([\s\S]*?)\n\}/.exec(polygram)?.[1] ?? '';
+  assert.match(builder, /buildPolygramDisplayHint\(/, 'that place is sessionDisplayHint');
+  assert.match(builder, /\{ inlineMedia: true, chatId, threadId: threadId \|\| null, mailbox: /, builder);
+  assert.match(polygram, /displayHint: sessionDisplayHint\(chatId, threadId \|\| null\),/, 'the spawn context');
+  const injected = [...polygram.matchAll(/displayHint: sessionDisplayHint,/g)];
+  assert.equal(injected.length, 2, 'the factory resolver and the SDK options both take it');
+  assert.match(polygram, /createBuildSdkOptions\(\{[^}]*displayHint: sessionDisplayHint,/);
+});
+
+test('the SDK options use the hint builder they are given', () => {
+  const { createBuildSdkOptions } = require('../lib/sdk/build-options');
+  const seen = [];
+  const build = createBuildSdkOptions({ config: { defaults: {}, bot: {}, chats: { '-1004462674958': {} } }, botName: 'test', childHome: '/tmp/x',
+    makeCanUseTool: () => async () => ({ behavior: 'allow' }), logEvent: () => {}, logger: { log() {}, warn() {}, error() {} },
+    processEnv: { PATH: '/usr/bin', HOME: '/tmp' },
+    displayHint: (chatId, threadId) => { seen.push([chatId, threadId]); return '## The one hint'; } });
+  const out = build('-1004462674958:1306', { chatConfig: { cwd: '/tmp' }, chatId: '-1004462674958', threadId: '1306', label: 'x', existingSessionId: null });
+  assert.deepEqual(seen, [['-1004462674958', '1306']]);
+  assert.match(out.systemPrompt.append, /## The one hint/);
+});
+
+test('the session\'s hint follows what the mailbox says about that chat and topic', () => {
+  // Runs polygram's own sessionDisplayHint against a stub mailbox, so the
+  // hint is proven to ask usesMailboxIn, and to ask it about this session.
+  const polygram = fs.readFileSync(path.join(__dirname, '..', 'polygram.js'), 'utf8');
+  const source = /function sessionDisplayHint\(chatId, threadId\) \{\n[\s\S]*?\n\}/.exec(polygram)?.[0];
+  assert.ok(source, 'sessionDisplayHint not found');
+  const { resolveRichTextEnabled } = require('../lib/telegram/rich');
+  const hintFor = (usesMailbox) => {
+    const asked = [];
+    const mailboxService = { usesMailboxIn: (chatId, threadId) => { asked.push([chatId, threadId]); return usesMailbox; } };
+    const config = { defaults: {}, bot: {}, chats: { '-1004462674958': { isolateTopics: true } } };
+    const hint = new Function('buildPolygramDisplayHint', 'resolveRichTextEnabled', 'config', 'mailboxService',
+      `${source}\nreturn sessionDisplayHint('-1004462674958', '2148');`)(buildPolygramDisplayHint, resolveRichTextEnabled, config, mailboxService);
+    return { hint, asked };
+  };
+  const on = hintFor(true);
+  assert.deepEqual(on.asked, [['-1004462674958', '2148']]);
+  assert.match(on.hint, /give its `link` from the mailbox directory/, 'a mailbox session gets the mailbox lines');
+  assert.doesNotMatch(hintFor(false).hint, /mailbox/i, 'any other session does not');
 });

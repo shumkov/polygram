@@ -140,19 +140,21 @@ test('a session cannot message itself under any of its names', (t) => {
   for (const to of ['music', 't3', `session:${MUSIC}`]) assert.throws(() => f.service.send(token, { to, kind: 'ask', body: 'x' }), /itself/, to);
 });
 
-test('directory lists whom the caller may message, by the name to use, including who cannot receive yet', (t) => {
+test('directory lists whom the caller may message, by the name to use, including who cannot receive yet', async (t) => {
   const f = fixture(t);
-  const listed = f.service.directory(f.human(GENERAL), {});
+  const listed = await f.service.directory(f.human(GENERAL), {});
   const byAddress = Object.fromEntries(listed.targets.map((entry) => [entry.address, entry]));
   assert.equal(byAddress[`session:${GENERAL}`], undefined, 'the caller is not listed');
-  assert.deepEqual(byAddress[`session:${MUSIC}`], { to: 'music', address: `session:${MUSIC}`, name: 'Shumabit@HOME / Music', canReceive: true });
-  assert.deepEqual(byAddress[`session:${CODEX}`], { to: 'orchestra', address: `session:${CODEX}`, name: 'Shumabit@HOME / Orchestra', canReceive: true });
+  assert.deepEqual(byAddress[`session:${MUSIC}`], { to: 'music', address: `session:${MUSIC}`, name: 'Shumabit@HOME / Music', canReceive: true,
+    link: 'https://t.me/c/3807211164/3' });
+  assert.deepEqual(byAddress[`session:${CODEX}`], { to: 'orchestra', address: `session:${CODEX}`, name: 'Shumabit@HOME / Orchestra', canReceive: true,
+    link: 'https://t.me/c/3807211164/5' });
   assert.equal(byAddress[`session:${OPS_TOPIC}`].to, 't40', 'an ambiguous alias gives way to one that names only this session');
   assert.equal(byAddress[`session:${GROUP}`].to, `session:${GROUP}`, 'with no unique alias left, the canonical address');
   assert.equal(byAddress[`session:${UNNAMED}`].to, 't3528');
   assert.equal(listed.you, 'general');
-  assert.throws(() => f.service.directory('invented', {}), /token/i);
-  assert.throws(() => f.service.directory(f.service.scope(GENERAL), { extra: 1 }), /unknown mailbox field/i);
+  await assert.rejects(async () => f.service.directory('invented', {}), /token/i);
+  await assert.rejects(async () => f.service.directory(f.service.scope(GENERAL), { extra: 1 }), /unknown mailbox field/i);
 });
 
 test('open lists the caller\'s asks still waiting for a reply, with their delivery state', (t) => {

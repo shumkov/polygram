@@ -241,7 +241,7 @@ test('a submitted link is kept only when polygram sent that message for the send
   assert.equal(f.row(kept.id).link, link);
   assert.deepEqual(f.cards()[0].links.slice(1), [['↗ Notion', NOTION_URL], ['↗ open', link]], 'Notion first, then the jump');
   const job = f.db.raw.prepare('SELECT task, payload FROM external_jobs WHERE request_id=?').get(`mailbox:${kept.id}`);
-  assert.ok(!`${job.task}${job.payload}`.includes('t.me'), 'the link is display data and never reaches the role');
+  assert.ok(!`${job.task}${job.payload}`.includes('t.me'), 'the stored job is a pure function of the message; the link reaches the role only in the links line added at dispatch');
   f.mailbox.submit({ sender: 'agent-org', to: 'orchestrator', body: 'No link', key: 'final:2' });
   assert.equal(f.logs.filter((line) => /mailbox-link-dropped/.test(line)).length, 0, 'a message without a link drops nothing');
 });

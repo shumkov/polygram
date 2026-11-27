@@ -274,7 +274,7 @@ test('nothing assumes a particular person is configured: a DM left out of assist
   assert.equal(f.service.scope(IVAN), null, 'Ivan\'s Codex DM gets no grant');
   assert.throws(() => f.service.send(f.roleTurn(FINANCE), { to: 'ivan', kind: 'tell', body: 'x' }), coded('MAILBOX_UNKNOWN_ROLE'));
   assert.throws(() => f.service.submit({ sender: 'agent-org', to: 'person:ivan', role: 'finance', body: 'x', key: 'k' }), coded('MAILBOX_UNKNOWN_ADDRESS'));
-  assert.deepEqual(f.service.directory(f.person(MAI).token, {}).targets.map((x) => x.to).sort(), ['ads', 'cmo', 'dina']);
+  assert.deepEqual((await f.service.directory(f.person(MAI).token, {})).targets.map((x) => x.to).sort(), ['ads', 'cmo', 'dina']);
   assert.equal(f.service.send(f.person(DINA).token, { to: 'finance', kind: 'ask', body: 'Runway?' }).state, 'queued');
 });
 
@@ -492,9 +492,9 @@ test('a tell whose go card cannot be posted stops waiting, so it neither lingers
 
 test('directory: an assistant sees the roles its person can reach; a role sees members\' assistants and the go-only rest', async (t) => {
   const f = await fixture(t);
-  const mai = f.service.directory(f.person(MAI).token, {}).targets.map((x) => x.to);
+  const mai = (await f.service.directory(f.person(MAI).token, {})).targets.map((x) => x.to);
   assert.deepEqual(mai.sort(), ['ads', 'cmo', 'dina', 'ivan'].sort());
-  const finance = f.service.directory(f.roleTurn(FINANCE), {}).targets;
+  const finance = (await f.service.directory(f.roleTurn(FINANCE), {})).targets;
   assert.equal(finance.find((x) => x.to === 'dina').access, undefined);
   assert.match(finance.find((x) => x.to === 'mai').access, /tell only/);
 });
