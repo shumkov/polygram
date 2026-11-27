@@ -239,3 +239,19 @@ test('a message into a direct chat never waits for its card, since a direct chat
   await settle();
   assert.ok(promptFor(f, sent.id), 'delivered at once, while the card in the direct chat is still being posted');
 });
+
+test('stopping the mailbox releases every delivery waiting for its card, so a restart never strands a claimed job', async (t) => {
+  const f = await fixture(t, { cardWaitMs: 60_000 });
+  f.hold = new Promise(() => {});
+  const sent = f.mailbox.send(f.token(OPS), { to: 'photoroom', kind: 'tell', body: 'stuck card' });
+  await settle();
+  assert.equal(promptFor(f, sent.id), undefined, 'waiting for the card');
+  f.mailbox.stop();
+  await settle();
+  assert.ok(promptFor(f, sent.id), 'the wait ends with the mailbox, and the delivery goes on without the link');
+  assert.deepEqual(linksOf(promptFor(f, sent.id).task), []);
+  f.hold = new Promise(() => {});
+  const late = f.mailbox.send(f.token(OPS), { to: 'photoroom', kind: 'tell', body: 'sent while stopping' });
+  await settle();
+  assert.ok(promptFor(f, late.id), 'a stopped mailbox starts no new wait');
+});
