@@ -488,7 +488,7 @@ describe('createRichMediaResolver', () => {
     const link = path.join(tmp, 'link.png');
     fs.symlinkSync(outsidePng, link);
     const [r] = make()([{ src: link, caption: '' }]);
-    assert.equal(r.rejected, 'path');
+    assert.equal(r.rejected, 'outside-roots');
   });
 
   test('a symlink inside the root resolves to the target realpath, never the alias path', () => {
@@ -504,7 +504,26 @@ describe('createRichMediaResolver', () => {
 
   test('a path outside the allowed roots is rejected', () => {
     const [r] = make()([{ src: outsidePng, caption: '' }]);
-    assert.equal(r.rejected, 'path');
+    assert.equal(r.rejected, 'outside-roots');
+  });
+
+  test('a missing file is "not-found", told apart from one outside the roots', () => {
+    // Both used to read 'path'. A staged file that was cleaned up and a
+    // security refusal need different fixes, so the event must say which.
+    const [r] = make()([{ src: path.join(tmp, 'gone.png'), caption: '' }]);
+    assert.equal(r.rejected, 'not-found');
+  });
+
+  test('unparsed constructs the caller reports are logged as rejections', () => {
+    const events = [];
+    const resolver = make({ logEvent: (kind, detail) => events.push({ kind, detail }) });
+    const results = resolver([{ src: okPng, caption: '' }], { unparsed: 2 });
+    assert.equal(results.length, 1, 'results stay index-aligned with the descriptors');
+    assert.ok(results[0].media);
+    assert.equal(events.length, 1);
+    assert.deepEqual(events[0].detail.reasons, ['unparsed', 'unparsed']);
+    assert.equal(events[0].detail.rejected_count, 2);
+    assert.equal(events[0].detail.accepted_count, 1);
   });
 
   test('relative paths and non-http schemes are rejected', () => {
@@ -645,13 +664,13 @@ describe('createRichMediaResolver', () => {
     const json = JSON.stringify(events[0].detail);
     assert.ok(!json.includes('hunter2'));
     assert.ok(!json.includes(outsidePng));
-    assert.deepEqual(events[0].detail.reasons, ['path']);
+    assert.deepEqual(events[0].detail.reasons, ['outside-roots']);
   });
 
   test('a broken logEvent never breaks resolution', () => {
     const resolver = make({ logEvent: () => { throw new Error('nope'); } });
     const [r] = resolver([{ src: outsidePng, caption: '' }]);
-    assert.equal(r.rejected, 'path');
+    assert.equal(r.rejected, 'outside-roots');
   });
 
   test('a shared cache hit crosses resolver instances only after ordinary validation', () => {
@@ -702,7 +721,7 @@ describe('createRichMediaResolver', () => {
     cache.set('photo', resolved.media.source, resolved.media.fingerprint, 'deleted-id');
     fs.unlinkSync(deleted);
     const [afterDelete] = firstResolver([{ src: deleted, caption: '' }]);
-    assert.equal(afterDelete.rejected, 'path');
+    assert.equal(afterDelete.rejected, 'not-found');
   });
 });
 

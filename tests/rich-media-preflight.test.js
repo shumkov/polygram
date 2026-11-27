@@ -357,7 +357,7 @@ describe('makeReplyMediaWiring', () => {
 
     const [r] = resolveMedia([{ src: outside.files['secret.png'], caption: '' }]);
 
-    assert.equal(r.rejected, 'path');
+    assert.equal(r.rejected, 'outside-roots');
   });
 
   test('per-file caps follow the chat\'s override', () => {
@@ -389,7 +389,7 @@ describe('makeReplyMediaWiring', () => {
     assert.equal(seen[0].detail.chat_id, '12345');
     assert.equal(seen[0].detail.thread_id, '77');
     assert.equal(seen[0].detail.bot, 'testbot');
-    assert.deepEqual(seen[0].detail.reasons, ['path']);
+    assert.deepEqual(seen[0].detail.reasons, ['outside-roots']);
     assert.ok(!JSON.stringify(seen[0]).includes(outside.dir),
       'a rejected path must not be echoed into telemetry');
   });
@@ -711,7 +711,7 @@ describe('the guarantees the whole boundary rests on', () => {
       allowedRoots: [other.dir], chatId: '2',
     });
     const [b] = sessionB.resolveMedia([{ src: shared.files['shared.png'], caption: '' }]);
-    assert.equal(b.rejected, 'path', 'B is refused by roots, cache or no cache');
+    assert.equal(b.rejected, 'outside-roots', 'B is refused by roots, cache or no cache');
     assert.equal(
       sessionB.mediaContext.preflightMedia({ ...a.media, fileId: 'A-id' }, 'photo').ok, false,
       'and cannot spend A\'s id by naming the envelope directly',
