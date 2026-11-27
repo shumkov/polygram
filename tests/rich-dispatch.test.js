@@ -658,7 +658,9 @@ test('image syntax the parser rejects never reaches the chat as text', async () 
   const cases = {
     'spaces (real file, in roots)': `Here you go:\n\n![the shot](${real.file})`,
     parens: 'Here you go:\n\n![shot](/Users/ivan/Desktop/shot (1).png)',
-    'unterminated fragment': `${TABLE}\n\n![shot](/Users/ivan/Desktop/id_rsa`,
+    // A fragment is cut when it names a media file. One that does not
+    // ("…/id_rsa") is prose in a finished reply, as any path in prose is.
+    'unterminated fragment': `${TABLE}\n\n![shot](/Users/ivan/Desktop/shot 1.png`,
     'wrapper around an unparseable path':
       `## Results\n\n<tg-collage>\n\n![a](/Users/ivan/Desktop/a b.png)\n\n</tg-collage>`,
   };

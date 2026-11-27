@@ -1692,7 +1692,8 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
   // transform (same class as tg()'s markdown→HTML conversion).
   const sanitizeLiveText = (text) => {
     if (!resolveRichTextEnabled(config, chatId, threadId)) return text;
-    const clean = stripMediaMarkdown(text);
+    // A tick may end mid-construct, its path still arriving.
+    const clean = stripMediaMarkdown(text, { partial: true });
     // An image-only chunk can sanitize to nothing; keep the bubble
     // alive with a minimal placeholder rather than tripping tg()'s
     // empty-text guard.
@@ -1913,8 +1914,9 @@ async function handleMessage(sessionKey, chatId, msg, bot, dispatchContext = nul
     // consume rule does: deliver the whole thing as chunks rather than leave
     // the user with a truncation.
     redeliver: async (text) => {
+      // A draft is whatever had streamed, so it may stop mid-construct.
       const chunks = chunkMarkdownText(
-        resolveRichTextEnabled(config, chatId, threadId) ? stripMediaMarkdown(text) : text,
+        resolveRichTextEnabled(config, chatId, threadId) ? stripMediaMarkdown(text, { partial: true }) : text,
         TG_CHUNK_BUDGET,
       );
       const r = await deliverReplies({
@@ -3852,7 +3854,9 @@ async function main() {
       setRichKnownUnsupported: () => { richKnownUnsupported = true; },
       getApiRoot: () => config.bot?.apiRoot || null,
       stripUrlCreds: stripUrlCredentials,
-      sanitizeFallbackText: stripMediaMarkdown,
+      // The streamer's fallback edits carry stream ticks, which may end
+      // mid-construct.
+      sanitizeFallbackText: (text) => stripMediaMarkdown(text, { partial: true }),
       capabilityLatch: richCapabilityLatch,
       // The SAME verdict the reply-tool path feeds. One renderer, one
       // server, one answer — a latch reachable from only one path would let

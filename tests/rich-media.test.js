@@ -395,66 +395,79 @@ describe('stripMediaMarkdown', () => {
     assert.equal(stripMediaMarkdown(md), md);
   });
 
-  test('a dangling unterminated trailing image fragment is cut — no partial path leaks', () => {
-    assert.equal(stripMediaMarkdown('Here it is ![shot](/Users/me/secret/pa'), 'Here it is ');
-    assert.equal(stripMediaMarkdown('typing ![alt'), 'typing ');
-    assert.equal(stripMediaMarkdown('typing ![alt]('), 'typing ');
-  });
+  // partial: a stream tick, where "![alt" may be the first half of a path
+  // that has not arrived yet. Any unterminated fragment is cut.
+  describe('partial (a stream tick, not a finished text)', () => {
+    const strip = (md) => stripMediaMarkdown(md, { partial: true });
 
-  test('a mid-text unterminated fragment on an earlier line is cut too (images never span lines)', () => {
-    const out = stripMediaMarkdown('broken ![x](/etc/passwd\nnext line');
-    assert.ok(!out.includes('/etc/passwd'));
-    assert.ok(out.includes('next line'));
-  });
-
-  test('fragment scrubbing leaves fenced content alone', () => {
-    const md = '```\n![x](/keep/me\n```';
-    assert.equal(stripMediaMarkdown(md), md);
-  });
-
-  // keepPathlessFragments: for text that is COMPLETE on arrival — a tool edit
-  // rather than a stream tick — nothing can finish a dangling "![alt", so the
-  // streaming rule that cuts it just eats the tail of a finished sentence.
-  // Only a fragment that can actually expose a path still goes.
-  describe('keepPathlessFragments (complete text, not a stream tick)', () => {
-    const strip = (md) => stripMediaMarkdown(md, { keepPathlessFragments: true });
-
-    test('a pathless opener survives as the literal the author wrote', () => {
-      assert.equal(strip('the syntax is ![alt'), 'the syntax is ![alt');
-      assert.equal(strip('write ![alt] to caption'), 'write ![alt] to caption');
-      assert.equal(strip('then ![alt]('), 'then ![alt](');
-    });
-
-    test('a fragment carrying a path still dies, and takes only itself', () => {
+    test('a dangling unterminated trailing image fragment is cut — no partial path leaks', () => {
       assert.equal(strip('Here it is ![shot](/Users/me/secret/pa'), 'Here it is ');
-      assert.equal(strip('broken ![x](/etc/passwd\nnext line'), 'broken \nnext line');
+      assert.equal(strip('typing ![alt'), 'typing ');
+      assert.equal(strip('typing ![alt]('), 'typing ');
     });
 
-    test('a Windows-style separator counts as a path', () => {
-      assert.equal(strip('shot ![x](C:\\Users\\me\\secret'), 'shot ');
+    test('a mid-text unterminated fragment on an earlier line is cut too (images never span lines)', () => {
+      const out = strip('broken ![x](/etc/passwd\nnext line');
+      assert.ok(!out.includes('/etc/passwd'));
+      assert.ok(out.includes('next line'));
     });
 
-    test('an unreadable tail hiding a COMPLETE path is still dropped whole', () => {
-      // The first construct fails to parse (its `]` is not followed by `(`),
-      // so the parser stops there — and everything after is kept or dropped as
-      // one piece. Keeping it would publish /real/path.png as literal text,
-      // which no rule about fragments should ever buy.
-      const out = strip('![a] ![b](/real/path.png)');
-      assert.ok(!out.includes('/real/path.png'), out);
+    test('fragment scrubbing leaves fenced content alone', () => {
+      const md = '```\n![x](/keep/me\n```';
+      assert.equal(strip(md), md);
     });
 
-    test('complete constructs still degrade to their captions, exactly as before', () => {
+    test('complete constructs degrade to their captions, exactly as in a finished text', () => {
       assert.equal(strip('see ![the fix](/abs/p.png) here'), 'see the fix here');
-      assert.equal(
-        strip('<tg-collage>\n![a](/x.png)\n</tg-collage>'),
-        stripMediaMarkdown('<tg-collage>\n![a](/x.png)\n</tg-collage>'),
-        'the option changes unterminated fragments and nothing else',
-      );
+    });
+  });
+
+  // The default: a finished text (a reply, an edit, a fallback body). Nothing
+  // can complete a fragment any more, so only what really is an image goes —
+  // a construct marked reads as an image, or an unparsed one whose
+  // destination is a path or URL naming a media file. Everything else is the
+  // author's text, and cutting it would deliver half a sentence.
+  describe('a finished text (default)', () => {
+    test('"![" that is not an image is kept whole', () => {
+      for (const text of [
+        'Replaced vec![] with Vec::new() in src/lib.rs',
+        'if (![1,2].includes(n)) in utils/x.js',
+        '![WIP] still drafting the release notes',
+        'Typing ![',
+        'the syntax is ![alt',
+        'write ![alt] to caption',
+        'then ![alt](',
+        'Toggle ![x] (/settings/page) to enable',
+        'See![note](./docs/read me.md) first',
+        'Literal \\![not image] stays text',
+        'Here it is ![shot](/Users/me/secret/pa',
+      ]) {
+        assert.equal(stripMediaMarkdown(text), text, text);
+      }
     });
 
-    test('the default is untouched — every streaming caller keeps the old cut', () => {
-      assert.equal(stripMediaMarkdown('typing ![alt'), 'typing ');
+    test('code spans and table cells are verbatim', () => {
+      for (const text of [
+        'Use `![alt](/abs/path.png)` to embed',
+        'Write `![alt](/path with spaces.png)` inline',
+        'Use ``![a](/x.png)`` here',
+        '| expr |\n|---|\n| `![a](/b.png)` |\n| vec![] |',
+      ]) {
+        assert.equal(stripMediaMarkdown(text), text, text);
+      }
     });
+
+    test('an unparsed image naming a media file still goes, and takes only itself', () => {
+      assert.equal(stripMediaMarkdown('a ![shot](/w/a b.png) b'), 'a shot b');
+      assert.equal(stripMediaMarkdown('broken ![x](/etc/secret.png\nnext line'), 'broken x\nnext line');
+      assert.equal(stripMediaMarkdown('shot ![x](C:\\Users\\me\\s.jpg) after'), 'shot x after');
+    });
+
+    test('a pathless opener before a real image does not shield the image', () => {
+      const out = stripMediaMarkdown('![a] ![b](/real/path.png)');
+      assert.equal(out, '![a] b');
+    });
+
   });
 });
 
