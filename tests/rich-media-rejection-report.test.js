@@ -38,6 +38,7 @@ const {
   isRichCapabilityError, isRichCapabilityErrorExplicit, isRichContentError,
   stripMediaMarkdown, inventoryImageSyntax,
 } = require('../lib/telegram/rich');
+const { buildPolygramDisplayHint } = require('../lib/telegram/display-hint');
 
 const fakeBot = {};
 const quietLogger = { warn: () => {}, error: () => {}, log: () => {}, debug: () => {} };
@@ -357,4 +358,13 @@ test('inventoryImageSyntax separates what will render from what marked leaves as
   assert.deepEqual(inv.images.map((i) => i.src), ['/w/ok.png', '/w/c d.png']);
   assert.deepEqual(inv.unparsed.map((i) => i.caption), ['spaced', 'listed', 'a', 'u']);
   assert.equal(inv.unparsed[0].src, '/w/a b.png');
+});
+
+test('the display hint teaches copying right before each send, names without spaces, and the loud failure', () => {
+  const hint = buildPolygramDisplayHint(true, { inlineMedia: true });
+  assert.match(hint, /right before each send/i);
+  assert.match(hint, /without spaces/i);
+  assert.match(hint, /<\/abs\/path with spaces\.png>/);
+  assert.doesNotMatch(hint, /it will not error/i, 'a rejected image now errors, and the hint must say so');
+  assert.doesNotMatch(hint, /dropped silently/i);
 });
