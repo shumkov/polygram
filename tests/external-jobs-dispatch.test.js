@@ -2,6 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createExternalJobDispatch } = require('../lib/external-jobs/dispatch');
+const { renderJobVoice } = require('../lib/external-jobs/voice');
 
 const target = { chatId: '-1001', threadId: '12', sessionKey: '-1001:12' };
 const job = { id: 7, routeId: 'marketing', requestId: 'mailbox:m_0000000000000001', task: 'Envelope', payload: { body: 'x' }, target };
@@ -28,7 +29,7 @@ test('the dispatched prompt carries every instruction block for the target sessi
   await f.dispatch(job, {});
   assert.deepEqual(sessions.at(-1), ['history-sent', job.requestId], 'the send point demotes the session\'s admin history reach');
   sessions.pop();
-  assert.equal(f.calls.runtime[0].job.task, 'Envelope\n[notify]\n[mailbox]\n[history]');
+  assert.equal(f.calls.runtime[0].job.task, `Envelope${renderJobVoice()}\n[notify]\n[mailbox]\n[history]`);
   assert.deepEqual(sessions, ['-1001:12', '-1001:12', '-1001:12']);
   assert.deepEqual(f.calls.events, [{ ...target, eventId: job.requestId }]);
 });
@@ -41,10 +42,10 @@ test('the send-point hook records the delivered job and keeps the caller hooks',
   assert.deepEqual(turns, ['turn-1']);
 });
 
-test('without a mailbox or notifications the task is dispatched unchanged', async () => {
+test('without a mailbox or notifications the task gets only the job-turn rule', async () => {
   const f = fixture();
   await f.dispatch({ ...job, requestId: 'notifications:1' }, {});
-  assert.equal(f.calls.runtime[0].job.task, 'Envelope');
+  assert.equal(f.calls.runtime[0].job.task, `Envelope${renderJobVoice()}`);
   assert.doesNotThrow(() => f.calls.runtime[0].hooks.onSend());
 });
 
