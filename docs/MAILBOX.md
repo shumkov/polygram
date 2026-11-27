@@ -224,7 +224,8 @@ An open bot's instructions name the session and point to `directory`, so a
 long list never goes into every prompt. `directory` returns the sessions the
 caller may message, each with the name to use and whether it can receive;
 `open` returns the caller's asks still waiting for a reply, with their
-delivery state.
+delivery state. Both carry Telegram links (see
+[Links for agents](#links-for-agents)).
 
 The command names the daemon's IPC directory itself, because a CLI session
 inherits its environment from whoever started the tmux server, which is often
@@ -332,6 +333,42 @@ In an `open` bot, a card links only into its own chat, since an open bot may
 span unrelated chats. Rich and HTML cards carry the same links. A header that
 would exceed 512 UTF-16 units renders without links. A failure to compute a
 link leaves that link out and never holds the card.
+
+### Links for agents
+
+Agents get the same proven links, so they refer to roles and messages by
+link and never by a bare number:
+
+- **`directory`**: each target has `link`, the link its name opens on cards
+  (`https://t.me/c/<chat>/<thread>` for a topic, `/1` for a confirmed
+  forum's General). A direct chat, a basic group or a supergroup without
+  topics has no topic link, and the field is left out: Telegram documents
+  no link that opens a whole private supergroup.
+- **A delivered message**: when the job is dispatched, polygram adds a trusted
+  line to the task, above the untrusted payload:
+  `Telegram links (from polygram): this message <card>; the original <link>; your question <card>. Point at these by link, never by a bare number.`
+  `this message` (`this answer` for a reply) is the card in the receiver's
+  topic, `the original` is a system sender's proven `link`, and
+  `your question` is the question's card for an answer. A notice carries
+  `your question`. A part without a proven link is left out, and so is the
+  whole line when no part has one. The stored job is unchanged: the line is
+  read when the job is dispatched. A links line inside the payload was
+  written by the sender and is never trusted.
+- **Receipts**: `mailbox_send`, `mailbox_reply` and `mailbox_submit` return
+  `link`, the message's target card, once it is posted.
+- **`open`**: each entry in `asks` and `toAnswer` carries its card's `link`.
+
+The target card is posted after the message commits, so the delivery and the
+receipt wait for it, for at most 5 seconds. Only a target in a supergroup is
+waited for, since a card anywhere else can have no link. If the card fails,
+lands elsewhere or takes longer than that, the message goes out without the
+link. Stopping the mailbox (shutdown runs this first) ends every wait, so a
+claimed delivery always reaches its send point.
+
+The display hint of a session that uses the mailbox (its "Links to
+messages" section, `lib/telegram/display-hint.js`) tells the agent to use
+these links. All three places that build the hint use one function,
+`sessionDisplayHint`, so the hint never reads as drift.
 
 ### Delivery notice card
 
