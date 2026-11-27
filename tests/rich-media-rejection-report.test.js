@@ -140,7 +140,7 @@ test('05:58 — a bare path with spaces is refused and named, not silently dropp
 
   assert.equal(res.ok, false, `the agent must not be told this went out: ${JSON.stringify(res)}`);
   assert.ok(res.error.includes(file), `the error names the item: ${res.error}`);
-  assert.ok(res.error.includes('unparsed image (spaces in the path? wrap it in <…>)'), res.error);
+  assert.ok(res.error.includes('unparsed image (spaces in the path? wrap it in <…>; not an image? put it in `code`)'), res.error);
   assert.equal(h.sentAnything(), false, 'nothing reached Telegram, so a corrected resend is not a duplicate');
 
   const [event] = h.rejectedEvents();
@@ -299,6 +299,34 @@ test('a reply without image syntax is untouched by all of this', async () => {
   assert.equal(h.rejectedEvents().length, 0);
 });
 
+test('plain prose with "![" in it is delivered, not refused', async () => {
+  const cwd = workspace();
+  for (const text of [
+    'Replaced vec![] with Vec::new() in src/lib.rs',
+    'Fixed: if (![1,2].includes(n)) in src/check.js',
+    'Wow![1] neat — notes are in /tmp/notes',
+  ]) {
+    const h = build();
+    const res = await reply(h, text, { sessionCwd: cwd });
+    assert.equal(res.ok, true, `${text}: ${JSON.stringify(res)}`);
+    assert.equal(h.rejectedEvents().length, 0, text);
+  }
+});
+
+test('a spaced path inside a collage is refused with a reason that does not loop', async () => {
+  const cwd = workspace();
+  const spaced = writeImage(cwd, 'a b.png');
+  const plain = writeImage(cwd, 'b.png');
+  const h = build();
+
+  const res = await reply(h, `## Pair\n\n<tg-collage>\n![a](<${spaced}>)\n![b](${plain})\n</tg-collage>`, { sessionCwd: cwd });
+
+  assert.equal(res.ok, false);
+  assert.ok(res.error.includes("paths inside a collage/slideshow can't contain spaces; rename the file"), res.error);
+  assert.doesNotMatch(res.error, /wrap it in/);
+  assert.equal(h.sentAnything(), false);
+});
+
 // ─── Loss after the text went out ──────────────────────────────────────────
 
 test('media lost after the text was delivered is reported with the delivered message_id', async () => {
@@ -358,6 +386,42 @@ test('inventoryImageSyntax separates what will render from what marked leaves as
   assert.deepEqual(inv.images.map((i) => i.src), ['/w/ok.png', '/w/c d.png']);
   assert.deepEqual(inv.unparsed.map((i) => i.caption), ['spaced', 'listed', 'a', 'u']);
   assert.equal(inv.unparsed[0].src, '/w/a b.png');
+  assert.equal(inv.unparsed[3].src, '![u](/w/u.png', 'an unterminated construct is quoted as written');
+});
+
+test('prose that merely contains "![" is not image syntax', () => {
+  // Each line also carries a path, so a filter that only asks "is there a
+  // separator in the tail?" would wrongly call every one an image.
+  const cases = [
+    'Replaced vec![] with Vec::new() in src/lib.rs',
+    'if (![1,2].includes(n)) return /x/;',
+    'Wow![1] neat, see /tmp/notes',
+  ];
+  for (const text of cases) {
+    assert.deepEqual(inventoryImageSyntax(text), { images: [], unparsed: [] }, text);
+  }
+});
+
+test('a long unterminated construct is quoted, truncated, not its whole tail', () => {
+  const tail = `![shot](/w/${'x'.repeat(200)}.png`;
+  const [item] = inventoryImageSyntax(tail).unparsed;
+  assert.equal(item.src, tail.slice(0, 60));
+});
+
+test('a reference-style image is reported as unparsed', () => {
+  // The renderer only sees inline images reliably; a reference image either
+  // renders or vanishes depending on what else the reply contains.
+  const inv = inventoryImageSyntax('## Shot\n\n![a][r]\n\n[r]: /w/a.png');
+  assert.deepEqual(inv.images, []);
+  assert.deepEqual(inv.unparsed.map((i) => i.caption), ['a']);
+});
+
+test('a spaced path inside a collage gets its own reason, never "wrap it in <…>"', () => {
+  // Angle brackets do not work inside a wrapper body, so advising them there
+  // sends the agent round the same refusal forever.
+  const inv = inventoryImageSyntax('<tg-collage>\n![a](</w/a b.png>)\n![b](/w/b.png)\n</tg-collage>');
+  assert.deepEqual(inv.images.map((i) => i.src), ['/w/b.png']);
+  assert.deepEqual(inv.unparsed.map((i) => i.reason), ['wrapper-spaces']);
 });
 
 test('the display hint teaches copying right before each send, names without spaces, and the loud failure', () => {
