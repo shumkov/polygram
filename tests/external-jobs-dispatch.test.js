@@ -97,3 +97,36 @@ test('the job\'s turn ends after the send point, and also when the turn fails', 
   assert.deepEqual(order, ['send', 'turn', 'end']);
 });
 
+
+test('the job\'s working state is prepared with its mailbox card and handed to the runtime', async () => {
+  const card = Promise.resolve({ chatId: '-1001', threadId: '12', messageId: 9 });
+  const prepared = [];
+  const handle = { context: {}, begin() {}, end() {} };
+  const f = createExternalJobDispatch({
+    dispatchExternalEvent: (_origin, run) => run(),
+    runtime: { dispatch: async (_job, hooks) => { assert.equal(hooks.presence, handle); return { outcome: 'succeeded' }; } },
+    getMailbox: () => ({ enabled: true, instructions: () => '', noteJobSend() {}, cardFor: (j) => (j === job ? card : null) }),
+    getPresence: () => ({ prepare: async (j, options) => { prepared.push([j, options.card]); return handle; } }),
+  });
+  assert.equal((await f(job, {})).outcome, 'succeeded');
+  assert.deepEqual(prepared, [[job, card]]);
+});
+
+test('a failure preparing the working state is logged and the job runs without it', async () => {
+  for (const broken of [
+    { mailbox: { cardFor: () => { throw new Error('database is locked'); } }, presence: { prepare: async () => ({}) } },
+    { mailbox: {}, presence: { prepare: async () => { throw Object.assign(new Error('boom'), { code: 'EBOOM' }); } } },
+  ]) {
+    const warnings = []; const seen = [];
+    const f = createExternalJobDispatch({
+      dispatchExternalEvent: (_origin, run) => run(),
+      runtime: { dispatch: async (_job, hooks) => { seen.push(hooks.presence); return { outcome: 'succeeded' }; } },
+      getMailbox: () => ({ enabled: true, instructions: () => '', noteJobSend() {}, ...broken.mailbox }),
+      getPresence: () => broken.presence, logger: { warn: (line) => warnings.push(line) },
+    });
+    assert.equal((await f(job, {})).outcome, 'succeeded');
+    assert.deepEqual(seen, [null]);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /mailbox:m_0000000000000001/);
+  }
+});
