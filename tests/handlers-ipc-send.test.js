@@ -33,8 +33,8 @@ describe('createHandleSendOverIpc — method allowlist', () => {
   test('rejects unknown method', async () => {
     const { handler } = fixture();
     await assert.rejects(
-      () => handler({ method: 'deleteMessage', params: { chat_id: '111' } }),
-      /method not allowed: deleteMessage/,
+      () => handler({ method: 'banChatMember', params: { chat_id: '111' } }),
+      /method not allowed: banChatMember/,
     );
   });
 
