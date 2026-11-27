@@ -343,6 +343,18 @@ test('a renamed collage path keeps working with its <…> still on', async () =>
   assert.ok(uploads.includes(fs.realpathSync(a)) && uploads.includes(fs.realpathSync(b)), uploads);
 });
 
+test('an unsupported-format image is refused as extension, its path never sent as text', async () => {
+  const cwd = workspace();
+  const file = writeImage(cwd, 'IMG 1.heic');
+  const h = build();
+
+  const res = await reply(h, `Photo: ![shot](${file}) here`, { sessionCwd: cwd });
+
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.ok(res.error.includes(`${file} (extension`), res.error);
+  assert.equal(h.sentAnything(), false);
+});
+
 // ─── Loss after the text went out ──────────────────────────────────────────
 
 test('media lost after the text was delivered is reported with the delivered message_id', async () => {
@@ -452,6 +464,13 @@ test('a destination that starts like a path but names no media file is prose', (
   // The incident's shapes name a media file and stay refused.
   assert.equal(inventoryImageSyntax('![1 UNTIL SUNDAY](/home/x/PREVIEW 1 until sunday.jpg)').unparsed.length, 1);
   assert.equal(inventoryImageSyntax('unterminated ![u](/w/u.png').unparsed.length, 1);
+});
+
+test('an image construct naming an unsupported media format is reported as "extension"', () => {
+  // `.heic` is an image, just not one Telegram takes. Treating it as prose
+  // would send its local path as text and drop the picture without a word.
+  const inv = inventoryImageSyntax('Photo: ![shot](/Users/ivan/Pictures/IMG 1.heic) here');
+  assert.deepEqual(inv.unparsed, [{ src: '/Users/ivan/Pictures/IMG 1.heic', caption: 'shot', reason: 'extension' }]);
 });
 
 test('a long unterminated construct is quoted, truncated, not its whole tail', () => {

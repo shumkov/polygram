@@ -463,6 +463,11 @@ describe('stripMediaMarkdown', () => {
       assert.equal(stripMediaMarkdown('shot ![x](C:\\Users\\me\\s.jpg) after'), 'shot x after');
     });
 
+    test('an image construct whose path names an unsupported media format never shows the path', () => {
+      assert.equal(stripMediaMarkdown('Photo: ![shot](/Users/ivan/Pictures/IMG 1.heic) here'), 'Photo: shot here');
+      assert.equal(stripMediaMarkdown('Clip ![c](/Users/ivan/a b.webm) end'), 'Clip c end');
+    });
+
     test('a pathless opener before a real image does not shield the image', () => {
       const out = stripMediaMarkdown('![a] ![b](/real/path.png)');
       assert.equal(out, '![a] b');
