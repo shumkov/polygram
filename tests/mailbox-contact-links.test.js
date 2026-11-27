@@ -231,3 +231,11 @@ test('the mailbox says which sessions use it, by chat and topic, for the display
   assert.equal(f.mailbox.usesMailboxIn(MARK, '9999'), false, 'a topic that is no role of a roles bot');
   assert.equal(f.mailbox.usesMailboxIn('-1001', null), false, 'a chat this bot does not have');
 });
+
+test('a message into a direct chat never waits for its card, since a direct chat has no links', async (t) => {
+  const f = await fixture(t);
+  f.hold = new Promise(() => {});
+  const sent = f.mailbox.send(f.token(PHOTOROOM), { to: 'ivan', kind: 'tell', body: 'Cutouts are ready.' });
+  await settle();
+  assert.ok(promptFor(f, sent.id), 'delivered at once, while the card in the direct chat is still being posted');
+});
