@@ -385,6 +385,16 @@ The event word is `No answer`, `Undelivered`, `Uncertain` or
 `Answer undelivered`. The card is best effort; the notice itself never
 depends on it.
 
+### Progress reactions on the card
+
+While the receiving turn runs, its topic shows typing, and the card of the
+message it is working on (the target card, or a notice's card) gets the status
+reactions a human message gets: 🤔, a tool face, then 👍 when the turn ends,
+whether or not it wrote a report; 🤯 when it failed; none after a stop. The
+sender's copy gets none. A card in a direct chat, and a notice card, are
+remembered only until the daemon restarts. Typing and reactions never affect
+delivery. See [`JOB_TURN_VOICE_SPEC.md`](./JOB_TURN_VOICE_SPEC.md).
+
 ### Fallback
 
 Rich sends use the shared capability latch. Unsupported or rejected rich cards

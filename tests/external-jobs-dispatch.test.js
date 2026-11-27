@@ -2,6 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createExternalJobDispatch } = require('../lib/external-jobs/dispatch');
+const { renderJobVoice } = require('../lib/external-jobs/voice');
 
 const target = { chatId: '-1001', threadId: '12', sessionKey: '-1001:12' };
 const job = { id: 7, routeId: 'marketing', requestId: 'mailbox:m_0000000000000001', task: 'Envelope', payload: { body: 'x' }, target };
@@ -28,7 +29,7 @@ test('the dispatched prompt carries every instruction block for the target sessi
   await f.dispatch(job, {});
   assert.deepEqual(sessions.at(-1), ['history-sent', job.requestId], 'the send point demotes the session\'s admin history reach');
   sessions.pop();
-  assert.equal(f.calls.runtime[0].job.task, 'Envelope\n[notify]\n[mailbox]\n[history]');
+  assert.equal(f.calls.runtime[0].job.task, `Envelope${renderJobVoice()}\n[notify]\n[mailbox]\n[history]`);
   assert.deepEqual(sessions, ['-1001:12', '-1001:12', '-1001:12']);
   assert.deepEqual(f.calls.events, [{ ...target, eventId: job.requestId }]);
 });
@@ -41,10 +42,10 @@ test('the send-point hook records the delivered job and keeps the caller hooks',
   assert.deepEqual(turns, ['turn-1']);
 });
 
-test('without a mailbox or notifications the task is dispatched unchanged', async () => {
+test('without a mailbox or notifications the task gets only the job-turn rule', async () => {
   const f = fixture();
   await f.dispatch({ ...job, requestId: 'notifications:1' }, {});
-  assert.equal(f.calls.runtime[0].job.task, 'Envelope');
+  assert.equal(f.calls.runtime[0].job.task, `Envelope${renderJobVoice()}`);
   assert.doesNotThrow(() => f.calls.runtime[0].hooks.onSend());
 });
 
@@ -96,3 +97,36 @@ test('the job\'s turn ends after the send point, and also when the turn fails', 
   assert.deepEqual(order, ['send', 'turn', 'end']);
 });
 
+
+test('the job\'s working state is prepared with its mailbox card and handed to the runtime', async () => {
+  const card = Promise.resolve({ chatId: '-1001', threadId: '12', messageId: 9 });
+  const prepared = [];
+  const handle = { context: {}, begin() {}, end() {} };
+  const f = createExternalJobDispatch({
+    dispatchExternalEvent: (_origin, run) => run(),
+    runtime: { dispatch: async (_job, hooks) => { assert.equal(hooks.presence, handle); return { outcome: 'succeeded' }; } },
+    getMailbox: () => ({ enabled: true, instructions: () => '', noteJobSend() {}, cardFor: (j) => (j === job ? card : null) }),
+    getPresence: () => ({ prepare: async (j, options) => { prepared.push([j, options.card]); return handle; } }),
+  });
+  assert.equal((await f(job, {})).outcome, 'succeeded');
+  assert.deepEqual(prepared, [[job, card]]);
+});
+
+test('a failure preparing the working state is logged and the job runs without it', async () => {
+  for (const broken of [
+    { mailbox: { cardFor: () => { throw new Error('database is locked'); } }, presence: { prepare: async () => ({}) } },
+    { mailbox: {}, presence: { prepare: async () => { throw Object.assign(new Error('boom'), { code: 'EBOOM' }); } } },
+  ]) {
+    const warnings = []; const seen = [];
+    const f = createExternalJobDispatch({
+      dispatchExternalEvent: (_origin, run) => run(),
+      runtime: { dispatch: async (_job, hooks) => { seen.push(hooks.presence); return { outcome: 'succeeded' }; } },
+      getMailbox: () => ({ enabled: true, instructions: () => '', noteJobSend() {}, ...broken.mailbox }),
+      getPresence: () => broken.presence, logger: { warn: (line) => warnings.push(line) },
+    });
+    assert.equal((await f(job, {})).outcome, 'succeeded');
+    assert.deepEqual(seen, [null]);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /mailbox:m_0000000000000001/);
+  }
+});

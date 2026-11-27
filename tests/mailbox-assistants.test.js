@@ -503,7 +503,7 @@ test('prompts: an assistant learns whose it is and that only its person\'s turn 
   const f = await fixture(t);
   const dina = f.service.instructions(DINA);
   assert.match(dina, /you are Dina's assistant/);
-  assert.match(dina, /In a turn another session started you cannot message or reply/);
+  assert.match(dina, /In a turn another session started you cannot run the mailbox send or reply commands/);
   assert.match(dina, /never Dina's private conversation/);
   assert.match(f.service.instructions(FINANCE), /ask a person's assistant/);
 });
