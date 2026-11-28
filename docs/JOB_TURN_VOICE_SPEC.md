@@ -345,7 +345,7 @@ it to the turn's result before the job service records the outcome:
 | a notice's, whatever it says (a notice turn that ran) | nothing | `silent` | `{"silent":"notice","turnId":…}` |
 | trimmed, exactly `NO_REPLY` | nothing | `silent` | `{"silent":"no-reply","turnId":…}` |
 | `NO_REPLY` as a control word next to other text: on a line of its own, or the first or last word | the text without the token | as today | as today |
-| the same, with no letter or digit left once the token is gone (`` `NO_REPLY` ``, `NO_REPLY.`, two Codex messages that were both `NO_REPLY`) | nothing | `silent` | `{"silent":"no-reply","turnId":…}` |
+| the same, with no letter or digit left once the token is gone (`` `NO_REPLY` ``, `NO_REPLY.`, the token alone in a code fence, two Codex messages that were both `NO_REPLY`) | nothing | `silent` | `{"silent":"no-reply","turnId":…}` |
 | `NO_REPLY` mentioned inside a sentence or in fenced code | as written | as today | as today |
 | no token | as today | as today | as today |
 
@@ -357,9 +357,13 @@ it to the turn's result before the job service records the outcome:
     `` `NO_REPLY` ``, `**NO_REPLY**`, `— NO_REPLY`) is dropped, without leaving
     a double blank line;
   - the first or last word of the whole text is cut together with the markup
-    around it and the dash or punctuation joining it to the rest
+    around it and the dash or punctuation joining it to the rest, when a
+    line break, `.!?:;` or a dash sets it apart from the sentence
     (`Ничего не нужно. NO_REPLY` → `Ничего не нужно.`,
-    `NO_REPLY — nothing else was needed.` → `nothing else was needed.`).
+    `NO_REPLY — nothing else was needed.` → `nothing else was needed.`);
+    `…is exactly NO_REPLY.` and `NO_REPLY is the token…` are sentences about
+    the rule and stay. A text that ends inside an unclosed code fence is never
+    cut at its end.
 
   Posting the rest, rather than silencing it, keeps a result the agent wrote
   next to the token, which is the case where silence would lose something a
@@ -483,7 +487,10 @@ ran no turn are left alone; an invalid silence reason no longer blocks the
 service's report-error fallback; the Codex mailbox spike gets the Codex
 wording and accepts a silent reply. Found while folding those in: the first
 cut used a backtracking pattern that was quadratic on long whitespace runs,
-now a linear scan with a regression test.
+now a linear scan with a regression test. A second pass of the same reviewer
+over that fix: an edge token is cut only when punctuation or a line break
+sets it apart, a fenced token alone is silent, the end of an unclosed fence is
+never cut, and neighbors are read by code point.
 
 ## Tests
 

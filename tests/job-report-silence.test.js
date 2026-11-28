@@ -65,6 +65,26 @@ test('a mention of the token inside a sentence or in code is posted as written',
   ]) assert.deepEqual(reportOf(text), { text, silent: null, stripped: false }, text);
 });
 
+// At the very start or end of the text the word is a control token only when
+// punctuation, a line break or the text's edge sets it apart from the
+// sentence; otherwise it ends or starts a sentence about the rule.
+test('a mention at the start or end of a sentence is posted as written', () => {
+  for (const text of [
+    'Fixed: a job report that is exactly NO_REPLY.',
+    'The constant is `NO_REPLY`',
+    'NO_REPLY is the token polygram honors.',
+    'Here:\n```\nreturn NO_REPLY',
+    'NO_REPLY x 𝐀NO_REPLY',
+  ]) assert.deepEqual(reportOf(text), { text, silent: null, stripped: false }, text);
+  assert.deepEqual(reportOf('NO_REPLY. Nothing else was needed.'), { text: 'Nothing else was needed.', silent: null, stripped: true });
+});
+
+test('a code block that holds only the token is silent too', () => {
+  for (const text of ['```\nNO_REPLY\n```', '```text\nNO_REPLY\n```', '~~~\n`NO_REPLY`\n~~~\n']) {
+    assert.deepEqual(reportOf(text), { text: '', silent: 'no-reply', stripped: false }, text);
+  }
+});
+
 test('a lookalike word is not the token: the text comes back exactly as written', () => {
   for (const text of ['FOO_NO_REPLY_BAR\n\n\nx  ', 'NO_REPLYING is not a word']) {
     assert.deepEqual(reportOf(text), { text, silent: null, stripped: false }, text);
