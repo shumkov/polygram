@@ -4,12 +4,15 @@
 // ("nothing to do", "I did not post in the topic") into busy topics, in the
 // wrong language, while a person's assistant stayed silent about asks meant
 // for its person. Every job turn, whatever started it and whichever backend
-// runs it, is told who reads its final text and when to write one.
+// runs it, is told who reads its final text, when to write one, and that
+// NO_REPLY posts nothing. 0.56.1 put that paragraph before the long tool
+// blocks and the payload and it changed nothing, so it is now the last thing
+// in the prompt.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { freshDb, cleanupDb } = require('./helpers/db-fixture');
 const { getSessionKey } = require('../lib/session-key');
-const { createExternalJobTargetResolver } = require('../lib/external-jobs/runtime');
+const { createExternalJobTargetResolver, buildExternalJobPrompt } = require('../lib/external-jobs/runtime');
 const { createExternalJobService } = require('../lib/external-jobs/service');
 const { createExternalJobDispatch } = require('../lib/external-jobs/dispatch');
 const { createMailboxService, humanTurn } = require('../lib/mailbox/service');
@@ -22,16 +25,26 @@ const MAI = '8744283195';
 const OPS = `${MGMT}:732`;
 const FINANCE = `${MGMT}:1041`;
 
-// The paragraph every job turn carries, in order: that no person here wrote,
-// that any text is posted here, when to write, how, and that silence is the
-// right outcome otherwise, overriding the progress rules a person's turn has.
-const VOICE = [
-  'No person in this chat wrote to you in this turn, yet any text you write in it is posted to the people here, like any message you send to this chat.',
-  'Write only when a person here needs to know something: a result, a problem you found, or a decision they must make; write it to them, in the language they are using in this chat now.',
-  'Otherwise write no text at all and just end the turn: that is the right outcome here.',
-  'The chat already shows that you are working, so post no plan, checklist or progress note;',
-].map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[^]*?');
-const VOICE_RE = new RegExp(VOICE);
+// The paragraph every job turn ends with, per backend. The Claude CLI posts
+// the final message; Codex joins and posts every message the turn wrote, and
+// has no reply tool.
+const CLI_VOICE = 'No person in this chat wrote to you in this turn. Your final message is not a private summary: polygram posts it, word for word, to this chat as a message from you.'
+  + ' If it would describe what you did, say that you posted nothing, or say that nothing was needed, make your entire final message exactly NO_REPLY.'
+  + ' Write a final message only when a person here needs it: a result, a problem, or a decision they must make, addressed to them, in the language they use in this chat.'
+  + ' If you already told them with the reply tool, end with NO_REPLY. Post no plan or progress note: the chat already shows that you are working.';
+const CODEX_VOICE = 'No person in this chat wrote to you in this turn. What you write is not a private summary: polygram joins every message you write in this turn and posts them, word for word, to this chat as a message from you.'
+  + ' If what you would write describes what you did, says that you posted nothing, or says that nothing was needed, write nothing in this turn but exactly NO_REPLY.'
+  + ' Write only when a person here needs it: a result, a problem, or a decision they must make, addressed to them, in the language they use in this chat.'
+  + ' Post no plan or progress note: the chat already shows that you are working.';
+// A notice's text is never posted, so its turn is told that instead.
+const CLI_NOTICE = 'This notice is for you, not for the people in this chat: polygram does not post your final message in this turn.'
+  + ' Use the reply tool only if a person here must know something now; post no plan or progress note.';
+const CODEX_NOTICE = 'This notice is for you, not for the people in this chat: polygram posts nothing you write in this turn.';
+const person = (name, how = 'with the reply tool or in your final message') => ` This is ${name}'s direct chat with you.`
+  + ` If what you received asks something of ${name} or is for ${name}, tell ${name} ${how}: who asks, what, by when, in ${name}'s language.`
+  + ` Never end such a turn with NO_REPLY before ${name} has been told.`;
+// The 0.56.1 wording, which must be gone.
+const OLD_VOICE_RE = /any text you write in it is posted to the people here|Otherwise write no text at all and just end the turn/;
 
 function config({ mirror = 'both', assistants = true } = {}) {
   return {
@@ -65,7 +78,7 @@ async function fixture(t, { mirror, assistants } = {}) {
   const f = { db, dispatched: [] };
   const runtime = { dispatch: async (job, hooks) => { hooks.onSend?.(); f.dispatched.push(job); return { outcome: 'succeeded', text: '', inactive: true }; } };
   f.jobs = createExternalJobService({ config: cfg, db, botName: 'shumabit', resolveTarget,
-    dispatch: createExternalJobDispatch({ dispatchExternalEvent: (_origin, run) => run(), runtime, getMailbox: () => f.mailbox, logger: { warn() {} } }),
+    dispatch: createExternalJobDispatch({ dispatchExternalEvent: (_origin, run) => run(), runtime, getMailbox: () => f.mailbox, getBackend: backendOf, logger: { warn() {} } }),
     checkInactive: async () => false, deliverPart: async () => ({ messageId: 1 }), logger: { error() {} } });
   let messageId = 100;
   const tg = async (_bot, _method, params) => ({ message_id: ++messageId, chat: { id: Number(params.chat_id) },
@@ -92,14 +105,17 @@ async function fixture(t, { mirror, assistants } = {}) {
   return f;
 }
 
-// The rule follows the stored task directly, before the tool blocks, so the
-// stored header and its tail still lead the prompt.
-function assertVoice(f, requestId) {
-  const prompt = f.prompt(requestId);
-  assert.ok(prompt, `${requestId} was dispatched`);
+// The prompt the process gets: the stored task leads, the tool blocks and the
+// untrusted payload follow, and the paragraph is the very last thing.
+function assertVoice(f, requestId, voice = CLI_VOICE) {
+  const job = f.dispatched.find((sent) => sent.requestId === requestId);
+  assert.ok(job, `${requestId} was dispatched`);
+  const prompt = buildExternalJobPrompt(job);
   const stored = f.stored(requestId);
   assert.ok(prompt.startsWith(`${stored}\n`), 'the stored task leads the prompt');
-  assert.match(prompt.slice(stored.length), new RegExp(`^\\n${VOICE}`), 'the rule follows the stored task');
+  assert.ok(prompt.endsWith(`</untrusted-input>\n\n${voice}`), `${requestId} ends with its paragraph, after the payload`);
+  assert.equal(prompt.indexOf(voice), prompt.length - voice.length, 'the paragraph appears once');
+  assert.doesNotMatch(prompt, OLD_VOICE_RE);
   return prompt;
 }
 
@@ -122,15 +138,16 @@ test('a system sender\'s task and a relayed human comment carry the rule', async
   for (const id of [task.id, comment.id]) assertVoice(f, `mailbox:${id}`);
 });
 
-test('a delivery notice carries the rule and no longer asks for a word in the topic', async (t) => {
+test('a delivery notice ends with the notice paragraph: its text is not posted, and the reply tool is how to tell a person', async (t) => {
   const f = await fixture(t);
   const asked = f.mailbox.send(f.role(OPS), { to: 'finance', kind: 'ask', body: 'What is the March runway?' });
   await f.run();
   await f.mailbox.tick();
   await f.run();
-  const prompt = assertVoice(f, `mailbox-notice:${asked.id}`);
+  const prompt = assertVoice(f, `mailbox-notice:${asked.id}`, CLI_NOTICE);
   assert.match(prompt, /^\[Inter-session notice\]/);
   assert.doesNotMatch(prompt, /say so in your topic/);
+  assert.doesNotMatch(prompt, /polygram posts it, word for word/, 'a notice is not told that its text is posted');
 });
 
 test('a notice tail only states what the turn can do, for every reason', () => {
@@ -142,38 +159,58 @@ test('a notice tail only states what the turn can do, for every reason', () => {
   }
 });
 
-test('a person\'s assistant is told to tell its person who asks what, by the configured name', async (t) => {
+test('a person\'s assistant is told to tell its person who asks what, by when, and not to end with NO_REPLY before that', async (t) => {
   const f = await fixture(t);
   const fromRole = f.mailbox.send(f.role(OPS), { to: 'mai', kind: 'ask', body: 'Can Mai approve the shoot budget?' });
   const fromAssistant = f.mailbox.send(f.person(DINA), { to: 'mai', kind: 'ask', body: 'Are you free on Friday?' });
-  const toCodex = f.mailbox.send(f.role(OPS), { to: 'ivan', kind: 'tell', body: 'The report is ready.' });
   await f.run();
-  for (const [id, name] of [[fromRole.id, 'Mai'], [fromAssistant.id, 'Mai'], [toCodex.id, 'Ivan']]) {
-    const prompt = assertVoice(f, `mailbox:${id}`);
-    assert.ok(prompt.includes(`This is ${name}'s direct chat with you. When what you received is for ${name} or asks something of ${name}, `
-      + `telling ${name} is the point of this turn: say who is asking, what, and what they need from ${name}, even though the message card shows it.`), name);
-  }
+  for (const id of [fromRole.id, fromAssistant.id]) assertVoice(f, `mailbox:${id}`, CLI_VOICE + person('Mai'));
   assert.match(f.prompt(`mailbox:${fromRole.id}`), /In a turn another session started you cannot run the mailbox send or reply commands: tell Mai in your final text what is asked/,
     'on the Claude CLI "reply" is also the Telegram tool, so the mailbox commands are named');
   const roleTurn = f.mailbox.send(f.person(MAI), { to: 'ops', kind: 'tell', body: 'Approved.' });
   await f.run();
-  assert.doesNotMatch(f.prompt(`mailbox:${roleTurn.id}`), /direct chat with you/, 'a role\'s turn has no person sentence');
+  assertVoice(f, `mailbox:${roleTurn.id}`);
+  assert.doesNotMatch(buildExternalJobPrompt(f.dispatched.find((job) => job.requestId === `mailbox:${roleTurn.id}`)), /direct chat with you/,
+    'a role\'s turn has no person sentence');
 });
 
-test('jobs that are not mailbox messages carry the rule too: a notification batch and an API job', async () => {
+// Codex joins and posts every message of the turn and has no reply tool, so
+// its turn is told that, and silence is writing nothing but NO_REPLY.
+test('a Codex target gets the Codex wording, its person sentence included', async (t) => {
+  const f = await fixture(t);
+  const told = f.mailbox.send(f.role(OPS), { to: 'ivan', kind: 'tell', body: 'The report is ready.' });
+  await f.run();
+  const prompt = assertVoice(f, `mailbox:${told.id}`, CODEX_VOICE + person('Ivan', 'in what you write'));
+  assert.doesNotMatch(prompt.slice(prompt.indexOf('</untrusted-input>')), /reply tool/, 'Codex has no reply tool');
+});
+
+test('a notice to an assistant gets the notice paragraph without the person sentence, and Codex its own notice wording', () => {
+  const { renderJobVoice } = require('../lib/external-jobs/voice');
+  assert.equal(renderJobVoice({ notice: true, person: 'Mai' }), CLI_NOTICE);
+  assert.equal(renderJobVoice({ notice: true, backend: 'codex', person: 'Ivan' }), CODEX_NOTICE);
+  assert.equal(renderJobVoice({ backend: 'sdk' }), CLI_VOICE, 'an unknown backend gets the Claude CLI wording');
+  assert.equal(renderJobVoice(), CLI_VOICE);
+});
+
+test('jobs that are not mailbox messages end with the rule too: a notification batch and an API job, on both backends', async () => {
   const dispatched = [];
   const dispatch = createExternalJobDispatch({
     dispatchExternalEvent: (_origin, run) => run(),
     runtime: { dispatch: async (job) => { dispatched.push(job); return { outcome: 'succeeded' }; } },
+    getBackend: ({ chatId }) => (chatId === '-1002' ? 'codex' : 'cli'),
   });
-  const target = { chatId: '-1001', threadId: '12', sessionKey: '-1001:12' };
-  for (const requestId of ['notifications:1', 'daily-digest:2026-11-27']) {
-    await dispatch({ id: 1, routeId: 'admin', requestId, task: 'Review the supplied data.', payload: {}, target }, {});
+  for (const chatId of ['-1001', '-1002']) {
+    const target = { chatId, threadId: '12', sessionKey: `${chatId}:12` };
+    for (const requestId of ['notifications:1', 'daily-digest:2026-11-27']) {
+      await dispatch({ id: 1, routeId: 'admin', requestId, task: 'Review the supplied data.', payload: { rows: 1 }, target }, {});
+    }
   }
+  assert.equal(dispatched.length, 4);
   for (const job of dispatched) {
-    assert.ok(job.task.startsWith('Review the supplied data.\n'));
-    assert.match(job.task, VOICE_RE);
-    assert.doesNotMatch(job.task, /direct chat with you/);
+    const prompt = buildExternalJobPrompt(job);
+    assert.ok(prompt.startsWith('Review the supplied data.\n'));
+    assert.ok(prompt.endsWith(`</untrusted-input>\n\n${job.target.chatId === '-1002' ? CODEX_VOICE : CLI_VOICE}`), job.requestId);
+    assert.doesNotMatch(prompt, /direct chat with you/);
   }
 });
 
@@ -182,7 +219,7 @@ test('a job stored before the rule existed gets it when dispatched', async (t) =
   const sent = f.mailbox.send(f.role(OPS), { to: 'finance', kind: 'tell', body: 'Old news.' });
   // The stored task is exactly what was stored before this change: the rule
   // is never part of it.
-  assert.doesNotMatch(f.stored(`mailbox:${sent.id}`), VOICE_RE);
+  assert.ok(!f.stored(`mailbox:${sent.id}`).includes('NO_REPLY'));
   await f.run();
   assertVoice(f, `mailbox:${sent.id}`);
 });
@@ -206,10 +243,10 @@ test('the display hint scopes its no-silence rule to a person\'s message', () =>
   }
 });
 
-// A notice queued before this change keeps its stored ending, which still
-// asks for a word in the topic; the rule follows it, so the turn reads both
-// for as long as that notice waits in the queue (seconds).
-test('a notice stored with the old ending gets the rule after it', async () => {
+// A notice queued before 0.56.1 keeps its stored ending, which still asks
+// for a word in the topic; the notice paragraph comes last and its text is
+// not posted anyway.
+test('a notice stored with the old ending ends with the notice paragraph', async () => {
   const dispatched = [];
   const dispatch = createExternalJobDispatch({
     dispatchExternalEvent: (_origin, run) => run(),
@@ -221,6 +258,7 @@ test('a notice stored with the old ending gets the rule after it', async () => {
     + 'This turn can reply to asks but cannot start a new ask or tell; if you still need the answer, say so in your topic.';
   await dispatch({ id: 1, routeId: 'ops', requestId: 'mailbox-notice:m_00000000000000a1', task: old, payload: {},
     target: { chatId: MGMT, threadId: '732', sessionKey: OPS } }, {});
-  assert.ok(dispatched[0].task.startsWith(`${old}\n`));
-  assert.match(dispatched[0].task.slice(old.length), new RegExp(`^\\n${VOICE}`));
+  const prompt = buildExternalJobPrompt(dispatched[0]);
+  assert.ok(prompt.startsWith(`${old}\n`));
+  assert.ok(prompt.endsWith(`</untrusted-input>\n\n${CLI_NOTICE}`));
 });

@@ -107,6 +107,15 @@ test('untrusted payload cannot escape its data boundary', () => {
   const prompt = buildExternalJobPrompt(job); assert.ok(prompt.startsWith(job.task));
   assert.equal(prompt.split('</untrusted-input>').length, 2); assert.match(prompt, /&lt;\/untrusted-input&gt;/);
 });
+// The job-turn rule is the last thing the model reads, after the payload; a
+// payload cannot pose as it, since its tag cannot close early.
+test('the job voice ends the prompt, after the untrusted payload', () => {
+  const voice = 'Your final message is posted.';
+  const prompt = buildExternalJobPrompt({ ...job, voice });
+  assert.ok(prompt.startsWith(job.task));
+  assert.ok(prompt.endsWith(`</untrusted-input>\n\n${voice}`));
+  assert.ok(buildExternalJobPrompt(job).endsWith('</untrusted-input>'), 'a job without a voice is unchanged');
+});
 test('only the human operator controls automation and aliases share session pause', async () => {
   const f = fixture(); const pauses = []; const replies = [];
   const handler = createAutomationCommandHandler({ ...f.deps, getService: () => ({ pauseSession: (...args) => pauses.push(args), status: () => ({ paused: true, pending: 2, running: 1 }) }), reply: async (...args) => replies.push(args) });
