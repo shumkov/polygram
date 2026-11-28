@@ -23,12 +23,15 @@ only works when sent in General. Version 1 dispatch supports the Claude CLI and
 Codex backends; a Codex destination is admitted only while its process is idle
 (or proven idle with no process), and its final text is the report. Mailbox
 deliveries are the tested Codex use; a notification consumer on a Codex
-route fails at boot.
-Every job's task gets one more paragraph at dispatch, after the stored task:
-the final text is posted to the people in the chat, so the turn writes one only
-when a person there needs to know something (a result, a problem found, a
-decision they must make), to them and in their current language, and otherwise
-ends with no text. While the turn runs the chat shows typing; a mailbox job's
+route fails at boot. On the Claude CLI a job turn's final text is never posted:
+the turn reaches people through the reply tool, as its system prompt says, and
+the text is kept privately (`reportState` `silent`, reason `private-final`).
+Every job's prompt ends with one more paragraph, after the payload, saying
+this: on the Claude CLI, anything a person needs goes through the reply tool;
+on Codex, everything it writes is posted, so it writes only when a person there
+needs to know something (a result, a problem found, a decision they must make),
+to them and in their current language, and otherwise writes exactly
+`NO_REPLY`. While the turn runs the chat shows typing; a mailbox job's
 card also gets the status reactions a human message gets, ending 👍. See
 [`JOB_TURN_VOICE_SPEC.md`](./JOB_TURN_VOICE_SPEC.md).
 Route names and request IDs are nonempty bounded strings; request IDs must be
@@ -55,10 +58,12 @@ All successful responses have the IPC envelope `ok: true`.
 `queued`, `running`, `succeeded`, `failed`, `interrupted`, `unknown`.
 Report state is `none`, `pending`, `delivered`, `unknown` or `silent`. `silent`
 means the turn's text was deliberately not posted; `reportReceipt.silent` says
-why: `no-reply` when the agent ended with exactly `NO_REPLY` (once the token is
-cut, nothing readable is left), or `notice` for a mailbox delivery notice
-(`mailbox-notice:` request ids), whose text is never posted. Next to other
-text, the token is cut where it is a control word (a line of its own, the
+why: `private-final` for a Claude CLI turn, whose final text is never posted;
+`notice` for a mailbox delivery notice (`mailbox-notice:` request ids), whose
+text is never posted; `no-reply` when a Codex turn ended with exactly
+`NO_REPLY` (once the token is cut, nothing readable is left). A held-back text
+is kept as a part with state `private`, never delivered. In a Codex text, next
+to other text, the token is cut where it is a control word (a line of its own, the
 first or last word) and the rest is posted; mentioned inside a sentence or in
 code, it is posted as written.
 `inactive: true` requires positive runtime evidence that the old turn is no

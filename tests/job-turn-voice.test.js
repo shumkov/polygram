@@ -25,26 +25,31 @@ const MAI = '8744283195';
 const OPS = `${MGMT}:732`;
 const FINANCE = `${MGMT}:1041`;
 
-// The paragraph every job turn ends with, per backend. The Claude CLI posts
-// the final message; Codex joins and posts every message the turn wrote, and
-// has no reply tool.
-const CLI_VOICE = 'No person in this chat wrote to you in this turn. Your final message is not a private summary: polygram posts it, word for word, to this chat as a message from you.'
-  + ' If it would describe what you did, say that you posted nothing, or say that nothing was needed, make your entire final message exactly NO_REPLY.'
-  + ' Write a final message only when a person here needs it: a result, a problem, or a decision they must make, addressed to them, in the language they use in this chat.'
-  + ' If you already told them with the reply tool, end with NO_REPLY. Post no plan or progress note: the chat already shows that you are working.';
+// The paragraph every job turn ends with, per backend. Orchestra's system
+// prompt tells a Claude CLI session that its inline text is not seen and that
+// anything for a person goes through the reply tool, so a Claude CLI job
+// turn's final text is a private log, never posted. Codex joins and posts
+// every message the turn wrote, and has no reply tool.
+const CLI_VOICE = 'No person in this chat wrote to you in this turn.'
+  + ' Anything a person here needs goes through the reply tool: a result, a problem, or a decision they must make, addressed to them, in the language they use in this chat.'
+  + ' Your final text is kept as a private log and is not posted. If nothing is needed, just end the turn.'
+  + ' For this turn, the plan-first checklist rule does not apply: don\'t post a plan or progress checklist.';
 const CODEX_VOICE = 'No person in this chat wrote to you in this turn. What you write is not a private summary: polygram joins every message you write in this turn and posts them, word for word, to this chat as a message from you.'
   + ' If what you would write describes what you did, says that you posted nothing, or says that nothing was needed, write nothing in this turn but exactly NO_REPLY.'
   + ' Write only when a person here needs it: a result, a problem, or a decision they must make, addressed to them, in the language they use in this chat.'
   + ' Post no plan or progress note: the chat already shows that you are working.';
 // A notice's text is never posted, so its turn is told that instead.
-const CLI_NOTICE = 'This notice is for you, not for the people in this chat: polygram does not post your final message in this turn.'
-  + ' Use the reply tool only if a person here must know something now; post no plan or progress note.';
+const CLI_NOTICE = 'This notice is for you, not for the people in this chat: your final text is kept as a private log and is not posted.'
+  + ' Use the reply tool only if a person here must know something now; don\'t post a plan or progress checklist.';
 const CODEX_NOTICE = 'This notice is for you, not for the people in this chat: polygram posts nothing you write in this turn.';
-const person = (name, how = 'with the reply tool or in your final message') => ` This is ${name}'s direct chat with you.`
-  + ` If what you received asks something of ${name} or is for ${name}, tell ${name} ${how}: who asks, what, by when, in ${name}'s language.`
+const CLI_PERSON = (name) => ` This is ${name}'s direct chat with you.`
+  + ` If what you received asks something of ${name} or is for ${name}, tell ${name} with the reply tool: who asks, what, by when, in ${name}'s language.`
+  + ` Never end such a turn before ${name} has been told.`;
+const CODEX_PERSON = (name) => ` This is ${name}'s direct chat with you.`
+  + ` If what you received asks something of ${name} or is for ${name}, tell ${name} in what you write: who asks, what, by when, in ${name}'s language.`
   + ` Never end such a turn with NO_REPLY before ${name} has been told.`;
 // The 0.56.1 wording, which must be gone.
-const OLD_VOICE_RE = /any text you write in it is posted to the people here|Otherwise write no text at all and just end the turn/;
+const OLD_VOICE_RE = /any text you write in it is posted to the people here|Otherwise write no text at all and just end the turn|polygram posts it, word for word|tell \w+ in your final text/;
 
 function config({ mirror = 'both', assistants = true } = {}) {
   return {
@@ -147,7 +152,7 @@ test('a delivery notice ends with the notice paragraph: its text is not posted, 
   const prompt = assertVoice(f, `mailbox-notice:${asked.id}`, CLI_NOTICE);
   assert.match(prompt, /^\[Inter-session notice\]/);
   assert.doesNotMatch(prompt, /say so in your topic/);
-  assert.doesNotMatch(prompt, /polygram posts it, word for word/, 'a notice is not told that its text is posted');
+  assert.doesNotMatch(prompt, /polygram joins every message/, 'a notice is not told that its text is posted');
 });
 
 test('a notice tail only states what the turn can do, for every reason', () => {
@@ -159,13 +164,15 @@ test('a notice tail only states what the turn can do, for every reason', () => {
   }
 });
 
-test('a person\'s assistant is told to tell its person who asks what, by when, and not to end with NO_REPLY before that', async (t) => {
+test('a person\'s assistant is told to tell its person with the reply tool who asks what, by when, before the turn ends', async (t) => {
   const f = await fixture(t);
   const fromRole = f.mailbox.send(f.role(OPS), { to: 'mai', kind: 'ask', body: 'Can Mai approve the shoot budget?' });
   const fromAssistant = f.mailbox.send(f.person(DINA), { to: 'mai', kind: 'ask', body: 'Are you free on Friday?' });
   await f.run();
-  for (const id of [fromRole.id, fromAssistant.id]) assertVoice(f, `mailbox:${id}`, CLI_VOICE + person('Mai'));
-  assert.match(f.prompt(`mailbox:${fromRole.id}`), /In a turn another session started you cannot run the mailbox send or reply commands: tell Mai in your final text what is asked/,
+  for (const id of [fromRole.id, fromAssistant.id]) assertVoice(f, `mailbox:${id}`, CLI_VOICE + CLI_PERSON('Mai'));
+  // The mailbox block agrees with the voice: a Claude CLI assistant's final
+  // text is private, so it tells its person with the reply tool.
+  assert.match(f.prompt(`mailbox:${fromRole.id}`), /In a turn another session started you cannot run the mailbox send or reply commands: tell Mai with the reply tool what is asked/,
     'on the Claude CLI "reply" is also the Telegram tool, so the mailbox commands are named');
   const roleTurn = f.mailbox.send(f.person(MAI), { to: 'ops', kind: 'tell', body: 'Approved.' });
   await f.run();
@@ -180,8 +187,9 @@ test('a Codex target gets the Codex wording, its person sentence included', asyn
   const f = await fixture(t);
   const told = f.mailbox.send(f.role(OPS), { to: 'ivan', kind: 'tell', body: 'The report is ready.' });
   await f.run();
-  const prompt = assertVoice(f, `mailbox:${told.id}`, CODEX_VOICE + person('Ivan', 'in what you write'));
+  const prompt = assertVoice(f, `mailbox:${told.id}`, CODEX_VOICE + CODEX_PERSON('Ivan'));
   assert.doesNotMatch(prompt.slice(prompt.indexOf('</untrusted-input>')), /reply tool/, 'Codex has no reply tool');
+  assert.match(prompt, /cannot run the mailbox send or reply commands: tell Ivan in what you write what is asked/, 'the Codex assistant\'s mailbox block says the same');
 });
 
 test('a notice to an assistant gets the notice paragraph without the person sentence, and Codex its own notice wording', () => {

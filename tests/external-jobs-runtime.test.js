@@ -33,6 +33,13 @@ test('external job dispatch durably identifies a CLI turn without inventing a Te
   assert.equal(f.calls[0][2].sourceMsgId, null); assert.equal(f.calls[0][2].origin.kind, 'external-event');
   assert.equal(f.calls[0][2].origin.eventId, job.id); assert.equal(f.calls[0][3].expectedProcess, f.entry);
 });
+// Which text is posted depends on the backend the turn really ran on (the
+// Claude CLI keeps its final text private), so the result says which one.
+test('the result names the backend the turn ran on, a failed send included', async () => {
+  assert.equal((await fixture().runtime.dispatch(job)).backend, 'cli');
+  const failed = fixture({ sendToProcess: async (...args) => { args[3].onDispatched(); throw new Error('lost'); } });
+  assert.equal((await failed.runtime.dispatch(job)).backend, 'cli');
+});
 test('busy, paused, expired auth, and unknown busy probes defer before dispatch', async () => {
   for (const overrides of [
     { isPaused: () => true }, { isShuttingDown: () => true },

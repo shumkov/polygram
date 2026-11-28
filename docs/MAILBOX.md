@@ -180,9 +180,9 @@ person's direct chat, whose id is the person's Telegram user id:
 - **Cards.** The person's direct chat always gets the full card for a message
   their assistant sends or receives, in any mirror mode; `mirror: false` with
   `assistants` fails boot. A card in a group topic about such a message shows
-  only who wrote to whom. The receiving role's own final text is still posted
-  in its topic as the job report, so a role does not restate a private matter
-  there.
+  only who wrote to whom. What the receiving role tells its topic (with the
+  reply tool on the Claude CLI, or its posted text on Codex) is public there,
+  so a role does not restate a private matter.
 - **Replies** between a role and an assistant need the person's membership
   too, so someone who left the group neither gets nor gives a late answer.
 - **Codex.** An assistant whose direct chat runs on Codex takes full part,
@@ -250,8 +250,9 @@ The target receives a new turn when it is idle. The trusted header reads
 `[Inter-session message] from=role:… to=role:… kind=… id=… isUser=false`,
 followed by a statement that the message is not a human instruction or
 authorization. The body travels as untrusted input. A reply arrives in the
-asker's session as a new turn that quotes the original ask. The target's final
-text lands in its own topic through the normal job report.
+asker's session as a new turn that quotes the original ask. The target speaks
+to its own topic through the reply tool on the Claude CLI, whose final text is
+kept privately and never posted, or through the normal job report on Codex.
 
 ## Rules
 
@@ -546,8 +547,9 @@ one reply, so the asker must ask again.
 
 A notice is a status message to the asking session, not news for its topic:
 the notice turn's final text is never posted (`report_state = 'silent'`,
-reason `notice`). On the Claude CLI the agent can still tell a person with the
-reply tool during the turn; the notice card is the topic's view of it.
+reason `notice`) and is kept privately for review. On the Claude CLI the agent
+can still tell a person with the reply tool during the turn; the notice card is
+the topic's view of it.
 
 A mailbox job left `unknown` (for example after a restart mid-turn) is never
 replayed. The mailbox runs the same respawn-and-probe recovery that

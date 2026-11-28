@@ -37,12 +37,12 @@ function config({ mirror = 'both', assistants = true } = {}) {
 // Real mailbox, external jobs, dispatch, runtime and presence over one
 // database. The process manager is an idle Claude CLI session; `turn` decides
 // how each prompt's turn ends. Telegram is recorded.
-async function fixture(t, { mirror, assistants, turn = async () => ({ text: '' }), failCards = false, checkInactive = async () => true } = {}) {
+async function fixture(t, { mirror, assistants, turn = async () => ({ text: '' }), failCards = false, checkInactive = async () => true, backend = 'cli' } = {}) {
   resetChatTypingState();
   const { db, dbPath } = freshDb('job-presence-wiring');
   const cfg = config({ mirror, assistants });
   const f = { db, cfg, posts: [], reactions: [], typing: [], reports: [], turns: [] };
-  const resolveTarget = createExternalJobTargetResolver({ config: cfg, getSessionKey, resolveBackend: () => 'cli' });
+  const resolveTarget = createExternalJobTargetResolver({ config: cfg, getSessionKey, resolveBackend: () => backend });
   let messageId = 100;
   const tg = async (_bot, method, params) => {
     if (method === 'setMessageReaction') { f.reactions.push({ chatId: String(params.chat_id), messageId: params.message_id, emoji: params.reaction[0]?.emoji ?? null }); return true; }
@@ -52,9 +52,11 @@ async function fixture(t, { mirror, assistants, turn = async () => ({ text: '' }
     return sent;
   };
   const bot = { api: { sendChatAction: async (chatId, _action, opts) => { f.typing.push({ chatId: String(chatId), threadId: opts.message_thread_id ?? null }); return true; } } };
-  const entry = { backend: 'cli', inFlight: false, probeBusyState: async () => ({ busy: false }) };
+  const entry = backend === 'codex'
+    ? { backend, inFlight: false, state: 'Idle', hasPendingDeliveryWork: () => false }
+    : { backend, inFlight: false, probeBusyState: async () => ({ busy: false }) };
   const runtime = createExternalJobRuntime({
-    config: cfg, pm: { get: () => entry }, intentLock: createAsyncLock(), getSessionKey, resolveBackend: () => 'cli',
+    config: cfg, pm: { get: () => entry }, intentLock: createAsyncLock(), getSessionKey, resolveBackend: () => backend,
     isPaused: () => false, isShuttingDown: () => false, needsAuth: () => false, awaitSessionRecovery: async () => {},
     getOrSpawnForChat: async () => entry,
     sendToProcess: async (_key, prompt, context, { onDispatched }) => {
@@ -67,10 +69,10 @@ async function fixture(t, { mirror, assistants, turn = async () => ({ text: '' }
   const presence = createJobPresence({ bot, tg, botName: 'shumabit', typingIntervalMs: 20, logger: { error() {}, warn() {} } });
   f.jobs = createExternalJobService({ config: cfg, db, botName: 'shumabit', resolveTarget,
     dispatch: createExternalJobDispatch({ dispatchExternalEvent: (_origin, run) => run(), runtime, getMailbox: () => f.mailbox,
-      getPresence: () => presence, logger: { warn() {} } }),
+      getPresence: () => presence, getBackend: () => backend, logger: { warn() {} } }),
     checkInactive, deliverPart: async (job, part) => { f.reports.push(part.text); return { messageId: 1 }; }, logger: { error() {} } });
   const members = { [MGMT]: { [DINA]: 'member', [MAI]: 'member' } };
-  f.make = () => createMailboxService({ config: cfg, db, botName: 'shumabit', jobs: f.jobs, resolveTarget, resolveBackend: () => 'cli', getSessionKey,
+  f.make = () => createMailboxService({ config: cfg, db, botName: 'shumabit', jobs: f.jobs, resolveTarget, resolveBackend: () => backend, getSessionKey,
     tg, bot: {}, sendRich: async () => ({ wentRich: false, fallback: 'unsupported' }),
     getChatMember: async (chatId, userId) => ({ status: members[chatId]?.[String(userId)] ?? 'left' }), logger: { error() {}, warn() {} } });
   f.mailbox = f.make();
@@ -85,6 +87,11 @@ async function fixture(t, { mirror, assistants, turn = async () => ({ text: '' }
   };
   f.cardIn = (chatId, threadId = null) => f.posts.filter((p) => p.chatId === chatId && String(p.threadId ?? '') === String(threadId ?? ''));
   f.on = (messageIdOf) => f.reactions.filter((r) => r.messageId === messageIdOf).map((r) => r.emoji);
+  f.record = (requestId) => {
+    const row = db.raw.prepare('SELECT id,state,report_state,report_receipt FROM external_jobs WHERE request_id=?').get(requestId);
+    const kept = db.raw.prepare("SELECT text FROM external_job_report_parts WHERE job_id=? AND state='private'").all(row.id).map((part) => part.text);
+    return { state: row.state, report: row.report_state, receipt: row.report_receipt ? JSON.parse(row.report_receipt) : null, kept };
+  };
   return f;
 }
 const job = (requestId, target = { chatId: MGMT, threadId: '1041', sessionKey: FINANCE }) => ({ requestId, target });
@@ -189,11 +196,12 @@ test('end to end: a silent job turn types in its topic and leaves its card at �
   assert.equal(f.db.raw.prepare("SELECT state FROM external_jobs WHERE request_id=?").get(`mailbox:${sent.id}`).state, 'succeeded');
 });
 
-// NO_REPLY is the agent choosing silence; the turn still succeeded, so its
-// card ends at 👍 like any finished job, and the record says why nothing was
-// posted.
-test('end to end: a NO_REPLY job turn posts no report, is recorded silent, and still leaves its card at 👍', { timeout: 5000 }, async (t) => {
-  const f = await fixture(t, { turn: async () => ({ text: 'NO_REPLY' }) });
+// Orchestra tells a Claude CLI session that its inline text is not seen and
+// that anything for a person goes through the reply tool. A job turn's final
+// text is therefore never posted on the Claude CLI: it is kept privately, and
+// the card still ends at 👍 like any finished job.
+test('end to end on the Claude CLI: a job turn\'s final text is never posted, is kept privately, and its card ends at 👍', { timeout: 5000 }, async (t) => {
+  const f = await fixture(t, { turn: async () => ({ text: 'I did not post in the topic: Monday is noted.' }) });
   f.jobs.start();
   const sent = f.mailbox.send(f.role(OPS), { to: 'finance', kind: 'tell', body: 'Budget review moved to Monday.' });
   await f.mailbox.cardsSettled();
@@ -202,25 +210,49 @@ test('end to end: a NO_REPLY job turn posts no report, is recorded silent, and s
   const [card] = f.cardIn(MGMT, '1041');
   assert.deepEqual(f.on(card.messageId), ['🤔', '👍']);
   assert.deepEqual(f.reports, []);
-  const row = f.db.raw.prepare('SELECT state,report_state,report_receipt FROM external_jobs WHERE request_id=?').get(`mailbox:${sent.id}`);
-  assert.deepEqual([row.state, row.report_state, JSON.parse(row.report_receipt).silent], ['succeeded', 'silent', 'no-reply']);
+  const record = f.record(`mailbox:${sent.id}`);
+  assert.deepEqual([record.state, record.report, record.receipt.silent, record.kept], ['succeeded', 'silent', 'private-final', ['I did not post in the topic: Monday is noted.']]);
 });
 
-test('end to end: a result written next to NO_REPLY is posted without the token', { timeout: 5000 }, async (t) => {
-  const f = await fixture(t, { turn: async () => ({ text: 'Runway is seven months.\n\nNO_REPLY' }) });
+// The reply tool is how a Claude CLI turn reaches people; such a turn keeps
+// its record and nothing more is posted.
+test('end to end on the Claude CLI: a turn that spoke through the reply tool keeps its record and posts nothing more', { timeout: 5000 }, async (t) => {
+  const f = await fixture(t, { turn: async () => ({ text: 'Budget review is on Monday.', alreadyDelivered: true }) });
   f.jobs.start();
-  f.mailbox.send(f.role(OPS), { to: 'finance', kind: 'tell', body: 'Budget review moved to Monday.' });
+  const sent = f.mailbox.send(f.role(OPS), { to: 'finance', kind: 'tell', body: 'Budget review moved to Monday.' });
   await f.mailbox.cardsSettled();
   for (let n = 0; n < 3; n++) await f.jobs.tick();
   await flush();
+  assert.deepEqual(f.reports, []);
+  const record = f.record(`mailbox:${sent.id}`);
+  assert.deepEqual([record.report, record.receipt.channelsAcknowledged, record.kept], ['unknown', true, []]);
+});
+
+// Codex has no reply tool: its text is the report, and NO_REPLY is how it
+// stays silent.
+test('end to end on Codex: NO_REPLY is silent with its card at 👍, and a result next to it is posted without the token', { timeout: 5000 }, async (t) => {
+  const texts = ['NO_REPLY', 'Runway is seven months.\n\nNO_REPLY'];
+  const f = await fixture(t, { backend: 'codex', turn: async () => ({ text: texts.shift() }) });
+  f.jobs.start();
+  const quiet = f.mailbox.send(f.role(OPS), { to: 'finance', kind: 'tell', body: 'Budget review moved to Monday.' });
+  const answered = f.mailbox.send(f.role(OPS), { to: 'finance', kind: 'tell', body: 'What is the runway?' });
+  await f.mailbox.cardsSettled();
+  for (let n = 0; n < 5; n++) await f.jobs.tick();
+  await flush();
+  const [card] = f.cardIn(MGMT, '1041');
+  assert.deepEqual(f.on(card.messageId), ['🤔', '👍']);
+  const record = f.record(`mailbox:${quiet.id}`);
+  assert.deepEqual([record.state, record.report, record.receipt.silent], ['succeeded', 'silent', 'no-reply']);
+  assert.equal(f.record(`mailbox:${answered.id}`).report, 'delivered');
   assert.deepEqual(f.reports, ['Runway is seven months.']);
 });
 
 // A notice is polygram's own status message to the asking session; all 10
 // notices after 0.56.1 posted a text into the topic although the notice says
-// "don't acknowledge it". Its text is never posted; the notice card stays the
+// "don't acknowledge it". Its text is never posted but kept privately, since
+// a notice turn can still find a real blocker; the notice card stays the
 // topic's view of it.
-test('end to end: a notice turn never posts its final text, is recorded silent, and its notice card ends at 👍', { timeout: 5000 }, async (t) => {
+test('end to end: a notice turn never posts its final text, keeps it privately, and its notice card ends at 👍', { timeout: 5000 }, async (t) => {
   const f = await fixture(t, { turn: async (_context, fx) => ({ text: fx.turns.at(-1).prompt.startsWith('[Inter-session notice]')
     ? 'Noted: finance has not answered yet, so I will wait.' : 'Asked finance for the runway.' }) });
   f.jobs.start(); f.mailbox.start();
@@ -235,9 +267,9 @@ test('end to end: a notice turn never posts its final text, is recorded silent, 
   const notice = f.cardIn(MGMT, '732').at(-1);
   assert.match(notice.text, /No answer/);
   assert.deepEqual(f.on(notice.messageId), ['🤔', '👍']);
-  const row = f.db.raw.prepare('SELECT state,report_state,report_receipt FROM external_jobs WHERE request_id=?').get(`mailbox-notice:${sent.id}`);
-  assert.deepEqual([row.state, row.report_state, JSON.parse(row.report_receipt).silent], ['succeeded', 'silent', 'notice']);
-  assert.deepEqual(f.reports, ['Asked finance for the runway.'], 'only the ask\'s own turn reported, never the notice\'s');
+  const record = f.record(`mailbox-notice:${sent.id}`);
+  assert.deepEqual([record.state, record.report, record.receipt.silent, record.kept], ['succeeded', 'silent', 'notice', ['Noted: finance has not answered yet, so I will wait.']]);
+  assert.deepEqual(f.reports, [], 'neither the ask\'s Claude CLI turn nor the notice posted its final text');
 });
 
 test('end to end: a failed job turn leaves its card at 🤯, and its delivery state is the turn\'s own', { timeout: 5000 }, async (t) => {

@@ -164,18 +164,20 @@ test('the service posts nothing for a silent result and records it as silent', a
 });
 
 // The dispatch every external job takes applies the rule to the turn's
-// result, so every job kind on both backends gets it.
-function dispatchWith(result) {
+// result, so every job kind gets it. The backend decides which rule: Codex
+// posts its text unless it is NO_REPLY; the Claude CLI never posts it.
+function dispatchWith(result, { backend = 'codex', getBackend = () => backend } = {}) {
   const logged = [];
   const dispatch = createExternalJobDispatch({
     dispatchExternalEvent: (_origin, run) => run(),
     runtime: { dispatch: async () => result },
+    getBackend,
     logEvent: (kind, detail) => logged.push([kind, detail]),
   });
   return { logged, run: (requestId = 'daily-digest:2026-11-28') => dispatch({ id: 1, routeId: 'admin', requestId, task: 'Review.', payload: {}, target }, {}) };
 }
 
-test('the dispatch turns a NO_REPLY result into a silent one and keeps the turn\'s outcome', async () => {
+test('Codex: the dispatch turns a NO_REPLY result into a silent one and keeps the turn\'s outcome', async () => {
   for (const outcome of ['succeeded', 'failed']) {
     const f = dispatchWith({ outcome, turnId: 't', text: ' NO_REPLY\n', inactive: true });
     assert.deepEqual(await f.run(), { outcome, turnId: 't', text: '', silent: 'no-reply', inactive: true });
@@ -183,13 +185,13 @@ test('the dispatch turns a NO_REPLY result into a silent one and keeps the turn\
   }
 });
 
-test('the dispatch cuts the token from a mixed text and records that it did', async () => {
+test('Codex: the dispatch cuts the token from a mixed text and records that it did', async () => {
   const f = dispatchWith({ outcome: 'succeeded', text: 'Runway is seven months.\n\nNO_REPLY' });
   assert.deepEqual(await f.run(), { outcome: 'succeeded', text: 'Runway is seven months.' });
   assert.deepEqual(f.logged, [['job-report-no-reply-stripped', { request_id: 'daily-digest:2026-11-28', session_key: target.sessionKey }]]);
 });
 
-test('the dispatch leaves a text without the token, and a deferral, untouched', async () => {
+test('Codex: the dispatch leaves a text without the token, and a deferral, untouched', async () => {
   const plain = { outcome: 'succeeded', text: 'Runway is seven months.' };
   assert.equal(await dispatchWith(plain).run(), plain);
   const deferred = { deferred: true, reason: 'Session is busy' };
@@ -205,25 +207,72 @@ test('the dispatch leaves a reply-tool delivery alone', async () => {
   assert.deepEqual(f.logged, []);
 });
 
+// Orchestra tells every Claude CLI session, as a hard contract, that its
+// inline text is not seen and that anything for a person goes through the
+// reply tool. Posting a job turn's final text broke that contract: 79% of the
+// reports after 0.56.1 said "I didn't post in the topic", and were posted. On
+// the Claude CLI a job turn's final text is now never posted; it is kept as a
+// private log, so a review can read what was held back.
+test('Claude CLI: a job turn\'s final text is never posted, for any outcome, and is kept privately', async () => {
+  for (const outcome of ['succeeded', 'failed', 'interrupted', 'unknown']) {
+    const f = dispatchWith({ outcome, turnId: 't', text: '  I did not post in the topic: nothing was needed.\n', inactive: true }, { backend: 'cli' });
+    assert.deepEqual(await f.run(), { outcome, turnId: 't', text: '', silent: 'private-final', privateText: 'I did not post in the topic: nothing was needed.', inactive: true }, outcome);
+    assert.deepEqual(f.logged, []);
+  }
+  // A result a person needed is held back too: the reply tool is how a Claude
+  // CLI turn reaches people, and its system prompt says so.
+  const result = await dispatchWith({ outcome: 'succeeded', text: 'Runway is seven months.' }, { backend: 'cli' }).run();
+  assert.deepEqual(result, { outcome: 'succeeded', text: '', silent: 'private-final', privateText: 'Runway is seven months.' });
+});
+
+test('Claude CLI: an empty final text or NO_REPLY is silent too, with nothing or the token held back', async () => {
+  for (const text of ['', '  \n']) {
+    assert.deepEqual(await dispatchWith({ outcome: 'succeeded', text }, { backend: 'cli' }).run(), { outcome: 'succeeded', text: '', silent: 'private-final' }, JSON.stringify(text));
+  }
+  assert.deepEqual(await dispatchWith({ outcome: 'succeeded', text: 'NO_REPLY' }, { backend: 'cli' }).run(),
+    { outcome: 'succeeded', text: '', silent: 'private-final', privateText: 'NO_REPLY' });
+});
+
+test('Claude CLI: a turn that spoke through the reply tool, and a turn that never ran, are unchanged', async () => {
+  const acked = { outcome: 'succeeded', text: 'Told the team.', channelsAcknowledged: true };
+  assert.equal(await dispatchWith(acked, { backend: 'cli' }).run(), acked);
+  const sendFailed = { outcome: 'unknown', turnId: null, inactive: false, error: 'Turn receipt is unavailable' };
+  assert.equal(await dispatchWith(sendFailed, { backend: 'cli' }).run(), sendFailed);
+});
+
+// The runtime reports the backend the turn really ran on; the resolver is the
+// fallback, and the Claude CLI rule applies when neither answers.
+test('the backend the turn ran on decides; without one, the resolver; without that, the Claude CLI rule', async () => {
+  const codexText = { outcome: 'succeeded', backend: 'codex', text: 'Runway is seven months.' };
+  assert.equal(await dispatchWith(codexText, { backend: 'cli' }).run(), codexText, 'a Codex turn is posted even if the resolver now says CLI');
+  const cliText = { outcome: 'succeeded', backend: 'cli', text: 'Runway is seven months.' };
+  assert.equal((await dispatchWith(cliText, { backend: 'codex' }).run()).silent, 'private-final');
+  const plain = { outcome: 'succeeded', text: 'Runway is seven months.' };
+  assert.equal((await dispatchWith(plain, { getBackend: () => { throw new Error('unknown chat'); } }).run()).silent, 'private-final');
+  assert.equal((await dispatchWith(plain, { getBackend: () => null }).run()).silent, 'private-final');
+});
+
 // Polygram's own delivery notice ("[Inter-session notice] …") is a status
 // message to the session that asked, not news for the people in its topic.
 // All 10 notices after 0.56.1 posted text against "don't acknowledge it", so
 // a notice turn's text is never posted; on the Claude CLI the agent can still
 // tell a person with the reply tool during the turn.
 const NOTICE = 'mailbox-notice:m_0000000000000001';
-function noticeDispatch(result) {
+function noticeDispatch(result, backend = 'cli') {
   const dispatch = createExternalJobDispatch({
     dispatchExternalEvent: (_origin, run) => run(),
     runtime: { dispatch: async () => result },
     getMailbox: () => ({ enabled: true, instructions: () => '', noteJobSend() {} }),
+    getBackend: () => backend,
   });
   return (requestId = NOTICE) => dispatch({ id: 1, routeId: 'ops', requestId, task: '[Inter-session notice] …', payload: {}, target }, {});
 }
 
-test('a notice never posts its final text, whatever it says', async () => {
-  for (const text of ['Noted; nothing for the team here.', 'NO_REPLY', '']) {
-    const result = await noticeDispatch({ outcome: 'succeeded', text, inactive: true })();
-    assert.deepEqual(result, { outcome: 'succeeded', text: '', silent: 'notice', inactive: true }, String(text));
+test('a notice never posts its final text, on either backend, and keeps it privately', async () => {
+  for (const backend of ['cli', 'codex']) {
+    const kept = await noticeDispatch({ outcome: 'succeeded', text: 'Finance has not answered: the March plan is blocked.', inactive: true }, backend)();
+    assert.deepEqual(kept, { outcome: 'succeeded', text: '', silent: 'notice', privateText: 'Finance has not answered: the March plan is blocked.', inactive: true }, backend);
+    assert.deepEqual(await noticeDispatch({ outcome: 'succeeded', text: '', inactive: true }, backend)(), { outcome: 'succeeded', text: '', silent: 'notice', inactive: true });
   }
   const failed = await noticeDispatch({ outcome: 'failed', text: 'It broke.', error: 'x' })();
   assert.equal(failed.silent, 'notice', 'a failed notice turn posts nothing either');
@@ -236,8 +285,8 @@ test('a notice that ran no turn keeps its own record', async () => {
   assert.equal(await noticeDispatch(sendFailed)(), sendFailed);
 });
 
-test('only polygram\'s notices are silenced: a reply about the same ask still reports', async () => {
-  const result = await noticeDispatch({ outcome: 'succeeded', text: 'Runway is seven months.' })('mailbox:m_0000000000000001');
+test('on Codex only polygram\'s notices are silenced: a reply about the same ask still reports', async () => {
+  const result = await noticeDispatch({ outcome: 'succeeded', text: 'Runway is seven months.' }, 'codex')('mailbox:m_0000000000000001');
   assert.deepEqual(result, { outcome: 'succeeded', text: 'Runway is seven months.' });
 });
 
@@ -248,4 +297,55 @@ test('the store records a notice as silent with reason notice; a reply-tool deli
   assert.deepEqual(store.finish(one.id, { outcome: 'succeeded', silent: 'notice', inactive: true }).reportReceipt, { silent: 'notice', turnId: null });
   const two = submit('mailbox-notice:m_0000000000000002');
   assert.equal(store.finish(two.id, { outcome: 'succeeded', silent: 'notice', channelsAcknowledged: true, inactive: true }).reportState, 'unknown');
+});
+
+// The held-back text is a private log: one row per job, never a delivery
+// part, so nothing can ever send it, and redacted like a posted report.
+const heldBack = (raw, jobId) => raw.prepare("SELECT part_index,text,state FROM external_job_report_parts WHERE job_id=? AND state='private'").all(jobId);
+test('the store keeps a held-back text privately: never a delivery part, never refreshed into a report', (t) => {
+  const raw = memoryDb(t);
+  const store = createExternalJobStore(raw, { botName: 'test', now: () => 1000 });
+  const submit = (requestId) => store.claim(store.submit({ routeId: 'review', requestId, task: 'Review.', payload: {} }, { ...target, sessionKey: `s:${requestId}` }).job.id);
+  const secret = 'sk-ant-api03-' + 'a'.repeat(100);
+  const one = submit('one'); store.setTurnId(one.id, 'turn-one');
+  const done = store.finish(one.id, { outcome: 'succeeded', silent: 'private-final', privateText: `Runway is seven months. Key ${secret}`, inactive: true });
+  assert.deepEqual([done.reportState, done.reportReceipt], ['silent', { silent: 'private-final', turnId: 'turn-one' }]);
+  const [row] = heldBack(raw, one.id);
+  assert.ok(row.text.startsWith('Runway is seven months.'));
+  assert.ok(!row.text.includes(secret), 'a secret is redacted as in a posted report');
+  assert.deepEqual(store.parts(one.id), [], 'no delivery part');
+  assert.deepEqual(store.reports(), []);
+  // A restart's recovery and any later refresh never turn it into a report.
+  store.recover();
+  assert.equal(store.work(one.id).reportState, 'silent');
+  // A notice's text is kept the same way; a long text is cut to a bound.
+  const two = submit('mailbox-notice:m_0000000000000003');
+  store.finish(two.id, { outcome: 'succeeded', silent: 'notice', privateText: 'x'.repeat(100000), inactive: true });
+  const [long] = heldBack(raw, two.id);
+  assert.ok(long.text.length <= 16384 && long.text.endsWith('…'), `kept ${long.text.length} characters`);
+  // Only a silent report keeps a text: a reply-tool delivery or a report that
+  // failed to render keeps none.
+  const three = submit('three');
+  store.finish(three.id, { outcome: 'succeeded', silent: 'private-final', privateText: 'x', channelsAcknowledged: true, inactive: true });
+  const four = submit('four');
+  store.finish(four.id, { outcome: 'succeeded', silent: 'private-final', privateText: 'x', reportError: 'bad', inactive: true });
+  assert.deepEqual([heldBack(raw, three.id), heldBack(raw, four.id)], [[], []]);
+  assert.throws(() => store.finish(submit('five').id, { outcome: 'succeeded', silent: 'private-final', privateText: 7, inactive: true }), /private/i);
+});
+
+test('the service posts nothing for a held-back result and stores its text', async (t) => {
+  const raw = memoryDb(t);
+  const sends = []; let prepared = 0;
+  const service = createExternalJobService({
+    config: { bot: { externalJobs: { enabled: true, routes: { review: { chatId: '-1001', threadId: '2' } } } } },
+    db: { raw }, botName: 'test', resolveTarget: (route) => ({ ...route, sessionKey: `${route.chatId}:${route.threadId}` }),
+    dispatch: async (job, hooks) => { hooks.onTurnId('turn-one'); return { outcome: 'succeeded', text: '', silent: 'private-final', privateText: 'Runway is seven months.', inactive: true }; },
+    prepareReport: (text) => { prepared++; return [text]; },
+    deliverPart: async (job, part) => { sends.push(part); return { messageId: 1 }; }, logger: { error() {} },
+  });
+  t.after(() => service.stop());
+  service.submit({ routeId: 'review', requestId: 'one', task: 'Review.', payload: {} }); service.start(); await service.tick();
+  const { job } = service.get({ routeId: 'review', requestId: 'one' });
+  assert.deepEqual([job.reportState, job.reportReceipt.silent, sends, prepared], ['silent', 'private-final', [], 0]);
+  assert.deepEqual(heldBack(raw, job.id).map((row) => row.text), ['Runway is seven months.']);
 });
