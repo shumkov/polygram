@@ -110,7 +110,8 @@ An SDK session has an address, gets no command, and a send to it is refused
 with `MAILBOX_BACKEND_UNSUPPORTED`.
 
 A Codex session takes a delivery only when its process is idle, as a Claude
-session does, and its final text is the job report. A delivery spawns the
+session does. Unlike a Claude CLI session's, a Codex session's final text is
+the job report. A delivery spawns the
 session's Codex process if needed, which holds the daemon's single Codex
 generation as a human message would; while another Codex session holds it,
 the delivery waits. After `/stop` kills a Codex process, the next delivery

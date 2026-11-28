@@ -189,7 +189,7 @@ test('a Codex target gets the Codex wording, its person sentence included', asyn
   await f.run();
   const prompt = assertVoice(f, `mailbox:${told.id}`, CODEX_VOICE + CODEX_PERSON('Ivan'));
   assert.doesNotMatch(prompt.slice(prompt.indexOf('</untrusted-input>')), /reply tool/, 'Codex has no reply tool');
-  assert.match(prompt, /cannot run the mailbox send or reply commands: tell Ivan in what you write what is asked/, 'the Codex assistant\'s mailbox block says the same');
+  assert.match(prompt, /cannot run the mailbox send or reply commands: tell Ivan what is asked in what you write, and reply/, 'the Codex assistant\'s mailbox block says the same');
 });
 
 test('a notice to an assistant gets the notice paragraph without the person sentence, and Codex its own notice wording', () => {

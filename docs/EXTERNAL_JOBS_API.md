@@ -57,7 +57,8 @@ All successful responses have the IPC envelope `ok: true`.
 `reportReceipt`, `error`, `inactive` and `paused`. The execution state is one of
 `queued`, `running`, `succeeded`, `failed`, `interrupted`, `unknown`.
 Report state is `none`, `pending`, `delivered`, `unknown` or `silent`. `silent`
-means the turn's text was deliberately not posted; `reportReceipt.silent` says
+means the turn ran and its text, if any, was deliberately not posted (a Claude
+CLI turn that just ended is `silent` too); `reportReceipt.silent` says
 why: `private-final` for a Claude CLI turn, whose final text is never posted;
 `notice` for a mailbox delivery notice (`mailbox-notice:` request ids), whose
 text is never posted; `no-reply` when a Codex turn ended with exactly

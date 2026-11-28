@@ -162,8 +162,8 @@ cannot message or reply: tell {Name} what is asked". On the Claude CLI
 changed it to: "you cannot run the mailbox send or reply commands: tell
 {Name} in your final text what is asked, and reply through the mailbox once
 {Name} answers." With a Claude CLI final text now private, it says "tell
-{Name} with the reply tool what is asked" on the Claude CLI and "tell {Name} in
-what you write what is asked" on Codex (the backend of the assistant's chat).
+{Name} with the reply tool what is asked" on the Claude CLI and "tell {Name}
+what is asked in what you write" on Codex (the backend of the assistant's chat).
 The mailbox skill says the same.
 
 ### The display hint
@@ -364,13 +364,15 @@ with its link for this.
 applies it to the turn's result before the job service records the outcome.
 `cli` is true unless the turn ran on Codex: the runtime's result names the
 backend the turn ran on, and the resolver the voice was worded by is the
-fallback, so the rule and the instructions the agent read agree.
+fallback. The two agree unless the chat's backend changes between building
+the prompt and running the turn, a rare race in which the turn's real backend
+wins.
 
 | Turn text | Posted | `report_state` | `report_receipt` | Kept privately |
 |---|---|---|---|---|
 | a turn that spoke through the reply tool (`channelsAcknowledged`) | nothing more | `unknown`, as today | `{"channelsAcknowledged":true,…}` | no |
 | a notice's, whatever it says (a notice turn that ran), either backend | nothing | `silent` | `{"silent":"notice","turnId":…}` | its text |
-| Claude CLI: any final text, any outcome | nothing | `silent` | `{"silent":"private-final","turnId":…}` | its text, if any |
+| Claude CLI: any final text, an empty one included, any outcome of a turn that ran | nothing | `silent` | `{"silent":"private-final","turnId":…}` | its text, if any |
 
 Codex, the rest of this section:
 
@@ -444,7 +446,8 @@ Codex, the rest of this section:
   the notice card (with mirroring on) is what the topic sees. Its text is kept
   privately, since a notice turn can still find a real blocker. A notice whose
   turn never ran (the send failed, the kill switch withdrew it) has no text
-  and keeps its own record, since `silent` means a text deliberately not
+  and keeps its own record, since `silent` means a turn that ran and whose
+  text, if it wrote any, was deliberately not
   posted.
 - **Precedence.** A turn whose reply tool already delivered its final message
   (`channelsAcknowledged`) keeps `report_state = 'unknown'` with its
@@ -555,6 +558,13 @@ now a linear scan with a regression test. A second pass of the same reviewer
 over that fix: an edge token is cut only when punctuation or a line break
 sets it apart, a fenced token alone is silent, the end of an unclosed fence is
 never cut, and neighbors are read by code point.
+
+A quick review of the Claude CLI private-final delta: clean. Folded in: the
+spec and API say `silent` covers a Claude CLI turn that just ended with no
+text (it followed "if nothing is needed, just end the turn"; the job's own
+state still shows a failure); the race between prompt and turn backends is
+stated; the Codex assistant line reads "tell {Name} what is asked in what you
+write"; two stale lines saying a final text is the job report now name Codex.
 
 ## Tests
 
