@@ -235,7 +235,7 @@ try {
   const reports = [];
   jobs = createExternalJobService({
     config, db, botName: BOT, resolveTarget,
-    dispatch: createExternalJobDispatch({ dispatchExternalEvent: (origin, run) => run(), runtime, getMailbox: () => mailbox, logger: quiet }),
+    dispatch: createExternalJobDispatch({ dispatchExternalEvent: (origin, run) => run(), runtime, getMailbox: () => mailbox, getBackend: resolveBackend, logger: quiet }),
     checkInactive: runtime.checkInactive, recoverInactive: runtime.recoverInactive,
     deliverPart: async (job) => { reports.push(job.requestId); return { messageId: reports.length }; }, logger: quiet,
   });
@@ -277,7 +277,10 @@ try {
   await jobs.tick();
   const replyJob = jobRow(`mailbox:${reply.id}`);
   check('general\'s reply runs as a job turn in Codex and settles succeeded', replyJob?.state === 'succeeded', `state=${replyJob?.state}`);
-  check('the Codex job turn\'s final text is reported', reports.includes(`mailbox:${reply.id}`));
+  // A reply that closes the ask leaves nothing a person needs, so the turn
+  // may end with NO_REPLY; either way it is decided, never lost.
+  check('the Codex job turn\'s final text is reported, or recorded silent by NO_REPLY',
+    reports.includes(`mailbox:${reply.id}`) || replyJob?.report_state === 'silent', `report_state=${replyJob?.report_state}`);
 
   // 4. general asks Codex; Codex replies with that job's command
   const generalAsk = mailbox.send(generalHuman(), { to: 'orchestra', kind: 'ask', body: 'general question' });
