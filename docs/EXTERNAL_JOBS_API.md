@@ -57,8 +57,10 @@ Report state is `none`, `pending`, `delivered`, `unknown` or `silent`. `silent`
 means the turn's text was deliberately not posted; `reportReceipt.silent` says
 why: `no-reply` when the agent ended with exactly `NO_REPLY` (once the token is
 cut, nothing readable is left), or `notice` for a mailbox delivery notice
-(`mailbox-notice:` request ids), whose text is never posted. The token inside
-other text is cut and the rest is posted.
+(`mailbox-notice:` request ids), whose text is never posted. Next to other
+text, the token is cut where it is a control word (a line of its own, the
+first or last word) and the rest is posted; mentioned inside a sentence or in
+code, it is posted as written.
 `inactive: true` requires positive runtime evidence that the old turn is no
 longer active; missing process state or a timeout is insufficient.
 

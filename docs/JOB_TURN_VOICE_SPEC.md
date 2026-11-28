@@ -342,21 +342,37 @@ it to the turn's result before the job service records the outcome:
 
 | Turn text | Posted | `report_state` | `report_receipt` |
 |---|---|---|---|
-| a notice's, whatever it says | nothing | `silent` | `{"silent":"notice","turnId":…}` |
+| a notice's, whatever it says (a notice turn that ran) | nothing | `silent` | `{"silent":"notice","turnId":…}` |
 | trimmed, exactly `NO_REPLY` | nothing | `silent` | `{"silent":"no-reply","turnId":…}` |
-| `NO_REPLY` with other text | the text without the token | as today | as today |
+| `NO_REPLY` as a control word next to other text: on a line of its own, or the first or last word | the text without the token | as today | as today |
 | the same, with no letter or digit left once the token is gone (`` `NO_REPLY` ``, `NO_REPLY.`, two Codex messages that were both `NO_REPLY`) | nothing | `silent` | `{"silent":"no-reply","turnId":…}` |
+| `NO_REPLY` mentioned inside a sentence or in fenced code | as written | as today | as today |
 | no token | as today | as today | as today |
 
-- **The token inside other text is removed, not posted.** The human-turn path
+- **The token as a control word is removed, not posted.** The human-turn path
   silences only an exact `NO_REPLY` and posts any other text as written, the
-  token included. For a job report, a literal `NO_REPLY` in the topic is never
-  what a person needs, so the token is cut: each word-bounded `NO_REPLY` is
-  removed, a line left blank by that is dropped, and the rest is posted.
+  token included. For a job report, a literal control token in the topic is
+  never what a person needs, so it is cut where it acts as one:
+  - a line whose only readable content is the token (`NO_REPLY`,
+    `` `NO_REPLY` ``, `**NO_REPLY**`, `— NO_REPLY`) is dropped, without leaving
+    a double blank line;
+  - the first or last word of the whole text is cut together with the markup
+    around it and the dash or punctuation joining it to the rest
+    (`Ничего не нужно. NO_REPLY` → `Ничего не нужно.`,
+    `NO_REPLY — nothing else was needed.` → `nothing else was needed.`).
+
   Posting the rest, rather than silencing it, keeps a result the agent wrote
-  before the token, which is the case where silence would lose something a
+  next to the token, which is the case where silence would lose something a
   person needed. A `job-report-no-reply-stripped` event records each such
   report, so a later review can count them.
+- **A mention is not the token.** Inside a sentence ("reports that are exactly
+  NO_REPLY are now silent") or in fenced code, the word is part of what a
+  person reads; cutting it would garble the text, so it is posted as written.
+  A lookalike (`NO_REPLY_TIMEOUT`) is not the token either.
+- **Linear time.** The check runs on the daemon's event loop for every report,
+  over text the agent wrote, so it scans characters instead of using
+  backtracking patterns: an anchored-at-end pattern took 1 s for 16 000
+  spaces and grew with the square of the length.
 - **Codex.** Its report joins every agent message with a blank line, so a
   turn that narrated and then wrote `NO_REPLY` posts the narration, without
   the token; a turn that wrote only `NO_REPLY` (once or several times) is
@@ -366,7 +382,10 @@ it to the turn's result before the job service records the outcome:
   carries only the joined text.
 - **A notice never posts its text.** On the Claude CLI the agent can still
   speak to people with the reply tool during the turn; on Codex it cannot, and
-  the notice card (with mirroring on) is what the topic sees.
+  the notice card (with mirroring on) is what the topic sees. A notice whose
+  turn never ran (the send failed, the kill switch withdrew it) has no text
+  and keeps its own record, since `silent` means a text deliberately not
+  posted.
 - **Precedence.** A turn whose reply tool already delivered its final message
   (`channelsAcknowledged`) keeps `report_state = 'unknown'` with its
   `channelsAcknowledged` receipt, notices included: that state already means
@@ -405,6 +424,10 @@ FROM external_jobs WHERE created_at > :deploy GROUP BY 1, 2;
   from a paragraph break. Codex is told instead that every message is posted.
 - **Silence any text that contains `NO_REPLY`, or starts with it.** Loses a
   result written next to the token. The token is removed instead.
+- **Cut every occurrence of the word.** The first implementation did; the
+  review showed it garbles a sentence that mentions the rule and code that
+  uses it, and leaves stray markup (``` `` ```, `****`, `—`) when the token was
+  wrapped.
 - **A notice voice that asks for `NO_REPLY` only, with its text still
   posted.** All 10 notices after 0.56.1 posted against "don't acknowledge it";
   a notice is polygram's own status message to the session, so nothing in its
@@ -452,7 +475,15 @@ timed out leaves the final 👍 out; a test for a notice stored with the old
 ending.
 
 v3 (0.56.2): one independent code review (correctness, no text lost that a
-person needed, the Codex path); its findings are in the PR.
+person needed, the Codex path). Folded in: the token is cut only where it is a
+control word (a line of its own, the first or last word) and never inside a
+sentence or fenced code, and its wrapping markup goes with it; a lookalike
+word no longer counts as the token; a reply-tool delivery and a notice that
+ran no turn are left alone; an invalid silence reason no longer blocks the
+service's report-error fallback; the Codex mailbox spike gets the Codex
+wording and accepts a silent reply. Found while folding those in: the first
+cut used a backtracking pattern that was quadratic on long whitespace runs,
+now a linear scan with a regression test.
 
 ## Tests
 
@@ -466,8 +497,12 @@ person needed, the Codex path); its findings are in the PR.
   dispatch.
 - A trimmed, exact `NO_REPLY` final text posts nothing and records
   `report_state = 'silent'` with reason `no-reply`; its card still ends 👍.
-- `NO_REPLY` inside other text posts the text without the token and logs
-  `job-report-no-reply-stripped`; with nothing readable left, it is silent.
+- `NO_REPLY` as a control word next to other text posts the text without the
+  token and its markup, and logs `job-report-no-reply-stripped`; with nothing
+  readable left, it is silent. A mention inside a sentence or code, and a
+  lookalike word, are posted as written.
+- A 40 000-character text with long whitespace runs is checked in linear
+  time.
 - A Codex text that joined a narration and `NO_REPLY` posts the narration;
   two `NO_REPLY` messages are silent.
 - A notice's final text is never posted, whatever it says; it records

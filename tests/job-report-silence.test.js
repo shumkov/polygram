@@ -44,6 +44,46 @@ test('only a whole word is the token: other words and text without it are posted
   assert.deepEqual(reportOf(undefined), { text: undefined, silent: null, stripped: false });
 });
 
+// The token is a control word only where an agent ends or starts on it, or
+// gives it a line of its own. Anywhere else it is a mention (a result about
+// polygram's own NO_REPLY rule, a code sample), and cutting it would garble
+// text a person needs.
+test('wrapping markup and dashes go with the token, so no stray "``", "****" or "—" is posted', () => {
+  assert.deepEqual(reportOf('Done.\n\n`NO_REPLY`'), { text: 'Done.', silent: null, stripped: true });
+  assert.deepEqual(reportOf('Done.\n\n**NO_REPLY**'), { text: 'Done.', silent: null, stripped: true });
+  assert.deepEqual(reportOf('Готово.\n\n— NO_REPLY'), { text: 'Готово.', silent: null, stripped: true });
+  assert.deepEqual(reportOf('Ничего не нужно. NO_REPLY'), { text: 'Ничего не нужно.', silent: null, stripped: true });
+  assert.deepEqual(reportOf('Done — NO_REPLY'), { text: 'Done', silent: null, stripped: true });
+  assert.deepEqual(reportOf('NO_REPLY — nothing else was needed.'), { text: 'nothing else was needed.', silent: null, stripped: true });
+});
+
+test('a mention of the token inside a sentence or in code is posted as written', () => {
+  for (const text of [
+    'Reports that are exactly NO_REPLY are now silent.',
+    'Fixed it:\n```js\n    if (text === NO_REPLY) return;\n```\nDeployed.',
+    'Done.\n```\nNO_REPLY\n```\nThat is the token.',
+  ]) assert.deepEqual(reportOf(text), { text, silent: null, stripped: false }, text);
+});
+
+test('a lookalike word is not the token: the text comes back exactly as written', () => {
+  for (const text of ['FOO_NO_REPLY_BAR\n\n\nx  ', 'NO_REPLYING is not a word']) {
+    assert.deepEqual(reportOf(text), { text, silent: null, stripped: false }, text);
+  }
+});
+
+// reportOf runs on the daemon's event loop for every job report, on text the
+// agent wrote. A backtracking pattern over a long whitespace run (a pasted
+// log, a wide table) took 1 s for 16 000 spaces and grew with the square of
+// the length, which would stall every chat. It must stay linear.
+test('a long text is checked in linear time, however much whitespace it holds', () => {
+  for (const text of [' '.repeat(20000) + 'a NO_REPLY b', 'x '.repeat(20000) + ' '.repeat(20000) + 'end NO_REPLY', `${'\t'.repeat(20000)}NO_REPLY`]) {
+    const started = process.hrtime.bigint();
+    reportOf(text);
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(ms < 300, `took ${ms.toFixed(0)} ms for ${text.length} characters`);
+  }
+});
+
 test('with nothing readable left once the token is cut, the report is silent', () => {
   // Markdown around the token, a full stop, or two Codex messages that were
   // both NO_REPLY (Codex joins every message of the turn with a blank line).
@@ -62,7 +102,7 @@ test('Codex: a narration followed by a NO_REPLY message posts the narration, wit
 
 test('the store records a silent report with its reason and posts no part', (t) => {
   const store = createExternalJobStore(memoryDb(t), { botName: 'test', now: () => 1000 });
-  const submit = (requestId) => store.claim(store.submit({ routeId: 'review', requestId, task: 'Review.', payload: {} }, target).job.id);
+  const submit = (requestId, sessionKey = target.sessionKey) => store.claim(store.submit({ routeId: 'review', requestId, task: 'Review.', payload: {} }, { ...target, sessionKey }).job.id);
   const job = submit('one'); store.setTurnId(job.id, 'turn-one');
   const done = store.finish(job.id, { outcome: 'succeeded', silent: 'no-reply', inactive: true });
   assert.equal(done.reportState, 'silent');
@@ -71,7 +111,11 @@ test('the store records a silent report with its reason and posts no part', (t) 
   assert.deepEqual(store.reports(), [], 'a silent report is never picked up for delivery');
   // The rule holds for any outcome: NO_REPLY is the agent's own choice.
   assert.equal(store.finish(submit('two').id, { outcome: 'failed', error: 'x', silent: 'no-reply', inactive: true }).reportState, 'silent');
-  assert.throws(() => store.finish(submit('three').id, { outcome: 'succeeded', silent: 'bored' }), /silence/i);
+  assert.throws(() => store.finish(submit('three').id, { outcome: 'succeeded', silent: 'bored', inactive: true }), /silence/i);
+  // The service's fallback after a failed report records the outcome with
+  // the error; the reason no longer matters then, so it must not throw again
+  // and leave the job running.
+  assert.equal(store.finish(submit('four', '-1001:4').id, { outcome: 'succeeded', silent: 'bored', reportError: 'Report preparation failed', inactive: true }).reportState, 'unknown');
 });
 
 test('a reply-tool delivery keeps its own record: channelsAcknowledged wins over silence', (t) => {
@@ -132,6 +176,15 @@ test('the dispatch leaves a text without the token, and a deferral, untouched', 
   assert.equal(await dispatchWith(deferred).run(), deferred);
 });
 
+// The reply tool already delivered this turn's final message, so its text is
+// never posted: nothing to decide, and no false "stripped" event.
+test('the dispatch leaves a reply-tool delivery alone', async () => {
+  const acked = { outcome: 'succeeded', text: 'Runway is seven months.\n\nNO_REPLY', channelsAcknowledged: true };
+  const f = dispatchWith(acked);
+  assert.equal(await f.run(), acked);
+  assert.deepEqual(f.logged, []);
+});
+
 // Polygram's own delivery notice ("[Inter-session notice] …") is a status
 // message to the session that asked, not news for the people in its topic.
 // All 10 notices after 0.56.1 posted text against "don't acknowledge it", so
@@ -148,12 +201,19 @@ function noticeDispatch(result) {
 }
 
 test('a notice never posts its final text, whatever it says', async () => {
-  for (const text of ['Noted; nothing for the team here.', 'NO_REPLY', '', undefined]) {
+  for (const text of ['Noted; nothing for the team here.', 'NO_REPLY', '']) {
     const result = await noticeDispatch({ outcome: 'succeeded', text, inactive: true })();
     assert.deepEqual(result, { outcome: 'succeeded', text: '', silent: 'notice', inactive: true }, String(text));
   }
   const failed = await noticeDispatch({ outcome: 'failed', text: 'It broke.', error: 'x' })();
   assert.equal(failed.silent, 'notice', 'a failed notice turn posts nothing either');
+});
+
+// "silent" records a text deliberately not posted; a notice whose send failed
+// ran no turn and has no text, like one the kill switch withdrew.
+test('a notice that ran no turn keeps its own record', async () => {
+  const sendFailed = { outcome: 'unknown', turnId: null, inactive: false, error: 'Turn receipt is unavailable' };
+  assert.equal(await noticeDispatch(sendFailed)(), sendFailed);
 });
 
 test('only polygram\'s notices are silenced: a reply about the same ask still reports', async () => {
