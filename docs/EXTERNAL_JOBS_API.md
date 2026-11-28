@@ -53,7 +53,11 @@ All successful responses have the IPC envelope `ok: true`.
 `job` includes `routeId`, `requestId`, `state`, `reportState`, `turnId`,
 `reportReceipt`, `error`, `inactive` and `paused`. The execution state is one of
 `queued`, `running`, `succeeded`, `failed`, `interrupted`, `unknown`.
-Report state is `none`, `pending`, `delivered` or `unknown`.
+Report state is `none`, `pending`, `delivered`, `unknown` or `silent`. `silent`
+means the turn's text was deliberately not posted; `reportReceipt.silent` says
+why: `no-reply` when the agent ended with exactly `NO_REPLY` (once the token is
+cut, nothing readable is left). The token inside other text is cut and the rest
+is posted.
 `inactive: true` requires positive runtime evidence that the old turn is no
 longer active; missing process state or a timeout is insufficient.
 

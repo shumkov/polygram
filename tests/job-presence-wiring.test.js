@@ -189,6 +189,33 @@ test('end to end: a silent job turn types in its topic and leaves its card at �
   assert.equal(f.db.raw.prepare("SELECT state FROM external_jobs WHERE request_id=?").get(`mailbox:${sent.id}`).state, 'succeeded');
 });
 
+// NO_REPLY is the agent choosing silence; the turn still succeeded, so its
+// card ends at 👍 like any finished job, and the record says why nothing was
+// posted.
+test('end to end: a NO_REPLY job turn posts no report, is recorded silent, and still leaves its card at 👍', { timeout: 5000 }, async (t) => {
+  const f = await fixture(t, { turn: async () => ({ text: 'NO_REPLY' }) });
+  f.jobs.start();
+  const sent = f.mailbox.send(f.role(OPS), { to: 'finance', kind: 'tell', body: 'Budget review moved to Monday.' });
+  await f.mailbox.cardsSettled();
+  for (let n = 0; n < 3; n++) await f.jobs.tick();
+  await flush();
+  const [card] = f.cardIn(MGMT, '1041');
+  assert.deepEqual(f.on(card.messageId), ['🤔', '👍']);
+  assert.deepEqual(f.reports, []);
+  const row = f.db.raw.prepare('SELECT state,report_state,report_receipt FROM external_jobs WHERE request_id=?').get(`mailbox:${sent.id}`);
+  assert.deepEqual([row.state, row.report_state, JSON.parse(row.report_receipt).silent], ['succeeded', 'silent', 'no-reply']);
+});
+
+test('end to end: a result written next to NO_REPLY is posted without the token', { timeout: 5000 }, async (t) => {
+  const f = await fixture(t, { turn: async () => ({ text: 'Runway is seven months.\n\nNO_REPLY' }) });
+  f.jobs.start();
+  f.mailbox.send(f.role(OPS), { to: 'finance', kind: 'tell', body: 'Budget review moved to Monday.' });
+  await f.mailbox.cardsSettled();
+  for (let n = 0; n < 3; n++) await f.jobs.tick();
+  await flush();
+  assert.deepEqual(f.reports, ['Runway is seven months.']);
+});
+
 test('end to end: a failed job turn leaves its card at 🤯, and its delivery state is the turn\'s own', { timeout: 5000 }, async (t) => {
   const f = await fixture(t, { turn: async () => ({ error: 'provider rejected' }) });
   f.jobs.start();
