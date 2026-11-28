@@ -33,6 +33,13 @@ test('external job dispatch durably identifies a CLI turn without inventing a Te
   assert.equal(f.calls[0][2].sourceMsgId, null); assert.equal(f.calls[0][2].origin.kind, 'external-event');
   assert.equal(f.calls[0][2].origin.eventId, job.id); assert.equal(f.calls[0][3].expectedProcess, f.entry);
 });
+// Which text is posted depends on the backend the turn really ran on (the
+// Claude CLI keeps its final text private), so the result says which one.
+test('the result names the backend the turn ran on, a failed send included', async () => {
+  assert.equal((await fixture().runtime.dispatch(job)).backend, 'cli');
+  const failed = fixture({ sendToProcess: async (...args) => { args[3].onDispatched(); throw new Error('lost'); } });
+  assert.equal((await failed.runtime.dispatch(job)).backend, 'cli');
+});
 test('busy, paused, expired auth, and unknown busy probes defer before dispatch', async () => {
   for (const overrides of [
     { isPaused: () => true }, { isShuttingDown: () => true },
@@ -106,6 +113,15 @@ test('route change during admission cannot redirect an accepted job', async () =
 test('untrusted payload cannot escape its data boundary', () => {
   const prompt = buildExternalJobPrompt(job); assert.ok(prompt.startsWith(job.task));
   assert.equal(prompt.split('</untrusted-input>').length, 2); assert.match(prompt, /&lt;\/untrusted-input&gt;/);
+});
+// The job-turn rule is the last thing the model reads, after the payload; a
+// payload cannot pose as it, since its tag cannot close early.
+test('the job voice ends the prompt, after the untrusted payload', () => {
+  const voice = 'Your final message is posted.';
+  const prompt = buildExternalJobPrompt({ ...job, voice });
+  assert.ok(prompt.startsWith(job.task));
+  assert.ok(prompt.endsWith(`</untrusted-input>\n\n${voice}`));
+  assert.ok(buildExternalJobPrompt(job).endsWith('</untrusted-input>'), 'a job without a voice is unchanged');
 });
 test('only the human operator controls automation and aliases share session pause', async () => {
   const f = fixture(); const pauses = []; const replies = [];

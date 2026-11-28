@@ -49,7 +49,8 @@ than a mailbox message can reply but cannot start a new ask or tell.
 **If you are a person's assistant** (your instructions say "you are <Name>'s
 assistant"), you act for that person only in a turn they started. In a turn
 another session started you can run neither `send` nor `reply`: tell your
-person in your final text what is asked, and reply once they answer. `open` lists the asks still waiting
+person what is asked (on the Claude CLI with the reply tool, since your final
+text is not posted there; on Codex in what you write), and reply once they answer. `open` lists the asks still waiting
 for their answer (`toAnswer`). Share work, never your person's private
 conversation; whatever you send a role appears in that role's topic.
 

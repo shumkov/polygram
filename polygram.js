@@ -4646,6 +4646,8 @@ async function main() {
       // While a job's turn runs its chat shows typing, and the card it came
       // from gets the status reactions a human message gets.
       getPresence: () => jobPresence,
+      // The job-turn rule is worded for what the target's backend posts.
+      getBackend: ({ chatId, threadId }) => resolvePromptBackend({ config, chatId, threadId }),
       logger: console, logEvent,
     }),
     checkInactive: externalRuntime.checkInactive,

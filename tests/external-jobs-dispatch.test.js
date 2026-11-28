@@ -29,7 +29,8 @@ test('the dispatched prompt carries every instruction block for the target sessi
   await f.dispatch(job, {});
   assert.deepEqual(sessions.at(-1), ['history-sent', job.requestId], 'the send point demotes the session\'s admin history reach');
   sessions.pop();
-  assert.equal(f.calls.runtime[0].job.task, `Envelope${renderJobVoice()}\n[notify]\n[mailbox]\n[history]`);
+  assert.equal(f.calls.runtime[0].job.task, 'Envelope\n[notify]\n[mailbox]\n[history]', 'the tool blocks follow the stored task');
+  assert.equal(f.calls.runtime[0].job.voice, renderJobVoice(), 'the job-turn rule travels apart, to end the prompt');
   assert.deepEqual(sessions, ['-1001:12', '-1001:12', '-1001:12']);
   assert.deepEqual(f.calls.events, [{ ...target, eventId: job.requestId }]);
 });
@@ -45,7 +46,8 @@ test('the send-point hook records the delivered job and keeps the caller hooks',
 test('without a mailbox or notifications the task gets only the job-turn rule', async () => {
   const f = fixture();
   await f.dispatch({ ...job, requestId: 'notifications:1' }, {});
-  assert.equal(f.calls.runtime[0].job.task, `Envelope${renderJobVoice()}`);
+  assert.equal(f.calls.runtime[0].job.task, 'Envelope');
+  assert.equal(f.calls.runtime[0].job.voice, renderJobVoice());
   assert.doesNotThrow(() => f.calls.runtime[0].hooks.onSend());
 });
 
@@ -129,4 +131,17 @@ test('a failure preparing the working state is logged and the job runs without i
     assert.equal(warnings.length, 1);
     assert.match(warnings[0], /mailbox:m_0000000000000001/);
   }
+});
+
+test('the rule is worded for the backend the target runs, and a resolver that throws falls back to the Claude CLI wording', async () => {
+  const seen = [];
+  for (const getBackend of [() => 'codex', () => 'cli', () => { throw new Error('unknown chat'); }]) {
+    const dispatch = createExternalJobDispatch({
+      dispatchExternalEvent: (_origin, run) => run(),
+      runtime: { dispatch: async (j) => { seen.push(j.voice); return { outcome: 'succeeded' }; } },
+      getBackend,
+    });
+    assert.equal((await dispatch({ ...job, requestId: 'notifications:1' }, {})).outcome, 'succeeded');
+  }
+  assert.deepEqual(seen, [renderJobVoice({ backend: 'codex' }), renderJobVoice(), renderJobVoice()]);
 });
