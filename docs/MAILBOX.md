@@ -544,6 +544,11 @@ on time or late, has its own delivery fail, get interrupted or become
 uncertain, the asker gets one notice about that reply; the ask already has its
 one reply, so the asker must ask again.
 
+A notice is a status message to the asking session, not news for its topic:
+the notice turn's final text is never posted (`report_state = 'silent'`,
+reason `notice`). On the Claude CLI the agent can still tell a person with the
+reply tool during the turn; the notice card is the topic's view of it.
+
 A mailbox job left `unknown` (for example after a restart mid-turn) is never
 replayed. The mailbox runs the same respawn-and-probe recovery that
 `notification_reinspect` uses, so the session's queue unblocks. It retries

@@ -216,6 +216,30 @@ test('end to end: a result written next to NO_REPLY is posted without the token'
   assert.deepEqual(f.reports, ['Runway is seven months.']);
 });
 
+// A notice is polygram's own status message to the asking session; all 10
+// notices after 0.56.1 posted a text into the topic although the notice says
+// "don't acknowledge it". Its text is never posted; the notice card stays the
+// topic's view of it.
+test('end to end: a notice turn never posts its final text, is recorded silent, and its notice card ends at 👍', { timeout: 5000 }, async (t) => {
+  const f = await fixture(t, { turn: async (_context, fx) => ({ text: fx.turns.at(-1).prompt.startsWith('[Inter-session notice]')
+    ? 'Noted: finance has not answered yet, so I will wait.' : 'Asked finance for the runway.' }) });
+  f.jobs.start(); f.mailbox.start();
+  const sent = f.mailbox.send(f.role(OPS), { to: 'finance', kind: 'ask', body: 'What is the runway?' });
+  await f.mailbox.cardsSettled();
+  for (let n = 0; n < 3; n++) await f.jobs.tick();
+  await f.mailbox.tick();
+  await f.mailbox.cardsSettled();
+  for (let n = 0; n < 3; n++) await f.jobs.tick();
+  await flush();
+  assert.ok(f.turns.some((turn) => turn.prompt.startsWith('[Inter-session notice]')), 'the notice ran as a turn');
+  const notice = f.cardIn(MGMT, '732').at(-1);
+  assert.match(notice.text, /No answer/);
+  assert.deepEqual(f.on(notice.messageId), ['🤔', '👍']);
+  const row = f.db.raw.prepare('SELECT state,report_state,report_receipt FROM external_jobs WHERE request_id=?').get(`mailbox-notice:${sent.id}`);
+  assert.deepEqual([row.state, row.report_state, JSON.parse(row.report_receipt).silent], ['succeeded', 'silent', 'notice']);
+  assert.deepEqual(f.reports, ['Asked finance for the runway.'], 'only the ask\'s own turn reported, never the notice\'s');
+});
+
 test('end to end: a failed job turn leaves its card at 🤯, and its delivery state is the turn\'s own', { timeout: 5000 }, async (t) => {
   const f = await fixture(t, { turn: async () => ({ error: 'provider rejected' }) });
   f.jobs.start();

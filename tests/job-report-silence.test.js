@@ -131,3 +131,41 @@ test('the dispatch leaves a text without the token, and a deferral, untouched', 
   const deferred = { deferred: true, reason: 'Session is busy' };
   assert.equal(await dispatchWith(deferred).run(), deferred);
 });
+
+// Polygram's own delivery notice ("[Inter-session notice] …") is a status
+// message to the session that asked, not news for the people in its topic.
+// All 10 notices after 0.56.1 posted text against "don't acknowledge it", so
+// a notice turn's text is never posted; on the Claude CLI the agent can still
+// tell a person with the reply tool during the turn.
+const NOTICE = 'mailbox-notice:m_0000000000000001';
+function noticeDispatch(result) {
+  const dispatch = createExternalJobDispatch({
+    dispatchExternalEvent: (_origin, run) => run(),
+    runtime: { dispatch: async () => result },
+    getMailbox: () => ({ enabled: true, instructions: () => '', noteJobSend() {} }),
+  });
+  return (requestId = NOTICE) => dispatch({ id: 1, routeId: 'ops', requestId, task: '[Inter-session notice] …', payload: {}, target }, {});
+}
+
+test('a notice never posts its final text, whatever it says', async () => {
+  for (const text of ['Noted; nothing for the team here.', 'NO_REPLY', '', undefined]) {
+    const result = await noticeDispatch({ outcome: 'succeeded', text, inactive: true })();
+    assert.deepEqual(result, { outcome: 'succeeded', text: '', silent: 'notice', inactive: true }, String(text));
+  }
+  const failed = await noticeDispatch({ outcome: 'failed', text: 'It broke.', error: 'x' })();
+  assert.equal(failed.silent, 'notice', 'a failed notice turn posts nothing either');
+});
+
+test('only polygram\'s notices are silenced: a reply about the same ask still reports', async () => {
+  const result = await noticeDispatch({ outcome: 'succeeded', text: 'Runway is seven months.' })('mailbox:m_0000000000000001');
+  assert.deepEqual(result, { outcome: 'succeeded', text: 'Runway is seven months.' });
+});
+
+test('the store records a notice as silent with reason notice; a reply-tool delivery keeps its own record', (t) => {
+  const store = createExternalJobStore(memoryDb(t), { botName: 'test', now: () => 1000 });
+  const submit = (requestId) => store.claim(store.submit({ routeId: 'ops', requestId, task: 'Notice.', payload: {} }, target).job.id);
+  const one = submit(NOTICE);
+  assert.deepEqual(store.finish(one.id, { outcome: 'succeeded', silent: 'notice', inactive: true }).reportReceipt, { silent: 'notice', turnId: null });
+  const two = submit('mailbox-notice:m_0000000000000002');
+  assert.equal(store.finish(two.id, { outcome: 'succeeded', silent: 'notice', channelsAcknowledged: true, inactive: true }).reportState, 'unknown');
+});
