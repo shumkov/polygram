@@ -1,9 +1,10 @@
 # Job turns: speak only when people need it, and show that they work
 
 Status: v3, 2026-11-28. v2 (0.56.1) shipped the instructions and the visible
-working state; v3 (0.56.2) adds `NO_REPLY`, silent notices, and rewords and
-moves the instructions (see [What 0.56.1 did not fix](#what-0561-did-not-fix)).
-Reviews are in the [review log](#review-log). Builds on
+working state; v3 (0.56.2) keeps a Claude CLI job turn's final text private,
+adds `NO_REPLY` for Codex, makes notices silent, and rewords and moves the
+instructions (see [What 0.56.1 did not fix](#what-0561-did-not-fix)). Reviews
+are in the [review log](#review-log). Builds on
 [`MAILBOX.md`](./MAILBOX.md),
 [`EXTERNAL_JOBS_API.md`](./EXTERNAL_JOBS_API.md) and
 [`MAILBOX_LINKS_SPEC.md`](./MAILBOX_LINKS_SPEC.md).
@@ -55,10 +56,31 @@ Shumabit, 2026-11-27 19:36 to 2026-11-28, after 0.56.1: 78 job turns.
 
 Agents still treat the final text as a private note to an operator, and almost
 never end with an empty text: an empty final message is not something a model
-does on purpose. So v3 gives the agent an explicit token for silence, which
-the human-turn path already honors (`result.text === 'NO_REPLY'` in
-`polygram.js`), and takes notices out of the reports entirely. Hiding reports
-by content in code is still ruled out; the agent decides, with a token.
+does on purpose.
+
+On the Claude CLI that reading is not a misunderstanding: it is what the
+session's system prompt says. Orchestra appends a hard contract to every Claude
+CLI session (`cli-process.js`, the "channels mode — HARD CONTRACT" block): its
+stdout and inline text are not seen by the user, and anything for the user goes
+through the reply tool. A job turn obeyed it, wrote "I didn't post in the
+topic" in its closing text, and polygram then posted that text as the report.
+A paragraph in the user prompt cannot outrank a system-prompt contract; making
+the contract true can. (Root-cause analysis:
+`/tmp/claude/mailbox-links/noise-think-codex.md`, Ivan's decision 2026-11-28.)
+
+So v3:
+
+- **Claude CLI:** a job turn's final text is never posted. It is kept as a
+  private log (part 3) for review, and the agent reaches people only through
+  the reply tool, as its system prompt already says. Turns that used the reply
+  tool are unchanged.
+- **Codex** has no reply tool, so its text stays the report, with an explicit
+  token for silence, `NO_REPLY`, which the human-turn path already honors
+  (`result.text === 'NO_REPLY'` in `polygram.js`).
+- **Notices** are never posted, on either backend.
+
+Hiding reports by content in code is still ruled out: on the Claude CLI the
+rule is the transport's own, and on Codex the agent decides, with a token.
 
 ## 1. The instructions
 
@@ -68,17 +90,15 @@ Every job turn ends with one paragraph from `renderJobVoice`
 (`lib/external-jobs/voice.js`). Its wording depends on the backend, since the
 two post different things, and on the kind of job.
 
-On the Claude CLI, where the report is the turn's final message:
+On the Claude CLI, whose final text is never posted (part 3) and whose system
+prompt already routes everything for a person through the reply tool:
 
-> No person in this chat wrote to you in this turn. Your final message is not
-> a private summary: polygram posts it, word for word, to this chat as a
-> message from you. If it would describe what you did, say that you posted
-> nothing, or say that nothing was needed, make your entire final message
-> exactly NO_REPLY. Write a final message only when a person here needs it: a
-> result, a problem, or a decision they must make, addressed to them, in the
-> language they use in this chat. If you already told them with the reply
-> tool, end with NO_REPLY. Post no plan or progress note: the chat already
-> shows that you are working.
+> No person in this chat wrote to you in this turn. Anything a person here
+> needs goes through the reply tool: a result, a problem, or a decision they
+> must make, addressed to them, in the language they use in this chat. Your
+> final text is kept as a private log and is not posted. If nothing is needed,
+> just end the turn. For this turn, the plan-first checklist rule does not
+> apply: don't post a plan or progress checklist.
 
 On Codex, where the report is every agent message of the turn, joined
 (`_finalTurnText` in Orchestra's `codex-process.js`), and there is no reply
@@ -95,25 +115,25 @@ tool:
 
 Why each part:
 
-- **"Not a private summary … word for word … as a message from you"** names
-  the misreading the evidence shows: a note to an operator.
-- **"Exactly NO_REPLY"** replaces "write no text at all". The three named
-  cases are the three noise classes of both reviews.
-- **"If you already told them with the reply tool, end with NO_REPLY"**: a
-  turn whose reply-tool message was final posts nothing more anyway, but a turn
-  that sent only an interim reply still has its final text rescued and posted
-  by Orchestra (`interim-rescue`).
-- **"Post no plan or progress note"** answers Orchestra's CLI channels
-  contract, which makes the first visible action of a multi-step task a
-  `reply` with a plan checklist. That rule is for a person waiting on the
-  turn; here the typing and the card's reaction (part 2) show the work.
+- **Claude CLI, "goes through the reply tool … your final text is kept as a
+  private log"** restates the system prompt's contract and makes it true,
+  instead of contradicting it from a weaker position.
+- **"The plan-first checklist rule does not apply"** names Orchestra's
+  "Staying responsive on a long task" contract, which makes the first visible
+  action of a multi-step task a `reply` with a plan checklist. That rule is for
+  a person waiting on the turn; here the typing and the card's reaction (part
+  2) show the work.
+- **Codex, "not a private summary … word for word … as a message from you"**
+  names the misreading the evidence shows: a note to an operator. **"Exactly
+  NO_REPLY"** replaces "write no text at all"; the three named cases are the
+  three noise classes of both reviews.
 
 A delivery notice (`renderNoticeTask`, `[Inter-session notice] …`) gets a
 different paragraph, since its text is never posted (part 3):
 
-> This notice is for you, not for the people in this chat: polygram does not
-> post your final message in this turn. Use the reply tool only if a person
-> here must know something now; post no plan or progress note.
+> This notice is for you, not for the people in this chat: your final text is
+> kept as a private log and is not posted. Use the reply tool only if a person
+> here must know something now; don't post a plan or progress checklist.
 
 On Codex, which has no reply tool:
 
@@ -126,21 +146,24 @@ assistant's mailbox block already uses, such as "Mai"), and the job is not a
 notice, the paragraph gains:
 
 > This is {Name}'s direct chat with you. If what you received asks something
-> of {Name} or is for {Name}, tell {Name} with the reply tool or in your final
-> message: who asks, what, by when, in {Name}'s language. Never end such a turn
-> with NO_REPLY before {Name} has been told.
+> of {Name} or is for {Name}, tell {Name} with the reply tool: who asks, what,
+> by when, in {Name}'s language. Never end such a turn before {Name} has been
+> told.
 
-On Codex "with the reply tool or in your final message" reads "in what you
-write". The config key is the reliable source of the name; the stored
-`to_label` ("Mai's assistant") is display data.
+On Codex: "tell {Name} in what you write: … Never end such a turn with
+NO_REPLY before {Name} has been told." The config key is the reliable source
+of the name; the stored `to_label` ("Mai's assistant") is display data.
 
 ### Wording that blocked the assistant
 
 The assistant's mailbox block said: "In a turn another session started you
 cannot message or reply: tell {Name} what is asked". On the Claude CLI
-`reply` is also the Telegram send tool, so this read as "say nothing". It now
-says: "you cannot run the mailbox send or reply commands: tell {Name} in your
-final text what is asked, and reply through the mailbox once {Name} answers."
+`reply` is also the Telegram send tool, so this read as "say nothing". 0.56.1
+changed it to: "you cannot run the mailbox send or reply commands: tell
+{Name} in your final text what is asked, and reply through the mailbox once
+{Name} answers." With a Claude CLI final text now private, it says "tell
+{Name} with the reply tool what is asked" on the Claude CLI and "tell {Name} in
+what you write what is asked" on Codex (the backend of the assistant's chat).
 The mailbox skill says the same.
 
 ### The display hint
@@ -337,18 +360,50 @@ with its link for this.
 
 ## 3. What of the text is posted
 
-`reportOf(text, { notice })` in `voice.js` decides it, and the dispatch applies
-it to the turn's result before the job service records the outcome:
+`reportOf(text, { notice, cli })` in `voice.js` decides it, and the dispatch
+applies it to the turn's result before the job service records the outcome.
+`cli` is true unless the turn ran on Codex: the runtime's result names the
+backend the turn ran on, and the resolver the voice was worded by is the
+fallback, so the rule and the instructions the agent read agree.
+
+| Turn text | Posted | `report_state` | `report_receipt` | Kept privately |
+|---|---|---|---|---|
+| a turn that spoke through the reply tool (`channelsAcknowledged`) | nothing more | `unknown`, as today | `{"channelsAcknowledged":true,…}` | no |
+| a notice's, whatever it says (a notice turn that ran), either backend | nothing | `silent` | `{"silent":"notice","turnId":…}` | its text |
+| Claude CLI: any final text, any outcome | nothing | `silent` | `{"silent":"private-final","turnId":…}` | its text, if any |
+
+Codex, the rest of this section:
 
 | Turn text | Posted | `report_state` | `report_receipt` |
 |---|---|---|---|
-| a notice's, whatever it says (a notice turn that ran) | nothing | `silent` | `{"silent":"notice","turnId":…}` |
 | trimmed, exactly `NO_REPLY` | nothing | `silent` | `{"silent":"no-reply","turnId":…}` |
 | `NO_REPLY` as a control word next to other text: on a line of its own, or the first or last word | the text without the token | as today | as today |
 | the same, with no letter or digit left once the token is gone (`` `NO_REPLY` ``, `NO_REPLY.`, the token alone in a code fence, two Codex messages that were both `NO_REPLY`) | nothing | `silent` | `{"silent":"no-reply","turnId":…}` |
 | `NO_REPLY` mentioned inside a sentence or in fenced code | as written | as today | as today |
 | no token | as today | as today | as today |
 
+- **Claude CLI: the final text is a private log.** Orchestra's system prompt
+  tells the session that its inline text is not seen and that anything for a
+  person goes through the reply tool; posting the final text broke that
+  contract (79% of the reports after 0.56.1 said "I didn't post"). Nothing a
+  Claude CLI job turn writes outside the reply tool reaches the chat, NO_REPLY
+  included, which on the Claude CLI is just a final text. What it held back is
+  kept (below), so a review can find a result that should have gone through
+  the reply tool. Orchestra's interim rescue (a turn that sent only an interim
+  `reply` and wrote its answer as final text) no longer posts that answer for
+  a job turn: the voice says the final text is private, and the private log
+  shows such cases.
+- **The held-back text.** A notice's or a Claude CLI turn's text is stored as
+  one row of `external_job_report_parts` with `state = 'private'`, redacted
+  like a posted report and cut to 16 384 characters. Delivery reads only the
+  other parts, so nothing can send it, and a restart's recovery leaves it
+  alone:
+
+  ```sql
+  SELECT j.request_id, j.report_receipt, p.text FROM external_jobs j
+  JOIN external_job_report_parts p ON p.job_id = j.id AND p.state = 'private'
+  WHERE j.created_at > :deploy ORDER BY j.id;
+  ```
 - **The token as a control word is removed, not posted.** The human-turn path
   silences only an exact `NO_REPLY` and posts any other text as written, the
   token included. For a job report, a literal control token in the topic is
@@ -386,7 +441,8 @@ it to the turn's result before the job service records the outcome:
   carries only the joined text.
 - **A notice never posts its text.** On the Claude CLI the agent can still
   speak to people with the reply tool during the turn; on Codex it cannot, and
-  the notice card (with mirroring on) is what the topic sees. A notice whose
+  the notice card (with mirroring on) is what the topic sees. Its text is kept
+  privately, since a notice turn can still find a real blocker. A notice whose
   turn never ran (the send failed, the kill switch withdrew it) has no text
   and keeps its own record, since `silent` means a text deliberately not
   posted.
@@ -396,15 +452,16 @@ it to the turn's result before the job service records the outcome:
   "the final text was not posted", and it records that the turn spoke. A
   report that failed to render keeps `unknown` with its error.
 - **Any outcome.** The rule applies to failed, interrupted and unknown turns
-  too: an explicit `NO_REPLY` is the agent's choice either way.
+  too: an explicit `NO_REPLY` is the agent's choice either way, and a Claude
+  CLI final text is private either way.
 - **The card still ends at 👍.** Presence ends from the turn's outcome in the
   runtime, before the report is decided, so a silent job's card goes 🤔 → 👍
   as before (part 2).
 - **API.** `reportState` gains the value `silent`
   ([`EXTERNAL_JOBS_API.md`](./EXTERNAL_JOBS_API.md)). No client switches on it
   today: agent-org and the notification consumer only display it.
-- No migration: `report_state` is free text and the reason lives in the
-  existing `report_receipt` JSON column.
+- No migration: `report_state` and the part's `state` are free text, and the
+  reason lives in the existing `report_receipt` JSON column.
 
 Counting after the deploy:
 
@@ -426,6 +483,13 @@ FROM external_jobs WHERE created_at > :deploy GROUP BY 1, 2;
   it wrote before.** It would drop the narration, but also a result written
   before the token, and the joined text cannot tell a Codex message boundary
   from a paragraph break. Codex is told instead that every message is posted.
+- **Post the Claude CLI final text unless it is `NO_REPLY`** (the first v3
+  design, and what Codex does). It keeps the contradiction with the system
+  prompt, which says inline text is not seen: the token is only a weaker
+  instruction against a hard contract. Rejected by Ivan, 2026-11-28.
+- **Change Orchestra's contract instead.** It is right for human turns, and a
+  job turn's text is polygram's choice to post; making polygram match the
+  contract needs no Orchestra release.
 - **Silence any text that contains `NO_REPLY`, or starts with it.** Loses a
   result written next to the token. The token is removed instead.
 - **Cut every occurrence of the word.** The first implementation did; the
@@ -502,7 +566,16 @@ never cut, and neighbors are read by code point.
 - The notice task no longer says "say so in your topic".
 - A stored job submitted with the old task text gets the paragraph at
   dispatch.
-- A trimmed, exact `NO_REPLY` final text posts nothing and records
+- A Claude CLI job turn's final text is never posted, for any outcome: it
+  records `silent` with reason `private-final` and keeps the text privately;
+  its card still ends 👍. A reply-tool turn and a turn that never ran are
+  unchanged. The runtime's backend decides, the resolver is the fallback, and
+  without either the Claude CLI rule applies.
+- The held-back text is never a delivery part, survives recovery as silent,
+  is redacted and bounded; only a silent report keeps one.
+- The assistant's mailbox block says "with the reply tool" on the Claude CLI
+  and "in what you write" on Codex.
+- Codex: a trimmed, exact `NO_REPLY` final text posts nothing and records
   `report_state = 'silent'` with reason `no-reply`; its card still ends 👍.
 - `NO_REPLY` as a control word next to other text posts the text without the
   token and its markup, and logs `job-report-no-reply-stripped`; with nothing
